@@ -3,6 +3,7 @@ const c = @import("native/bindings.zig").c;
 const Clay = @import("ui/clay.zig").Layout;
 const Theme = @import("ui/theme.zig").Theme;
 const parseTheme = @import("ui/theme.zig").parse;
+const beforeLastGrapheme = @import("text/edit.zig").beforeLastGrapheme;
 
 pub const App = struct {
     window: *c.SDL_Window,
@@ -12,6 +13,7 @@ pub const App = struct {
     theme: Theme,
     draft: std.ArrayList(u8) = .empty,
     preedit: std.ArrayList(u8) = .empty,
+    grapheme_scratch: std.ArrayList(u8) = .empty,
     allocator: std.mem.Allocator,
     running: bool = true,
     dirty: bool = true,
@@ -39,6 +41,7 @@ pub const App = struct {
         _ = c.SDL_StopTextInput(self.window);
         self.draft.deinit(self.allocator);
         self.preedit.deinit(self.allocator);
+        self.grapheme_scratch.deinit(self.allocator);
         self.layout.deinit();
         c.spica_text_destroy(self.text);
         c.SDL_DestroyRenderer(self.renderer);
@@ -93,6 +96,14 @@ pub const App = struct {
         switch (event.type) {
             c.SDL_EVENT_QUIT => self.running = false,
             c.SDL_EVENT_WINDOW_EXPOSED, c.SDL_EVENT_WINDOW_RESIZED => self.dirty = true,
+            c.SDL_EVENT_KEY_DOWN => {
+                if (event.key.key == c.SDLK_BACKSPACE and self.preedit.items.len == 0 and self.draft.items.len != 0) {
+                    try self.grapheme_scratch.resize(self.allocator, self.draft.items.len);
+                    const end = try beforeLastGrapheme(self.draft.items, self.grapheme_scratch.items);
+                    self.draft.shrinkRetainingCapacity(end);
+                    self.dirty = true;
+                }
+            },
             c.SDL_EVENT_TEXT_INPUT => {
                 const bytes = std.mem.span(event.text.text);
                 if (bytes.len > 65536 - self.draft.items.len) return error.DraftBudgetExceeded;

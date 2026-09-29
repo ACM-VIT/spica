@@ -6,6 +6,14 @@
     "Inter": {"version": "4.1", "url": "https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip", "sha256": "9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e"},
     "JetBrainsMono": {"version": "2.304", "url": "https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip", "sha256": "6f6376c6ed2960ea8a963cd7387ec9d76e3f629125bc33d1fdcd7eb7012f7bbf"},
     "SDL_image": {"version": "release-3.4.6", "url": "https://codeload.github.com/libsdl-org/SDL_image/tar.gz/refs/tags/release-3.4.6", "sha256": "0bbac8c799273488ce32c4a53a44fc0fc70a6079458bd9d46fc4e72da138367f"},
-    "cmark-gfm": {"version": "0.29.0.gfm.13", "url": "https://codeload.github.com/github/cmark-gfm/tar.gz/refs/tags/0.29.0.gfm.13", "sha256": "5abc61798ebd9de5660bc076443c07abad2b8d15dbc11094a3a79644b8ad243a"}
+    "cmark-gfm": {"version": "0.29.0.gfm.13", "url": "https://codeload.github.com/github/cmark-gfm/tar.gz/refs/tags/0.29.0.gfm.13", "sha256": "5abc61798ebd9de5660bc076443c07abad2b8d15dbc11094a3a79644b8ad243a"},
+    "jpeg": {"version": "9db4612eee1913e689f58ce62cd3b8708b290fd3", "url": "https://codeload.github.com/libsdl-org/jpeg/tar.gz/9db4612eee1913e689f58ce62cd3b8708b290fd3", "sha256": "5145ba77cfd4caa2287899ae32ca2661a5098eba10586969d841c0ea1519102f"},
+    "libpng": {"version": "4b9e071b2fc4216369372a3ed260d335dd036f15", "url": "https://codeload.github.com/libsdl-org/libpng/tar.gz/4b9e071b2fc4216369372a3ed260d335dd036f15", "sha256": "83705529542d2bf31e9c717ebea0ad7a892bc28477493af5d2bc13a16d6628e3"},
+    "libwebp": {"version": "0b4545ee8210ff72ec47ab1ad56c2e7460663d11", "url": "https://codeload.github.com/libsdl-org/libwebp/tar.gz/0b4545ee8210ff72ec47ab1ad56c2e7460663d11", "sha256": "9bd4faa68b113b5f6ca41884eee8ecec54eea46e730ecfd4d6a5f6473d6eb433"},
+    "zlib": {"version": "0e68590d11e618d60866aa86629fbda128bc068a", "url": "https://codeload.github.com/libsdl-org/zlib/tar.gz/0e68590d11e618d60866aa86629fbda128bc068a", "sha256": "31247e726cace84b33bcf2c930d7d6e6d989a8f59b718deca557848b0f47dcda"},
+    "libunibreak": {"version": "libunibreak_8_0", "url": "https://codeload.github.com/adah1972/libunibreak/tar.gz/refs/tags/libunibreak_8_0", "sha256": "35f1008184c13de55793fa292b62a0c10739f1294f401a3b6a772edc145a4b3b"},
+    "fribidi": {"version": "v1.0.17", "url": "https://codeload.github.com/fribidi/fribidi/tar.gz/refs/tags/v1.0.17", "sha256": "ab015bb040b2ff4bf815813c21948947dad1e0186473359e99a8881c79878d5d"},
+    "meson": {"version": "1.12.1", "url": "https://codeload.github.com/mesonbuild/meson/tar.gz/refs/tags/1.12.1", "sha256": "64731a3a08ae94837e480f866cb1a2be9b12b9010899317f1db097ce5281a52a"},
+    "ninja": {"version": "v1.13.2", "url": "https://codeload.github.com/ninja-build/ninja/tar.gz/refs/tags/v1.13.2", "sha256": "974d6b2f4eeefa25625d34da3cb36bdcebe7fbce40f4c16ac0835fd1c0cbae17"}
   }
 }

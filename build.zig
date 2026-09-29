@@ -27,14 +27,15 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("SDL3", .{});
     exe.root_module.linkSystemLibrary("freetype", .{});
     exe.root_module.linkSystemLibrary("harfbuzz", .{});
+    exe.root_module.linkSystemLibrary("unibreak", .{});
     b.installArtifact(exe);
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run Spica").dependOn(&run.step);
-    const tests = b.step("test", "Run protocol, storage, and theme regressions");
-    inline for (.{ "src/core/protocol_test.zig", "src/core/store_test.zig", "src/ui/theme.zig" }) |path| {
+    const tests = b.step("test", "Run protocol, storage, theme, and Unicode regressions");
+    inline for (.{ "src/core/protocol_test.zig", "src/core/store_test.zig", "src/ui/theme.zig", "src/text/edit.zig" }) |path| {
         const test_artifact = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(path),
@@ -43,6 +44,11 @@ pub fn build(b: *std.Build) void {
                 .link_libc = true,
             }),
         });
+        if (std.mem.eql(u8, path, "src/text/edit.zig")) {
+            test_artifact.root_module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{prefix}) });
+            test_artifact.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
+            test_artifact.root_module.linkSystemLibrary("unibreak", .{});
+        }
         if (std.mem.eql(u8, path, "src/core/store_test.zig"))
             test_artifact.root_module.linkSystemLibrary("sqlite3", .{});
         tests.dependOn(&b.addRunArtifact(test_artifact).step);
