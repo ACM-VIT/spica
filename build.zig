@@ -33,7 +33,18 @@ pub fn build(b: *std.Build) void {
     run.step.dependOn(b.getInstallStep());
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run Spica").dependOn(&run.step);
-    b.step("test", "Compile and run application tests").dependOn(&b.addRunArtifact(b.addTest(.{
-        .root_module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .link_libc = true }),
-    })).step);
+    const tests = b.step("test", "Run protocol, storage, and theme regressions");
+    inline for (.{ "src/core/protocol_test.zig", "src/core/store_test.zig", "src/ui/theme.zig" }) |path| {
+        const test_artifact = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(path),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        if (std.mem.eql(u8, path, "src/core/store_test.zig"))
+            test_artifact.root_module.linkSystemLibrary("sqlite3", .{});
+        tests.dependOn(&b.addRunArtifact(test_artifact).step);
+    }
 }
