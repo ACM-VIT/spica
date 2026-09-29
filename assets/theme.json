@@ -1,0 +1,17 @@
+{
+  "light": {
+    "canvas": "#F7F9FC", "panel": "#FFFFFF", "raised": "#EDF1F6",
+    "border": "#CCD5E0", "text": "#182231", "muted": "#526174",
+    "accent": "#2357B5", "success": "#247242", "error": "#B42332"
+  },
+  "dark": {
+    "canvas": "#14171B", "panel": "#1B2027", "raised": "#232A33",
+    "border": "#343E4B", "text": "#E7EDF5", "muted": "#A8B3C2",
+    "accent": "#8AB4F8", "success": "#8BD5A5", "error": "#FF9B9B"
+  },
+  "metrics": {
+    "sidebar_width": 248, "header_height": 48, "inspector_width": 320,
+    "chat_max_width": 960, "label_px": 13, "body_px": 15,
+    "line_height_px": 22, "code_px": 13, "radius_px": 8
+  }
+}

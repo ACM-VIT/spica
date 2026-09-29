@@ -4,6 +4,8 @@
     "SDL": {"version": "release-3.4.16", "url": "https://codeload.github.com/libsdl-org/SDL/tar.gz/refs/tags/release-3.4.16", "sha256": "c2ee715e42ec520c4d11fd8d249ef1d2b2baf4ad31148b72b3b000276c0b3633"},
     "clay": {"version": "b25a31c1a152915cd7dd6796e6592273e5a10aac", "url": "https://codeload.github.com/nicbarker/clay/tar.gz/b25a31c1a152915cd7dd6796e6592273e5a10aac", "sha256": "1cba69296adf4efb57dbabc46076f0d50912319ed703d372c655e6a45c47129d"},
     "Inter": {"version": "4.1", "url": "https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip", "sha256": "9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e"},
-    "JetBrainsMono": {"version": "2.304", "url": "https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip", "sha256": "6f6376c6ed2960ea8a963cd7387ec9d76e3f629125bc33d1fdcd7eb7012f7bbf"}
+    "JetBrainsMono": {"version": "2.304", "url": "https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip", "sha256": "6f6376c6ed2960ea8a963cd7387ec9d76e3f629125bc33d1fdcd7eb7012f7bbf"},
+    "SDL_image": {"version": "release-3.4.6", "url": "https://codeload.github.com/libsdl-org/SDL_image/tar.gz/refs/tags/release-3.4.6", "sha256": "0bbac8c799273488ce32c4a53a44fc0fc70a6079458bd9d46fc4e72da138367f"},
+    "cmark-gfm": {"version": "0.29.0.gfm.13", "url": "https://codeload.github.com/github/cmark-gfm/tar.gz/refs/tags/0.29.0.gfm.13", "sha256": "5abc61798ebd9de5660bc076443c07abad2b8d15dbc11094a3a79644b8ad243a"}
   }
 }
