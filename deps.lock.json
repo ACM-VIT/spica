@@ -14,6 +14,8 @@
     "libunibreak": {"version": "libunibreak_8_0", "url": "https://codeload.github.com/adah1972/libunibreak/tar.gz/refs/tags/libunibreak_8_0", "sha256": "35f1008184c13de55793fa292b62a0c10739f1294f401a3b6a772edc145a4b3b"},
     "fribidi": {"version": "v1.0.17", "url": "https://codeload.github.com/fribidi/fribidi/tar.gz/refs/tags/v1.0.17", "sha256": "ab015bb040b2ff4bf815813c21948947dad1e0186473359e99a8881c79878d5d"},
     "meson": {"version": "1.12.1", "url": "https://codeload.github.com/mesonbuild/meson/tar.gz/refs/tags/1.12.1", "sha256": "64731a3a08ae94837e480f866cb1a2be9b12b9010899317f1db097ce5281a52a"},
-    "ninja": {"version": "v1.13.2", "url": "https://codeload.github.com/ninja-build/ninja/tar.gz/refs/tags/v1.13.2", "sha256": "974d6b2f4eeefa25625d34da3cb36bdcebe7fbce40f4c16ac0835fd1c0cbae17"}
+    "ninja": {"version": "v1.13.2", "url": "https://codeload.github.com/ninja-build/ninja/tar.gz/refs/tags/v1.13.2", "sha256": "974d6b2f4eeefa25625d34da3cb36bdcebe7fbce40f4c16ac0835fd1c0cbae17"},
+    "FreeType": {"version": "VER-2-14-3", "url": "https://codeload.github.com/freetype/freetype/tar.gz/refs/tags/VER-2-14-3", "sha256": "dc49de6b01a266eef4876a4dd34d9842c475d3e28ff2eff63bd2fb760ab56261"},
+    "HarfBuzz": {"version": "14.5.0", "url": "https://codeload.github.com/harfbuzz/harfbuzz/tar.gz/refs/tags/14.5.0", "sha256": "97ec7488a46b974e18e08ee774af93173e7e1dbf738424796eb315ebcb735ec5"}
   }
 }

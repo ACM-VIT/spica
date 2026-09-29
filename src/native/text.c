@@ -8,6 +8,7 @@
 #include <string.h>
 
 #define GLYPH_LIMIT 512
+#define GLYPH_GPU_LIMIT (4u * 1024u * 1024u)
 
 typedef struct {
     unsigned int index;
@@ -22,6 +23,9 @@ struct SpicaText {
     hb_font_t *font;
     hb_buffer_t *buffer;
     Glyph glyphs[GLYPH_LIMIT];
+    unsigned short slots[1024];
+    Uint32 alpha_pixels[256];
+    size_t glyph_bytes;
     unsigned count;
 };
 
@@ -35,6 +39,10 @@ SpicaText *spica_text_create(SDL_Renderer *renderer, const char *font_path) {
     text->font = hb_ft_font_create_referenced(text->face);
     text->buffer = hb_buffer_create();
     if (!text->font || !text->buffer || !hb_buffer_allocation_successful(text->buffer)) goto fail;
+    const SDL_PixelFormatDetails *format = SDL_GetPixelFormatDetails(SDL_PIXELFORMAT_RGBA8888);
+    if (!format) goto fail;
+    for (unsigned i = 0; i < 256; ++i)
+        text->alpha_pixels[i] = SDL_MapRGBA(format, NULL, 255, 255, 255, (Uint8)i);
     return text;
 fail:
     spica_text_destroy(text);
@@ -52,12 +60,18 @@ void spica_text_destroy(SpicaText *text) {
 }
 
 static Glyph *get_glyph(SpicaText *text, unsigned index) {
-    for (unsigned i = 0; i < text->count; ++i)
-        if (text->glyphs[i].index == index) return &text->glyphs[i];
+    unsigned slot_index = (index * 2654435761u) & 1023u;
+    while (text->slots[slot_index]) {
+        Glyph *candidate = &text->glyphs[text->slots[slot_index] - 1];
+        if (candidate->index == index) return candidate;
+        slot_index = (slot_index + 1) & 1023u;
+    }
     if (text->count == GLYPH_LIMIT || FT_Load_Glyph(text->face, index, FT_LOAD_RENDER)) return NULL;
     FT_GlyphSlot slot = text->face->glyph;
     FT_Bitmap *bitmap = &slot->bitmap;
     if (bitmap->width > 128 || bitmap->rows > 128) return NULL;
+    const size_t glyph_bytes = (size_t)bitmap->width * bitmap->rows * 4;
+    if (glyph_bytes > GLYPH_GPU_LIMIT - text->glyph_bytes) return NULL;
     Glyph *glyph = &text->glyphs[text->count];
     *glyph = (Glyph){.index = index, .left = slot->bitmap_left, .top = slot->bitmap_top,
                      .width = (int)bitmap->width, .height = (int)bitmap->rows};
@@ -74,8 +88,7 @@ static Glyph *get_glyph(SpicaText *text, unsigned index) {
                 unsigned char a = bitmap->pixel_mode == FT_PIXEL_MODE_GRAY ? row[x] :
                                   bitmap->pixel_mode == FT_PIXEL_MODE_MONO ?
                                   (row[x / 8] & (0x80 >> (x % 8)) ? 255 : 0) : 0;
-                pixels[(size_t)y * glyph->width + x] = SDL_MapRGBA(
-                    SDL_GetPixelFormatDetails(SDL_PIXELFORMAT_RGBA8888), NULL, 255, 255, 255, a);
+                pixels[(size_t)y * glyph->width + x] = text->alpha_pixels[a];
             }
         }
         bool uploaded = SDL_UpdateTexture(glyph->texture, NULL, pixels, glyph->width * 4);
@@ -85,7 +98,8 @@ static Glyph *get_glyph(SpicaText *text, unsigned index) {
             return NULL;
         }
     }
-    ++text->count;
+    text->glyph_bytes += glyph_bytes;
+    text->slots[slot_index] = (unsigned short)(++text->count);
     return glyph;
 }
 

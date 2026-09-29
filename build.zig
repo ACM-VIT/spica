@@ -18,6 +18,8 @@ pub fn build(b: *std.Build) void {
     });
     const prefix = b.fmt(".deps/install/{s}-{s}", .{ @tagName(target.result.os.tag), @tagName(target.result.cpu.arch) });
     exe.root_module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{prefix}) });
+    exe.root_module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/freetype2", .{prefix}) });
+    exe.root_module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/harfbuzz", .{prefix}) });
     exe.root_module.addIncludePath(.{ .cwd_relative = "src/native" });
     exe.root_module.addIncludePath(.{ .cwd_relative = ".deps/src/clay-b25a31c1a152915cd7dd6796e6592273e5a10aac" });
     exe.root_module.addCSourceFile(.{ .file = b.path("src/native/clay.c"), .flags = &.{ "-std=c11", "-O2" } });
@@ -34,8 +36,8 @@ pub fn build(b: *std.Build) void {
     run.step.dependOn(b.getInstallStep());
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run Spica").dependOn(&run.step);
-    const tests = b.step("test", "Run protocol, storage, theme, and Unicode regressions");
-    inline for (.{ "src/core/protocol_test.zig", "src/core/store_test.zig", "src/ui/theme.zig", "src/text/edit.zig" }) |path| {
+    const tests = b.step("test", "Run protocol, storage, theme, Unicode, and Markdown regressions");
+    inline for (.{ "src/core/protocol_test.zig", "src/core/store_test.zig", "src/ui/theme.zig", "src/text/edit.zig", "src/native/markdown_test.zig" }) |path| {
         const test_artifact = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(path),
@@ -48,6 +50,16 @@ pub fn build(b: *std.Build) void {
             test_artifact.root_module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{prefix}) });
             test_artifact.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
             test_artifact.root_module.linkSystemLibrary("unibreak", .{});
+        }
+        if (std.mem.eql(u8, path, "src/native/markdown_test.zig")) {
+            test_artifact.root_module.addIncludePath(.{ .cwd_relative = "src/native" });
+            test_artifact.root_module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{prefix}) });
+            test_artifact.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
+            test_artifact.root_module.addCSourceFile(.{ .file = b.path("src/native/parse_arena.c"), .flags = &.{ "-std=c11", "-O2" } });
+            test_artifact.root_module.addCSourceFile(.{ .file = b.path("src/native/parse_arena_test.c"), .flags = &.{ "-std=c11", "-O2" } });
+            test_artifact.root_module.addCSourceFile(.{ .file = b.path("src/native/markdown.c"), .flags = &.{ "-std=c11", "-O2" } });
+            test_artifact.root_module.linkSystemLibrary("cmark-gfm-extensions", .{});
+            test_artifact.root_module.linkSystemLibrary("cmark-gfm", .{});
         }
         if (std.mem.eql(u8, path, "src/core/store_test.zig"))
             test_artifact.root_module.linkSystemLibrary("sqlite3", .{});

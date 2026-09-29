@@ -72,6 +72,8 @@ def main():
     fribidi = acquire('fribidi')
     meson = acquire('meson')
     ninja = acquire('ninja')
+    freetype = acquire('FreeType')
+    harfbuzz = acquire('HarfBuzz')
     for codec in ('jpeg', 'libpng', 'libwebp', 'zlib'):
         source = acquire(codec)
         destination = image / 'external' / codec
@@ -134,6 +136,33 @@ def main():
         subprocess.run([sys.executable, 'configure.py', '--bootstrap'], cwd=ninja, check=True)
         shutil.copy2(ninja / 'ninja', ninja_binary)
     child_env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ.get('PATH', ''))
+    pkg_config = str(prefix / 'lib' / 'pkgconfig')
+    child_env['PKG_CONFIG_PATH'] = pkg_config + os.pathsep + child_env.get('PKG_CONFIG_PATH', '')
+    freetype_library = prefix / 'lib' / 'libfreetype.so'
+    if not freetype_library.exists():
+        build = CACHE / 'build' / 'freetype'
+        subprocess.run(['cmake', '-S', str(freetype), '-B', str(build),
+                        '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
+                        '-DBUILD_SHARED_LIBS=ON', '-DFT_DISABLE_HARFBUZZ=ON'], check=True)
+        subprocess.run(['cmake', '--build', str(build), '--parallel', '4'], check=True)
+        subprocess.run(['cmake', '--install', str(build)], check=True)
+        if not freetype_library.exists():
+            raise RuntimeError(f'FreeType install did not produce {freetype_library}')
+    harfbuzz_library = prefix / 'lib' / 'libharfbuzz.so'
+    if not harfbuzz_library.exists():
+        build = CACHE / 'build' / 'harfbuzz'
+        subprocess.run([sys.executable, str(meson / 'meson.py'), 'setup', str(build), str(harfbuzz),
+                        '--prefix', str(prefix), '--buildtype=release',
+                        '-Ddefault_library=shared', '-Dfreetype=enabled',
+                        '-Dglib=disabled', '-Dgobject=disabled', '-Dicu=disabled',
+                        '-Dcairo=disabled', '-Dsubset=disabled', '-Draster=disabled',
+                        '-Dvector=disabled', '-Dgpu=disabled', '-Dpng=disabled',
+                        '-Dutilities=disabled', '-Dtests=disabled', '-Ddocs=disabled',
+                        '-Dintrospection=disabled'], env=child_env, check=True)
+        subprocess.run([str(ninja_binary), '-C', str(build)], env=child_env, check=True)
+        subprocess.run([str(ninja_binary), '-C', str(build), 'install'], env=child_env, check=True)
+        if not harfbuzz_library.exists():
+            raise RuntimeError(f'HarfBuzz install did not produce {harfbuzz_library}')
     unibreak_library = prefix / 'lib' / 'libunibreak.a'
     if not unibreak_library.exists():
         subprocess.run(['autoreconf', '-fi'], cwd=unibreak, check=True)
