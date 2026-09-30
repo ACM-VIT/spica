@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const c = @import("native/bindings.zig").c;
 const Clay = @import("ui/clay.zig").Layout;
 const theme_module = @import("ui/theme.zig");
-const DocumentView = @import("ui/document.zig").View;
+const TranscriptView = @import("ui/transcript.zig").View;
 const widgets = @import("ui/widgets.zig");
 const Composer = @import("text/composer.zig").Composer;
 const ContentWorker = @import("content/worker.zig");
@@ -13,9 +13,11 @@ const Options = @import("options.zig").Options;
 const Paths = @import("platform/paths.zig").Paths;
 const fixture = @import("diagnostics/fixture.zig");
 const build_options = @import("build_options");
+const SessionCatalog = @import("core/catalog.zig");
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
-const Action = union(enum) { start, new_thread, sidebar, trust, without_resources, cancel_trust, send, stop, theme, mode, behavior, previous, next, latest, models, select_model: usize, thinking, select_thinking: usize, reasoning, force_stop, wait };
+const Action = union(enum) { start, new_thread, sidebar, open_thread: usize, send, stop, theme, mode, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, reasoning: usize, force_stop, wait };
+const ThreadTarget = struct { path: [:0]u8, cwd: [:0]u8 };
 const Button = struct { bounds: c.SDL_FRect, action: Action };
 
 pub const App = struct {
@@ -41,12 +43,10 @@ pub const App = struct {
     runtime: ?*pi.Runtime = null,
     runtime_snapshot: ?pi.Snapshot = null,
     closing: bool = false,
-    trust_dialog: bool = false,
     force_dialog: bool = false,
     model_menu: bool = false,
     model_first: usize = 0,
     thinking_menu: bool = false,
-    show_thinking: bool = false,
     sidebar_visible: bool = true,
     editor_bounds: c.SDL_FRect = undefined,
     model_bounds: c.SDL_FRect = undefined,
@@ -62,20 +62,21 @@ pub const App = struct {
     draft_revision: u64 = 0,
     submitted_prompt: ?struct { token: u64, draft_revision: u64 } = null,
     accepted_clear_revision: ?u64 = null,
-    buttons: [24]Button = undefined,
+    buttons: [64]Button = undefined,
     button_count: usize = 0,
-    follow_latest: bool = true,
     follow_bottom: bool = false,
-    document: ?ContentWorker.Ready = null,
-    document_view: DocumentView,
-    image_texture: ?*c.SDL_Texture = null,
-    image_width: f32 = 0,
-    image_height: f32 = 0,
+    transcript: TranscriptView,
+    catalog_worker: *SessionCatalog.Worker,
+    catalog: ?SessionCatalog.Catalog = null,
+    sidebar_first: usize = 0,
+    pending_thread: ?ThreadTarget = null,
+    resume_path: ?[:0]u8 = null,
+    conversation_dirty: bool = false,
+    content_pending: bool = false,
+    pending_ordinal: ?usize = null,
+    last_content_metadata: bool = false,
     paths: Paths,
     project_path: [:0]u8,
-    project_layout: ?*c.SpicaTextLayout = null,
-    project_layout_width: f32 = 0,
-    trust_path_scroll: f32 = 0,
     options: Options,
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -85,7 +86,6 @@ pub const App = struct {
     focused_editor: bool = true,
     dragging: bool = false,
     light: bool = false,
-    selected_message: usize = fixture.message_count - 1,
     generation: u64 = 0,
     scroll: f32 = 0,
     wake_event: u32,
@@ -150,6 +150,10 @@ pub const App = struct {
         const draft_writer = try Draft.Writer.create(io, paths.state, wake_event);
         errdefer draft_writer.destroy();
         if (!c.SDL_StartTextInput(window)) return error.TextInputInitialization;
+        const legacy_sessions = try std.fs.path.join(allocator, &.{ paths.data, "pi-sessions" });
+        defer allocator.free(legacy_sessions);
+        const catalog_worker = try SessionCatalog.Worker.create(io, environ, legacy_sessions, wake_event);
+        errdefer catalog_worker.destroy();
         return .{
             .window = window,
             .renderer = renderer,
@@ -160,7 +164,8 @@ pub const App = struct {
             .copy_buffer = copy_buffer,
             .content = content,
             .draft_writer = draft_writer,
-            .document_view = DocumentView.init(allocator),
+            .transcript = TranscriptView.init(allocator),
+            .catalog_worker = catalog_worker,
             .paths = paths,
             .options = options,
             .io = io,
@@ -168,7 +173,7 @@ pub const App = struct {
             .wake_event = wake_event,
             .project_path = project_path,
             .light = options.light or restored.value().light,
-            .selected_message = if (options.fixture) @min(restored.value().selected_message, fixture.message_count - 1) else restored.value().selected_message,
+            .follow_bottom = true,
             .quit_due = if (options.quit_after_ms) |ms| c.SDL_GetTicks() + ms else null,
         };
     }
@@ -177,15 +182,19 @@ pub const App = struct {
         if (self.runtime) |runtime| runtime.destroy() catch |err| std.log.err("Runtime shutdown invariant: {s}", .{@errorName(err)});
         if (self.runtime_snapshot) |*snapshot| snapshot.deinit();
         self.saveDraft() catch |err| std.log.err("final draft queue: {s}", .{@errorName(err)});
-        if (self.project_layout) |layout| c.spica_text_layout_release(layout);
         self.draft_writer.destroy();
         self.content.destroy();
+        self.catalog_worker.destroy();
+        if (self.catalog) |*catalog| catalog.deinit();
+        if (self.resume_path) |path| self.allocator.free(path);
+        if (self.pending_thread) |target| {
+            self.allocator.free(target.path);
+            self.allocator.free(target.cwd);
+        }
         _ = c.SDL_StopTextInput(self.window);
         if (self.editor_layout) |layout| c.spica_text_layout_release(layout);
         for (self.labels) |label_value| if (label_value.layout) |layout| c.spica_text_layout_release(layout);
-        self.document_view.deinit();
-        if (self.document) |*document| document.deinit();
-        if (self.image_texture) |texture| c.SDL_DestroyTexture(texture);
+        self.transcript.deinit();
         self.editor.deinit();
         self.allocator.free(self.copy_buffer);
         self.preedit.deinit(self.allocator);
@@ -261,17 +270,82 @@ pub const App = struct {
         self.dirty = true;
     }
 
-    fn requestMessage(self: *App, ordinal: usize) void {
-        const session_file = if (self.options.fixture) fixture.session_file else if (self.runtime_snapshot) |snapshot| snapshot.session_file else return;
-        const last = if (self.options.fixture) fixture.message_count - 1 else if (self.runtime_snapshot) |snapshot| @as(usize, @intCast(@max(0, snapshot.active_count - 1))) else return;
-        if (session_file.len == 0 or (!self.options.fixture and self.runtime_snapshot.?.active_count == 0)) return;
-        self.selected_message = @min(ordinal, last);
-        self.follow_latest = self.options.fixture;
-        self.follow_bottom = false;
+    fn requestConversation(self: *App) void {
+        self.conversation_dirty = true;
+        self.dirty = true;
+    }
+
+    fn pumpContent(self: *App) !void {
+        if (self.content_pending or self.minimized) return;
+        if (self.last_content_metadata) {
+            if (self.transcript.request(self.generation + 1)) |request| {
+                self.generation += 1;
+                try self.content.request(request);
+                self.content_pending = true;
+                self.pending_ordinal = request.ordinal;
+                self.last_content_metadata = false;
+                return;
+            }
+        }
+        if (self.conversation_dirty) {
+            const session_file = if (self.options.fixture) fixture.session_file else if (self.runtime_snapshot) |snapshot| snapshot.session_file else return;
+            if (session_file.len == 0) return;
+            self.generation += 1;
+            try self.content.request(.{
+                .generation = self.generation,
+                .conversation = true,
+                .session_file = session_file,
+                .runtime_id = if (self.runtime_snapshot) |snapshot| snapshot.runtime_id else 0,
+                .run_generation = if (self.runtime_snapshot) |snapshot| snapshot.generation else 0,
+            });
+            self.conversation_dirty = false;
+            self.content_pending = true;
+            self.pending_ordinal = null;
+            self.last_content_metadata = true;
+        } else if (self.transcript.request(self.generation + 1)) |request| {
+            self.generation += 1;
+            try self.content.request(request);
+            self.content_pending = true;
+            self.pending_ordinal = request.ordinal;
+            self.last_content_metadata = false;
+        }
+    }
+
+    fn openThread(self: *App, index: usize) !void {
+        const catalog = self.catalog orelse return;
+        if (index >= catalog.threads.len or self.pending_thread != null) return;
+        if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) return error.StopCurrentRunBeforeSwitchingThread;
+        const thread = catalog.threads[index];
+        if (self.runtime_snapshot) |snapshot| if (std.mem.eql(u8, snapshot.session_file, thread.path)) {
+            self.follow_bottom = true;
+            self.dirty = true;
+            return;
+        };
+        const path = try self.allocator.dupeZ(u8, thread.path);
+        errdefer self.allocator.free(path);
+        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, thread.cwd, self.allocator);
+        errdefer self.allocator.free(cwd);
+        try self.saveDraft();
+        if (self.runtime) |runtime| if (!runtime.isFinished()) try runtime.shutdown();
+        self.pending_thread = .{ .path = path, .cwd = cwd };
+        try self.finishThreadSwitch();
+    }
+
+    fn finishThreadSwitch(self: *App) !void {
+        const target = self.pending_thread orelse return;
+        if (self.runtime) |runtime| if (!runtime.isFinished()) return;
+        self.pending_thread = null;
+        self.allocator.free(self.project_path);
+        self.project_path = target.cwd;
+        if (self.resume_path) |path| self.allocator.free(path);
+        self.resume_path = target.path;
+        self.options.resume_file = target.path;
+        self.transcript.clear();
         self.scroll = 0;
+        self.follow_bottom = true;
         self.generation += 1;
-        self.content.request(.{ .generation = self.generation, .ordinal = self.selected_message, .session_file = session_file }) catch |err| self.report("Requesting message", err);
-        self.draft_due = c.SDL_GetTicks() + 250;
+        self.content_pending = false;
+        try self.beginRuntime();
     }
 
     fn runtimeStatus(self: *const App) pi.Status {
@@ -284,14 +358,6 @@ pub const App = struct {
 
     fn beginRuntime(self: *App) !void {
         if (self.options.fixture or self.closing) return;
-        if (self.options.trust_project == null) {
-            self.trust_dialog = true;
-            self.focused_editor = false;
-            self.preedit.clearRetainingCapacity();
-            _ = c.SDL_StopTextInput(self.window);
-            self.dirty = true;
-            return;
-        }
         if (self.runtime) |runtime| {
             if (!runtime.isFinished()) return;
             try runtime.destroy();
@@ -302,15 +368,13 @@ pub const App = struct {
         self.model_menu = false;
         self.submitted_prompt = null;
         self.error_len = 0;
-        self.follow_latest = true;
         self.follow_bottom = true;
         self.runtime = try pi.Runtime.create(self.allocator, self.io, .{
             .database_path = self.paths.database,
-            .data_dir = self.paths.data,
             .project_path = self.project_path,
             .node_path = self.options.node_path,
             .pi_entrypoint = self.options.pi_entrypoint,
-            .trust_project = self.options.trust_project.?,
+            .trust_project = self.options.trust_project orelse false,
             .resume_file = self.options.resume_file,
             .wake_event = self.wake_event,
         });
@@ -336,46 +400,31 @@ pub const App = struct {
     }
 
     fn requestLatest(self: *App) void {
-        const snapshot = self.runtime_snapshot orelse return;
-        const id = (if (self.show_thinking) snapshot.thinking_content_ref else snapshot.visible_content_ref) orelse return;
-        self.follow_latest = true;
-        self.selected_message = @intCast(@max(0, snapshot.visible_active_ordinal));
-        self.generation += 1;
-        self.content.request(.{
-            .generation = self.generation,
-            .ordinal = self.selected_message,
-            .content_id = id,
-            .published_length = if (self.show_thinking) snapshot.thinking_length else snapshot.visible_length,
-            .role = if (self.show_thinking) .assistant else ContentWorker.roleFor(snapshot.role, snapshot.kind),
-        }) catch |err| self.report("Requesting live message", err);
+        self.follow_bottom = true;
+        self.requestConversation();
     }
 
     fn consumeRuntime(self: *App) void {
         const runtime = self.runtime orelse return;
         if (runtime.takeSnapshot()) |incoming| {
-            const previous_revision = if (self.runtime_snapshot) |snapshot| snapshot.visible_revision else 0;
             const previous_status = self.runtimeStatus();
+            const generation_changed = self.runtime_snapshot != null and incoming.generation != self.runtime_snapshot.?.generation;
             const session_changed = incoming.session_file.len != 0 and (self.runtime_snapshot == null or !std.mem.eql(u8, self.runtime_snapshot.?.session_file, incoming.session_file));
-            const thinking_changed = if (self.runtime_snapshot) |snapshot| !std.meta.eql(snapshot.thinking_content_ref, incoming.thinking_content_ref) or snapshot.thinking_length != incoming.thinking_length else incoming.thinking_content_ref != null;
             const changed_error = incoming.error_message.len != 0 and (self.runtime_snapshot == null or !std.mem.eql(u8, self.runtime_snapshot.?.error_message, incoming.error_message));
             const recovery_changed = incoming.recovery_revision != 0 and (self.runtime_snapshot == null or incoming.recovery_revision != self.runtime_snapshot.?.recovery_revision);
             if (self.runtime_snapshot) |*old| old.deinit();
             self.runtime_snapshot = incoming;
             const snapshot = &self.runtime_snapshot.?;
-            if (session_changed) {
+            if (session_changed or generation_changed) {
                 self.thread_title_len = 0;
                 self.run_started = null;
                 self.run_elapsed = null;
-                self.show_thinking = false;
-                self.follow_latest = true;
                 self.behavior = .prompt;
                 self.generation += 1;
-                self.document_view.clear();
-                if (self.document) |*old| old.deinit();
-                self.document = null;
-                if (self.image_texture) |texture| c.SDL_DestroyTexture(texture);
-                self.image_texture = null;
-                self.follow_bottom = true;
+                self.content_pending = false;
+                self.transcript.clear();
+                self.scroll = 0;
+                self.catalog_worker.refresh();
             }
             if (changed_error) {
                 const text = clippedLabel(snapshot.error_message);
@@ -409,8 +458,15 @@ pub const App = struct {
                 };
                 self.edited();
             }
-            if (self.follow_latest and !self.minimized and (session_changed or (if (self.show_thinking) thinking_changed else snapshot.visible_revision != previous_revision))) {
-                self.requestLatest();
+            if (!self.minimized) self.requestConversation();
+            if (snapshot.session_file.len != 0 and (self.resume_path == null or !std.mem.eql(u8, self.resume_path.?, snapshot.session_file))) {
+                const path = self.allocator.dupeZ(u8, snapshot.session_file) catch |err| {
+                    self.report("Retaining current session path", err);
+                    return;
+                };
+                if (self.resume_path) |old| self.allocator.free(old);
+                self.resume_path = path;
+                self.options.resume_file = path;
             }
             if (changed_error and snapshot.visible_length == 0 and snapshot.status == .ready and self.run_started != null and self.accepted_clear_revision == self.draft_revision and self.editor.len == 0) {
                 if (self.editor.undo()) self.edited();
@@ -425,6 +481,7 @@ pub const App = struct {
             self.dirty = true;
         }
         if (self.closing and runtime.isFinished()) self.running = false;
+        if (!self.closing) self.finishThreadSwitch() catch |err| self.report("Opening thread", err);
     }
 
     fn submit(self: *App) !void {
@@ -441,7 +498,6 @@ pub const App = struct {
             @memcpy(self.thread_title[0..first.len], first);
             self.thread_title_len = first.len;
         }
-        self.show_thinking = false;
         self.run_started = c.SDL_GetTicks();
         self.run_base_revision = if (self.runtime_snapshot) |snapshot| snapshot.visible_revision else 0;
         self.run_elapsed = null;
@@ -454,7 +510,6 @@ pub const App = struct {
             const token = try runtime.sendPrompt(text, behavior);
             self.submitted_prompt = .{ .token = token, .draft_revision = self.draft_revision };
         }
-        self.follow_latest = true;
         self.follow_bottom = true;
         self.dirty = true;
     }
@@ -468,18 +523,7 @@ pub const App = struct {
                 } else try self.beginRuntime();
             },
             .sidebar => self.sidebar_visible = !self.sidebar_visible,
-            .trust, .without_resources => {
-                self.options.trust_project = action == .trust;
-                self.trust_dialog = false;
-                try self.beginRuntime();
-                self.focused_editor = true;
-                _ = c.SDL_StartTextInput(self.window);
-            },
-            .cancel_trust => {
-                self.trust_dialog = false;
-                self.focused_editor = true;
-                _ = c.SDL_StartTextInput(self.window);
-            },
+            .open_thread => |index| try self.openThread(index),
             .send => try self.submit(),
             .stop => if (self.runtime) |runtime| {
                 try runtime.stop();
@@ -490,10 +534,7 @@ pub const App = struct {
             },
             .mode => self.bash_mode = !self.bash_mode,
             .behavior => self.behavior = if (self.behavior == .steer) .follow_up else .steer,
-            .previous => self.requestMessage(self.selected_message -| 1),
-            .next => self.requestMessage(self.selected_message + 1),
             .latest => {
-                self.show_thinking = false;
                 self.follow_bottom = true;
                 self.requestLatest();
             },
@@ -511,11 +552,9 @@ pub const App = struct {
                 try (self.runtime orelse return error.PiNotReady).setThinkingLevel(snapshot.thinking_levels[index]);
                 self.thinking_menu = false;
             },
-            .reasoning => {
-                self.show_thinking = !self.show_thinking;
-                self.follow_bottom = !self.show_thinking;
-                self.scroll = 0;
-                self.requestLatest();
+            .reasoning => |ordinal| {
+                self.transcript.toggle(ordinal);
+                self.follow_bottom = false;
             },
             .select_model => |index| {
                 const snapshot = self.runtime_snapshot orelse return error.PiNotReady;
@@ -598,31 +637,7 @@ pub const App = struct {
                 for (snapshot.thinking_levels, 0..) |level, index| try self.flatButton(.{ .select_thinking = index }, level, .{ .x = x + 4, .y = y + 8 + @as(f32, @floatFromInt(index)) * 32, .w = 122, .h = 30 });
             }
         }
-        if (self.trust_dialog) {
-            const width = @min(640, self.shell.conversation.width - 64);
-            const x = self.shell.conversation.x + (self.shell.conversation.width - width) / 2;
-            if (self.project_layout == null or self.project_layout_width != width - 48) {
-                if (self.project_layout) |layout| c.spica_text_layout_release(layout);
-                self.project_layout = null;
-                self.project_layout = c.spica_text_layout_create(self.text, self.project_path.ptr, self.project_path.len, width - 48, 13, true) orelse return error.ProjectPathLayout;
-                self.project_layout_width = width - 48;
-            }
-            const path_height = c.spica_text_layout_height(self.project_layout.?);
-            const height = @min(self.shell.conversation.height - 48, @max(210, path_height + 150));
-            const y = self.shell.conversation.y + 24;
-            try self.rectangle(x, y, width, height, 12, colors.border);
-            try self.rectangle(x + 1, y + 1, width - 2, height - 2, 11, colors.panel);
-            try self.label("Allow this project's pi resources?", x + 24, y + 20, 18, colors.text);
-            const path_clip = c.SDL_Rect{ .x = @intFromFloat(x + 24), .y = @intFromFloat(y + 58), .w = @intFromFloat(width - 48), .h = @intFromFloat(height - 144) };
-            self.trust_path_scroll = @min(self.trust_path_scroll, @max(0, path_height - @as(f32, @floatFromInt(path_clip.h))));
-            _ = c.SDL_SetRenderClipRect(self.renderer, &path_clip);
-            if (!c.spica_text_layout_draw(self.text, self.project_layout.?, x + 24, y + 58 - self.trust_path_scroll, rgba(colors.text))) return error.ProjectPathDraw;
-            _ = c.SDL_SetRenderClipRect(self.renderer, null);
-            try self.label("Project resources can execute code. No prompt is replayed.", x + 24, y + height - 78, 12, colors.muted);
-            try self.button(.trust, "Trust · T", .{ .x = x + 24, .y = y + height - 48, .w = 100, .h = 32 });
-            try self.button(.without_resources, "Skip project resources · S", .{ .x = x + 138, .y = y + height - 48, .w = 194, .h = 32 });
-            try self.button(.cancel_trust, "Cancel · Esc", .{ .x = x + width - 132, .y = y + height - 48, .w = 108, .h = 32 });
-        } else if (self.closing or self.force_dialog) {
+        if (self.closing or self.force_dialog) {
             const x = self.shell.conversation.x + 36;
             try self.rectangle(x, 110, self.shell.conversation.width - 72, 166, 10, colors.panel);
             try self.label(if (self.force_dialog) "Pi has not exited" else "Closing pi gracefully...", x + 20, 130, 18, colors.text);
@@ -636,53 +651,56 @@ pub const App = struct {
 
     fn consume(self: *App) void {
         self.consumeRuntime();
+        if (self.catalog_worker.take()) |result| switch (result) {
+            .ready => |catalog| {
+                if (self.catalog) |*old| old.deinit();
+                self.catalog = catalog;
+                self.sidebar_first = @min(self.sidebar_first, catalog.threads.len -| 1);
+                self.dirty = true;
+            },
+            .failure => |err| self.report("Discovering pi threads", err),
+        };
         if (self.draft_writer.takeError()) |err| self.report("Draft could not be saved", err);
         if (self.content.take()) |result_value| {
             var result = result_value;
+            const generation = switch (result) {
+                .ready => |value| value.generation,
+                .conversation => |value| value.generation,
+                .failure => |value| value.generation orelse self.generation,
+            };
+            if (generation != self.generation) {
+                result.deinit();
+                return;
+            }
+            self.content_pending = false;
             switch (result) {
-                .failure => |failure| if (failure.generation == null or failure.generation.? == self.generation) {
+                .failure => |failure| {
+                    if (self.pending_ordinal) |ordinal| self.transcript.fail(ordinal);
                     self.report("Loading conversation", failure.err);
                 },
-                .ready => |*ready| {
-                    if (ready.generation != self.generation or self.minimized) {
-                        result.deinit();
-                        return;
-                    }
-                    if (self.formatting_error) {
-                        self.error_len = 0;
-                        self.formatting_error = false;
-                    }
-                    self.document_view.clear();
-                    if (self.document) |*old| old.deinit();
-                    if (self.image_texture) |texture| c.SDL_DestroyTexture(texture);
-                    self.image_texture = null;
-                    self.image_height = 0;
-                    self.image_width = 0;
-                    if (ready.image.pixels != null) {
-                        const texture = c.SDL_CreateTexture(self.renderer, c.SDL_PIXELFORMAT_RGBA32, c.SDL_TEXTUREACCESS_STATIC, ready.image.width, ready.image.height);
-                        if (texture) |created| {
-                            if (c.SDL_UpdateTexture(created, null, ready.image.pixels, ready.image.stride) and c.SDL_SetTextureScaleMode(created, c.SDL_SCALEMODE_LINEAR)) {
-                                self.image_texture = created;
-                                self.image_width = @floatFromInt(ready.image.width);
-                                self.image_height = @floatFromInt(ready.image.height);
-                            } else {
-                                c.SDL_DestroyTexture(created);
-                                self.report("Uploading image", error.ImageUpload);
+                .conversation => |*value| {
+                    if (self.runtime_snapshot) |snapshot| if (snapshot.thinking_content_ref) |id| {
+                        var index = value.entries.len;
+                        while (index > 0) {
+                            index -= 1;
+                            if (value.entries[index].role == .assistant and value.entries[index].ordinal >= @import("core/store.zig").live_ordinal_base) {
+                                value.entries[index].reasoning = .{ .content_ref = id, .length = snapshot.thinking_length };
+                                break;
                             }
-                        } else self.report("Creating image texture", error.ImageUpload);
-                        c.spica_image_release(&ready.image);
-                    } else if (ready.image_status != c.SPICA_IMAGE_OK) self.report("Decoding image", error.ImageDecode);
-                    self.document = ready.*;
-                    if (!self.follow_latest) self.scroll = 0;
-                    self.dirty = true;
+                        }
+                    };
+                    self.transcript.update(value.entries) catch |err| self.report("Updating conversation", err);
+                    value.deinit();
                 },
+                .ready => |ready| self.transcript.accept(self.renderer, ready) catch |err| self.report("Rendering message", err),
             }
+            self.dirty = true;
         }
     }
 
     fn saveDraft(self: *App) !void {
         const bytes = self.editor.textBytes();
-        try self.draft_writer.submit(.{ .draft = bytes, .selected_message = self.selected_message, .light = self.light });
+        try self.draft_writer.submit(.{ .draft = bytes, .light = self.light });
         self.draft_due = null;
     }
 
@@ -746,7 +764,7 @@ pub const App = struct {
         defer self.allocator.free(bytes);
         const next = try theme_module.parse(self.allocator, bytes);
         self.theme = next;
-        self.document_view.width = 0;
+        self.transcript.invalidateLayouts();
         self.editor_width = 0;
         self.error_len = 0;
         self.dirty = true;
@@ -777,10 +795,26 @@ pub const App = struct {
             try self.iconButton(.new_thread, .plus, .{ .x = sidebar.width - 42, .y = 9, .w = 30, .h = 30 }, colors.muted);
             try widgets.icon(self.renderer, .folder, .{ .x = 22, .y = 84, .w = 14, .h = 14 }, colors.muted);
             try self.label("All projects", 46, 84, 13, colors.muted);
-            try self.rectangle(10, 120, sidebar.width - 20, 70, 7, colors.raised);
-            try self.hit(.latest, .{ .x = 10, .y = 120, .w = sidebar.width - 20, .h = 70 });
-            try self.fitLabel(project, 22, 133, sidebar.width - 44, 13, colors.text);
-            try self.fitLabel(clippedLabel(self.title()), 22, 160, sidebar.width - 44, 12, colors.muted);
+            try self.rectangle(10, 112, sidebar.width - 20, 66, 7, colors.raised);
+            try self.hit(.latest, .{ .x = 10, .y = 112, .w = sidebar.width - 20, .h = 66 });
+            try self.fitLabel(clippedLabel(self.title()), 22, 125, sidebar.width - 44, 13, colors.text);
+            try self.fitLabel(project, 22, 151, sidebar.width - 44, 11, colors.muted);
+            if (self.catalog) |catalog| {
+                const sidebar_clip = c.SDL_Rect{ .x = 10, .y = 188, .w = @intFromFloat(sidebar.width - 20), .h = @max(0, height - 244) };
+                _ = c.SDL_SetRenderClipRect(self.renderer, &sidebar_clip);
+                var row_y: f32 = 188;
+                var index = self.sidebar_first;
+                while (index < catalog.threads.len and row_y + 58 <= @as(f32, @floatFromInt(height)) - 56) : (index += 1) {
+                    const thread = catalog.threads[index];
+                    const selected = if (self.runtime_snapshot) |snapshot| std.mem.eql(u8, snapshot.session_file, thread.path) else false;
+                    if (selected) try self.rectangle(10, row_y, sidebar.width - 20, 54, 6, colors.raised);
+                    try self.hit(.{ .open_thread = index }, .{ .x = 10, .y = row_y, .w = sidebar.width - 20, .h = 54 });
+                    try self.fitLabel(clippedLabel(thread.title), 22, row_y + 8, sidebar.width - 44, 13, colors.text);
+                    try self.fitLabel(clippedLabel(thread.cwd), 22, row_y + 32, sidebar.width - 44, 10, colors.muted);
+                    row_y += 58;
+                }
+                _ = c.SDL_SetRenderClipRect(self.renderer, null);
+            }
             try self.iconButton(.theme, .theme, .{ .x = 12, .y = @as(f32, @floatFromInt(height)) - 42, .w = 30, .h = 30 }, colors.muted);
         } else try self.iconButton(.sidebar, .sidebar, .{ .x = header.x + 12, .y = 7, .w = 30, .h = 30 }, colors.muted);
         const crumb_x = header.x + (if (self.sidebar_visible) @as(f32, 22) else 52);
@@ -789,41 +823,16 @@ pub const App = struct {
         const title_x = crumb_x + 40 + try self.labelWidth(project, 13);
         try self.label("/", title_x, 15, 13, colors.muted);
         try self.fitLabel(clippedLabel(self.title()), title_x + 20, 15, @max(0, header.x + header.width - 110 - title_x), 13, colors.muted);
-        if (!self.options.fixture and (self.runtime == null or self.runtime.?.isFinished())) try self.button(.start, "Start", .{ .x = header.x + header.width - 86, .y = 8, .w = 68, .h = 28 });
+        if (!self.options.fixture and self.pending_thread == null and (self.runtime == null or self.runtime.?.isFinished())) try self.button(.start, "Retry", .{ .x = header.x + header.width - 86, .y = 8, .w = 68, .h = 28 });
 
         const content_width = @min(self.theme.metrics.chat_max_width, conversation.width - 64);
         const content_x = conversation.x + (conversation.width - content_width) / 2;
-        const body_top = conversation.y + 68;
-        const viewport_height = conversation.height - 78;
-        if (self.run_elapsed != null or (self.runtime_snapshot != null and self.runtime_snapshot.?.thinking_content_ref != null)) {
-            var worked_buffer: [64]u8 = undefined;
-            const worked = if (self.run_elapsed) |elapsed| try std.fmt.bufPrint(&worked_buffer, "Worked for {d}s", .{@max(1, elapsed / 1000)}) else "Reasoning";
-            try self.label(worked, content_x, conversation.y + 28, 12, colors.muted);
-            if (self.runtime_snapshot != null and self.runtime_snapshot.?.thinking_content_ref != null) try self.iconButton(.reasoning, .chevron_down, .{ .x = content_x + try self.labelWidth(worked, 12) + 4, .y = conversation.y + 19, .w = 28, .h = 28 }, colors.muted);
-        }
+        const body_top = conversation.y + 24;
+        const viewport_height = conversation.height - 34;
         const clip = c.SDL_Rect{ .x = @intFromFloat(content_x), .y = @intFromFloat(body_top), .w = @intFromFloat(content_width), .h = @intFromFloat(viewport_height) };
         _ = c.SDL_SetRenderClipRect(self.renderer, &clip);
-        if (self.document) |*ready| {
-            const doc = &ready.document;
-            if (doc.state == .display_budget) {
-                try self.label("Formatting unavailable; source retained", content_x, body_top, 13, colors.error_color);
-            } else {
-                if (self.document_view.width != content_width) try self.document_view.rebuild(doc, content_width);
-                const image_height = if (self.image_texture != null) self.image_height * @min(1, content_width / self.image_width) else 0;
-                self.document_view.prepare(self.text, doc, &self.scroll, viewport_height, image_height + 20, self.follow_bottom, self.theme.metrics) catch |err| {
-                    self.report("Formatting retained source", err);
-                    self.formatting_error = true;
-                    self.document_view.clear();
-                    doc.state = .display_budget;
-                };
-                if (doc.state == .rich) try self.document_view.draw(self.text, self.renderer, doc, ready.highlights.items, content_x, body_top - self.scroll, colors, self.light);
-                if (self.image_texture) |texture| {
-                    const scale = @min(1, content_width / self.image_width);
-                    const destination = c.SDL_FRect{ .x = content_x, .y = body_top + 12 - self.scroll + self.document_view.height, .w = self.image_width * scale, .h = self.image_height * scale };
-                    if (!c.SDL_RenderTexture(self.renderer, texture, null, &destination)) return error.ImageDraw;
-                }
-            }
-        }
+        try self.transcript.draw(self.text, self.renderer, content_x, body_top, content_width, viewport_height, &self.scroll, self.follow_bottom, self.theme.metrics, colors, self.light);
+        for (self.transcript.disclosures[0..self.transcript.disclosure_count]) |disclosure| try self.hit(.{ .reasoning = disclosure.ordinal }, disclosure.bounds);
         _ = c.SDL_SetRenderClipRect(self.renderer, null);
         self.composer_bounds = .{ .x = content_x, .y = @as(f32, @floatFromInt(height)) - 194, .w = content_width, .h = 144 };
         const composer = self.composer_bounds;
@@ -874,7 +883,7 @@ pub const App = struct {
             if (snapshot.attention.len != 0) try self.fitLabel(clippedLabel(snapshot.attention), composer.x, composer.y - 25, composer.w, 12, colors.muted);
         }
         try self.drawOverlays();
-        if (!self.captured and self.options.capture != null and (!self.options.fixture or self.document != null)) {
+        if (!self.captured and self.options.capture != null and self.transcript.wanted == null and !self.content_pending and !self.conversation_dirty and (if (self.options.fixture) self.transcript.items.items.len != 0 else self.runtimeStatus() == .ready)) {
             const surface = c.SDL_RenderReadPixels(self.renderer, null) orelse return error.ScreenCapture;
             defer c.SDL_DestroySurface(surface);
             const path = try self.allocator.dupeZ(u8, self.options.capture.?);
@@ -961,7 +970,7 @@ pub const App = struct {
 
     pub fn run(self: *App) !void {
         errdefer self.retainOwnedProcessOnError();
-        self.requestMessage(self.selected_message);
+        if (self.options.fixture) self.requestConversation() else self.beginRuntime() catch |err| self.report("Starting pi", err);
         while (self.running) {
             self.consume();
             const now = c.SDL_GetTicks();
@@ -975,6 +984,7 @@ pub const App = struct {
                 self.draft_due = null;
             };
             if (self.dirty and !self.minimized) try self.paint();
+            self.pumpContent() catch |err| self.report("Loading viewport", err);
             var timeout: c_int = -1;
             if (self.quit_due) |due| timeout = @intCast(@min(2147483647, due -| c.SDL_GetTicks()));
             if (self.draft_due) |due| {
@@ -1009,15 +1019,24 @@ pub const App = struct {
             c.SDL_EVENT_WINDOW_RESTORED => {
                 self.minimized = false;
                 self.dirty = true;
-                if (self.options.fixture or !self.follow_latest) self.requestMessage(self.selected_message) else self.requestLatest();
+                self.requestConversation();
             },
             c.SDL_EVENT_MOUSE_WHEEL => {
-                if (self.trust_dialog) self.trust_path_scroll = @max(0, self.trust_path_scroll - event.wheel.y * 32) else if (self.model_menu) {
+                if (self.model_menu) {
                     const last = if (self.runtime_snapshot) |snapshot| snapshot.models.len -| 1 else 0;
                     self.model_first = if (event.wheel.y > 0) self.model_first -| 1 else @min(last, self.model_first + 1);
                 } else if (!self.closing) {
-                    self.follow_bottom = false;
-                    self.scroll = @max(0, self.scroll - event.wheel.y * 44);
+                    var mouse_x: f32 = 0;
+                    var mouse_y: f32 = 0;
+                    _ = c.SDL_GetMouseState(&mouse_x, &mouse_y);
+                    if (self.sidebar_visible and mouse_x < self.shell.sidebar.width) {
+                        const last = if (self.catalog) |catalog| catalog.threads.len -| 1 else 0;
+                        self.sidebar_first = if (event.wheel.y > 0) self.sidebar_first -| 1 else @min(last, self.sidebar_first + 1);
+                    } else {
+                        self.follow_bottom = false;
+                        self.scroll = @max(0, self.scroll - event.wheel.y * 60);
+                        if (event.wheel.y < 0 and self.scroll >= @max(0, self.transcript.height - self.transcript.viewport_height)) self.follow_bottom = true;
+                    }
                 }
                 self.dirty = true;
             },
@@ -1026,14 +1045,13 @@ pub const App = struct {
                 while (button_index != 0) {
                     button_index -= 1;
                     const pressed = self.buttons[button_index];
-                    if (self.trust_dialog and pressed.action != .trust and pressed.action != .without_resources and pressed.action != .cancel_trust) continue;
                     if ((self.closing or self.force_dialog) and pressed.action != .force_stop and pressed.action != .wait) continue;
                     if (contains(pressed.bounds, event.button.x, event.button.y)) {
                         try self.act(pressed.action);
                         return;
                     }
                 }
-                if (self.trust_dialog or self.closing or self.force_dialog) return;
+                if (self.closing or self.force_dialog) return;
                 if (self.model_menu or self.thinking_menu) {
                     self.model_menu = false;
                     self.thinking_menu = false;
@@ -1060,15 +1078,6 @@ pub const App = struct {
                 const shift = (event.key.mod & c.SDL_KMOD_SHIFT) != 0;
                 if (command and shift and event.key.key == c.SDLK_ESCAPE and self.runtimeStatus() == .needs_force_stop) {
                     try self.act(.force_stop);
-                    return;
-                }
-                if (self.trust_dialog) {
-                    switch (event.key.key) {
-                        c.SDLK_T => try self.act(.trust),
-                        c.SDLK_S => try self.act(.without_resources),
-                        c.SDLK_ESCAPE => try self.act(.cancel_trust),
-                        else => {},
-                    }
                     return;
                 }
                 if (self.closing or self.force_dialog) {
@@ -1119,12 +1128,18 @@ pub const App = struct {
                     try self.submit();
                     return;
                 }
-                if (event.key.key == c.SDLK_PAGEUP) {
-                    self.requestMessage(self.selected_message -| 1);
+                if (event.key.key == c.SDLK_PAGEUP or event.key.key == c.SDLK_PAGEDOWN) {
+                    self.follow_bottom = false;
+                    const amount = @max(100, self.transcript.viewport_height - 48);
+                    self.scroll = @max(0, self.scroll + (if (event.key.key == c.SDLK_PAGEUP) -amount else amount));
+                    if (self.scroll >= @max(0, self.transcript.height - self.transcript.viewport_height)) self.follow_bottom = true;
+                    self.dirty = true;
                     return;
                 }
-                if (event.key.key == c.SDLK_PAGEDOWN) {
-                    self.requestMessage(self.selected_message + 1);
+                if (command and !self.focused_editor and (event.key.key == c.SDLK_HOME or event.key.key == c.SDLK_END)) {
+                    self.follow_bottom = event.key.key == c.SDLK_END;
+                    self.scroll = if (self.follow_bottom) @max(0, self.transcript.height - self.transcript.viewport_height) else 0;
+                    self.dirty = true;
                     return;
                 }
                 if (command and event.key.key == c.SDLK_L) {
@@ -1135,6 +1150,7 @@ pub const App = struct {
                 }
                 if (command and event.key.key == c.SDLK_R) {
                     try self.reloadTheme();
+                    self.catalog_worker.refresh();
                     return;
                 }
                 if (!self.focused_editor) return;
@@ -1215,13 +1231,13 @@ pub const App = struct {
                 }
             },
             c.SDL_EVENT_TEXT_INPUT => {
-                if (!self.focused_editor or self.trust_dialog or self.model_menu or self.closing) return;
+                if (!self.focused_editor or self.model_menu or self.closing) return;
                 try self.editor.insert(std.mem.span(event.text.text), if (self.preedit.items.len != 0) .ime else .typing);
                 self.preedit.clearRetainingCapacity();
                 self.edited();
             },
             c.SDL_EVENT_TEXT_EDITING => {
-                if (!self.focused_editor or self.trust_dialog or self.model_menu or self.closing) return;
+                if (!self.focused_editor or self.model_menu or self.closing) return;
                 const bytes = std.mem.span(event.edit.text);
                 if (bytes.len > 4096) return error.PreeditBudgetExceeded;
                 self.preedit.clearRetainingCapacity();

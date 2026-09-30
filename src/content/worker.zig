@@ -17,6 +17,9 @@ pub fn roleFor(role: []const u8, kind: []const u8) Role {
 
 pub const Request = struct {
     generation: u64,
+    conversation: bool = false,
+    runtime_id: u64 = 0,
+    run_generation: i64 = 0,
     ordinal: usize = 0,
     session_file: []const u8 = fixture.session_file,
     content_id: ?ContentId = null,
@@ -46,11 +49,23 @@ pub const Ready = struct {
         self.highlights.deinit(allocator);
     }
 };
+pub const Conversation = struct {
+    generation: u64,
+    entries: []@import("../core/store.zig").ConversationEntry,
+    pub fn deinit(self: *Conversation) void {
+        allocator.free(self.entries);
+    }
+};
 pub const Result = union(enum) {
     ready: Ready,
+    conversation: Conversation,
     failure: struct { err: anyerror, generation: ?u64 },
     pub fn deinit(self: *Result) void {
-        if (self.* == .ready) self.ready.deinit();
+        switch (self.*) {
+            .ready => |*value| value.deinit(),
+            .conversation => |*value| value.deinit(),
+            .failure => {},
+        }
     }
 };
 
@@ -176,6 +191,14 @@ pub const Worker = struct {
                     self.publish(.{ .failure = .{ .err = err, .generation = value.generation } }, value.generation);
                     continue;
                 };
+            }
+            if (value.conversation) {
+                const entries = reader.?.conversationEntries(allocator, value.session_file, self.fixture_mode, value.runtime_id, value.run_generation) catch |err| {
+                    self.publish(.{ .failure = .{ .err = err, .generation = value.generation } }, value.generation);
+                    continue;
+                };
+                self.publish(.{ .conversation = .{ .generation = value.generation, .entries = entries } }, value.generation);
+                continue;
             }
             const loaded = load(&reader.?, value, self.fixture_mode) catch |err| {
                 self.publish(.{ .failure = .{ .err = err, .generation = value.generation } }, value.generation);

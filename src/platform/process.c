@@ -50,10 +50,9 @@ static int spawn(SpicaProcess *p,const char *node,char *const argv[],const char 
 fail:
  for(int i=0;i<2;i++){spica_close(in[i]);spica_close(out[i]);spica_close(err[i]);} return -1;
 }
-int spica_process_spawn(SpicaProcess *p,const char *node,const char *entry,const char *cwd,const char *dir,const char *id,const char *resume,int trust) {
- char *argv[16]; int n=0; argv[n++]=(char*)node;argv[n++]=(char*)entry;argv[n++]="--mode";argv[n++]="rpc";argv[n++]=trust?"--approve":"--no-approve";
- argv[n++]="--session-dir";argv[n++]=(char*)dir;
- if(resume){argv[n++]="--session";argv[n++]=(char*)resume;}else{argv[n++]="--session-id";argv[n++]=(char*)id;}
+int spica_process_spawn(SpicaProcess *p,const char *node,const char *entry,const char *cwd,const char *resume,int trust) {
+ char *argv[8]; int n=0; argv[n++]=(char*)node;argv[n++]=(char*)entry;argv[n++]="--mode";argv[n++]="rpc";argv[n++]=trust?"--approve":"--no-approve";
+ if(resume){argv[n++]="--session";argv[n++]=(char*)resume;}
  argv[n]=0;return spawn(p,node,argv,cwd);
 }
 long spica_process_read(int fd,void *b,size_t n){ssize_t r;do{r=read(fd,b,n);}while(r<0&&errno==EINTR);return r<0&&(errno==EAGAIN||errno==EWOULDBLOCK)?-2:r;}
@@ -162,7 +161,7 @@ int spica_process_version(SpicaProcess *p,const char *node,const char *entry){
 uint64_t spica_runtime_id(void){uint64_t id=0;ssize_t n;do{n=syscall(SYS_getrandom,&id,sizeof id,0);}while(n<0&&errno==EINTR);if(n!=(ssize_t)sizeof id)return 0;id&=INT64_MAX;return id?id:1;}
 #else
 int spica_wake_create(int f[2]){(void)f;return -1;}void spica_wake(int f){(void)f;}void spica_close(int f){(void)f;}
-int spica_process_spawn(SpicaProcess*p,const char*n,const char*e,const char*c,const char*d,const char*i,const char*r,int t){(void)p;(void)n;(void)e;(void)c;(void)d;(void)i;(void)r;(void)t;return -1;}
+int spica_process_spawn(SpicaProcess*p,const char*n,const char*e,const char*c,const char*r,int t){(void)p;(void)n;(void)e;(void)c;(void)r;(void)t;return -1;}
 int spica_process_version(SpicaProcess*p,const char*n,const char*e){(void)p;(void)n;(void)e;return -1;}int spica_process_poll(SpicaProcess*p,int w,int x,int t){(void)p;(void)w;(void)x;(void)t;return -1;}
 long spica_process_read(int f,void*b,size_t n){(void)f;(void)b;(void)n;return -1;}long spica_process_write(int f,const void*b,size_t n){(void)f;(void)b;(void)n;return -1;}
 int spica_process_reap(SpicaProcess*p,int*s){(void)p;(void)s;return -1;}int spica_process_force(SpicaProcess*p){(void)p;return -1;}void spica_process_dispose(SpicaProcess*p){(void)p;}uint64_t spica_runtime_id(void){return 1;}

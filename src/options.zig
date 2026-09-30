@@ -49,7 +49,7 @@ pub const help =
     \\             [--capture PNG_PATH] [--quit-after MILLISECONDS]
     \\
     \\Software is the lower-residency default. Neither backend has passed the 32 MiB gate.
-    \\Real pi starts only after an explicit Start action; absent flags, trust is a UI choice.
+    \\Pi starts automatically. Project resources are disabled unless --trust-project is given.
     \\The real-process first-pass demo is Linux-only, pinned to pi 0.87.1.
     \\Executable defaults match a system Node and npm installation.
     \\Use --node and --pi-entry for another installation. --resume is explicit, not replay.
@@ -57,19 +57,22 @@ pub const help =
     \\Keep the checkout's .deps and assets directories; rebuild after moving the checkout.
     \\Project resources may run code: --trust-project opts in; --no-project-resources opts out.
     \\
-    \\First-pass UI: compact project/thread sidebar, centered Markdown and composer.
-    \\Ctrl+P starts pi; the sidebar + starts a new pi session without deleting history.
+    \\The sidebar discovers existing pi threads across project folders and legacy Spica sessions.
+    \\Select a thread to resume it in its own folder; + creates a new session without deleting history.
+    \\New sessions use pi's normal configured storage, shared with the pi CLI.
+    \\Stop active work before switching threads. Ctrl+P retries a failed pi startup.
     \\The first prompt's first line names an unnamed pi session; explicit resume keeps it.
     \\Enter sends; Shift+Enter inserts a newline; Ctrl+Enter also sends.
     \\While running, input is a follow-up; click that control to choose steering instead.
     \\Ctrl+B switches Prompt/Bash; Ctrl+M opens actual configured models.
-    \\Thinking choices come from pi; the Worked/Reasoning chevron reveals retained reasoning.
+    \\Thinking choices come from pi; each assistant's Reasoning disclosure keeps its answer visible.
     \\Ctrl+. clears queues and aborts agent/Bash work. Close requests graceful shutdown.
     \\Cancelled queue text stays on disk; an empty editor recovers one cancelled message.
     \\Large multiline tool output uses visible text segments, not an unbounded layout.
     \\If pi will not exit, Force requires an explicit choice (also Ctrl+Shift+Esc).
-    \\PageUp/PageDown select cached active-path entries; wheel scrolls the current entry.
-    \\Ctrl+L switches light/dark; Ctrl+R reloads validated theme assets.
+    \\Wheel and PageUp/PageDown scroll the full conversation, including previous prompts.
+    \\Scrolling upward stops auto-follow; scrolling to the bottom or clicking the current thread resumes it.
+    \\The sidebar has its own wheel scroll. Ctrl+L switches light/dark; Ctrl+R reloads theme/history.
     \\Composer supports Unicode multiline editing, selection, undo and durable drafts.
     \\
     \\Resource scene: disk-backed Markdown, code, tables, mixed scripts, and PNG.

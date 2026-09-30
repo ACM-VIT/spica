@@ -15,7 +15,6 @@ pub const Status = enum { stopped, starting, ready, streaming, stopping, needs_f
 pub const Model = struct { provider: []const u8, id: []const u8, name: []const u8 };
 pub const Options = struct {
     database_path: []const u8,
-    data_dir: []const u8,
     project_path: []const u8,
     node_path: []const u8,
     pi_entrypoint: []const u8,
@@ -168,7 +167,7 @@ pub const Runtime = struct {
         errdefer arena.deinit();
         const temp = arena.allocator();
         var owned = options;
-        inline for (.{ "database_path", "data_dir", "project_path", "node_path", "pi_entrypoint" }) |field| @field(owned, field) = try temp.dupeZ(u8, @field(options, field));
+        inline for (.{ "database_path", "project_path", "node_path", "pi_entrypoint" }) |field| @field(owned, field) = try temp.dupeZ(u8, @field(options, field));
         if (options.resume_file) |file| owned.resume_file = try temp.dupeZ(u8, file);
         var state = try copySnapshot(a, .{ .allocator = a, .runtime_id = p.spica_runtime_id() });
         errdefer state.deinit();
@@ -496,20 +495,15 @@ pub const Runtime = struct {
         const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.options.project_path, self.allocator);
         defer self.allocator.free(cwd);
         self.options.project_path = try self.options_arena.allocator().dupeZ(u8, cwd);
-        const cwd_z = cwd;
-        const dir = try std.fs.path.join(self.allocator, &.{ self.options.data_dir, "pi-sessions" });
-        defer self.allocator.free(dir);
-        try std.Io.Dir.cwd().createDirPath(self.io, dir);
-        const dir_z = try std.Io.Dir.cwd().realPathFileAlloc(self.io, dir, self.allocator);
-        defer self.allocator.free(dir_z);
-        const uuid = try std.fmt.allocPrintSentinel(self.allocator, "{x:0>8}-{x:0>4}-4{x:0>3}-8{x:0>3}-{x:0>12}", .{ @as(u32, @truncate(p.spica_monotonic_ms())), @as(u16, @truncate(self.state.runtime_id)), @as(u12, @truncate(self.content_counter)), @as(u12, @truncate(p.spica_monotonic_ms())), p.spica_monotonic_ms() & 0xffffffffffff }, 0);
-        defer self.allocator.free(uuid);
         const resume_path = if (self.options.resume_file) |file| try std.Io.Dir.cwd().realPathFileAlloc(self.io, file, self.allocator) else null;
         defer if (resume_path) |file| self.allocator.free(file);
-        if (p.spica_process_spawn(&self.process, node, entry, cwd_z, dir_z, uuid, if (resume_path) |r| r.ptr else null, @intFromBool(self.options.trust_project)) != 0) return error.PiLaunchFailed;
-        try self.queue(.{ .type = "get_state" });
+        if (p.spica_process_spawn(&self.process, node, entry, cwd, if (resume_path) |r| r.ptr else null, @intFromBool(self.options.trust_project)) != 0) return error.PiLaunchFailed;
+        try self.requestState();
         try self.queue(.{ .type = "get_available_models" });
         try self.queue(.{ .type = "get_available_thinking_levels" });
+    }
+    fn requestState(self: *Runtime) !void {
+        try self.queue(.{ .type = "get_state", .id = self.state.generation });
     }
     fn queue(self: *Runtime, value: anytype) !void {
         const bytes = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
@@ -677,6 +671,10 @@ pub const Runtime = struct {
         const ty = string(value, "type");
         const data = child(value, "data");
         if (std.mem.eql(u8, ty, "response")) {
+            const command_name = string(value, "command");
+            // Pi handles RPC input concurrently. Replies queued before a successful
+            // new_session must never import the outgoing history into its successor.
+            if ((std.mem.eql(u8, command_name, "get_state") or std.mem.eql(u8, command_name, "get_entries")) and integer(value, "id") != self.state.generation) return;
             try self.acknowledge(value);
             if (!boolean(value, "success")) {
                 if (std.mem.eql(u8, string(value, "command"), "bash")) self.state.bash_running = false;
@@ -688,7 +686,6 @@ pub const Runtime = struct {
                 try self.publish();
                 return;
             }
-            const command_name = string(value, "command");
             if (std.mem.eql(u8, command_name, "get_state")) {
                 try self.replace(&self.state.session_file, string(data, "sessionFile"));
                 try self.replace(&self.state.session_id, string(data, "sessionId"));
@@ -758,21 +755,28 @@ pub const Runtime = struct {
                 try self.replace(&self.state.model, string(data, "id"));
                 try self.replace(&self.state.provider, string(data, "provider"));
                 self.clearThinkingLevels();
-                try self.queue(.{ .type = "get_state" });
+                try self.requestState();
                 try self.queue(.{ .type = "get_available_thinking_levels" });
             } else if (std.mem.eql(u8, command_name, "set_thinking_level") or std.mem.eql(u8, command_name, "set_session_name")) {
-                try self.queue(.{ .type = "get_state" });
+                try self.requestState();
             } else if (std.mem.eql(u8, command_name, "new_session")) {
                 if (boolean(data, "cancelled")) {
                     try self.replace(&self.state.attention, "New session was cancelled; current thread retained");
                 } else {
                     const generation = try std.math.add(i64, self.state.generation, 1);
+                    try self.store.?.clearLiveGeneration(self.state.runtime_id, self.state.generation);
                     try self.replace(&self.last_entry_id, "");
                     try self.replace(&self.leaf_id, "");
+                    try self.replace(&self.last_prompt, "");
                     try self.replace(&self.state.session_file, "");
                     try self.replace(&self.state.session_id, "");
                     try self.replace(&self.state.session_name, "");
                     try self.replace(&self.state.attention, "");
+                    try self.replace(&self.state.error_message, "");
+                    try self.replace(&self.state.content_status, "");
+                    self.state.queued_count = 0;
+                    self.state.bash_running = false;
+                    self.stop_requested = false;
                     self.state.generation = generation;
                     self.state.last_ordinal = -1;
                     self.state.active_count = 0;
@@ -789,7 +793,7 @@ pub const Runtime = struct {
                     self.tools.clearRetainingCapacity();
                     self.sequence = 0;
                     self.message_sequence = 0;
-                    try self.queue(.{ .type = "get_state" });
+                    try self.requestState();
                     try self.queue(.{ .type = "get_available_thinking_levels" });
                 }
             } else if (std.mem.eql(u8, command_name, "bash")) {
@@ -797,7 +801,7 @@ pub const Runtime = struct {
                 const output = string(data, "output");
                 const id = try self.content(output, "text/plain");
                 try self.visible(id, output.len, "bashExecution", "bash", "complete");
-                try self.queue(.{ .type = "get_state" });
+                try self.requestState();
             }
         } else if (std.mem.eql(u8, ty, "queue_update")) {
             const steering = child(value, "steering");
@@ -810,7 +814,7 @@ pub const Runtime = struct {
             try self.replace(&self.state.error_message, "");
         } else if (std.mem.eql(u8, ty, "agent_settled")) {
             self.state.status = if (self.closing) .stopping else .ready;
-            if (!self.closing) try self.queue(.{ .type = "get_state" });
+            if (!self.closing) try self.requestState();
         } else if (std.mem.eql(u8, ty, "message_start")) {
             const message = child(value, "message");
             if (std.mem.eql(u8, string(message, "role"), "assistant")) {
@@ -819,6 +823,15 @@ pub const Runtime = struct {
                 self.message_sequence = self.sequence;
                 self.state.thinking_content_ref = null;
                 self.state.thinking_length = 0;
+            } else if (std.mem.eql(u8, string(message, "role"), "user")) {
+                self.sequence += 1;
+                const text = try session.messageText(self.allocator, message);
+                defer self.allocator.free(text);
+                const id = try self.content(text, "text/markdown");
+                try self.store.?.putLiveRow(.{ .runtime = self.state.runtime_id, .run_generation = self.state.generation, .local_sequence = self.sequence, .content_index = 0, .row = .{ .row_id = "live-user", .kind = "message", .role = "user", .revision = @intCast(self.state.revision), .status = "complete", .content_ref = id } });
+                self.state.thinking_content_ref = null;
+                self.state.thinking_length = 0;
+                try self.visible(id, text.len, "user", "message", "complete");
             }
         } else if (std.mem.eql(u8, ty, "message_update")) {
             const update = child(value, "assistantMessageEvent");
@@ -870,6 +883,8 @@ pub const Runtime = struct {
                 const text = try session.messageText(self.allocator, message);
                 defer self.allocator.free(text);
                 const id = try self.content(text, "text/markdown");
+                try self.store.?.clearLiveMessage(self.state.runtime_id, self.state.generation, self.message_sequence);
+                try self.store.?.putLiveRow(.{ .runtime = self.state.runtime_id, .run_generation = self.state.generation, .local_sequence = self.message_sequence, .content_index = 0, .row = .{ .row_id = "live-assistant", .kind = "message", .role = role, .revision = @intCast(self.state.revision), .status = "complete", .content_ref = id } });
                 try self.visible(id, text.len, role, "message", "complete");
                 const thinking = try session.thinkingText(self.allocator, message);
                 defer self.allocator.free(thinking);
@@ -941,7 +956,7 @@ pub const Runtime = struct {
             self.entries_again = true;
             return;
         }
-        if (self.last_entry_id.len == 0) try self.queue(.{ .type = "get_entries" }) else try self.queue(.{ .type = "get_entries", .since = self.last_entry_id });
+        if (self.last_entry_id.len == 0) try self.queue(.{ .type = "get_entries", .id = self.state.generation }) else try self.queue(.{ .type = "get_entries", .id = self.state.generation, .since = self.last_entry_id });
         self.entries_inflight = true;
     }
 };
@@ -1017,6 +1032,13 @@ const Sink = struct {
         const first = prefix.items;
         if (first.len == 0) return;
         if (std.mem.indexOf(u8, first[0..@min(first.len, 4096)], "\"command\":\"get_entries\"") != null and std.mem.indexOf(u8, first, "\"entries\":[") != null) {
+            // The pinned pi serializer puts id first in the compact response header.
+            // Check it before the streaming reducer can mutate canonical rows.
+            const id_prefix = "{\"id\":";
+            if (!std.mem.startsWith(u8, first, id_prefix)) return;
+            const id_end = std.mem.indexOfScalarPos(u8, first, id_prefix.len, ',') orelse return;
+            const generation = std.fmt.parseInt(i64, first[id_prefix.len..id_end], 10) catch return;
+            if (generation != self.runtime.state.generation) return;
             self.runtime.entries_inflight = false;
             session.reconcile(self.runtime, source, first) catch |err| switch (err) {
                 error.OutOfMemory, error.SqliteFailure => return err,

@@ -84,6 +84,15 @@ pub const ContentInfo = struct {
         self.* = undefined;
     }
 };
+pub const ConversationEntry = struct {
+    ordinal: usize,
+    role: enum { user, assistant, tool, bash, system },
+    content_id: ContentId,
+    length: u64,
+    reasoning: ?ReasoningReference = null,
+};
+pub const live_ordinal_base: usize = std.math.maxInt(usize) / 2;
+
 
 pub const Store = struct {
     db: *c.sqlite3,
@@ -377,6 +386,57 @@ pub const Store = struct {
         try bindText(stmt, 1, session_file);
         return self.collectRows(allocator, stmt);
     }
+    /// Only compact references reside in the viewport; message bodies stay on disk.
+    pub fn conversationEntries(self: *Store, allocator: std.mem.Allocator, session_file: []const u8, fixture_mode: bool, runtime: u64, generation: i64) ![]ConversationEntry {
+        try field(session_file, max_key);
+        const stmt = try self.prepare(if (fixture_mode)
+            "SELECT e.append_ordinal,e.role,e.content_ref,o.total_length,r.content_ref,r.length FROM entries e JOIN content_objects o ON o.content_id=e.content_ref LEFT JOIN entry_reasoning r ON r.session_file=e.session_file AND r.entry_id=e.entry_id WHERE e.session_file=?1 AND e.entry_type='message' ORDER BY e.append_ordinal"
+        else
+            "SELECT p.ordinal,e.role,e.content_ref,o.total_length,r.content_ref,r.length FROM sessions s JOIN active_path p ON p.session_file=s.session_file AND p.leaf_id=s.leaf_id JOIN entries e ON e.session_file=p.session_file AND e.entry_id=p.entry_id JOIN content_objects o ON o.content_id=e.content_ref LEFT JOIN entry_reasoning r ON r.session_file=e.session_file AND r.entry_id=e.entry_id WHERE s.session_file=?1 AND ((e.entry_type='message' AND e.role IN ('user','assistant','toolResult','bashExecution')) OR (e.kind='unsupported_oversized_entry' AND e.status='display_budget')) ORDER BY p.ordinal");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, session_file);
+        var entries: std.ArrayList(ConversationEntry) = .empty;
+        errdefer entries.deinit(allocator);
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteFailure;
+            const bytes = c.sqlite3_column_text(stmt, 1);
+            const role = if (bytes) |p| std.mem.span(p) else "";
+            const reasoning = try columnId(stmt, 4);
+            try entries.append(allocator, .{
+                .ordinal = @intCast(c.sqlite3_column_int64(stmt, 0)),
+                .role = if (std.mem.eql(u8, role, "user")) .user else if (std.mem.eql(u8, role, "assistant")) .assistant else if (std.mem.eql(u8, role, "toolResult")) .tool else if (std.mem.eql(u8, role, "bashExecution")) .bash else .system,
+                .content_id = (try columnId(stmt, 2)) orelse return error.CorruptCache,
+                .length = @intCast(c.sqlite3_column_int64(stmt, 3)),
+                .reasoning = if (reasoning) |id| .{ .content_ref = id, .length = @intCast(c.sqlite3_column_int64(stmt, 5)) } else null,
+            });
+        }
+        if (!fixture_mode and runtime != 0) {
+            if (runtime > std.math.maxInt(i64)) return error.LengthOverflow;
+            const live = try self.prepare("SELECT l.local_sequence,l.content_index,l.role,l.content_ref,o.total_length FROM live_rows l JOIN content_objects o ON o.content_id=l.content_ref WHERE l.runtime=?1 AND l.run_generation=?2 AND l.kind!='thinking' ORDER BY l.local_sequence,l.content_index");
+            defer _ = c.sqlite3_finalize(live);
+            try bindInt(live, 1, @intCast(runtime));
+            try bindInt(live, 2, generation);
+            while (true) {
+                const rc = c.sqlite3_step(live);
+                if (rc == c.SQLITE_DONE) break;
+                if (rc != c.SQLITE_ROW) return error.SqliteFailure;
+                const bytes = c.sqlite3_column_text(live, 2);
+                const role = if (bytes) |p| std.mem.span(p) else "";
+                const sequence: usize = @intCast(c.sqlite3_column_int64(live, 0));
+                const index: usize = @intCast(c.sqlite3_column_int64(live, 1));
+                try entries.append(allocator, .{
+                    .ordinal = live_ordinal_base + sequence * 512 + index,
+                    .role = if (std.mem.eql(u8, role, "user")) .user else if (std.mem.eql(u8, role, "assistant")) .assistant else if (std.mem.eql(u8, role, "toolResult")) .tool else if (std.mem.eql(u8, role, "bashExecution")) .bash else .system,
+                    .content_id = (try columnId(live, 3)) orelse return error.CorruptCache,
+                    .length = @intCast(c.sqlite3_column_int64(live, 4)),
+                });
+            }
+        }
+        return entries.toOwnedSlice(allocator);
+    }
+
 
     pub fn putEntryReasoning(self: *Store, session_file: []const u8, entry_id: []const u8, reference: ?ReasoningReference) !void {
         try field(session_file, max_key);
@@ -439,6 +499,16 @@ pub const Store = struct {
         try bindInt(stmt, 5, limit);
         return self.collectRows(allocator, stmt);
     }
+    pub fn clearLiveMessage(self: *Store, runtime: u64, generation: i64, sequence: i64) !void {
+        if (runtime > std.math.maxInt(i64)) return error.LengthOverflow;
+        const stmt = try self.prepare("DELETE FROM live_rows WHERE runtime=?1 AND run_generation=?2 AND local_sequence=?3");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindInt(stmt, 1, @intCast(runtime));
+        try bindInt(stmt, 2, generation);
+        try bindInt(stmt, 3, sequence);
+        try done(stmt);
+    }
+
 
     pub fn clearLiveGeneration(self: *Store, runtime: u64, generation: i64) !void {
         if (runtime > std.math.maxInt(i64)) return error.LengthOverflow;
@@ -687,6 +757,13 @@ test "active branch paging and visible content ignore later inactive appends" {
     }
     try store.rebuildActivePath(path, "active-leaf");
     try std.testing.expectEqual(@as(i64, 3), try store.activeEntryCount(path));
+    const transcript = try store.conversationEntries(allocator, path, false, 0, 0);
+    defer allocator.free(transcript);
+    try std.testing.expectEqual(@as(usize, 3), transcript.len);
+    try std.testing.expectEqual(.user, transcript[0].role);
+    try std.testing.expectEqual(.assistant, transcript[1].role);
+    try std.testing.expectEqual(.user, transcript[2].role);
+    try std.testing.expectEqual(@as(usize, 2), transcript[2].ordinal);
     var first = try store.pageActiveEntries(allocator, path, -1, 2);
     defer first.deinit();
     try std.testing.expectEqual(@as(usize, 2), first.rows.len);
@@ -757,6 +834,29 @@ test "active branch paging and visible content ignore later inactive appends" {
     try std.testing.expectEqual(@as(usize, 1), context_visible.rows.len);
     try std.testing.expectEqualStrings("inactive-tail", context_visible.rows[0].row_id);
     try std.testing.expectEqual(@as(?i64, 1), context_visible.next_cursor);
+    const context_transcript = try store.conversationEntries(allocator, path, false, 0, 0);
+    defer allocator.free(context_transcript);
+    try std.testing.expectEqual(@as(usize, 2), context_transcript.len);
+    try std.testing.expectEqualSlices(u8, &inactive_ref, &context_transcript[1].content_id);
+    try store.putLiveRow(.{ .runtime = 1, .run_generation = 4, .local_sequence = 1, .content_index = 0, .row = .{ .row_id = "prompt", .kind = "message", .role = "user", .content_ref = display_ref } });
+    try store.putLiveRow(.{ .runtime = 1, .run_generation = 4, .local_sequence = 2, .content_index = 0, .row = .{ .row_id = "reasoning", .kind = "thinking", .role = "assistant", .content_ref = raw_ref } });
+    try store.putLiveRow(.{ .runtime = 1, .run_generation = 4, .local_sequence = 2, .content_index = 1, .row = .{ .row_id = "partial", .kind = "message", .role = "assistant", .content_ref = display_ref } });
+    const streaming = try store.conversationEntries(allocator, path, false, 1, 4);
+    defer allocator.free(streaming);
+    try std.testing.expectEqual(@as(usize, 4), streaming.len);
+    try std.testing.expectEqual(.user, streaming[2].role);
+    try std.testing.expectEqual(.assistant, streaming[3].role);
+    try std.testing.expectEqualSlices(u8, &display_ref, &streaming[3].content_id);
+    try store.clearLiveMessage(1, 4, 2);
+    try store.putLiveRow(.{ .runtime = 1, .run_generation = 4, .local_sequence = 2, .content_index = 0, .row = .{ .row_id = "completed", .kind = "message", .role = "assistant", .content_ref = inactive_ref } });
+    const completed = try store.conversationEntries(allocator, path, false, 1, 4);
+    defer allocator.free(completed);
+    try std.testing.expectEqual(@as(usize, 4), completed.len);
+    try std.testing.expectEqualSlices(u8, &display_ref, &completed[2].content_id);
+    try std.testing.expectEqualSlices(u8, &inactive_ref, &completed[3].content_id);
+    const other_generation = try store.conversationEntries(allocator, path, false, 1, 5);
+    defer allocator.free(other_generation);
+    try std.testing.expectEqual(@as(usize, 2), other_generation.len);
     var context_page = try store.pageActiveEntries(allocator, path, 1, 2);
     defer context_page.deinit();
     try std.testing.expectEqual(@as(usize, 2), context_page.rows.len);

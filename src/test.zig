@@ -1,6 +1,7 @@
 test {
     _ = @import("core/protocol_test.zig");
     _ = @import("core/store_test.zig");
+    _ = @import("core/catalog.zig");
     _ = @import("ui/theme.zig");
     _ = @import("text/edit.zig");
     _ = @import("text/composer.zig");

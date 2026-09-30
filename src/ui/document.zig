@@ -17,8 +17,7 @@ const Box = struct {
     layout: ?*c.SpicaTextLayout = null,
 };
 
-// Only the selected document's compact block metadata is retained. Shapes for
-// offscreen blocks are released; text source and rich structure remain intact.
+// Compact block metadata stays resident while offscreen text shapes are released.
 pub const View = struct {
     allocator: std.mem.Allocator,
     boxes: std.ArrayList(Box) = .empty,
@@ -135,14 +134,19 @@ pub const View = struct {
         self.height = y;
     }
 
-    pub fn prepare(self: *View, engine: *c.SpicaText, document: *const md.Document, scroll: *f32, viewport_height: f32, trailing_height: f32, follow_bottom: bool, metrics: Theme.Metrics) !void {
-        // Each changed pass makes another block's estimated height exact.
-        // Reflow can reveal a previously offscreen block, so finish that work
-        // before presenting rather than leaving an unshaped hole until input.
+
+    pub fn releaseShapes(self: *View) void {
+        for (self.boxes.items) |*box| {
+            if (box.layout) |layout| c.spica_text_layout_release(layout);
+            box.layout = null;
+        }
+    }
+
+    /// A transcript supplies the unclamped local viewport, including negative
+    /// offsets when a message starts partway down the visible conversation.
+    pub fn prepareRegion(self: *View, engine: *c.SpicaText, document: *const md.Document, scroll: f32, viewport_height: f32, metrics: Theme.Metrics) !void {
         for (0..self.boxes.items.len + 2) |_| {
-            const maximum = @max(0, self.height + trailing_height - viewport_height);
-            scroll.* = if (follow_bottom) maximum else @min(scroll.*, maximum);
-            if (!try self.shapeVisible(engine, document, scroll.*, viewport_height, metrics)) return;
+            if (!try self.shapeVisible(engine, document, scroll, viewport_height, metrics)) return;
         }
         return error.UnstableTextReflow;
     }

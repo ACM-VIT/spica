@@ -2,7 +2,7 @@ const std = @import("std");
 const c = @import("../native/bindings.zig").c;
 const allocator = std.heap.page_allocator;
 
-pub const State = struct { draft: []const u8 = "", selected_message: usize = 199, light: bool = false };
+pub const State = struct { draft: []const u8 = "", light: bool = false };
 pub const Restored = struct {
     parsed: ?std.json.Parsed(State) = null,
     pub fn value(self: Restored) State { return if (self.parsed) |parsed| parsed.value else .{}; }
@@ -11,7 +11,7 @@ pub const Restored = struct {
 pub fn restore(io: std.Io, path: []const u8) !Restored {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(512 * 1024)) catch |err| switch (err) { error.FileNotFound => return .{}, else => return err };
     defer allocator.free(bytes);
-    const parsed = try std.json.parseFromSlice(State, allocator, bytes, .{ .allocate = .alloc_always });
+    const parsed = try std.json.parseFromSlice(State, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     errdefer parsed.deinit();
     if (parsed.value.draft.len > 65536 or !std.unicode.utf8ValidateSlice(parsed.value.draft)) return error.InvalidDraft;
     return .{ .parsed = parsed };
