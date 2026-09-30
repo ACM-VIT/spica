@@ -39,13 +39,12 @@ static bool charge(size_t bytes) {
     return true;
 }
 
-static void *SDLCALL image_malloc(size_t size) {
+static void *image_allocate(size_t size, bool charged) {
     if (size > SIZE_MAX - sizeof(Allocation)) {
-        if (active_job) atomic_store(&hit_limit, true);
+        if (charged) atomic_store(&hit_limit, true);
         return NULL;
     }
     size_t total = sizeof(Allocation) + size;
-    bool charged = active_job;
     if (charged && !charge(total)) return NULL;
     Allocation *block = malloc(total);
     if (!block) {
@@ -55,6 +54,10 @@ static void *SDLCALL image_malloc(size_t size) {
     block->record.size = total;
     block->record.charged = charged;
     return block + 1;
+}
+
+static void *SDLCALL image_malloc(size_t size) {
+    return image_allocate(size, active_job);
 }
 
 static void *SDLCALL image_calloc(size_t count, size_t size) {
@@ -84,21 +87,15 @@ static void *SDLCALL image_realloc(void *ptr, size_t size) {
         return NULL;
     }
     Allocation *old = (Allocation *)ptr - 1;
-    size_t before = old->record.size;
-    size_t after = sizeof(Allocation) + size;
-    bool was_charged = old->record.charged;
-    bool charged = was_charged || active_job;
-    size_t extra = !was_charged && charged ? after : (charged && after > before ? after - before : 0);
-    if (extra && !charge(extra)) return NULL;
-    Allocation *replacement = realloc(old, after);
-    if (!replacement) {
-        if (extra) atomic_fetch_sub(&charged_live, extra);
-        return NULL;
-    }
-    replacement->record.size = after;
-    replacement->record.charged = charged;
-    if (was_charged && after < before) atomic_fetch_sub(&charged_live, before - after);
-    return replacement + 1;
+    /* A growing realloc may keep both blocks live inside libc. Charge that
+     * overlap explicitly rather than relying on an in-place realloc. */
+    size_t before = old->record.size - sizeof(Allocation);
+    if (size <= before) return ptr; /* Keep capacity; no copy or hidden overlap. */
+    void *replacement = image_allocate(size, active_job || old->record.charged);
+    if (!replacement) return NULL;
+    memcpy(replacement, ptr, before);
+    image_free(ptr);
+    return replacement;
 }
 
 bool spica_image_install_sdl_allocator(void) {
@@ -184,7 +181,6 @@ static SpicaImageStatus dimensions(const uint8_t *p, size_t n,
 SpicaImageStatus spica_image_decode(const uint8_t *source, size_t length,
                                     int max_width, int max_height,
                                     size_t thumbnail_limit,
-                                    bool allow_untracked_codec,
                                     SpicaImageResult *out) {
     if (!out) return SPICA_IMAGE_INVALID_ARGUMENT;
     *out = (SpicaImageResult){0};
@@ -198,10 +194,6 @@ SpicaImageStatus spica_image_decode(const uint8_t *source, size_t length,
     if (status != SPICA_IMAGE_OK) return status;
     out->source_width = width; out->source_height = height;
     out->mime_type = mime;
-    out->codec_allocations_untracked = strcmp(type, "GIF") != 0;
-    if (out->codec_allocations_untracked && !allow_untracked_codec)
-        return SPICA_IMAGE_CODEC_ALLOCATIONS_UNTRACKED;
-    if (atomic_load(&charged_live)) return SPICA_IMAGE_SDL_ALLOCATOR_UNAVAILABLE;
 
     /* Aspect-preserving, integer-only, downscale-or-original fit. */
     int target_width = width, target_height = height;
@@ -222,13 +214,20 @@ SpicaImageStatus spica_image_decode(const uint8_t *source, size_t length,
     /* SDL_IOFromConstMem takes size_t, but decoder paths may cast lengths
      * or seek through signed offsets. Reject inputs outside int range. */
     if (length > INT_MAX) return SPICA_IMAGE_BUDGET_EXCEEDED;
+    /* Caller-owned encoded bytes are resident for the complete job too. */
+    if (length > SPICA_IMAGE_JOB_LIMIT) return SPICA_IMAGE_BUDGET_EXCEEDED;
 
     SDL_IOStream *io = NULL;
     SDL_Surface *surface = NULL, *destination = NULL;
     uint8_t *pixels = NULL;
+    bool source_charged = false;
     atomic_store(&hit_limit, false);
-    atomic_store(&peak_live, 0);
+    /* SDL's process-global property registry may grow during a decode. Keep
+     * its allocations charged in later jobs until SDL actually frees them. */
+    atomic_store(&peak_live, atomic_load(&charged_live));
     active_job = true;
+    if (!charge(length)) goto failure;
+    source_charged = true;
     io = SDL_IOFromConstMem(source, length);
     if (!io) goto failure;
     surface = IMG_LoadTyped_IO(io, false, type);
@@ -255,12 +254,10 @@ SpicaImageStatus spica_image_decode(const uint8_t *source, size_t length,
     SDL_DestroySurface(destination); destination = NULL;
     SDL_DestroySurface(surface); surface = NULL;
     SDL_CloseIO(io); io = NULL;
+    SDL_CleanupTLS();
+    atomic_fetch_sub(&charged_live, length);
     atomic_fetch_sub(&charged_live, bytes);
     active_job = false;
-    if (atomic_load(&charged_live)) {
-        free(pixels);
-        return SPICA_IMAGE_SDL_ALLOCATOR_UNAVAILABLE;
-    }
     out->pixels = pixels;
     out->byte_length = bytes;
     out->width = target_width; out->height = target_height;
@@ -274,6 +271,8 @@ cleanup:
     if (destination) SDL_DestroySurface(destination);
     if (surface) SDL_DestroySurface(surface);
     if (io) SDL_CloseIO(io);
+    SDL_CleanupTLS();
+    if (source_charged) atomic_fetch_sub(&charged_live, length);
     if (pixels) { free(pixels); atomic_fetch_sub(&charged_live, bytes); }
     active_job = false;
     return status;

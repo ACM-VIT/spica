@@ -62,6 +62,147 @@ def acquire_font(name, member, filename):
             while chunk := source.read(65536):
                 output.write(chunk)
 
+def patch_native(path, old, new, count=1):
+    """Apply one audited allocator change, rejecting upstream source drift."""
+    text = path.read_text()
+    if text.count(new) == count and old not in text.replace(new, ''):
+        return
+    if text.count(old) != count or new in text:
+        raise RuntimeError(f'{path}: allocator patch no longer matches pinned source')
+    path.write_text(text.replace(old, new))
+
+
+def configure_image_allocators(sdl, image, codecs):
+    # SDL captures these functions in each error buffer, so replacing them is
+    # ownership-safe. Otherwise decoder errors allocate outside the job hooks.
+    patch_native(sdl / 'src/thread/SDL_thread.c',
+                 'SDL_GetOriginalMemoryFunctions(NULL, NULL, &realloc_func, &free_func);',
+                 'SDL_GetMemoryFunctions(NULL, NULL, &realloc_func, &free_func);')
+    patch_native(sdl / 'src/thread/SDL_thread.c',
+                 '        SDL_SetTLS(&tls_errbuf, errbuf, SDL_FreeErrBuf);',
+                 '        if (!SDL_SetTLS(&tls_errbuf, errbuf, SDL_FreeErrBuf)) {\n'
+                 '            SDL_FreeErrBuf(errbuf);\n'
+                 '            return SDL_GetStaticErrBuf();\n'
+                 '        }')
+    for name, source in codecs.items():
+        destination = image / 'external' / name
+        if destination.is_symlink():
+            if destination.resolve() != source.resolve():
+                raise RuntimeError(f'{destination}: unexpected codec source link')
+        else:
+            # Discard only the old generated vendored copy, never the pinned
+            # source. All future builds share that source through a symlink.
+            if destination.exists():
+                shutil.rmtree(destination)
+            destination.symlink_to(source, target_is_directory=True)
+    # Custom libpng hooks cover creation, row/metadata heaps, and zlib's
+    # png_zalloc/png_zfree without changing unrelated libpng allocation owners.
+    png_loader = image / 'src/IMG_libpng.c'
+    patch_native(png_loader,
+                 'png_structp (*png_create_read_struct)(png_const_charp user_png_ver, png_voidp error_ptr, png_error_ptr error_fn, png_error_ptr warn_fn);',
+                 'png_structp (*png_create_read_struct_2)(png_const_charp user_png_ver, png_voidp error_ptr, png_error_ptr error_fn, png_error_ptr warn_fn, png_voidp mem_ptr, png_malloc_ptr malloc_fn, png_free_ptr free_fn);')
+    patch_native(png_loader,
+                 'FUNCTION_LOADER_LIBPNG(png_create_read_struct, png_structp(*)(png_const_charp user_png_ver, png_voidp error_ptr, png_error_ptr error_fn, png_error_ptr warn_fn))',
+                 'FUNCTION_LOADER_LIBPNG(png_create_read_struct_2, png_structp(*)(png_const_charp user_png_ver, png_voidp error_ptr, png_error_ptr error_fn, png_error_ptr warn_fn, png_voidp mem_ptr, png_malloc_ptr malloc_fn, png_free_ptr free_fn))')
+    patch_native(png_loader, 'struct png_load_vars\n{',
+                 'static png_voidp PNGCBAPI spica_png_malloc(png_structp png_ptr, png_alloc_size_t size)\n'
+                 '{\n    (void)png_ptr;\n    return SDL_malloc(size);\n}\n\n'
+                 'static void PNGCBAPI spica_png_free(png_structp png_ptr, png_voidp ptr)\n'
+                 '{\n    (void)png_ptr;\n    SDL_free(ptr);\n}\n\n'
+                 'static void PNGCBAPI spica_png_error(png_structp png_ptr, png_const_charp message)\n'
+                 '{\n    SDL_SetError("%s", message);\n    png_longjmp(png_ptr, 1);\n}\n\n'
+                 'static void PNGCBAPI spica_png_warning(png_structp png_ptr, png_const_charp message)\n'
+                 '{\n    (void)png_ptr;\n    SDL_SetError("%s", message);\n}\n\n'
+                 'struct png_load_vars\n{')
+    patch_native(png_loader,
+                 'lib.png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL)',
+                 'lib.png_create_read_struct_2(PNG_LIBPNG_VER_STRING, NULL, spica_png_error, spica_png_warning, NULL, spica_png_malloc, spica_png_free)',
+                 count=2)
+    jpeg = codecs['jpeg']
+    # Use the upstream no-backing-store manager: jmemansi's tmpfile/stdio heap
+    # cannot be included through jpeg's allocation callbacks.
+    patch_native(jpeg / 'CMakeLists.txt',
+                 'target_sources(jpeg PRIVATE jmemansi.c)',
+                 'target_sources(jpeg PRIVATE jmemnobs.c)')
+    patch_native(jpeg / 'jmemnobs.c', '#include "jinclude.h"',
+                 '#include "jinclude.h"\n#include <SDL3/SDL_stdinc.h>')
+    patch_native(jpeg / 'jmemnobs.c', ' malloc(sizeofobject);',
+                 ' SDL_malloc(sizeofobject);', count=2)
+    patch_native(jpeg / 'jmemnobs.c', '  free(object);', '  SDL_free(object);', count=2)
+    webp = codecs['libwebp']
+    patch_native(webp / 'src/utils/utils.c', '#include <stdlib.h>',
+                 '#include <stdlib.h>\n#include <SDL3/SDL_stdinc.h>')
+    patch_native(webp / 'src/utils/utils.c', 'ptr = malloc((size_t)(nmemb * size));',
+                 'ptr = SDL_malloc((size_t)(nmemb * size));')
+    patch_native(webp / 'src/utils/utils.c', 'ptr = calloc((size_t)nmemb, size);',
+                 'ptr = SDL_calloc((size_t)nmemb, size);')
+    patch_native(webp / 'src/utils/utils.c', '  free(ptr);', '  SDL_free(ptr);')
+    # All decode/demux heaps use WebPSafe*. Their utils object libraries need
+    # SDL's headers; final codec libraries need ordinary SDL symbol resolution.
+    patch_native(image / 'CMakeLists.txt',
+                 'add_subdirectory(external/jpeg external/jpeg-build EXCLUDE_FROM_ALL)',
+                 'add_subdirectory(external/jpeg external/jpeg-build EXCLUDE_FROM_ALL)\n'
+                 '            target_link_libraries(jpeg PRIVATE SDL3::SDL3-shared)')
+    patch_native(image / 'CMakeLists.txt',
+                 'add_subdirectory(external/libwebp external/libwebp-build EXCLUDE_FROM_ALL)',
+                 'add_subdirectory(external/libwebp external/libwebp-build EXCLUDE_FROM_ALL)\n'
+                 '        target_link_libraries(webputils PRIVATE SDL3::Headers)\n'
+                 '        target_link_libraries(webputilsdecode PRIVATE SDL3::Headers)\n'
+                 '        target_link_libraries(webp PRIVATE SDL3::SDL3-shared)\n'
+                 '        target_link_libraries(webpdecoder SDL3::SDL3-shared)')
+
+
+def allocator_fingerprint():
+    # Include patch rules, CMake flags, platform, and all locked source versions.
+    # A preexisting .so is not evidence that it uses the inclusive allocator.
+    digest = hashlib.sha256(Path(__file__).read_bytes())
+    digest.update((ROOT / 'deps.lock.json').read_bytes())
+    digest.update((platform.system() + platform.machine()).encode())
+    return digest.hexdigest()
+
+
+def build_is_current(library, stamp, fingerprint):
+    return library.exists() and stamp.exists() and stamp.read_text() == fingerprint
+
+def build_highlighting(prefix, fingerprint):
+    core = acquire('tree-sitter')
+    grammars = {name: acquire('tree-sitter-' + name)
+                for name in ('zig', 'json', 'javascript', 'python')}
+    libraries = prefix / 'lib'
+    libraries.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(core / 'lib' / 'include' / 'tree_sitter',
+                    prefix / 'include' / 'tree_sitter', dirs_exist_ok=True)
+    system = platform.system()
+    if system not in ('Linux', 'Darwin'):
+        raise RuntimeError('Native Tree-sitter bootstrap currently requires a Unix C toolchain; Windows artifacts are not verified')
+    suffix = '.dylib' if system == 'Darwin' else '.so'
+    shared = '-dynamiclib' if system == 'Darwin' else '-shared'
+    runtime = libraries / ('libtree-sitter' + suffix)
+    runtime_stamp = prefix / '.tree-sitter-allocator-config'
+    if not build_is_current(runtime, runtime_stamp, fingerprint):
+        identity = ['-Wl,-install_name,@rpath/' + runtime.name] if system == 'Darwin' else ['-Wl,-soname,' + runtime.name]
+        subprocess.run(['cc', '-std=c11', '-D_DEFAULT_SOURCE', '-O2', '-fPIC', shared,
+                        '-I' + str(core / 'lib' / 'include'),
+                        '-I' + str(core / 'lib' / 'src'),
+                        str(core / 'lib' / 'src' / 'lib.c'),
+                        *identity, '-o', str(runtime)], check=True)
+        runtime_stamp.write_text(fingerprint)
+    for name, source in grammars.items():
+        library = libraries / ('libspica-tree-sitter-' + name + suffix)
+        stamp = prefix / ('.tree-sitter-' + name + '-allocator-config')
+        if build_is_current(library, stamp, fingerprint):
+            continue
+        sources = [str(source / 'src' / 'parser.c')]
+        scanner = source / 'src' / 'scanner.c'
+        if scanner.exists():
+            sources.append(str(scanner))
+        loader = ['-Wl,-rpath,@loader_path'] if system == 'Darwin' else ['-Wl,-rpath,$ORIGIN', '-Wl,-z,defs']
+        subprocess.run(['cc', '-std=c11', '-O2', '-fPIC', shared,
+                        '-DTREE_SITTER_REUSE_ALLOCATOR', '-I' + str(source / 'src'),
+                        *sources, '-L' + str(libraries), '-ltree-sitter',
+                        *loader, '-o', str(library)], check=True)
+        stamp.write_text(fingerprint)
+
 
 def main():
     sdl = acquire('SDL')
@@ -74,19 +215,23 @@ def main():
     ninja = acquire('ninja')
     freetype = acquire('FreeType')
     harfbuzz = acquire('HarfBuzz')
-    for codec in ('jpeg', 'libpng', 'libwebp', 'zlib'):
-        source = acquire(codec)
-        destination = image / 'external' / codec
-        if not (destination / 'CMakeLists.txt').exists():
-            shutil.copytree(source, destination, dirs_exist_ok=True)
+    codecs = {name: acquire(name) for name in ('jpeg', 'libpng', 'libwebp', 'zlib')}
+    configure_image_allocators(sdl, image, codecs)
+    fingerprint = allocator_fingerprint()
     acquire_font('JetBrainsMono', 'fonts/ttf/JetBrainsMono-Regular.ttf', 'JetBrainsMono-Regular.ttf')
     acquire_font('Inter', 'InterVariable.ttf', 'Inter.ttf')
+    acquire_font('Inter', 'InterVariable-Italic.ttf', 'InterVariable-Italic.ttf')
+    for style in ('Bold', 'Italic', 'BoldItalic'):
+        filename = 'JetBrainsMono-' + style + '.ttf'
+        acquire_font('JetBrainsMono', 'fonts/ttf/' + filename, filename)
     machine = platform.machine().lower()
     machine = {'amd64': 'x86_64', 'arm64': 'aarch64'}.get(machine, machine)
     system = {'darwin': 'macos', 'windows': 'windows'}.get(platform.system().lower(), platform.system().lower())
     prefix = CACHE / 'install' / (system + '-' + machine)
+    build_highlighting(prefix, fingerprint)
     library = prefix / 'lib' / ('libSDL3.dylib' if system == 'macos' else 'libSDL3.so')
-    if not library.exists():
+    sdl_stamp = prefix / '.sdl-allocator-config'
+    if not build_is_current(library, sdl_stamp, fingerprint):
         build = CACHE / 'build' / 'sdl'
         subprocess.run(['cmake', '-S', str(sdl), '-B', str(build), '-DCMAKE_BUILD_TYPE=Release',
                         f'-DCMAKE_INSTALL_PREFIX={prefix}', '-DSDL_SHARED=ON', '-DSDL_STATIC=OFF',
@@ -98,8 +243,10 @@ def main():
         subprocess.run(['cmake', '--install', str(build)], check=True)
         if not library.exists():
             raise RuntimeError(f'SDL install did not produce {library}')
+        sdl_stamp.write_text(fingerprint)
     image_library = prefix / 'lib' / ('libSDL3_image.dylib' if system == 'macos' else 'libSDL3_image.so')
-    if not image_library.exists():
+    image_stamp = prefix / '.image-allocator-config'
+    if not build_is_current(image_library, image_stamp, fingerprint):
         build = CACHE / 'build' / 'sdl-image'
         subprocess.run(['cmake', '-S', str(image), '-B', str(build),
                         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
@@ -107,6 +254,9 @@ def main():
                         '-DSDLIMAGE_VENDORED=ON', '-DSDLIMAGE_STRICT=ON',
                         '-DSDLIMAGE_BACKEND_STB=OFF', '-DSDLIMAGE_BACKEND_WIC=OFF',
                         '-DSDLIMAGE_BACKEND_IMAGEIO=OFF', '-DSDLIMAGE_PNG_LIBPNG=ON',
+                        '-DSDLIMAGE_JPG_SHARED=OFF', '-DSDLIMAGE_PNG_SHARED=OFF',
+                        '-DSDLIMAGE_WEBP_SHARED=OFF', '-DSDLIMAGE_ZLIB_SHARED=OFF',
+                        '-DWEBP_USE_THREAD=OFF',
                         '-DSDLIMAGE_JPG=ON', '-DSDLIMAGE_PNG=ON', '-DSDLIMAGE_GIF=ON',
                         '-DSDLIMAGE_WEBP=ON', '-DSDLIMAGE_PNG_SAVE=ON',
                         '-DSDLIMAGE_ANI=OFF', '-DSDLIMAGE_AVIF=OFF', '-DSDLIMAGE_BMP=OFF',
@@ -118,6 +268,7 @@ def main():
         subprocess.run(['cmake', '--install', str(build)], check=True)
         if not image_library.exists():
             raise RuntimeError(f'SDL_image install did not produce {image_library}')
+        image_stamp.write_text(fingerprint)
     cmark_library = prefix / 'lib' / 'libcmark-gfm.a'
     if not cmark_library.exists():
         build = CACHE / 'build' / 'cmark-gfm'

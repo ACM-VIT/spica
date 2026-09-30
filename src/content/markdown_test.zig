@@ -129,7 +129,7 @@ test "serialization carries source identity separately from rendered text" {
     const Sink = struct {
         data: std.ArrayList(u8) = .empty,
         allocator: std.mem.Allocator,
-        fn write(self: *@This(), bytes: []const u8) !void {
+        pub fn write(self: *@This(), bytes: []const u8) !void {
             try self.data.appendSlice(self.allocator, bytes);
         }
     };

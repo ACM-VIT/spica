@@ -4,6 +4,11 @@
 #include <cmark-gfm-extension_api.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include "node.h"
+
+static cmark_mem job_allocator = {
+    spica_parse_calloc, spica_parse_realloc, spica_parse_free
+};
 
 struct SpicaMarkdown {
     SpicaParseArena arena;
@@ -33,8 +38,7 @@ SpicaRichResult spica_markdown_parse(const char *source, size_t length,
         free(job);
         return SPICA_RICH_BUDGET_EXCEEDED;
     }
-    cmark_mem mem = {spica_parse_calloc, spica_parse_realloc, spica_parse_free};
-    cmark_parser *parser = cmark_parser_new_with_mem(CMARK_OPT_DEFAULT, &mem);
+    cmark_parser *parser = cmark_parser_new_with_mem(CMARK_OPT_DEFAULT, &job_allocator);
     if (!parser) {
         spica_parse_arena_release(&job->arena);
         free(job);
@@ -64,6 +68,29 @@ SpicaRichResult spica_markdown_parse(const char *source, size_t length,
 
 cmark_node *spica_markdown_root(SpicaMarkdown *job) {
     return job ? job->root : NULL;
+}
+
+static SpicaMarkdownBytes chunk_bytes(const cmark_chunk *chunk) {
+    return (SpicaMarkdownBytes){ (const char *)chunk->data, (size_t)chunk->len };
+}
+SpicaMarkdownBytes spica_markdown_literal(cmark_node *node) {
+    if (!node) return (SpicaMarkdownBytes){0};
+    switch (node->type) {
+    case CMARK_NODE_TEXT: case CMARK_NODE_CODE:
+    case CMARK_NODE_HTML_BLOCK: case CMARK_NODE_HTML_INLINE:
+        return chunk_bytes(&node->as.literal);
+    case CMARK_NODE_CODE_BLOCK:
+        return chunk_bytes(&node->as.code.literal);
+    default: return (SpicaMarkdownBytes){0};
+    }
+}
+SpicaMarkdownBytes spica_markdown_fence_info(cmark_node *node) {
+    return node && node->type == CMARK_NODE_CODE_BLOCK
+        ? chunk_bytes(&node->as.code.info) : (SpicaMarkdownBytes){0};
+}
+SpicaMarkdownBytes spica_markdown_url(cmark_node *node) {
+    return node && (node->type == CMARK_NODE_LINK || node->type == CMARK_NODE_IMAGE)
+        ? chunk_bytes(&node->as.link.url) : (SpicaMarkdownBytes){0};
 }
 
 void spica_markdown_release(SpicaMarkdown *job) {

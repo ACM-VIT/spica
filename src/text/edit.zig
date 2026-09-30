@@ -1,5 +1,8 @@
 const std = @import("std");
-const c = @cImport({ @cInclude("graphemebreak.h"); });
+const c = @cImport({
+    @cInclude("graphemebreak.h");
+    @cInclude("wordbreak.h");
+});
 
 /// Returns the byte offset before the last extended grapheme cluster.
 /// The caller reuses `breaks` across edits; no per-keystroke allocation.
@@ -14,6 +17,36 @@ pub fn beforeLastGrapheme(utf8: []const u8, breaks: []u8) !usize {
         if (breaks[i] == c.GRAPHEMEBREAK_BREAK) return i + 1;
     }
     return 0;
+}
+
+/// The composer validates external input before mutation; the assembled text
+/// stays valid by construction. Avoid rescanning it before each native pass.
+pub fn analyzeValidUtf8(utf8: []const u8, graphemes: []u8, words: []u8) void {
+    std.debug.assert(graphemes.len >= utf8.len and words.len >= utf8.len);
+    if (utf8.len == 0) return;
+    c.set_graphemebreaks_utf8(utf8.ptr, utf8.len, null, @ptrCast(graphemes.ptr));
+    c.set_wordbreaks_utf8(utf8.ptr, utf8.len, null, @ptrCast(words.ptr));
+}
+
+/// libunibreak marks a boundary on the final byte preceding it.
+pub fn isBoundary(breaks: []const u8, offset: usize) bool {
+    return offset == 0 or (offset <= breaks.len and breaks[offset - 1] == 0);
+}
+
+pub fn previousBoundary(breaks: []const u8, offset: usize) usize {
+    var at = @min(offset, breaks.len);
+    if (at == 0) return 0;
+    at -= 1;
+    while (!isBoundary(breaks, at)) at -= 1;
+    return at;
+}
+
+pub fn nextBoundary(breaks: []const u8, offset: usize) usize {
+    var at = @min(offset, breaks.len);
+    if (at == breaks.len) return at;
+    at += 1;
+    while (at < breaks.len and !isBoundary(breaks, at)) at += 1;
+    return at;
 }
 
 test "delete complete combining, flag, and emoji joiner clusters" {

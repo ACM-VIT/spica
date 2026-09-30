@@ -206,7 +206,7 @@ const Walker = struct {
 
     fn children(self: Walker, parent: *c.cmark_node, block_parent: ?u32, style: Style, depth: usize) !void {
         if (depth >= max_depth) return error.DisplayBudget;
-        const is_row = eq(parent, "table_row");
+        const is_row = eq(parent, "table_row") or eq(parent, "table_header");
         const ordered = c.cmark_node_get_type(parent) == c.CMARK_NODE_LIST and
             c.cmark_node_get_list_type(parent) == c.CMARK_ORDERED_LIST;
         var child = c.cmark_node_first_child(parent);
@@ -256,11 +256,11 @@ const Walker = struct {
             if (kind == .table) block.columns = c.cmark_gfm_extensions_get_table_columns(node);
             if (kind == .table_row) block.header = c.cmark_gfm_extensions_get_table_row_is_header(node) != 0;
             if (kind == .table_cell) block.alignment = alignment;
-            if (kind == .code) block.info = try self.addMetadata(optionalSpan(c.cmark_node_get_fence_info(node)));
+            if (kind == .code) block.info = try self.addMetadata(borrowed(c.spica_markdown_fence_info(node)));
             try self.doc.blocks.append(self.doc.allocator, block);
             switch (kind) {
-                .code => try self.appendText(optionalSpan(c.cmark_node_get_literal(node)), .code, .{}),
-                .html => try self.appendText(optionalSpan(c.cmark_node_get_literal(node)), .html, .{}),
+                .code => try self.appendText(borrowed(c.spica_markdown_literal(node)), .code, .{}),
+                .html => try self.appendText(borrowed(c.spica_markdown_literal(node)), .html, .{}),
                 .rule => try self.appendText("―", .text, .{}),
                 else => try self.children(node, index, style, depth),
             }
@@ -272,9 +272,9 @@ const Walker = struct {
             return;
         }
         const name = std.mem.span(c.cmark_node_get_type_string(node));
-        if (std.mem.eql(u8, name, "text")) return self.appendText(optionalSpan(c.cmark_node_get_literal(node)), if (style.image) .image else .text, style);
-        if (std.mem.eql(u8, name, "code")) return self.appendText(optionalSpan(c.cmark_node_get_literal(node)), .code, style);
-        if (std.mem.eql(u8, name, "html_inline")) return self.appendText(optionalSpan(c.cmark_node_get_literal(node)), .html, style);
+        if (std.mem.eql(u8, name, "text")) return self.appendText(borrowed(c.spica_markdown_literal(node)), if (style.image) .image else .text, style);
+        if (std.mem.eql(u8, name, "code")) return self.appendText(borrowed(c.spica_markdown_literal(node)), .code, style);
+        if (std.mem.eql(u8, name, "html_inline")) return self.appendText(borrowed(c.spica_markdown_literal(node)), .html, style);
         if (std.mem.eql(u8, name, "softbreak") or std.mem.eql(u8, name, "linebreak")) return self.appendText("\n", .line_break, style);
         var nested = style;
         if (std.mem.eql(u8, name, "emph")) nested.emphasis = true;
@@ -282,7 +282,7 @@ const Walker = struct {
         if (std.mem.eql(u8, name, "strikethrough")) nested.strike = true;
         if (std.mem.eql(u8, name, "link") or std.mem.eql(u8, name, "image")) {
             const image = std.mem.eql(u8, name, "image");
-            const target = optionalSpan(c.cmark_node_get_url(node));
+            const target = borrowed(c.spica_markdown_url(node));
             nested.target = try self.addMetadata(target);
             nested.policy = if (image) .blocked else linkPolicy(target);
             nested.image = image;
@@ -320,13 +320,13 @@ const Walker = struct {
 fn eq(node: *c.cmark_node, name: []const u8) bool {
     return std.mem.eql(u8, std.mem.span(c.cmark_node_get_type_string(node)), name);
 }
-fn optionalSpan(ptr: anytype) []const u8 {
-    return if (ptr == null) "" else std.mem.span(ptr);
+fn borrowed(bytes: c.SpicaMarkdownBytes) []const u8 {
+    return if (bytes.length == 0) "" else bytes.data[0..bytes.length];
 }
 fn blockKind(node: *c.cmark_node) ?BlockKind {
     const name = std.mem.span(c.cmark_node_get_type_string(node));
-    const names = [_][]const u8{ "paragraph", "heading", "block_quote", "list", "item", "tasklist", "code_block", "html_block", "thematic_break", "table", "table_row", "table_cell" };
-    const kinds = [_]BlockKind{ .paragraph, .heading, .quote, .list, .item, .item, .code, .html, .rule, .table, .table_row, .table_cell };
+    const names = [_][]const u8{ "paragraph", "heading", "block_quote", "list", "item", "tasklist", "code_block", "html_block", "thematic_break", "table", "table_row", "table_header", "table_cell" };
+    const kinds = [_]BlockKind{ .paragraph, .heading, .quote, .list, .item, .item, .code, .html, .rule, .table, .table_row, .table_row, .table_cell };
     for (names, kinds) |entry, kind| if (std.mem.eql(u8, name, entry)) return kind;
     return null;
 }

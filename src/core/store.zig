@@ -112,6 +112,21 @@ pub const Store = struct {
         return self;
     }
 
+    pub fn openReadOnly(allocator: std.mem.Allocator, database_path: []const u8) !Store {
+        if (database_path.len == 0 or database_path.len > max_key or std.mem.indexOfScalar(u8, database_path, 0) != null) return error.InvalidPath;
+        const path = try allocator.dupeZ(u8, database_path);
+        defer allocator.free(path);
+        var handle: ?*c.sqlite3 = null;
+        if (c.sqlite3_open_v2(path.ptr, &handle, c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_NOMUTEX, null) != c.SQLITE_OK) {
+            if (handle) |h| _ = c.sqlite3_close(h);
+            return error.SqliteFailure;
+        }
+        var self: Store = .{ .db = handle.? };
+        errdefer self.deinit();
+        try self.exec("PRAGMA query_only=ON; PRAGMA foreign_keys=ON; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA cache_size=-256;");
+        return self;
+    }
+
     pub fn deinit(self: *Store) void {
         _ = c.sqlite3_close(self.db);
         self.* = undefined;

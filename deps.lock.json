@@ -16,6 +16,11 @@
     "meson": {"version": "1.12.1", "url": "https://codeload.github.com/mesonbuild/meson/tar.gz/refs/tags/1.12.1", "sha256": "64731a3a08ae94837e480f866cb1a2be9b12b9010899317f1db097ce5281a52a"},
     "ninja": {"version": "v1.13.2", "url": "https://codeload.github.com/ninja-build/ninja/tar.gz/refs/tags/v1.13.2", "sha256": "974d6b2f4eeefa25625d34da3cb36bdcebe7fbce40f4c16ac0835fd1c0cbae17"},
     "FreeType": {"version": "VER-2-14-3", "url": "https://codeload.github.com/freetype/freetype/tar.gz/refs/tags/VER-2-14-3", "sha256": "dc49de6b01a266eef4876a4dd34d9842c475d3e28ff2eff63bd2fb760ab56261"},
-    "HarfBuzz": {"version": "14.5.0", "url": "https://codeload.github.com/harfbuzz/harfbuzz/tar.gz/refs/tags/14.5.0", "sha256": "97ec7488a46b974e18e08ee774af93173e7e1dbf738424796eb315ebcb735ec5"}
+    "HarfBuzz": {"version": "14.5.0", "url": "https://codeload.github.com/harfbuzz/harfbuzz/tar.gz/refs/tags/14.5.0", "sha256": "97ec7488a46b974e18e08ee774af93173e7e1dbf738424796eb315ebcb735ec5"},
+    "tree-sitter": {"version": "v0.27.0", "url": "https://codeload.github.com/tree-sitter/tree-sitter/tar.gz/refs/tags/v0.27.0", "sha256": "d35c96e68736bd9569d2757c3cc71052485f33082c3825f1aed9d0e86013a159"},
+    "tree-sitter-json": {"version": "v0.24.8", "url": "https://codeload.github.com/tree-sitter/tree-sitter-json/tar.gz/refs/tags/v0.24.8", "sha256": "acf6e8362457e819ed8b613f2ad9a0e1b621a77556c296f3abea58f7880a9213"},
+    "tree-sitter-javascript": {"version": "v0.25.0", "url": "https://codeload.github.com/tree-sitter/tree-sitter-javascript/tar.gz/refs/tags/v0.25.0", "sha256": "9712fc283d3dc01d996d20b6392143445d05867a7aad76fdd723824468428b86"},
+    "tree-sitter-python": {"version": "v0.25.0", "url": "https://codeload.github.com/tree-sitter/tree-sitter-python/tar.gz/refs/tags/v0.25.0", "sha256": "4609a3665a620e117acf795ff01b9e965880f81745f287a16336f4ca86cf270c"},
+    "tree-sitter-zig": {"version": "v1.1.2", "url": "https://codeload.github.com/tree-sitter-grammars/tree-sitter-zig/tar.gz/refs/tags/v1.1.2", "sha256": "612d67059faa90ec7691e5d786d70d8f7c2c8b15b83de901b9b801122ad4cf25"}
   }
 }
