@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("../native/bindings.zig").c;
 const allocator = std.heap.page_allocator;
+const storage = @import("store.zig");
 
 pub const Thread = struct {
     path: [:0]u8,
@@ -8,6 +9,7 @@ pub const Thread = struct {
     title: []u8,
     /// Authoritative file modification time, in Unix milliseconds.
     modified: i64,
+    available: bool = true,
 
     fn deinit(self: *Thread) void {
         allocator.free(self.path);
@@ -16,11 +18,23 @@ pub const Thread = struct {
     }
 };
 
+pub const Folder = struct {
+    cwd: []const u8,
+    first_row: usize,
+    row_count: usize,
+};
+pub const SidebarRow = union(enum) { folder: usize, thread: usize };
+
 pub const Catalog = struct {
     threads: []Thread,
+    folders: []Folder,
+    rows: []SidebarRow,
+    warning: ?anyerror = null,
 
     pub fn deinit(self: *Catalog) void {
         for (self.threads) |*thread| thread.deinit();
+        allocator.free(self.folders);
+        allocator.free(self.rows);
         allocator.free(self.threads);
         self.* = undefined;
     }
@@ -44,12 +58,13 @@ pub const Worker = struct {
     io: std.Io,
     environment: std.process.Environ.Map,
     legacy_dir: []u8,
+    database_path: []u8,
     wake_event: u32,
     pending: bool = true,
     closing: bool = false,
     result: ?Result = null,
 
-    pub fn create(io: std.Io, environ: std.process.Environ, legacy_dir: []const u8, wake_event: u32) !*Worker {
+    pub fn create(io: std.Io, environ: std.process.Environ, legacy_dir: []const u8, database_path: []const u8, wake_event: u32) !*Worker {
         const self = try allocator.create(Worker);
         errdefer allocator.destroy(self);
         const mutex = c.SDL_CreateMutex() orelse return error.MutexCreation;
@@ -60,7 +75,9 @@ pub const Worker = struct {
         errdefer environment.deinit();
         const legacy = try allocator.dupe(u8, legacy_dir);
         errdefer allocator.free(legacy);
-        self.* = .{ .mutex = mutex, .condition = condition, .io = io, .environment = environment, .legacy_dir = legacy, .wake_event = wake_event };
+        const database = try allocator.dupe(u8, database_path);
+        errdefer allocator.free(database);
+        self.* = .{ .mutex = mutex, .condition = condition, .io = io, .environment = environment, .legacy_dir = legacy, .database_path = database, .wake_event = wake_event };
         self.thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, run, .{self});
         return self;
     }
@@ -89,6 +106,7 @@ pub const Worker = struct {
         if (self.result) |*result| result.deinit();
         self.environment.deinit();
         allocator.free(self.legacy_dir);
+        allocator.free(self.database_path);
         c.SDL_DestroyCondition(self.condition);
         c.SDL_DestroyMutex(self.mutex);
         allocator.destroy(self);
@@ -105,7 +123,7 @@ pub const Worker = struct {
             }
             self.pending = false;
             c.SDL_UnlockMutex(self.mutex);
-            var result: Result = if (discover(self.io, &self.environment, self.legacy_dir)) |catalog|
+            var result: Result = if (discover(self.io, &self.environment, self.legacy_dir, self.database_path)) |catalog|
                 .{ .ready = catalog }
             else |err|
                 .{ .failure = err };
@@ -145,7 +163,7 @@ fn expandPath(path: []const u8, home: ?[]const u8) ![]u8 {
     return allocator.dupe(u8, path);
 }
 
-fn discover(io: std.Io, environment: *const std.process.Environ.Map, legacy_dir: []const u8) !Catalog {
+fn discover(io: std.Io, environment: *const std.process.Environ.Map, legacy_dir: []const u8, database_path: ?[]const u8) !Catalog {
     var threads: std.ArrayList(Thread) = .empty;
     errdefer {
         for (threads.items) |*thread| thread.deinit();
@@ -153,6 +171,13 @@ fn discover(io: std.Io, environment: *const std.process.Environ.Map, legacy_dir:
     }
     var seen: std.StringHashMap(void) = .init(allocator);
     defer seen.deinit();
+    var warning: ?anyerror = null;
+    var store: ?storage.Store = if (database_path) |path| storage.Store.init(allocator, path) catch |err| blk: {
+        warning = err;
+        break :blk null;
+    } else null;
+    defer if (store) |*db| db.deinit();
+    if (store) |*db| try loadIndexed(io, db, &threads, &seen, &warning);
     const home = nonempty(environment, "HOME");
     const agent = if (nonempty(environment, "PI_CODING_AGENT_DIR")) |path|
         try expandPath(path, home)
@@ -164,29 +189,111 @@ fn discover(io: std.Io, environment: *const std.process.Environ.Map, legacy_dir:
     if (agent) |path| {
         const sessions = try std.fs.path.join(allocator, &.{ path, "sessions" });
         defer allocator.free(sessions);
-        try scanRoot(io, sessions, &threads, &seen);
+        try scanRoot(io, sessions, &threads, &seen, &warning);
         // pi also permits a global settings.json sessionDir. The environment
         // wins for new sessions, but both roots may contain existing threads.
         if (try settingsSessionDir(io, path)) |custom| {
             defer allocator.free(custom);
             const expanded = try expandPath(custom, home);
             defer allocator.free(expanded);
-            try scanRoot(io, expanded, &threads, &seen);
+            try scanRoot(io, expanded, &threads, &seen, &warning);
         }
     }
     if (nonempty(environment, "PI_CODING_AGENT_SESSION_DIR")) |path| {
         const expanded = try expandPath(path, home);
         defer allocator.free(expanded);
-        try scanRoot(io, expanded, &threads, &seen);
+        try scanRoot(io, expanded, &threads, &seen, &warning);
     }
-    try scanRoot(io, legacy_dir, &threads, &seen);
+    try scanRoot(io, legacy_dir, &threads, &seen, &warning);
+    if (store) |*db| {
+        var page: [storage.max_page_rows]storage.SessionIndexEntry = undefined;
+        var offset: usize = 0;
+        while (offset < threads.items.len) {
+            const count = @min(page.len, threads.items.len - offset);
+            for (threads.items[offset..][0..count], page[0..count]) |thread, *entry| {
+                entry.* = .{ .session_file = thread.path, .cwd = thread.cwd, .title = thread.title, .modified = thread.modified };
+            }
+            db.putSessionIndexPage(page[0..count]) catch |err| {
+                warning = err;
+            };
+            offset += count;
+        }
+    }
     std.mem.sort(Thread, threads.items, {}, struct {
         fn less(_: void, a: Thread, b: Thread) bool {
             if (a.modified != b.modified) return a.modified > b.modified;
             return std.mem.order(u8, a.path, b.path) == .lt;
         }
     }.less);
-    return .{ .threads = try threads.toOwnedSlice(allocator) };
+    const owned = try threads.toOwnedSlice(allocator);
+    errdefer {
+        for (owned) |*thread| thread.deinit();
+        allocator.free(owned);
+    }
+    return try groupThreads(owned, warning);
+}
+
+fn loadIndexed(io: std.Io, db: *storage.Store, threads: *std.ArrayList(Thread), seen: *std.StringHashMap(void), warning: *?anyerror) !void {
+    var cursor: []u8 = try allocator.dupe(u8, "");
+    defer allocator.free(cursor);
+    while (true) {
+        var page = try db.pageSessionIndex(allocator, cursor);
+        defer page.deinit();
+        if (page.entries.len == 0) return;
+        for (page.entries) |entry| {
+            // Cached metadata remains visible if its original source is offline;
+            // reopening reports that explicitly rather than creating a thread.
+            var thread = (try readThread(io, entry.session_file, warning)) orelse try indexedThread(entry);
+            errdefer thread.deinit();
+            try seen.put(thread.path, {});
+            try threads.append(allocator, thread);
+        }
+        const next = try allocator.dupe(u8, page.entries[page.entries.len - 1].session_file);
+        allocator.free(cursor);
+        cursor = next;
+    }
+}
+
+fn indexedThread(entry: storage.SessionIndexEntry) !Thread {
+    const path = try allocator.dupeZ(u8, entry.session_file);
+    errdefer allocator.free(path);
+    const cwd = try allocator.dupeZ(u8, entry.cwd);
+    errdefer allocator.free(cwd);
+    return .{
+        .path = path,
+        .cwd = cwd,
+        .title = try allocator.dupe(u8, entry.title),
+        .modified = entry.modified,
+        .available = false,
+    };
+}
+
+fn groupThreads(threads: []Thread, warning: ?anyerror) !Catalog {
+    const indices = try allocator.alloc(usize, threads.len);
+    defer allocator.free(indices);
+    for (indices, 0..) |*index, i| index.* = i;
+    std.mem.sort(usize, indices, threads, struct {
+        fn less(items: []Thread, a: usize, b: usize) bool {
+            const order = std.mem.order(u8, items[a].cwd, items[b].cwd);
+            return if (order == .eq) a < b else order == .lt;
+        }
+    }.less);
+    var folders: std.ArrayList(Folder) = .empty;
+    defer folders.deinit(allocator);
+    var rows: std.ArrayList(SidebarRow) = .empty;
+    defer rows.deinit(allocator);
+    for (indices) |index| {
+        const cwd = threads[index].cwd;
+        if (folders.items.len == 0 or !std.mem.eql(u8, folders.items[folders.items.len - 1].cwd, cwd)) {
+            try rows.append(allocator, .{ .folder = folders.items.len });
+            try folders.append(allocator, .{ .cwd = cwd, .first_row = rows.items.len - 1, .row_count = 1 });
+        }
+        try rows.append(allocator, .{ .thread = index });
+        folders.items[folders.items.len - 1].row_count += 1;
+    }
+    const owned_folders = try folders.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_folders);
+    return .{ .threads = threads, .folders = owned_folders, .rows = try rows.toOwnedSlice(allocator), .warning = warning };
 }
 
 fn settingsSessionDir(io: std.Io, agent: []const u8) !?[]u8 {
@@ -206,7 +313,7 @@ fn settingsSessionDir(io: std.Io, agent: []const u8) !?[]u8 {
     return if (custom.len == 0) null else try allocator.dupe(u8, custom);
 }
 
-fn scanRoot(io: std.Io, root: []const u8, threads: *std.ArrayList(Thread), seen: *std.StringHashMap(void)) !void {
+fn scanRoot(io: std.Io, root: []const u8, threads: *std.ArrayList(Thread), seen: *std.StringHashMap(void), warning: *?anyerror) !void {
     var directories: std.ArrayList([]u8) = .empty;
     defer {
         for (directories.items) |path| allocator.free(path);
@@ -220,10 +327,16 @@ fn scanRoot(io: std.Io, root: []const u8, threads: *std.ArrayList(Thread), seen:
     var index: usize = 0;
     while (index < directories.items.len) : (index += 1) {
         const path = directories.items[index];
-        var directory = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch continue;
+        var directory = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
+            if (err != error.FileNotFound) warning.* = err;
+            continue;
+        };
         defer directory.close(io);
         var iterator = directory.iterate();
-        while (iterator.next(io) catch null) |entry| {
+        while (iterator.next(io) catch |err| blk: {
+            warning.* = err;
+            break :blk null;
+        }) |entry| {
             if (entry.kind == .directory) {
                 const child_path = try std.fs.path.join(allocator, &.{ path, entry.name });
                 directories.append(allocator, child_path) catch |err| {
@@ -234,10 +347,13 @@ fn scanRoot(io: std.Io, root: []const u8, threads: *std.ArrayList(Thread), seen:
             }
             if (entry.kind != .file and entry.kind != .sym_link) continue;
             if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
-            const canonical = directory.realPathFileAlloc(io, entry.name, allocator) catch continue;
+            const canonical = directory.realPathFileAlloc(io, entry.name, allocator) catch |err| {
+                warning.* = err;
+                continue;
+            };
             defer allocator.free(canonical);
             if (seen.contains(canonical)) continue;
-            var thread = (try readThread(io, canonical)) orelse continue;
+            var thread = (try readThread(io, canonical, warning)) orelse continue;
             errdefer thread.deinit();
             try seen.put(thread.path, {});
             try threads.append(allocator, thread);
@@ -462,10 +578,16 @@ const Metadata = struct {
     }
 };
 
-fn readThread(io: std.Io, path: []const u8) !?Thread {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+fn readThread(io: std.Io, path: []const u8, warning: *?anyerror) !?Thread {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
+        if (err != error.FileNotFound) warning.* = err;
+        return null;
+    };
     defer file.close(io);
-    const stat = file.stat(io) catch return null;
+    const stat = file.stat(io) catch |err| {
+        warning.* = err;
+        return null;
+    };
     if (stat.kind != .file) return null;
     var metadata: Metadata = .{};
     defer metadata.deinit();
@@ -479,7 +601,10 @@ fn readThread(io: std.Io, path: []const u8) !?Thread {
     var offset: u64 = 0;
     // Read only the size observed at scan start, rather than chase a live writer.
     while (offset < stat.size) {
-        const count = file.readPositional(io, &.{buffer[0..@min(buffer.len, stat.size - offset)]}, offset) catch return null;
+        const count = file.readPositional(io, &.{buffer[0..@min(buffer.len, stat.size - offset)]}, offset) catch |err| {
+            warning.* = err;
+            return null;
+        };
         if (count == 0) break;
         offset += count;
         var start: usize = 0;
@@ -527,7 +652,7 @@ fn testDiscoverOnWorker(io: std.Io, environment: *const std.process.Environ.Map,
         result: Result = undefined,
 
         fn run(self: *@This()) void {
-            self.result = if (discover(self.io, self.environment, self.legacy_dir)) |catalog|
+            self.result = if (discover(self.io, self.environment, self.legacy_dir, null)) |catalog|
                 .{ .ready = catalog }
             else |err|
                 .{ .failure = err };
@@ -598,7 +723,7 @@ test "catalog honors agent/session directory overrides and settings, deduplicate
     try testWrite(tmp.dir, "configured/c.jsonl", "{\"type\":\"session\",\"cwd\":\"/settings\"}\n", 3000);
     const legacy = try std.fs.path.join(std.testing.allocator, &.{ root, "custom-sessions", "." });
     defer std.testing.allocator.free(legacy);
-    var catalog = try discover(io, &environment, legacy);
+    var catalog = try discover(io, &environment, legacy, null);
     defer catalog.deinit();
     try std.testing.expectEqual(@as(usize, 3), catalog.threads.len);
     try std.testing.expectEqualStrings("/settings", catalog.threads[0].cwd);
@@ -607,7 +732,7 @@ test "catalog honors agent/session directory overrides and settings, deduplicate
     try environment.put("HOME", "/does-not-exist/spica-catalog-test");
     try environment.put("PI_CODING_AGENT_DIR", "");
     try environment.put("PI_CODING_AGENT_SESSION_DIR", "");
-    var absent = try discover(io, &environment, "/does-not-exist/spica-catalog-test/legacy");
+    var absent = try discover(io, &environment, "/does-not-exist/spica-catalog-test/legacy", null);
     defer absent.deinit();
     try std.testing.expectEqual(@as(usize, 0), absent.threads.len);
 }
@@ -645,7 +770,7 @@ test "catalog streams oversized prompts and attachments, recovers after invalid 
         defer std.testing.allocator.free(bytes);
         try testWrite(tmp.dir, path, bytes, @intCast(index));
     }
-    var catalog = try discover(io, &environment, root);
+    var catalog = try discover(io, &environment, root, null);
     defer catalog.deinit();
     try std.testing.expectEqual(@as(usize, 141), catalog.threads.len);
     try std.testing.expectEqualStrings("/huge", catalog.threads[0].cwd);
@@ -661,10 +786,75 @@ test "catalog streams oversized prompts and attachments, recovers after invalid 
     defer append.close(io);
     const before = try append.stat(io);
     try append.writePositionalAll(io, "{\"type\":\"session_info\",\"name\":\"\"}\n", before.size);
-    var refreshed = try discover(io, &environment, root);
+    var refreshed = try discover(io, &environment, root, null);
     defer refreshed.deinit();
     const expected: [title_limit]u8 = @splat('x');
     try std.testing.expectEqualStrings(&expected, refreshed.threads[0].title);
     const after = try append.stat(io);
     try std.testing.expectEqual(before.size + "{\"type\":\"session_info\",\"name\":\"\"}\n".len, after.size);
+}
+
+test "catalog restart retains indexed and imported sessions outside current discovery roots" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const db_path = try std.fs.path.join(a, &.{ root, "history.sqlite" });
+    defer a.free(db_path);
+    const legacy = try std.fs.path.join(a, &.{ root, "missing-legacy" });
+    defer a.free(legacy);
+    const indexed_path = try std.fs.path.join(a, &.{ root, ".pi", "agent", "sessions", "a.jsonl" });
+    defer a.free(indexed_path);
+    const imported_path = try std.fs.path.join(a, &.{ root, "external", "b.jsonl" });
+    defer a.free(imported_path);
+    try testWrite(tmp.dir, ".pi/agent/sessions/a.jsonl",
+        "{\"type\":\"session\",\"cwd\":\"/first-project\"}\n" ++
+        "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"Original first prompt\"}}\n", 1000);
+    try testWrite(tmp.dir, "external/b.jsonl",
+        "{\"type\":\"session\",\"cwd\":\"/second-project\"}\n" ++
+        "{\"type\":\"session_info\",\"name\":\"Original external chat\"}\n", 2000);
+    {
+        var db = try storage.Store.init(a, db_path);
+        defer db.deinit();
+        try db.putSession(.{ .session_file = imported_path, .session_id = "external-id", .project_id = "/second-project", .leaf_id = "original-leaf" });
+    }
+    var environment = std.process.Environ.Map.init(a);
+    defer environment.deinit();
+    try environment.put("HOME", root);
+    {
+        var catalog = try discover(io, &environment, legacy, db_path);
+        defer catalog.deinit();
+        try std.testing.expectEqual(@as(usize, 2), catalog.threads.len);
+        try std.testing.expectEqualStrings(imported_path, catalog.threads[0].path);
+        try std.testing.expectEqualStrings("/second-project", catalog.threads[0].cwd);
+        try std.testing.expectEqualStrings("Original external chat", catalog.threads[0].title);
+        try std.testing.expectEqualStrings(indexed_path, catalog.threads[1].path);
+        try std.testing.expect(catalog.threads[0].available and catalog.threads[1].available);
+    }
+    // Neither source is under the new default root. Reopening must still use
+    // its original source path and cwd, not a newly created session.
+    try environment.put("HOME", "/does-not-exist/spica-catalog-restart");
+    {
+        var restarted = try discover(io, &environment, legacy, db_path);
+        defer restarted.deinit();
+        try std.testing.expectEqual(@as(usize, 2), restarted.threads.len);
+        try std.testing.expectEqualStrings(imported_path, restarted.threads[0].path);
+        try std.testing.expectEqualStrings(indexed_path, restarted.threads[1].path);
+        try std.testing.expectEqualStrings("Original first prompt", restarted.threads[1].title);
+        try std.testing.expectEqual(@as(usize, 2), restarted.folders.len);
+        try std.testing.expectEqualStrings("/first-project", restarted.folders[0].cwd);
+        try std.testing.expectEqualStrings("/second-project", restarted.folders[1].cwd);
+    }
+    try tmp.dir.deleteFile(io, "external/b.jsonl");
+    {
+        var offline = try discover(io, &environment, legacy, db_path);
+        defer offline.deinit();
+        try std.testing.expectEqual(@as(usize, 2), offline.threads.len);
+        try std.testing.expectEqualStrings(imported_path, offline.threads[0].path);
+        try std.testing.expectEqualStrings("Original external chat", offline.threads[0].title);
+        try std.testing.expect(!offline.threads[0].available);
+        try std.testing.expect(offline.threads[1].available);
+    }
 }

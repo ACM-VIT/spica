@@ -152,7 +152,7 @@ pub const App = struct {
         if (!c.SDL_StartTextInput(window)) return error.TextInputInitialization;
         const legacy_sessions = try std.fs.path.join(allocator, &.{ paths.data, "pi-sessions" });
         defer allocator.free(legacy_sessions);
-        const catalog_worker = try SessionCatalog.Worker.create(io, environ, legacy_sessions, wake_event);
+        const catalog_worker = try SessionCatalog.Worker.create(io, environ, legacy_sessions, paths.database, wake_event);
         errdefer catalog_worker.destroy();
         return .{
             .window = window,

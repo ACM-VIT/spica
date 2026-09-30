@@ -24,6 +24,23 @@ pub const Session = struct {
     file_mtime: i64 = 0,
 };
 
+pub const SessionIndexEntry = struct {
+    session_file: []const u8,
+    cwd: []const u8,
+    title: []const u8,
+    modified: i64,
+};
+
+pub const SessionIndexPage = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: []SessionIndexEntry,
+
+    pub fn deinit(self: *SessionIndexPage) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const Row = struct {
     row_id: []const u8,
     kind: []const u8,
@@ -144,33 +161,32 @@ pub const Store = struct {
         }
         var self: Store = .{ .db = handle.? };
         errdefer self.deinit();
+        _ = c.sqlite3_busy_timeout(self.db, 5000);
         try self.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA cache_size=-256;");
+        // Serialize schema inspection with migrations on other worker connections.
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
         const version = try self.prepare("PRAGMA user_version");
         const rc_version = c.sqlite3_step(version);
         const number: c_int = if (rc_version == c.SQLITE_ROW) c.sqlite3_column_int(version, 0) else -1;
         _ = c.sqlite3_finalize(version);
         if (number < 0) return error.SqliteFailure;
-        if (number != 0 and number != 1 and number != 2 and number != 3) return error.UnsupportedSchema;
+        if (number > 4) return error.UnsupportedSchema;
         if (number == 0) {
-            try self.exec("BEGIN IMMEDIATE");
-            errdefer self.exec("ROLLBACK") catch {};
             try self.exec(schema);
             try self.exec("PRAGMA user_version=3");
-            try self.exec("COMMIT");
         }
         if (number == 1) {
-            try self.exec("BEGIN IMMEDIATE");
-            errdefer self.exec("ROLLBACK") catch {};
             try self.exec("ALTER TABLE diagnostics RENAME TO diagnostics_v1; CREATE TABLE diagnostics(diagnostic_id INTEGER PRIMARY KEY,session_file TEXT REFERENCES sessions(session_file) ON DELETE CASCADE,runtime INTEGER NOT NULL,kind TEXT NOT NULL,summary TEXT NOT NULL,raw_content_ref BLOB,timestamp INTEGER NOT NULL); INSERT INTO diagnostics SELECT * FROM diagnostics_v1; DROP TABLE diagnostics_v1; CREATE INDEX diagnostics_session ON diagnostics(session_file,diagnostic_id); PRAGMA user_version=2;");
-            try self.exec("COMMIT");
         }
         if (number == 1 or number == 2) {
-            try self.exec("BEGIN IMMEDIATE");
-            errdefer self.exec("ROLLBACK") catch {};
             try self.exec(reasoning_schema);
             try self.exec("PRAGMA user_version=3");
-            try self.exec("COMMIT");
         }
+        if (number < 4) {
+            try self.exec("CREATE TABLE IF NOT EXISTS session_index(session_file TEXT PRIMARY KEY,cwd TEXT NOT NULL,title TEXT NOT NULL,modified INTEGER NOT NULL); PRAGMA user_version=4;");
+        }
+        try self.exec("COMMIT");
         return self;
     }
 
@@ -359,6 +375,53 @@ pub const Store = struct {
         try bindInt(stmt, 8, session.file_size);
         try bindInt(stmt, 9, session.file_mtime);
         try done(stmt);
+    }
+
+    /// Discovery metadata never writes sessions: leaf, source fingerprint, and
+    /// imported transcript state remain exclusively owned by the importer.
+    pub fn putSessionIndex(self: *Store, entry: SessionIndexEntry) !void {
+        try field(entry.session_file, max_key);
+        try field(entry.cwd, max_key);
+        try field(entry.title, max_label);
+        const stmt = try self.prepare("INSERT INTO session_index(session_file,cwd,title,modified) VALUES(?1,?2,?3,?4) ON CONFLICT(session_file) DO UPDATE SET cwd=excluded.cwd,title=excluded.title,modified=excluded.modified");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, entry.session_file);
+        try bindText(stmt, 2, entry.cwd);
+        try bindText(stmt, 3, entry.title);
+        try bindInt(stmt, 4, entry.modified);
+        try done(stmt);
+    }
+
+    pub fn putSessionIndexPage(self: *Store, entries: []const SessionIndexEntry) !void {
+        if (entries.len > max_page_rows) return error.InvalidLimit;
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        for (entries) |entry| try self.putSessionIndex(entry);
+        try self.exec("COMMIT");
+    }
+
+    /// Keyset pages include imported sessions outside today's discovery roots.
+    pub fn pageSessionIndex(self: *Store, allocator: std.mem.Allocator, after: []const u8) !SessionIndexPage {
+        try field(after, max_key);
+        const stmt = try self.prepare("SELECT session_file,cwd,title,modified FROM (SELECT session_file,cwd,title,modified FROM session_index UNION ALL SELECT s.session_file,s.project_id,CASE WHEN s.display_name='' THEN 'Untitled session' ELSE s.display_name END,s.file_mtime FROM sessions s WHERE NOT EXISTS(SELECT 1 FROM session_index i WHERE i.session_file=s.session_file)) WHERE session_file>?1 ORDER BY session_file LIMIT 128");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, after);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var entries: std.ArrayList(SessionIndexEntry) = .empty;
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteFailure;
+            try entries.append(a, .{
+                .session_file = try columnText(a, stmt, 0, max_key),
+                .cwd = try columnText(a, stmt, 1, max_key),
+                .title = try columnText(a, stmt, 2, max_label),
+                .modified = c.sqlite3_column_int64(stmt, 3),
+            });
+        }
+        return .{ .arena = arena, .entries = try entries.toOwnedSlice(a) };
     }
 
     pub fn putEntry(self: *Store, entry: Entry) !void {
@@ -1061,4 +1124,118 @@ test "v2 migration preserves active chat and separately retained reasoning and r
         defer allocator.free(retained_raw);
         try std.testing.expectEqualStrings(raw_json, retained_raw);
     }
+}
+
+test "discovery index migration and metadata refresh preserve resumable chat and source fingerprint" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/history.sqlite", .{tmp.sub_path});
+    defer a.free(db_path);
+    const path = "/outside-discovery/original.jsonl";
+    const raw_ref: ContentId = @splat(61);
+    const body_ref: ContentId = @splat(62);
+    {
+        var db = try Store.init(a, db_path);
+        defer db.deinit();
+        try db.putSession(.{
+            .session_file = path,
+            .session_id = "original-id",
+            .project_id = "/original-project",
+            .display_name = "Imported title",
+            .leaf_id = "answer",
+            .last_entry_id = "answer",
+            .file_identity = "original-fingerprint",
+            .file_size = 1234,
+            .file_mtime = 5678,
+        });
+        try db.append(raw_ref, 0, "{\"id\":\"answer\",\"source\":\"unchanged\"}", true);
+        try db.append(body_ref, 0, "The original answer", true);
+        try db.putEntry(.{
+            .session_file = path,
+            .entry_id = "answer",
+            .append_ordinal = 0,
+            .entry_type = "message",
+            .raw_content_ref = raw_ref,
+            .row = .{ .row_id = "answer", .kind = "message", .role = "assistant", .content_ref = body_ref },
+        });
+        try db.rebuildActivePath(path, "answer");
+        try db.exec("DROP TABLE session_index; PRAGMA user_version=3;");
+    }
+    {
+        var db = try Store.init(a, db_path);
+        defer db.deinit();
+        var existing = try db.pageSessionIndex(a, "");
+        defer existing.deinit();
+        try std.testing.expectEqual(@as(usize, 1), existing.entries.len);
+        try std.testing.expectEqualStrings(path, existing.entries[0].session_file);
+        try std.testing.expectEqualStrings("/original-project", existing.entries[0].cwd);
+        try db.putSessionIndexPage(&.{.{ .session_file = path, .cwd = "/original-project", .title = "Discovered title", .modified = 9000 }});
+    }
+    {
+        var reader = try Store.openReadOnly(a, db_path);
+        defer reader.deinit();
+        var indexed = try reader.pageSessionIndex(a, "");
+        defer indexed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), indexed.entries.len);
+        try std.testing.expectEqualStrings("Discovered title", indexed.entries[0].title);
+        try std.testing.expectEqual(@as(i64, 9000), indexed.entries[0].modified);
+        const stmt = try reader.prepare("SELECT session_id,leaf_id,last_entry_id,file_identity,file_size,file_mtime FROM sessions WHERE session_file=?1");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, path);
+        try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+        for ([_][]const u8{ "original-id", "answer", "answer", "original-fingerprint" }, 0..) |expected, i| {
+            try std.testing.expectEqualStrings(expected, std.mem.span(c.sqlite3_column_text(stmt, @intCast(i)).?));
+        }
+        try std.testing.expectEqual(@as(i64, 1234), c.sqlite3_column_int64(stmt, 4));
+        try std.testing.expectEqual(@as(i64, 5678), c.sqlite3_column_int64(stmt, 5));
+        var visible = try reader.lastDisplayableActiveEntry(a, path);
+        defer visible.deinit();
+        try std.testing.expectEqual(@as(usize, 1), visible.rows.len);
+        try std.testing.expectEqualStrings("answer", visible.rows[0].row_id);
+        const body = (try reader.readChunk(a, visible.rows[0].content_ref.?, 0)).?;
+        defer a.free(body);
+        try std.testing.expectEqualStrings("The original answer", body);
+        const raw = (try reader.readChunk(a, raw_ref, 0)).?;
+        defer a.free(raw);
+        try std.testing.expectEqualStrings("{\"id\":\"answer\",\"source\":\"unchanged\"}", raw);
+    }
+}
+
+test "session index keyset pages keep imported sessions beyond the discovery page boundary" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/history.sqlite", .{tmp.sub_path});
+    defer a.free(db_path);
+    {
+        var db = try Store.init(a, db_path);
+        defer db.deinit();
+        for (0..130) |i| {
+            const path = try std.fmt.allocPrint(a, "/external/session-{d:0>3}.jsonl", .{i});
+            defer a.free(path);
+            if (i < 128) {
+                try db.putSessionIndex(.{ .session_file = path, .cwd = "/indexed-project", .title = "Indexed chat", .modified = @intCast(i) });
+            } else {
+                try db.putSession(.{ .session_file = path, .session_id = path, .project_id = "/imported-project", .display_name = "Imported chat" });
+            }
+        }
+    }
+    var reader = try Store.openReadOnly(a, db_path);
+    defer reader.deinit();
+    var first = try reader.pageSessionIndex(a, "");
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 128), first.entries.len);
+    try std.testing.expectEqualStrings("/external/session-000.jsonl", first.entries[0].session_file);
+    try std.testing.expectEqualStrings("/external/session-127.jsonl", first.entries[127].session_file);
+    var next = try reader.pageSessionIndex(a, first.entries[127].session_file);
+    defer next.deinit();
+    try std.testing.expectEqual(@as(usize, 2), next.entries.len);
+    try std.testing.expectEqualStrings("/external/session-128.jsonl", next.entries[0].session_file);
+    try std.testing.expectEqualStrings("/external/session-129.jsonl", next.entries[1].session_file);
+    try std.testing.expectEqualStrings("/imported-project", next.entries[0].cwd);
+    try std.testing.expectEqualStrings("Imported chat", next.entries[1].title);
+    var end = try reader.pageSessionIndex(a, next.entries[1].session_file);
+    defer end.deinit();
+    try std.testing.expectEqual(@as(usize, 0), end.entries.len);
 }
