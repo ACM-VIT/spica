@@ -44,3 +44,63 @@ pub fn panel(renderer: *c.SDL_Renderer, rect: c.SDL_FRect, radius_value: f32, co
     }
     if (!c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_BLEND) or !c.SDL_RenderGeometry(renderer, null, &vertices, vertices.len, &indices, indices.len)) return error.RoundedRectangleDraw;
 }
+
+pub const Icon = enum { sidebar, plus, folder, layers, arrow_up, stop, chevron_down, theme };
+
+fn line(renderer: *c.SDL_Renderer, x1: f32, y1: f32, x2: f32, y2: f32) !void {
+    if (!c.SDL_RenderLine(renderer, x1, y1, x2, y2)) return error.IconDraw;
+}
+
+pub fn icon(renderer: *c.SDL_Renderer, kind: Icon, bounds: c.SDL_FRect, color: Color) !void {
+    if (!c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, 255)) return error.IconDraw;
+    const x = bounds.x;
+    const y = bounds.y;
+    const s = bounds.w / 16;
+    switch (kind) {
+        .sidebar => {
+            const border = c.SDL_FRect{ .x = x + 2 * s, .y = y + 2 * s, .w = 12 * s, .h = 12 * s };
+            if (!c.SDL_RenderRect(renderer, &border)) return error.IconDraw;
+            try line(renderer, x + 6 * s, y + 2 * s, x + 6 * s, y + 14 * s);
+        },
+        .plus => {
+            try line(renderer, x + 3 * s, y + 8 * s, x + 13 * s, y + 8 * s);
+            try line(renderer, x + 8 * s, y + 3 * s, x + 8 * s, y + 13 * s);
+        },
+        .folder => {
+            const points = [_]c.SDL_FPoint{
+                .{ .x = x + 2 * s, .y = y + 13 * s }, .{ .x = x + 2 * s, .y = y + 3 * s },
+                .{ .x = x + 7 * s, .y = y + 3 * s },  .{ .x = x + 9 * s, .y = y + 5 * s },
+                .{ .x = x + 14 * s, .y = y + 5 * s }, .{ .x = x + 14 * s, .y = y + 13 * s },
+                .{ .x = x + 2 * s, .y = y + 13 * s },
+            };
+            if (!c.SDL_RenderLines(renderer, &points, points.len)) return error.IconDraw;
+        },
+        .layers => {
+            const points = [_]c.SDL_FPoint{
+                .{ .x = x + s, .y = y + 4 * s },      .{ .x = x + 8 * s, .y = y + s },
+                .{ .x = x + 15 * s, .y = y + 4 * s }, .{ .x = x + 8 * s, .y = y + 7 * s },
+                .{ .x = x + s, .y = y + 4 * s },
+            };
+            if (!c.SDL_RenderLines(renderer, &points, points.len)) return error.IconDraw;
+            for ([_]f32{ 7, 10 }) |offset| {
+                try line(renderer, x + s, y + offset * s, x + 8 * s, y + (offset + 3) * s);
+                try line(renderer, x + 8 * s, y + (offset + 3) * s, x + 15 * s, y + offset * s);
+            }
+        },
+        .arrow_up => {
+            try line(renderer, x + 4 * s, y + 7 * s, x + 8 * s, y + 3 * s);
+            try line(renderer, x + 8 * s, y + 3 * s, x + 12 * s, y + 7 * s);
+            try line(renderer, x + 8 * s, y + 3 * s, x + 8 * s, y + 13 * s);
+        },
+        .stop => try panel(renderer, .{ .x = x + 4 * s, .y = y + 4 * s, .w = 8 * s, .h = 8 * s }, s, color),
+        .chevron_down => {
+            try line(renderer, x + 4 * s, y + 6 * s, x + 8 * s, y + 10 * s);
+            try line(renderer, x + 8 * s, y + 10 * s, x + 12 * s, y + 6 * s);
+        },
+        .theme => {
+            const border = c.SDL_FRect{ .x = x + 2 * s, .y = y + 2 * s, .w = 12 * s, .h = 12 * s };
+            if (!c.SDL_RenderRect(renderer, &border)) return error.IconDraw;
+            try panel(renderer, .{ .x = x + 3 * s, .y = y + 3 * s, .w = 5 * s, .h = 10 * s }, 0, color);
+        },
+    }
+}

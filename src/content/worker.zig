@@ -6,11 +6,35 @@ const md = @import("markdown.zig");
 const fixture = @import("../diagnostics/fixture.zig");
 const allocator = std.heap.page_allocator;
 
-pub const Request = struct { generation: u64, ordinal: usize };
+pub const Role = enum { user, assistant, tool, bash, system };
+pub fn roleFor(role: []const u8, kind: []const u8) Role {
+    if (std.mem.eql(u8, role, "user")) return .user;
+    if (std.mem.eql(u8, role, "bashExecution") or std.mem.eql(u8, kind, "bash")) return .bash;
+    if (std.mem.eql(u8, role, "toolResult") or std.mem.eql(u8, kind, "tool")) return .tool;
+    if (std.mem.eql(u8, role, "assistant")) return .assistant;
+    return .system;
+}
+
+pub const Request = struct {
+    generation: u64,
+    ordinal: usize = 0,
+    session_file: []const u8 = fixture.session_file,
+    content_id: ?ContentId = null,
+    published_length: ?u64 = null,
+    role: Role = .assistant,
+};
+const OwnedRequest = struct {
+    value: Request,
+    session_storage: ?[]u8 = null,
+    fn deinit(self: *OwnedRequest) void {
+        if (self.session_storage) |bytes| allocator.free(bytes);
+    }
+};
 pub const Highlight = struct { start: u32, end: u32, token_class: c_uint };
 pub const Ready = struct {
     generation: u64,
     ordinal: usize,
+    role: Role = .assistant,
     document: md.Document,
     image: c.SpicaImageResult = std.mem.zeroes(c.SpicaImageResult),
     image_status: c.SpicaImageStatus = c.SPICA_IMAGE_OK,
@@ -24,7 +48,7 @@ pub const Ready = struct {
 };
 pub const Result = union(enum) {
     ready: Ready,
-    failure: anyerror,
+    failure: struct { err: anyerror, generation: ?u64 },
     pub fn deinit(self: *Result) void {
         if (self.* == .ready) self.ready.deinit();
     }
@@ -41,7 +65,7 @@ pub const Worker = struct {
     fixture_mode: bool,
     wake_event: u32,
     closing: bool = false,
-    pending: ?Request = null,
+    pending: ?OwnedRequest = null,
     result: ?Result = null,
     latest_generation: u64 = 0,
 
@@ -65,6 +89,7 @@ pub const Worker = struct {
         c.SDL_BroadcastCondition(self.condition);
         c.SDL_UnlockMutex(self.mutex);
         if (self.thread) |thread| thread.join();
+        if (self.pending) |*pending| pending.deinit();
         if (self.result) |*result| result.deinit();
         c.SDL_DestroyCondition(self.condition);
         c.SDL_DestroyMutex(self.mutex);
@@ -72,11 +97,17 @@ pub const Worker = struct {
         allocator.destroy(self);
     }
 
-    pub fn request(self: *Worker, value: Request) void {
+    pub fn request(self: *Worker, value: Request) !void {
+        var owned: OwnedRequest = .{ .value = value };
+        if (value.content_id == null) {
+            owned.session_storage = try allocator.dupe(u8, value.session_file);
+            owned.value.session_file = owned.session_storage.?;
+        }
         c.SDL_LockMutex(self.mutex);
         defer c.SDL_UnlockMutex(self.mutex);
         self.latest_generation = value.generation;
-        self.pending = value;
+        if (self.pending) |*previous| previous.deinit();
+        self.pending = owned;
         c.SDL_SignalCondition(self.condition);
     }
 
@@ -112,22 +143,22 @@ pub const Worker = struct {
     }
 
     fn threadMain(self: *Worker) void {
-        self.run() catch |err| self.publish(.{ .failure = err }, null);
+        self.run() catch |err| self.publish(.{ .failure = .{ .err = err, .generation = null } }, null);
         c.SDL_CleanupTLS();
     }
 
     fn run(self: *Worker) !void {
-        {
+        if (self.fixture_mode) {
             var writer = try Store.init(allocator, self.database_path);
             defer writer.deinit();
-            if (self.fixture_mode) {
-                var page = try writer.pageEntries(allocator, fixture.session_file, -1, 1);
-                defer page.deinit();
-                if (page.rows.len == 0) try fixture.seed(&writer, allocator, self.io);
-            }
+            var page = try writer.pageEntries(allocator, fixture.session_file, -1, 1);
+            defer page.deinit();
+            if (page.rows.len == 0) try fixture.seed(&writer, allocator, self.io);
         }
-        var reader = try Store.openReadOnly(allocator, self.database_path);
-        defer reader.deinit();
+        // Real runtimes are the sole initializer/writer. A viewport request is
+        // published only after that owner has committed the referenced source.
+        var reader: ?Store = null;
+        defer if (reader) |*db| db.deinit();
         while (true) {
             c.SDL_LockMutex(self.mutex);
             while (self.pending == null and !self.closing) c.SDL_WaitCondition(self.condition, self.mutex);
@@ -135,14 +166,22 @@ pub const Worker = struct {
                 c.SDL_UnlockMutex(self.mutex);
                 return;
             }
-            const request_value = self.pending.?;
+            var owned = self.pending.?;
             self.pending = null;
             c.SDL_UnlockMutex(self.mutex);
-            const loaded = load(&reader, request_value) catch |err| {
-                self.publish(.{ .failure = err }, request_value.generation);
+            defer owned.deinit();
+            const value = owned.value;
+            if (reader == null) {
+                reader = Store.openReadOnly(allocator, self.database_path) catch |err| {
+                    self.publish(.{ .failure = .{ .err = err, .generation = value.generation } }, value.generation);
+                    continue;
+                };
+            }
+            const loaded = load(&reader.?, value, self.fixture_mode) catch |err| {
+                self.publish(.{ .failure = .{ .err = err, .generation = value.generation } }, value.generation);
                 continue;
             };
-            self.publish(.{ .ready = loaded }, request_value.generation);
+            self.publish(.{ .ready = loaded }, value.generation);
         }
     }
 
@@ -164,15 +203,54 @@ pub const Worker = struct {
         return source;
     }
 
-    fn load(db: *Store, value: Request) !Ready {
-        var page = try db.pageEntries(allocator, fixture.session_file, @as(i64, @intCast(value.ordinal)) - 1, 1);
-        defer page.deinit();
-        if (page.rows.len == 0) return error.ContentNotFound;
-        const id = page.rows[0].content_ref orelse return error.ContentNotFound;
-        const source = try readSource(db, id, md.max_source_bytes);
+    fn readPublishedSource(db: *Store, id: ContentId, length: u64) ![]u8 {
+        const source = try allocator.alloc(u8, @intCast(length));
+        errdefer allocator.free(source);
+        var offset: usize = 0;
+        var index: u64 = 0;
+        while (offset < source.len) : (index += 1) {
+            const chunk = (try db.readPublishedChunk(allocator, id, index, offset, length)) orelse return error.UnpublishedContent;
+            defer allocator.free(chunk);
+            if (chunk.len == 0 or chunk.len > source.len - offset) return error.CorruptCache;
+            @memcpy(source[offset..][0..chunk.len], chunk);
+            offset += chunk.len;
+        }
+        return source;
+    }
+
+    fn load(db: *Store, value: Request, fixture_mode: bool) !Ready {
+        var role = value.role;
+        const id = value.content_id orelse blk: {
+            var page = if (fixture_mode) try db.pageEntries(allocator, value.session_file, @as(i64, @intCast(value.ordinal)) - 1, 1) else try db.pageActiveEntries(allocator, value.session_file, @as(i64, @intCast(value.ordinal)) - 1, 1);
+            defer page.deinit();
+            if (page.rows.len == 0) return error.ContentNotFound;
+            role = roleFor(page.rows[0].role, page.rows[0].kind);
+            break :blk page.rows[0].content_ref orelse return error.ContentNotFound;
+        };
+        const length = value.published_length orelse blk: {
+            var info = try db.contentInfo(allocator, id);
+            defer info.deinit();
+            break :blk info.total_length;
+        };
+        if (length > md.max_source_bytes) return .{
+            .generation = value.generation,
+            .ordinal = value.ordinal,
+            .role = role,
+            .document = .{ .allocator = allocator, .source_id = id, .source_length = length, .state = .display_budget },
+        };
+        const source = if (value.published_length != null) try readPublishedSource(db, id, length) else try readSource(db, id, md.max_source_bytes);
         defer allocator.free(source);
-        var ready: Ready = .{ .generation = value.generation, .ordinal = value.ordinal, .document = try md.parse(allocator, id, source) };
+        var ready: Ready = .{
+            .generation = value.generation,
+            .ordinal = value.ordinal,
+            .role = role,
+            .document = if (role == .tool or role == .bash) .{ .allocator = allocator, .source_id = id, .source_length = length } else try md.parse(allocator, id, source),
+        };
         errdefer ready.deinit();
+        if (role == .tool or role == .bash) {
+            try ready.document.text.appendSlice(allocator, source);
+            try ready.document.blocks.append(allocator, .{ .kind = .code, .parent = null, .text_start = 0, .text_end = @intCast(source.len), .first_run = 0, .end_run = 0 });
+        }
         for (ready.document.blocks.items) |block| {
             if (block.kind != .code) continue;
             const info = ready.document.metadata.items[block.info.start..][0..block.info.len];
@@ -185,18 +263,24 @@ pub const Worker = struct {
             var job: ?*c.SpicaHighlight = null;
             const status = c.spica_highlight_parse(code.ptr, code.len, &language, (@import("build_options").native_library_dir ++ "\x00").ptr, md.parse_arena_bytes, &job);
             if (status == c.SPICA_HIGHLIGHT_UNSUPPORTED) continue;
-            if (status != c.SPICA_HIGHLIGHT_OK) { ready.highlight_limited = true; continue; }
+            if (status != c.SPICA_HIGHLIGHT_OK) {
+                ready.highlight_limited = true;
+                continue;
+            }
             defer c.spica_highlight_release(job);
             const count = c.spica_highlight_span_count(job);
             const spans = c.spica_highlight_spans(job);
-            if (count > 16384 - ready.highlights.items.len) { ready.highlight_limited = true; continue; }
+            if (count > 16384 - ready.highlights.items.len) {
+                ready.highlight_limited = true;
+                continue;
+            }
             for (spans[0..count]) |span| try ready.highlights.append(allocator, .{
                 .start = block.text_start + @as(u32, @intCast(span.byte_start)),
                 .end = block.text_start + @as(u32, @intCast(span.byte_end)),
                 .token_class = span.token_class,
             });
         }
-        if (value.ordinal == fixture.message_count - 1) {
+        if (fixture_mode and value.ordinal == fixture.message_count - 1) {
             const image_source = try readSource(db, fixture.image_id, 2 * 1024 * 1024);
             defer allocator.free(image_source);
             ready.image_status = c.spica_image_decode(image_source.ptr, image_source.len, 512, 256, 2 * 1024 * 1024, &ready.image);

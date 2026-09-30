@@ -42,6 +42,8 @@ pub const Snapshot = struct {
     attention: []const u8 = "",
     visible_active_ordinal: i64 = -1,
     pending_draft: []const u8 = "",
+    recovery_revision: u64 = 0,
+    queued_count: usize = 0,
     rejected_command_id: []const u8 = "",
     accepted_command_id: []const u8 = "",
     models: []Model = &.{},
@@ -110,7 +112,7 @@ fn copySnapshot(a: std.mem.Allocator, original: Snapshot) !Snapshot {
     }
     return result;
 }
-const QueuedBytes = struct { data: []u8, command_id: ?u64 = null, bash: bool = false };
+const QueuedBytes = struct { data: []u8, command_id: ?u64 = null, bash: bool = false, stop: bool = false };
 const Input = union(enum) { start, bytes: QueuedBytes, shutdown, force };
 const Pending = struct { id: []u8, draft: []u8 };
 const Block = struct { index: i64, id: storage.ContentId, length: u64 = 0 };
@@ -146,6 +148,7 @@ pub const Runtime = struct {
     leaf_id: []const u8 = "",
     last_prompt: []const u8 = "",
     shutdown_deadline: ?u64 = null,
+    stop_requested: bool = false,
     entries_inflight: bool = false,
     entries_again: bool = false,
 
@@ -204,7 +207,7 @@ pub const Runtime = struct {
     }
     pub fn stop(self: *Runtime) !void {
         // One queue item preserves ordering even with simultaneous UI producers.
-        try self.enqueue(.{ .bytes = .{ .data = try self.allocator.dupe(u8, "{\"type\":\"clear_queue\"}\n{\"type\":\"abort\"}\n{\"type\":\"abort_bash\"}\n") } });
+        try self.enqueue(.{ .bytes = .{ .data = try self.allocator.dupe(u8, "{\"type\":\"clear_queue\"}\n{\"type\":\"abort\"}\n{\"type\":\"abort_bash\"}\n"), .stop = true } });
     }
     pub fn shutdown(self: *Runtime) !void {
         try self.enqueue(.shutdown);
@@ -458,6 +461,7 @@ pub const Runtime = struct {
                 } else {
                     if (self.outgoing.items.len + queued.data.len > 2 * 1024 * 1024) return error.OutgoingQueueFull;
                     try self.outgoing.appendSlice(self.allocator, queued.data);
+                    if (queued.stop) self.stop_requested = true;
                     if (queued.bash) {
                         self.state.bash_running = true;
                         self.state.thinking_content_ref = null;
@@ -579,10 +583,34 @@ pub const Runtime = struct {
         if (bytes.len == 0) try self.store.?.append(id, 0, "", true);
         return id;
     }
+    fn offerRecovery(self: *Runtime, text: []const u8) !void {
+        try self.replace(&self.state.pending_draft, text);
+        if (text.len != 0) self.state.recovery_revision += 1;
+    }
+
+    fn recoverCancelledQueue(self: *Runtime, data: Value) !void {
+        const steering = child(data, "steering");
+        const follow_up = child(data, "followUp");
+        if (steering != .array or follow_up != .array) return error.UnsupportedCancelledQueue;
+        const count = steering.array.items.len + follow_up.array.items.len;
+        if (count == 0) return;
+        var draft = if (follow_up.array.items.len > 0) follow_up.array.items[follow_up.array.items.len - 1] else steering.array.items[steering.array.items.len - 1];
+        // Prefer the newest locally acknowledged input if it was cancelled.
+        // Pi's separate arrays do not encode cross-queue chronological order.
+        inline for (.{ steering, follow_up }) |queue_value| {
+            for (queue_value.array.items) |item| {
+                if (item != .string) return error.UnsupportedCancelledQueue;
+                if (std.mem.eql(u8, item.string, self.last_prompt)) draft = item;
+            }
+        }
+        try self.offerRecovery(draft.string);
+        try self.replace(&self.state.attention, "Cancelled queued messages retained in protocol cache");
+    }
+
     fn recoverDrafts(self: *Runtime) !void {
         native.SDL_LockMutex(self.mutex);
         defer native.SDL_UnlockMutex(self.mutex);
-        try self.replace(&self.state.pending_draft, if (self.pending.items.len > 0) self.pending.items[self.pending.items.len - 1].draft else self.last_prompt);
+        try self.offerRecovery(if (self.pending.items.len > 0) self.pending.items[self.pending.items.len - 1].draft else self.last_prompt);
     }
     fn rejectUnsent(self: *Runtime, token: u64) !void {
         var id_buffer: [32]u8 = undefined;
@@ -591,7 +619,7 @@ pub const Runtime = struct {
         defer native.SDL_UnlockMutex(self.mutex);
         try self.replace(&self.state.rejected_command_id, id);
         for (self.pending.items, 0..) |item, i| if (std.mem.eql(u8, id, item.id)) {
-            try self.replace(&self.state.pending_draft, item.draft);
+            try self.offerRecovery(item.draft);
             self.allocator.free(item.id);
             self.allocator.free(item.draft);
             _ = self.pending.orderedRemove(i);
@@ -604,7 +632,7 @@ pub const Runtime = struct {
         if (self.pending.items.len > 0) {
             const latest = self.pending.items[self.pending.items.len - 1];
             try self.replace(&self.state.rejected_command_id, latest.id);
-            try self.replace(&self.state.pending_draft, latest.draft);
+            try self.offerRecovery(latest.draft);
         }
         for (self.pending.items) |item| {
             self.allocator.free(item.id);
@@ -624,7 +652,7 @@ pub const Runtime = struct {
                 try self.replace(&self.state.pending_draft, "");
             } else {
                 try self.replace(&self.state.rejected_command_id, id);
-                try self.replace(&self.state.pending_draft, item.draft);
+                try self.offerRecovery(item.draft);
             }
             self.allocator.free(item.id);
             self.allocator.free(item.draft);
@@ -674,6 +702,8 @@ pub const Runtime = struct {
                     try self.persistSession();
                     try self.requestEntries();
                 }
+            } else if (std.mem.eql(u8, command_name, "clear_queue")) {
+                try self.recoverCancelledQueue(data);
             } else if (std.mem.eql(u8, command_name, "get_available_models")) {
                 const models = child(data, "models");
                 var next_models: std.ArrayList(Model) = .empty;
@@ -769,7 +799,13 @@ pub const Runtime = struct {
                 try self.visible(id, output.len, "bashExecution", "bash", "complete");
                 try self.queue(.{ .type = "get_state" });
             }
+        } else if (std.mem.eql(u8, ty, "queue_update")) {
+            const steering = child(value, "steering");
+            const follow_up = child(value, "followUp");
+            if (steering != .array or follow_up != .array) return error.UnsupportedQueueUpdate;
+            self.state.queued_count = steering.array.items.len + follow_up.array.items.len;
         } else if (std.mem.eql(u8, ty, "agent_start")) {
+            self.stop_requested = false;
             self.state.status = .streaming;
             try self.replace(&self.state.error_message, "");
         } else if (std.mem.eql(u8, ty, "agent_settled")) {
@@ -840,7 +876,8 @@ pub const Runtime = struct {
                 self.state.thinking_content_ref = if (thinking.len > 0) try self.content(thinking, "text/markdown") else null;
                 self.state.thinking_length = thinking.len;
                 const err = string(message, "errorMessage");
-                if (err.len > 0) {
+                const requested_abort = (self.stop_requested or self.closing) and std.mem.eql(u8, string(message, "stopReason"), "aborted");
+                if (err.len > 0 and !requested_abort) {
                     try self.replace(&self.state.error_message, err);
                     try self.recoverDrafts();
                 }
