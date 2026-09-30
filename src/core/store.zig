@@ -48,6 +48,11 @@ pub const Entry = struct {
     row: Row,
 };
 
+pub const ReasoningReference = struct {
+    content_ref: ContentId,
+    length: u64,
+};
+
 pub const LiveRow = struct {
     runtime: u64,
     run_generation: i64,
@@ -101,12 +106,25 @@ pub const Store = struct {
         const number: c_int = if (rc_version == c.SQLITE_ROW) c.sqlite3_column_int(version, 0) else -1;
         _ = c.sqlite3_finalize(version);
         if (number < 0) return error.SqliteFailure;
-        if (number != 0 and number != 1) return error.UnsupportedSchema;
+        if (number != 0 and number != 1 and number != 2 and number != 3) return error.UnsupportedSchema;
         if (number == 0) {
             try self.exec("BEGIN IMMEDIATE");
             errdefer self.exec("ROLLBACK") catch {};
             try self.exec(schema);
-            try self.exec("PRAGMA user_version=1");
+            try self.exec("PRAGMA user_version=3");
+            try self.exec("COMMIT");
+        }
+        if (number == 1) {
+            try self.exec("BEGIN IMMEDIATE");
+            errdefer self.exec("ROLLBACK") catch {};
+            try self.exec("ALTER TABLE diagnostics RENAME TO diagnostics_v1; CREATE TABLE diagnostics(diagnostic_id INTEGER PRIMARY KEY,session_file TEXT REFERENCES sessions(session_file) ON DELETE CASCADE,runtime INTEGER NOT NULL,kind TEXT NOT NULL,summary TEXT NOT NULL,raw_content_ref BLOB,timestamp INTEGER NOT NULL); INSERT INTO diagnostics SELECT * FROM diagnostics_v1; DROP TABLE diagnostics_v1; CREATE INDEX diagnostics_session ON diagnostics(session_file,diagnostic_id); PRAGMA user_version=2;");
+            try self.exec("COMMIT");
+        }
+        if (number == 1 or number == 2) {
+            try self.exec("BEGIN IMMEDIATE");
+            errdefer self.exec("ROLLBACK") catch {};
+            try self.exec(reasoning_schema);
+            try self.exec("PRAGMA user_version=3");
             try self.exec("COMMIT");
         }
         return self;
@@ -255,6 +273,28 @@ pub const Store = struct {
         return try allocator.dupe(u8, bytes[0..size]);
     }
 
+    /// Reads the immutable prefix advertised by a runtime snapshot, including
+    /// unsealed live objects. Chunk indices are storage indices (an append may
+    /// be shorter than 64 KiB). Returns null exactly at the published watermark.
+    pub fn readPublishedChunk(self: *Store, allocator: std.mem.Allocator, id: ContentId, index: u64, published_offset: u64, published_length: u64) !?[]u8 {
+        if (index > std.math.maxInt(i64) or published_length > std.math.maxInt(i64)) return error.InvalidChunk;
+        if (published_offset >= published_length) return null;
+        const stmt = try self.prepare("SELECT payload,(SELECT total_length FROM content_objects WHERE content_id=?1) FROM content_chunks WHERE content_id=?1 AND chunk_index=?2");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindId(stmt, 1, id);
+        try bindInt(stmt, 2, @intCast(index));
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return error.SqliteFailure;
+        const total = c.sqlite3_column_int64(stmt, 1);
+        if (total < 0 or @as(u64, @intCast(total)) < published_length) return error.UnpublishedContent;
+        const stored: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        if (stored == 0 or stored > chunk_size) return error.CorruptCache;
+        const size: usize = @intCast(@min(stored, published_length - published_offset));
+        const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 0) orelse return error.CorruptCache);
+        return try allocator.dupe(u8, ptr[0..size]);
+    }
+
     pub fn putSession(self: *Store, session: Session) !void {
         try field(session.session_file, max_key);
         try field(session.session_id, max_key);
@@ -306,6 +346,74 @@ pub const Store = struct {
         return self.collectRows(allocator, stmt);
     }
 
+    // The cursor belongs to the selected branch, not the canonical append log.
+    // Resolve the persisted leaf so readers never mix cached paths for old leaves.
+    pub fn pageActiveEntries(self: *Store, allocator: std.mem.Allocator, session_file: []const u8, after_path_ordinal: i64, limit: u32) !RowPage {
+        if (limit == 0 or limit > max_page_rows) return error.InvalidLimit;
+        try field(session_file, max_key);
+        const stmt = try self.prepare("SELECT e.row_id,e.kind,e.role,e.revision,e.title,e.status,e.content_ref,e.tool_call_id,e.is_error,e.expanded,e.timestamp,p.ordinal,NULL FROM sessions AS s JOIN active_path AS p ON p.session_file=s.session_file AND p.leaf_id=s.leaf_id JOIN entries AS e ON e.session_file=p.session_file AND e.entry_id=p.entry_id WHERE s.session_file=?1 AND p.ordinal>?2 ORDER BY p.ordinal LIMIT ?3");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, session_file);
+        try bindInt(stmt, 2, after_path_ordinal);
+        try bindInt(stmt, 3, limit);
+        return self.collectRows(allocator, stmt);
+    }
+
+    pub fn activeEntryCount(self: *Store, session_file: []const u8) !i64 {
+        try field(session_file, max_key);
+        const stmt = try self.prepare("SELECT COUNT(*) FROM sessions AS s JOIN active_path AS p ON p.session_file=s.session_file AND p.leaf_id=s.leaf_id WHERE s.session_file=?1");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, session_file);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.SqliteFailure;
+        return c.sqlite3_column_int64(stmt, 0);
+    }
+
+    pub fn lastDisplayableActiveEntry(self: *Store, allocator: std.mem.Allocator, session_file: []const u8) !RowPage {
+        // Context metadata also has source content; only conversation rows and
+        // explicit display-budget placeholders belong on the default chat surface.
+        try field(session_file, max_key);
+        const stmt = try self.prepare("SELECT e.row_id,e.kind,e.role,e.revision,e.title,e.status,e.content_ref,e.tool_call_id,e.is_error,e.expanded,e.timestamp,p.ordinal,NULL FROM sessions AS s JOIN active_path AS p ON p.session_file=s.session_file AND p.leaf_id=s.leaf_id JOIN entries AS e ON e.session_file=p.session_file AND e.entry_id=p.entry_id WHERE s.session_file=?1 AND e.content_ref IS NOT NULL AND ((e.entry_type='message' AND e.role IN ('assistant','user','toolResult','bashExecution')) OR (e.kind='unsupported_oversized_entry' AND e.status='display_budget')) ORDER BY p.ordinal DESC LIMIT 1");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, session_file);
+        return self.collectRows(allocator, stmt);
+    }
+
+    pub fn putEntryReasoning(self: *Store, session_file: []const u8, entry_id: []const u8, reference: ?ReasoningReference) !void {
+        try field(session_file, max_key);
+        try field(entry_id, max_key);
+        if (reference) |ref| {
+            if (ref.length > std.math.maxInt(i64)) return error.LengthOverflow;
+            const stmt = try self.prepare("INSERT INTO entry_reasoning(session_file,entry_id,content_ref,length) VALUES(?1,?2,?3,?4) ON CONFLICT(session_file,entry_id) DO UPDATE SET content_ref=excluded.content_ref,length=excluded.length");
+            defer _ = c.sqlite3_finalize(stmt);
+            try bindText(stmt, 1, session_file);
+            try bindText(stmt, 2, entry_id);
+            try bindId(stmt, 3, ref.content_ref);
+            try bindInt(stmt, 4, @intCast(ref.length));
+            try done(stmt);
+        } else {
+            const stmt = try self.prepare("DELETE FROM entry_reasoning WHERE session_file=?1 AND entry_id=?2");
+            defer _ = c.sqlite3_finalize(stmt);
+            try bindText(stmt, 1, session_file);
+            try bindText(stmt, 2, entry_id);
+            try done(stmt);
+        }
+    }
+
+    pub fn referenceForEntry(self: *Store, session_file: []const u8, entry_id: []const u8) !?ReasoningReference {
+        try field(session_file, max_key);
+        try field(entry_id, max_key);
+        const stmt = try self.prepare("SELECT content_ref,length FROM entry_reasoning WHERE session_file=?1 AND entry_id=?2");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, session_file);
+        try bindText(stmt, 2, entry_id);
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return error.SqliteFailure;
+        const length = c.sqlite3_column_int64(stmt, 1);
+        if (length < 0) return error.CorruptCache;
+        return .{ .content_ref = (try columnId(stmt, 0)) orelse return error.CorruptCache, .length = @intCast(length) };
+    }
+
     pub fn putLiveRow(self: *Store, row: LiveRow) !void {
         try checkRow(row.row);
         if (row.runtime > std.math.maxInt(i64)) return error.LengthOverflow;
@@ -339,6 +447,18 @@ pub const Store = struct {
         try bindInt(stmt, 1, @intCast(runtime));
         try bindInt(stmt, 2, generation);
         try done(stmt);
+    }
+
+    pub fn rebuildActivePath(self: *Store, session_file: []const u8, leaf_id: []const u8) !void {
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        try self.clearActivePath(session_file, leaf_id);
+        const stmt = try self.prepare("WITH RECURSIVE branch(entry_id,parent_id,depth) AS (SELECT entry_id,parent_id,0 FROM entries WHERE session_file=?1 AND entry_id=?2 UNION ALL SELECT e.entry_id,e.parent_id,b.depth+1 FROM entries e JOIN branch b ON e.entry_id=b.parent_id WHERE e.session_file=?1 AND b.depth<100000) INSERT INTO active_path(session_file,leaf_id,ordinal,entry_id) SELECT ?1,?2,(SELECT MAX(depth) FROM branch)-depth,entry_id FROM branch");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, session_file);
+        try bindText(stmt, 2, leaf_id);
+        try done(stmt);
+        try self.exec("COMMIT");
     }
 
     pub fn clearActivePath(self: *Store, session_file: []const u8, leaf_id: []const u8) !void {
@@ -387,7 +507,7 @@ pub const Store = struct {
         {
             const stmt = try self.prepare("INSERT INTO diagnostics(session_file,runtime,kind,summary,raw_content_ref,timestamp) VALUES(?1,?2,?3,?4,?5,?6)");
             defer _ = c.sqlite3_finalize(stmt);
-            try bindText(stmt, 1, session_file);
+            try bindOptionalText(stmt, 1, if (session_file.len == 0) null else session_file);
             try bindInt(stmt, 2, @intCast(runtime));
             try bindText(stmt, 3, kind);
             try bindText(stmt, 4, summary);
@@ -396,9 +516,9 @@ pub const Store = struct {
             try done(stmt);
         }
         {
-            const stmt = try self.prepare("DELETE FROM diagnostics WHERE session_file=?1 AND diagnostic_id NOT IN (SELECT diagnostic_id FROM diagnostics WHERE session_file=?1 ORDER BY diagnostic_id DESC LIMIT 1000)");
+            const stmt = try self.prepare("DELETE FROM diagnostics WHERE session_file IS ?1 AND diagnostic_id NOT IN (SELECT diagnostic_id FROM diagnostics WHERE session_file IS ?1 ORDER BY diagnostic_id DESC LIMIT 1000)");
             defer _ = c.sqlite3_finalize(stmt);
-            try bindText(stmt, 1, session_file);
+            try bindOptionalText(stmt, 1, if (session_file.len == 0) null else session_file);
             try done(stmt);
         }
         {
@@ -520,6 +640,9 @@ fn columnId(stmt: *c.sqlite3_stmt, index: c_int) !?ContentId {
     return id;
 }
 
+const reasoning_schema =
+    "CREATE TABLE entry_reasoning(session_file TEXT NOT NULL,entry_id TEXT NOT NULL,content_ref BLOB NOT NULL CHECK(length(content_ref)=16),length INTEGER NOT NULL CHECK(length>=0),PRIMARY KEY(session_file,entry_id),FOREIGN KEY(session_file,entry_id) REFERENCES entries(session_file,entry_id) ON DELETE CASCADE);";
+
 const schema: [*:0]const u8 =
     "CREATE TABLE sessions(session_file TEXT PRIMARY KEY,session_id TEXT NOT NULL,project_id TEXT NOT NULL,display_name TEXT NOT NULL DEFAULT '',leaf_id TEXT,last_entry_id TEXT,file_identity TEXT NOT NULL DEFAULT '',file_size INTEGER NOT NULL DEFAULT 0,file_mtime INTEGER NOT NULL DEFAULT 0,diagnostic_evictions INTEGER NOT NULL DEFAULT 0);" ++
     "CREATE TABLE content_objects(content_id BLOB PRIMARY KEY CHECK(length(content_id)=16),encoding TEXT NOT NULL,mime_type TEXT NOT NULL,total_length INTEGER NOT NULL DEFAULT 0 CHECK(total_length>=0),next_index INTEGER NOT NULL DEFAULT 0 CHECK(next_index>=0),sealed INTEGER NOT NULL DEFAULT 0 CHECK(sealed IN (0,1)));" ++
@@ -528,5 +651,238 @@ const schema: [*:0]const u8 =
     "CREATE INDEX entries_parent ON entries(session_file,parent_id);" ++
     "CREATE TABLE live_rows(runtime INTEGER NOT NULL,run_generation INTEGER NOT NULL,local_sequence INTEGER NOT NULL,content_index INTEGER NOT NULL,row_id TEXT NOT NULL,kind TEXT NOT NULL,role TEXT NOT NULL,revision INTEGER NOT NULL,title TEXT NOT NULL,status TEXT NOT NULL,content_ref BLOB,tool_call_id TEXT,is_error INTEGER NOT NULL,expanded INTEGER NOT NULL,timestamp INTEGER NOT NULL,PRIMARY KEY(runtime,run_generation,local_sequence,content_index));" ++
     "CREATE TABLE active_path(session_file TEXT NOT NULL REFERENCES sessions(session_file) ON DELETE CASCADE,leaf_id TEXT NOT NULL,ordinal INTEGER NOT NULL,entry_id TEXT NOT NULL,PRIMARY KEY(session_file,leaf_id,ordinal));" ++
-    "CREATE TABLE diagnostics(diagnostic_id INTEGER PRIMARY KEY,session_file TEXT NOT NULL REFERENCES sessions(session_file) ON DELETE CASCADE,runtime INTEGER NOT NULL,kind TEXT NOT NULL,summary TEXT NOT NULL,raw_content_ref BLOB,timestamp INTEGER NOT NULL);" ++
-    "CREATE INDEX diagnostics_session ON diagnostics(session_file,diagnostic_id);";
+    "CREATE TABLE diagnostics(diagnostic_id INTEGER PRIMARY KEY,session_file TEXT REFERENCES sessions(session_file) ON DELETE CASCADE,runtime INTEGER NOT NULL,kind TEXT NOT NULL,summary TEXT NOT NULL,raw_content_ref BLOB,timestamp INTEGER NOT NULL);" ++
+    "CREATE INDEX diagnostics_session ON diagnostics(session_file,diagnostic_id);" ++
+    reasoning_schema;
+
+test "active branch paging and visible content ignore later inactive appends" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/history.sqlite", .{tmp.sub_path});
+    defer allocator.free(db_path);
+    var store = try Store.init(allocator, db_path);
+    defer store.deinit();
+    const path = "/project/branch-session.jsonl";
+    try store.putSession(.{ .session_file = path, .session_id = "branch-session", .project_id = "project", .leaf_id = "active-leaf" });
+    const display_ref: ContentId = @splat(17);
+    const raw_ref: ContentId = @splat(18);
+    const inactive_ref: ContentId = @splat(19);
+    try store.append(display_ref, 0, "Active decoded\ncontent", true);
+    try store.append(raw_ref, 0, "{\"content\":\"Active decoded\\ncontent\"}", true);
+    try store.append(inactive_ref, 0, "Inactive tail", true);
+    const ids = [_][]const u8{ "root", "active-answer", "active-leaf", "inactive-tail" };
+    const parents = [_]?[]const u8{ null, "root", "active-answer", "root" };
+    const roles = [_][]const u8{ "user", "assistant", "user", "assistant" };
+    for (ids, parents, roles, 0..) |id, parent, role, ordinal| {
+        try store.putEntry(.{
+            .session_file = path,
+            .entry_id = id,
+            .parent_id = parent,
+            .append_ordinal = @intCast(ordinal),
+            .entry_type = "message",
+            .raw_content_ref = raw_ref,
+            .row = .{ .row_id = id, .kind = "message", .role = role, .status = "complete", .content_ref = if (ordinal == 3) inactive_ref else display_ref },
+        });
+    }
+    try store.rebuildActivePath(path, "active-leaf");
+    try std.testing.expectEqual(@as(i64, 3), try store.activeEntryCount(path));
+    var first = try store.pageActiveEntries(allocator, path, -1, 2);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 2), first.rows.len);
+    try std.testing.expectEqualStrings("root", first.rows[0].row_id);
+    try std.testing.expectEqualStrings("active-answer", first.rows[1].row_id);
+    try std.testing.expectEqual(@as(?i64, 1), first.next_cursor);
+    var next = try store.pageActiveEntries(allocator, path, first.next_cursor.?, 2);
+    defer next.deinit();
+    try std.testing.expectEqual(@as(usize, 1), next.rows.len);
+    try std.testing.expectEqualStrings("active-leaf", next.rows[0].row_id);
+    try std.testing.expectEqual(@as(?i64, 2), next.next_cursor);
+    var exhausted = try store.pageActiveEntries(allocator, path, next.next_cursor.?, 2);
+    defer exhausted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), exhausted.rows.len);
+    var visible = try store.lastDisplayableActiveEntry(allocator, path);
+    defer visible.deinit();
+    try std.testing.expectEqual(@as(usize, 1), visible.rows.len);
+    try std.testing.expectEqualStrings("active-leaf", visible.rows[0].row_id);
+    const selected_ref = visible.rows[0].content_ref.?;
+    try std.testing.expectEqualSlices(u8, &display_ref, &selected_ref);
+    const selected = (try store.readChunk(allocator, selected_ref, 0)).?;
+    defer allocator.free(selected);
+    try std.testing.expectEqualStrings("Active decoded\ncontent", selected);
+    const raw = (try store.readChunk(allocator, raw_ref, 0)).?;
+    defer allocator.free(raw);
+    try std.testing.expectEqualStrings("{\"content\":\"Active decoded\\ncontent\"}", raw);
+
+    // Switching leaves must not expose the cached path for the old branch.
+    try store.putSession(.{ .session_file = path, .session_id = "branch-session", .project_id = "project", .leaf_id = "inactive-tail" });
+    try store.rebuildActivePath(path, "inactive-tail");
+    try std.testing.expectEqual(@as(i64, 2), try store.activeEntryCount(path));
+    var switched = try store.pageActiveEntries(allocator, path, -1, 2);
+    defer switched.deinit();
+    try std.testing.expectEqual(@as(usize, 2), switched.rows.len);
+    try std.testing.expectEqualStrings("root", switched.rows[0].row_id);
+    try std.testing.expectEqualStrings("inactive-tail", switched.rows[1].row_id);
+    var switched_visible = try store.lastDisplayableActiveEntry(allocator, path);
+    defer switched_visible.deinit();
+    try std.testing.expectEqualStrings("inactive-tail", switched_visible.rows[0].row_id);
+    const switched_ref = switched_visible.rows[0].content_ref.?;
+    try std.testing.expectEqualSlices(u8, &inactive_ref, &switched_ref);
+    try std.testing.expectError(error.InvalidLimit, store.pageActiveEntries(allocator, path, -1, max_page_rows + 1));
+
+    // Context entries retain inspectable source content but must not replace chat.
+    try store.putEntry(.{
+        .session_file = path,
+        .entry_id = "model-context",
+        .parent_id = "inactive-tail",
+        .append_ordinal = 4,
+        .entry_type = "model_change",
+        .raw_content_ref = raw_ref,
+        .row = .{ .row_id = "model-context", .kind = "unsupported_entry", .role = "", .status = "complete", .content_ref = raw_ref },
+    });
+    try store.putEntry(.{
+        .session_file = path,
+        .entry_id = "thinking-context",
+        .parent_id = "model-context",
+        .append_ordinal = 5,
+        .entry_type = "thinking_level_change",
+        .raw_content_ref = raw_ref,
+        .row = .{ .row_id = "thinking-context", .kind = "unsupported_entry", .role = "", .status = "complete", .content_ref = raw_ref },
+    });
+    try store.putSession(.{ .session_file = path, .session_id = "branch-session", .project_id = "project", .leaf_id = "thinking-context" });
+    try store.rebuildActivePath(path, "thinking-context");
+    try std.testing.expectEqual(@as(i64, 4), try store.activeEntryCount(path));
+    var context_visible = try store.lastDisplayableActiveEntry(allocator, path);
+    defer context_visible.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context_visible.rows.len);
+    try std.testing.expectEqualStrings("inactive-tail", context_visible.rows[0].row_id);
+    try std.testing.expectEqual(@as(?i64, 1), context_visible.next_cursor);
+    var context_page = try store.pageActiveEntries(allocator, path, 1, 2);
+    defer context_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), context_page.rows.len);
+    try std.testing.expectEqualStrings("model-context", context_page.rows[0].row_id);
+    try std.testing.expectEqualStrings("thinking-context", context_page.rows[1].row_id);
+    const retained_context = context_page.rows[1].content_ref.?;
+    try std.testing.expectEqualSlices(u8, &raw_ref, &retained_context);
+
+    try store.putEntry(.{
+        .session_file = path,
+        .entry_id = "startup-context",
+        .append_ordinal = 6,
+        .entry_type = "model_change",
+        .raw_content_ref = raw_ref,
+        .row = .{ .row_id = "startup-context", .kind = "unsupported_entry", .role = "", .status = "complete", .content_ref = raw_ref },
+    });
+    try store.putSession(.{ .session_file = path, .session_id = "branch-session", .project_id = "project", .leaf_id = "startup-context" });
+    try store.rebuildActivePath(path, "startup-context");
+    var startup_visible = try store.lastDisplayableActiveEntry(allocator, path);
+    defer startup_visible.deinit();
+    try std.testing.expectEqual(@as(usize, 0), startup_visible.rows.len);
+    try std.testing.expectEqual(@as(?i64, null), startup_visible.next_cursor);
+}
+
+test "v2 migration preserves active chat and separately retained reasoning and raw source" {
+    const projection = @import("session.zig");
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/history.sqlite", .{tmp.sub_path});
+    defer allocator.free(db_path);
+    const raw_json = "{\"id\":\"answer\",\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Check branch\\nprivately\"},{\"type\":\"text\",\"text\":\"Final answer\"},{\"type\":\"thinking\",\"thinking\":\"Then verify\"}]}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+    defer parsed.deinit();
+    const message = parsed.value.object.get("message").?;
+    const body = try projection.messageText(allocator, message);
+    defer allocator.free(body);
+    const thinking = try projection.thinkingText(allocator, message);
+    defer allocator.free(thinking);
+    try std.testing.expectEqualStrings("Final answer", body);
+    try std.testing.expectEqualStrings("Check branch\nprivately\n\nThen verify", thinking);
+    const path = "/project/reasoning-session.jsonl";
+    const body_ref: ContentId = @splat(31);
+    const raw_ref: ContentId = @splat(32);
+    const thinking_ref: ContentId = @splat(33);
+    const other_ref: ContentId = @splat(34);
+    {
+        var store = try Store.init(allocator, db_path);
+        defer store.deinit();
+        // These are the actual v2 tables, populated before the v3-only relation.
+        try store.exec("DROP TABLE entry_reasoning; PRAGMA user_version=2;");
+        try store.putSession(.{ .session_file = path, .session_id = "reasoning", .project_id = "project", .leaf_id = "context" });
+        try store.append(body_ref, 0, body, true);
+        try store.append(raw_ref, 0, raw_json, true);
+        try store.append(thinking_ref, 0, thinking, true);
+        try store.append(other_ref, 0, "Unrelated branch reasoning", true);
+        try store.putEntry(.{
+            .session_file = path,
+            .entry_id = "answer",
+            .append_ordinal = 0,
+            .entry_type = "message",
+            .raw_content_ref = raw_ref,
+            .row = .{ .row_id = "answer", .kind = "message", .role = "assistant", .content_ref = body_ref },
+        });
+        try store.putEntry(.{
+            .session_file = path,
+            .entry_id = "context",
+            .parent_id = "answer",
+            .append_ordinal = 1,
+            .entry_type = "model_change",
+            .raw_content_ref = raw_ref,
+            .row = .{ .row_id = "context", .kind = "unsupported_entry", .role = "", .content_ref = raw_ref },
+        });
+        try store.putEntry(.{
+            .session_file = path,
+            .entry_id = "inactive",
+            .append_ordinal = 2,
+            .entry_type = "message",
+            .raw_content_ref = raw_ref,
+            .row = .{ .row_id = "inactive", .kind = "message", .role = "assistant", .content_ref = other_ref },
+        });
+        try store.rebuildActivePath(path, "context");
+    }
+    {
+        var store = try Store.init(allocator, db_path);
+        defer store.deinit();
+        try std.testing.expectEqual(@as(i64, 2), try store.activeEntryCount(path));
+        try std.testing.expect((try store.referenceForEntry(path, "answer")) == null);
+        try store.putEntryReasoning(path, "answer", .{ .content_ref = thinking_ref, .length = thinking.len });
+        try store.putEntryReasoning(path, "inactive", .{ .content_ref = other_ref, .length = "Unrelated branch reasoning".len });
+    }
+    {
+        var reader = try Store.openReadOnly(allocator, db_path);
+        defer reader.deinit();
+        var visible = try reader.lastDisplayableActiveEntry(allocator, path);
+        defer visible.deinit();
+        try std.testing.expectEqual(@as(usize, 1), visible.rows.len);
+        try std.testing.expectEqualStrings("answer", visible.rows[0].row_id);
+        try std.testing.expectEqual(@as(?i64, 0), visible.next_cursor);
+        const answer = (try reader.readChunk(allocator, visible.rows[0].content_ref.?, 0)).?;
+        defer allocator.free(answer);
+        try std.testing.expectEqualStrings("Final answer", answer);
+        const reference = (try reader.referenceForEntry(path, visible.rows[0].row_id)).?;
+        try std.testing.expectEqual(@as(u64, thinking.len), reference.length);
+        try std.testing.expectEqualSlices(u8, &thinking_ref, &reference.content_ref);
+        const retained_thinking = (try reader.readChunk(allocator, reference.content_ref, 0)).?;
+        defer allocator.free(retained_thinking);
+        try std.testing.expectEqualStrings(thinking, retained_thinking);
+        const stmt = try reader.prepare("SELECT raw_content_ref FROM entries WHERE session_file=?1 AND entry_id='answer'");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, path);
+        try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+        const retained_raw_ref = (try columnId(stmt, 0)).?;
+        try std.testing.expectEqualSlices(u8, &raw_ref, &retained_raw_ref);
+        const retained_raw = (try reader.readChunk(allocator, retained_raw_ref, 0)).?;
+        defer allocator.free(retained_raw);
+        try std.testing.expectEqualStrings(raw_json, retained_raw);
+    }
+    {
+        var store = try Store.init(allocator, db_path);
+        defer store.deinit();
+        try store.putEntryReasoning(path, "answer", null);
+        try std.testing.expect((try store.referenceForEntry(path, "answer")) == null);
+        // Clearing a derived disclosure must not delete its authoritative source.
+        const retained_raw = (try store.readChunk(allocator, raw_ref, 0)).?;
+        defer allocator.free(retained_raw);
+        try std.testing.expectEqualStrings(raw_json, retained_raw);
+    }
+}

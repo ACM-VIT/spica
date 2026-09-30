@@ -37,6 +37,7 @@ fn nativeDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const 
     inline for (.{ "clay", "text", "parse_arena", "markdown", "images", "highlight" }) |name| {
         module.addCSourceFile(.{ .file = b.path("src/native/" ++ name ++ ".c"), .flags = &.{ "-std=c11", "-O2" } });
     }
+    module.addCSourceFile(.{ .file = b.path("src/platform/process.c"), .flags = &.{ "-std=c11", "-O2" } });
     module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
     module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
     inline for (.{ "SDL3_image", "SDL3", "freetype", "harfbuzz", "unibreak", "fribidi", "cmark-gfm-extensions", "cmark-gfm", "tree-sitter", "sqlite3" }) |name| {
