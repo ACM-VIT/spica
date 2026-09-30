@@ -7,10 +7,13 @@ pub fn build(b: *std.Build) void {
     b.step("deps", "Acquire and build locked native dependencies").dependOn(&bootstrap.step);
     const prefix = b.fmt(".deps/install/{s}-{s}", .{ @tagName(target.result.os.tag), @tagName(target.result.cpu.arch) });
     const options = b.addOptions();
-    options.addOption([]const u8, "native_library_dir", b.fmt("{s}/lib", .{prefix}));
+    options.addOption([]const u8, "native_library_dir", b.path(b.fmt("{s}/lib", .{prefix})).getPath(b));
+    options.addOption([]const u8, "asset_directory", b.path("assets").getPath(b));
+    options.addOption([]const u8, "font_directory", b.path(".deps/install/fonts").getPath(b));
 
     const module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     module.addOptions("build_options", options);
+    if (target.result.os.tag == .linux) module.addRPathSpecial(b.fmt("$ORIGIN/../../{s}/lib", .{prefix}));
     nativeDependencies(b, module, prefix);
     const exe = b.addExecutable(.{ .name = "spica", .root_module = module });
     b.installArtifact(exe);
@@ -38,8 +41,8 @@ fn nativeDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const 
         module.addCSourceFile(.{ .file = b.path("src/native/" ++ name ++ ".c"), .flags = &.{ "-std=c11", "-O2" } });
     }
     module.addCSourceFile(.{ .file = b.path("src/platform/process.c"), .flags = &.{ "-std=c11", "-O2" } });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
-    module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
+    module.addLibraryPath(b.path(b.fmt("{s}/lib", .{prefix})));
+    module.addRPath(b.path(b.fmt("{s}/lib", .{prefix})));
     inline for (.{ "SDL3_image", "SDL3", "freetype", "harfbuzz", "unibreak", "fribidi", "cmark-gfm-extensions", "cmark-gfm", "tree-sitter", "sqlite3" }) |name| {
         module.linkSystemLibrary(name, .{});
     }

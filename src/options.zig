@@ -53,6 +53,8 @@ pub const help =
     \\The real-process first-pass demo is Linux-only, pinned to pi 0.87.1.
     \\Executable defaults match a system Node and npm installation.
     \\Use --node and --pi-entry for another installation. --resume is explicit, not replay.
+    \\Checkout demo libraries, fonts and themes resolve independently of the launch directory.
+    \\Keep the checkout's .deps and assets directories; rebuild after moving the checkout.
     \\Project resources may run code: --trust-project opts in; --no-project-resources opts out.
     \\
     \\First-pass UI: compact project/thread sidebar, centered Markdown and composer.

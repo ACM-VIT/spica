@@ -12,6 +12,7 @@ const pi = @import("core/runtime.zig");
 const Options = @import("options.zig").Options;
 const Paths = @import("platform/paths.zig").Paths;
 const fixture = @import("diagnostics/fixture.zig");
+const build_options = @import("build_options");
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
 const Action = union(enum) { start, new_thread, sidebar, trust, without_resources, cancel_trust, send, stop, theme, mode, behavior, previous, next, latest, models, select_model: usize, thinking, select_thinking: usize, reasoning, force_stop, wait };
@@ -103,7 +104,7 @@ pub const App = struct {
         errdefer paths.deinit();
         const project_path = if (options.fixture) try allocator.dupeZ(u8, options.project) else try std.Io.Dir.cwd().realPathFileAlloc(io, options.project, allocator);
         errdefer allocator.free(project_path);
-        const theme_bytes = try std.Io.Dir.cwd().readFileAlloc(io, "assets/theme.json", allocator, .limited(16384));
+        const theme_bytes = try std.Io.Dir.cwd().readFileAlloc(io, build_options.asset_directory ++ "/theme.json", allocator, .limited(16384));
         defer allocator.free(theme_bytes);
         const theme = try theme_module.parse(allocator, theme_bytes);
         var restored = try Draft.restore(io, paths.state);
@@ -134,11 +135,11 @@ pub const App = struct {
             return error.RendererCreation;
         };
         errdefer c.SDL_DestroyRenderer(renderer);
-        const text = c.spica_text_create(renderer, ".deps/install/fonts/Inter.ttf") orelse return error.FontInitialization;
+        const text = c.spica_text_create(renderer, build_options.font_directory ++ "/Inter.ttf") orelse return error.FontInitialization;
         errdefer c.spica_text_destroy(text);
-        if (!c.spica_text_set_monospace(text, ".deps/install/fonts/JetBrainsMono-Regular.ttf")) return error.FontInitialization;
+        if (!c.spica_text_set_monospace(text, build_options.font_directory ++ "/JetBrainsMono-Regular.ttf")) return error.FontInitialization;
         inline for (.{ "InterVariable-Italic.ttf", "JetBrainsMono-Bold.ttf", "JetBrainsMono-Italic.ttf", "JetBrainsMono-BoldItalic.ttf" }) |font| {
-            if (!c.spica_text_add_fallback(text, ".deps/install/fonts/" ++ font, 0)) return error.FontInitialization;
+            if (!c.spica_text_add_fallback(text, build_options.font_directory ++ "/" ++ font, 0)) return error.FontInitialization;
         }
         var layout = try Clay.init(allocator, 1280, 800);
         errdefer layout.deinit();
@@ -741,7 +742,7 @@ pub const App = struct {
         self.dirty = true;
     }
     fn reloadTheme(self: *App) !void {
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, "assets/theme.json", self.allocator, .limited(16384));
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, build_options.asset_directory ++ "/theme.json", self.allocator, .limited(16384));
         defer self.allocator.free(bytes);
         const next = try theme_module.parse(self.allocator, bytes);
         self.theme = next;

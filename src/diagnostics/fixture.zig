@@ -59,7 +59,7 @@ pub fn seed(db: *store.Store, allocator: std.mem.Allocator, io: std.Io) !void {
         const row_id = try std.fmt.bufPrint(&row_buffer, "message:{d}", .{ordinal});
         try db.putEntry(.{ .session_file = session_file, .entry_id = row_id, .append_ordinal = @intCast(ordinal), .entry_type = "message", .row = .{ .row_id = row_id, .kind = "message", .role = if (ordinal % 2 == 0) "user" else "assistant", .content_ref = id } });
     }
-    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, "assets/resource.png", allocator, .limited(2 * 1024 * 1024));
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, @import("build_options").asset_directory ++ "/resource.png", allocator, .limited(2 * 1024 * 1024));
     defer allocator.free(encoded);
     try db.beginContent(image_id, "binary", "image/png");
     var offset: usize = 0;
