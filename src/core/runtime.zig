@@ -115,7 +115,28 @@ const QueuedBytes = struct { data: []u8, command_id: ?u64 = null, bash: bool = f
 const Input = union(enum) { start, bytes: QueuedBytes, shutdown, force };
 const Pending = struct { id: []u8, draft: []u8 };
 const Block = struct { index: i64, id: storage.ContentId, length: u64 = 0 };
-const Tool = struct { id: []u8, sequence: i64 };
+const Tool = struct {
+    id: []u8,
+    sequence: i64,
+    activity: storage.Activity = .{},
+    name: [64]u8 = [_]u8{0} ** 64,
+    name_len: u8 = 0,
+    status: []const u8 = "unknown",
+    timestamp: i64 = 0,
+    is_error: bool = false,
+    content: ?storage.ContentId = null,
+    length: u64 = 0,
+
+    fn caption(self: *Tool, name: []const u8, args: Value) void {
+        if (name.len > 0) {
+            var size = @min(name.len, self.name.len);
+            while (size > 0 and size < name.len and (name[size] & 0xc0) == 0x80) size -= 1;
+            @memcpy(self.name[0..size], name[0..size]);
+            self.name_len = @intCast(size);
+        }
+        if (args != .null or self.activity.len == 0) self.activity = session.toolActivity(self.name[0..self.name_len], args);
+    }
+};
 
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
@@ -143,6 +164,7 @@ pub const Runtime = struct {
     tools: std.ArrayList(Tool) = .empty,
     sequence: i64 = 0,
     message_sequence: i64 = 0,
+    message_timestamp: i64 = 0,
     last_entry_id: []const u8 = "",
     leaf_id: []const u8 = "",
     last_prompt: []const u8 = "",
@@ -662,6 +684,64 @@ pub const Runtime = struct {
         try self.replace(&self.state.kind, kind);
         try self.replace(&self.state.content_status, status);
     }
+
+    fn toolFor(self: *Runtime, call: []const u8, raw: storage.ContentId) !?*Tool {
+        for (self.tools.items) |*tool| if (std.mem.eql(u8, tool.id, call)) return tool;
+        if (call.len == 0 or call.len > 4096 or self.tools.items.len >= 128) {
+            try self.inspect(raw, "unsupported_tool_budget", "Tool identity or concurrent tool budget unsupported; complete record retained");
+            return null;
+        }
+        const id = try self.allocator.dupe(u8, call);
+        errdefer self.allocator.free(id);
+        self.sequence += 1;
+        try self.tools.append(self.allocator, .{ .id = id, .sequence = self.sequence });
+        return &self.tools.items[self.tools.items.len - 1];
+    }
+
+    fn toolRow(self: *Runtime, tool: *Tool, status: []const u8) !void {
+        if (tool.content == null) tool.content = try self.content("", "text/markdown");
+        tool.status = status;
+        try self.store.?.putLiveRow(.{
+            .runtime = self.state.runtime_id,
+            .run_generation = self.state.generation,
+            .local_sequence = tool.sequence,
+            .content_index = 0,
+            .row = .{
+                .row_id = tool.id,
+                .kind = "tool",
+                .role = "toolResult",
+                .revision = @intCast(self.state.revision),
+                .title = tool.activity.slice(),
+                .status = if (tool.is_error) "failed" else status,
+                .content_ref = tool.content,
+                .tool_call_id = tool.id,
+                .is_error = tool.is_error,
+                .timestamp = tool.timestamp,
+            },
+        });
+    }
+
+    fn projectTool(self: *Runtime, value: Value, raw: storage.ContentId) !void {
+        const tool = (try self.toolFor(string(value, "toolCallId"), raw)) orelse return;
+        const name = string(value, "toolName");
+        const args = child(value, "args");
+        // Partial results usually omit metadata; preserve the initial caption.
+        tool.caption(name, args);
+        const stamp = session.timestamp(value);
+        if (stamp != 0 and (tool.timestamp == 0 or std.mem.eql(u8, tool.status, "unknown"))) tool.timestamp = stamp;
+        const ended = std.mem.endsWith(u8, string(value, "type"), "_end");
+        const result = if (ended) child(value, "result") else child(value, "partialResult");
+        tool.is_error = tool.is_error or boolean(value, "isError") or boolean(result, "isError") or string(result, "errorMessage").len > 0;
+        if (result != .null) {
+            const body = try session.messageText(self.allocator, result);
+            defer self.allocator.free(body);
+            tool.content = try self.content(body, "text/markdown");
+            tool.length = body.len;
+        }
+        const status = if (tool.is_error) "failed" else if (ended) "complete" else "running";
+        try self.toolRow(tool, status);
+        try self.visible(tool.content.?, tool.length, "toolResult", "tool", status);
+    }
     fn clearThinkingLevels(self: *Runtime) void {
         for (self.state.thinking_levels) |level| self.allocator.free(level);
         self.allocator.free(self.state.thinking_levels);
@@ -821,6 +901,7 @@ pub const Runtime = struct {
                 self.blocks.clearRetainingCapacity();
                 self.sequence += 1;
                 self.message_sequence = self.sequence;
+                self.message_timestamp = session.timestamp(message);
                 self.state.thinking_content_ref = null;
                 self.state.thinking_length = 0;
             } else if (std.mem.eql(u8, string(message, "role"), "user")) {
@@ -828,7 +909,7 @@ pub const Runtime = struct {
                 const text = try session.messageText(self.allocator, message);
                 defer self.allocator.free(text);
                 const id = try self.content(text, "text/markdown");
-                try self.store.?.putLiveRow(.{ .runtime = self.state.runtime_id, .run_generation = self.state.generation, .local_sequence = self.sequence, .content_index = 0, .row = .{ .row_id = "live-user", .kind = "message", .role = "user", .revision = @intCast(self.state.revision), .status = "complete", .content_ref = id } });
+                try self.store.?.putLiveRow(.{ .runtime = self.state.runtime_id, .run_generation = self.state.generation, .local_sequence = self.sequence, .content_index = 0, .row = .{ .row_id = "live-user", .kind = "message", .role = "user", .revision = @intCast(self.state.revision), .status = "complete", .content_ref = id, .timestamp = session.timestamp(message) } });
                 self.state.thinking_content_ref = null;
                 self.state.thinking_length = 0;
                 try self.visible(id, text.len, "user", "message", "complete");
@@ -874,7 +955,7 @@ pub const Runtime = struct {
                     self.state.thinking_content_ref = block.id;
                     self.state.thinking_length = block.length;
                 } else try self.visible(block.id, block.length, "assistant", "message", "streaming");
-                try self.store.?.putLiveRow(.{ .runtime = self.state.runtime_id, .run_generation = self.state.generation, .local_sequence = self.message_sequence, .content_index = index, .row = .{ .row_id = "live-assistant", .kind = if (thinking) "thinking" else "message", .role = "assistant", .revision = @intCast(self.state.revision), .status = "streaming", .content_ref = block.id } });
+                try self.store.?.putLiveRow(.{ .runtime = self.state.runtime_id, .run_generation = self.state.generation, .local_sequence = self.message_sequence, .content_index = index, .row = .{ .row_id = "live-assistant", .kind = if (thinking) "thinking" else "message", .role = "assistant", .revision = @intCast(self.state.revision), .status = "streaming", .content_ref = block.id, .timestamp = self.message_timestamp } });
             } else try self.inspect(raw, "unsupported_update", update_type);
         } else if (std.mem.eql(u8, ty, "message_end")) {
             const message = child(value, "message");
@@ -883,13 +964,23 @@ pub const Runtime = struct {
                 const text = try session.messageText(self.allocator, message);
                 defer self.allocator.free(text);
                 const id = try self.content(text, "text/markdown");
+                const source_stamp = session.timestamp(message);
+                const stamp = if (source_stamp != 0) source_stamp else self.message_timestamp;
                 try self.store.?.clearLiveMessage(self.state.runtime_id, self.state.generation, self.message_sequence);
-                try self.store.?.putLiveRow(.{ .runtime = self.state.runtime_id, .run_generation = self.state.generation, .local_sequence = self.message_sequence, .content_index = 0, .row = .{ .row_id = "live-assistant", .kind = "message", .role = role, .revision = @intCast(self.state.revision), .status = "complete", .content_ref = id } });
+                try self.store.?.putLiveRow(.{ .runtime = self.state.runtime_id, .run_generation = self.state.generation, .local_sequence = self.message_sequence, .content_index = 0, .row = .{ .row_id = "live-assistant", .kind = "message", .role = role, .revision = @intCast(self.state.revision), .status = if (string(message, "errorMessage").len > 0 or std.mem.eql(u8, string(message, "stopReason"), "error")) "failed" else "complete", .content_ref = id, .timestamp = stamp } });
                 try self.visible(id, text.len, role, "message", "complete");
                 const thinking = try session.thinkingText(self.allocator, message);
                 defer self.allocator.free(thinking);
                 self.state.thinking_content_ref = if (thinking.len > 0) try self.content(thinking, "text/markdown") else null;
                 self.state.thinking_length = thinking.len;
+                const blocks = child(message, "content");
+                if (blocks == .array) for (blocks.array.items) |block| {
+                    if (!std.mem.eql(u8, string(block, "type"), "toolCall")) continue;
+                    const tool = (try self.toolFor(string(block, "id"), raw)) orelse continue;
+                    tool.caption(string(block, "name"), child(block, "arguments"));
+                    if (tool.timestamp == 0) tool.timestamp = stamp;
+                    try self.toolRow(tool, tool.status);
+                };
                 const err = string(message, "errorMessage");
                 const requested_abort = (self.stop_requested or self.closing) and std.mem.eql(u8, string(message, "stopReason"), "aborted");
                 if (err.len > 0 and !requested_abort) {
@@ -898,27 +989,7 @@ pub const Runtime = struct {
                 }
             }
         } else if (std.mem.startsWith(u8, ty, "tool_execution_")) {
-            const call = string(value, "toolCallId");
-            var seq: ?i64 = null;
-            for (self.tools.items) |tool| if (std.mem.eql(u8, tool.id, call)) {
-                seq = tool.sequence;
-                break;
-            };
-            if (call.len == 0 or call.len > 4096 or (seq == null and self.tools.items.len >= 128)) {
-                try self.inspect(raw, "unsupported_tool_budget", "Tool identity or concurrent tool budget unsupported; complete record retained");
-                return;
-            }
-            if (seq == null) {
-                self.sequence += 1;
-                seq = self.sequence;
-                try self.tools.append(self.allocator, .{ .id = try self.allocator.dupe(u8, call), .sequence = seq.? });
-            }
-            const result = if (std.mem.endsWith(u8, ty, "_end")) child(value, "result") else child(value, "partialResult");
-            const text = try session.messageText(self.allocator, result);
-            defer self.allocator.free(text);
-            const id = try self.content(text, "text/markdown");
-            try self.store.?.putLiveRow(.{ .runtime = self.state.runtime_id, .run_generation = self.state.generation, .local_sequence = seq.?, .content_index = 0, .row = .{ .row_id = call, .kind = "tool", .role = "toolResult", .revision = @intCast(self.state.revision), .title = string(value, "toolName"), .status = if (std.mem.endsWith(u8, ty, "_end")) "complete" else "running", .content_ref = id, .tool_call_id = call, .is_error = boolean(value, "isError") } });
-            try self.visible(id, text.len, "toolResult", "tool", "running");
+            try self.projectTool(value, raw);
         } else if (std.mem.eql(u8, ty, "bash_execution_update")) {
             const delta = string(value, "delta");
             if (!std.mem.eql(u8, self.state.kind, "bash") or self.state.visible_content_ref == null) {
@@ -960,6 +1031,79 @@ pub const Runtime = struct {
         self.entries_inflight = true;
     }
 };
+
+test "live tool updates preserve captions timestamps output and failure state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/live-tools.sqlite", .{tmp.sub_path});
+    defer allocator.free(db_path);
+    var runtime: Runtime = .{
+        .allocator = allocator,
+        .io = undefined,
+        .options = undefined,
+        .options_arena = undefined,
+        .mutex = undefined,
+        .wake = undefined,
+        .state = .{ .allocator = allocator, .runtime_id = 7, .role = "", .kind = "" },
+        .store = try storage.Store.init(allocator, db_path),
+    };
+    defer runtime.store.?.deinit();
+    defer {
+        allocator.free(runtime.state.role);
+        allocator.free(runtime.state.kind);
+        allocator.free(runtime.state.content_status);
+        for (runtime.tools.items) |tool| allocator.free(tool.id);
+        runtime.tools.deinit(allocator);
+    }
+    const events = [_][]const u8{
+        \\{"type":"tool_execution_start","toolCallId":"bash-1","toolName":"bash","args":{"command":"git status --short"},"timestamp":1234}
+        ,
+        \\{"type":"tool_execution_update","toolCallId":"bash-1","partialResult":{"content":[{"type":"text","text":"fatal: not a repository"}],"isError":true}}
+        ,
+        \\{"type":"tool_execution_end","toolCallId":"bash-1"}
+        ,
+    };
+    for (events, 0..) |bytes, index| {
+        const parsed = try std.json.parseFromSlice(Value, allocator, bytes, .{});
+        defer parsed.deinit();
+        try runtime.projectTool(parsed.value, @splat(0));
+        const entries = try runtime.store.?.conversationEntries(allocator, "/live.jsonl", false, 7, 1);
+        defer allocator.free(entries);
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        try std.testing.expectEqualStrings("bash git status --short", entries[0].activity[0..entries[0].activity_len]);
+        try std.testing.expectEqual(@as(i64, 1234), entries[0].timestamp);
+        try std.testing.expectEqual(@as(@TypeOf(entries[0].status), if (index == 0) .running else .failed), entries[0].status);
+        if (index > 0) {
+            const output = (try runtime.store.?.readChunk(allocator, entries[0].content_id, 0)).?;
+            defer allocator.free(output);
+            try std.testing.expectEqualStrings("fatal: not a repository", output);
+        }
+    }
+    const tool = (try runtime.toolFor("pending-read", @splat(0))).?;
+    const args = try std.json.parseFromSlice(Value, allocator, "{\"path\":\"README.md\"}", .{});
+    defer args.deinit();
+    tool.caption("read", args.value);
+    try runtime.toolRow(tool, "unknown");
+    const waiting = try runtime.store.?.conversationEntries(allocator, "/live.jsonl", false, 7, 1);
+    defer allocator.free(waiting);
+    try std.testing.expectEqual(.unknown, waiting[1].status);
+    const start = try std.json.parseFromSlice(Value, allocator, "{\"type\":\"tool_execution_start\",\"toolCallId\":\"pending-read\"}", .{});
+    defer start.deinit();
+    try runtime.projectTool(start.value, @splat(0));
+    const pending = try runtime.store.?.conversationEntries(allocator, "/live.jsonl", false, 7, 1);
+    defer allocator.free(pending);
+    try std.testing.expectEqualStrings("read README.md", pending[1].activity[0..pending[1].activity_len]);
+    try std.testing.expectEqual(.running, pending[1].status);
+    try std.testing.expectEqual(@as(i64, 0), pending[1].timestamp);
+    const end = try std.json.parseFromSlice(Value, allocator, "{\"type\":\"tool_execution_end\",\"toolCallId\":\"pending-read\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"configuration\"}]}}", .{});
+    defer end.deinit();
+    try runtime.projectTool(end.value, @splat(0));
+    const completed = try runtime.store.?.conversationEntries(allocator, "/live.jsonl", false, 7, 1);
+    defer allocator.free(completed);
+    try std.testing.expectEqual(.complete, completed[1].status);
+    try std.testing.expectEqualStrings("complete", runtime.state.content_status);
+}
 
 pub fn child(value: Value, key: []const u8) Value {
     return if (value == .object) value.object.get(key) orelse .null else .null;

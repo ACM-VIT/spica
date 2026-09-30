@@ -19,15 +19,7 @@ pub fn messageText(a: std.mem.Allocator, message: Value) ![]u8 {
     errdefer result.deinit(a);
     if (content == .array) for (content.array.items) |block| {
         const ty = text(block, "type");
-        if (std.mem.eql(u8, ty, "text")) try result.appendSlice(a, text(block, "text")) else if (std.mem.eql(u8, ty, "thinking")) continue else if (std.mem.eql(u8, ty, "toolCall")) {
-            try result.appendSlice(a, "\n\nTool: ");
-            try result.appendSlice(a, text(block, "name"));
-            try result.appendSlice(a, "\n```json\n");
-            const args = try std.json.Stringify.valueAlloc(a, child(block, "arguments"), .{});
-            defer a.free(args);
-            try result.appendSlice(a, args);
-            try result.appendSlice(a, "\n```\n");
-        } else if (std.mem.eql(u8, ty, "image")) {
+        if (std.mem.eql(u8, ty, "text")) try result.appendSlice(a, text(block, "text")) else if (std.mem.eql(u8, ty, "thinking") or std.mem.eql(u8, ty, "toolCall")) continue else if (std.mem.eql(u8, ty, "image")) {
             try result.appendSlice(a, "\n[Image content retained in authoritative record]\n");
         } else {
             try result.appendSlice(a, "\n[Unsupported content block: ");
@@ -38,8 +30,11 @@ pub fn messageText(a: std.mem.Allocator, message: Value) ![]u8 {
     if (result.items.len == 0) {
         const output = text(message, "output");
         if (output.len != 0) try result.appendSlice(a, output);
-        const err = text(message, "errorMessage");
-        if (err.len != 0) try result.appendSlice(a, err);
+    }
+    const err = text(message, "errorMessage");
+    if (err.len != 0 and !std.mem.eql(u8, result.items, err)) {
+        if (result.items.len > 0) try result.appendSlice(a, "\n\n");
+        try result.appendSlice(a, err);
     }
     return result.toOwnedSlice(a);
 }
@@ -57,6 +52,66 @@ pub fn thinkingText(a: std.mem.Allocator, message: Value) ![]u8 {
         try result.appendSlice(a, thinking);
     };
     return result.toOwnedSlice(a);
+}
+
+pub fn toolActivity(name: []const u8, args: Value) storage.Activity {
+    var activity: storage.Activity = .{};
+    activity.append(if (name.len > 0) name else "Tool");
+    inline for (.{ "command", "path", "file_path", "filePath", "target", "url", "query", "pattern" }) |key| {
+        const target = text(args, key);
+        if (target.len > 0) {
+            activity.append(" ");
+            var prefix_len = @min(target.len, activity.bytes.len);
+            while (prefix_len > 0 and prefix_len < target.len and (target[prefix_len] & 0xc0) == 0x80) prefix_len -= 1;
+            var start: usize = 0;
+            var cursor: usize = 0;
+            while (cursor < prefix_len and activity.len < activity.bytes.len) : (cursor += 1) {
+                if (!std.ascii.isWhitespace(target[cursor])) continue;
+                activity.append(target[start..cursor]);
+                if (activity.len > 0 and activity.bytes[activity.len - 1] != ' ') activity.append(" ");
+                start = cursor + 1;
+            }
+            activity.append(target[start..cursor]);
+            break;
+        }
+    }
+    return activity;
+}
+
+/// Pi message timestamps are Unix milliseconds. Canonical envelopes also carry
+/// UTC ISO dates; keep unknown timestamps zero instead of inventing elapsed time.
+pub fn timestamp(value: Value) i64 {
+    const stamp = child(value, "timestamp");
+    if (stamp == .integer) return stamp.integer;
+    if (stamp != .string) return 0;
+    const s = stamp.string;
+    if (s.len < 20 or s[4] != '-' or s[7] != '-' or s[10] != 'T' or s[13] != ':' or s[16] != ':') return 0;
+    var year = std.fmt.parseInt(i64, s[0..4], 10) catch return 0;
+    const month = std.fmt.parseInt(i64, s[5..7], 10) catch return 0;
+    const day = std.fmt.parseInt(i64, s[8..10], 10) catch return 0;
+    const hour = std.fmt.parseInt(i64, s[11..13], 10) catch return 0;
+    const minute = std.fmt.parseInt(i64, s[14..16], 10) catch return 0;
+    const second = std.fmt.parseInt(i64, s[17..19], 10) catch return 0;
+    if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 59) return 0;
+    var end: usize = 19;
+    var millis: i64 = 0;
+    if (s[end] == '.') {
+        end += 1;
+        const begin = end;
+        while (end < s.len and std.ascii.isDigit(s[end])) : (end += 1) {
+            if (end - begin < 3) millis = millis * 10 + s[end] - '0';
+        }
+        if (end == begin) return 0;
+        if (end - begin == 1) millis *= 100 else if (end - begin == 2) millis *= 10;
+    }
+    if (end >= s.len or s[end] != 'Z' or end + 1 != s.len) return 0;
+    year -= if (month <= 2) @as(i64, 1) else 0;
+    const era = @divFloor(year, 400);
+    const year_of_era = year - era * 400;
+    const shifted_month = month + (if (month > 2) @as(i64, -3) else 9);
+    const day_of_year = @divFloor(153 * shifted_month + 2, 5) + day - 1;
+    const days = era * 146097 + year_of_era * 365 + @divFloor(year_of_era, 4) - @divFloor(year_of_era, 100) + day_of_year - 719468;
+    return ((days * 24 + hour) * 3600 + minute * 60 + second) * 1000 + millis;
 }
 
 /// Split the entries array directly from the spool. Never build a generic JSON
@@ -191,8 +246,17 @@ fn putEntry(runtime: anytype, bytes: []const u8, response_raw: storage.ContentId
     const kind = if (!is_message) "unsupported_entry" else if (std.mem.eql(u8, role, "toolResult")) "tool" else "message";
     const tool_id = text(message, "toolCallId");
     const error_value = child(message, "isError");
-    runtime.state.last_ordinal += 1;
     const parent_id = text(value, "parentId");
+    var activity = toolActivity(text(message, "toolName"), child(message, "args"));
+    if (std.mem.eql(u8, role, "toolResult") and tool_id.len > 0) {
+        if (try runtime.store.?.toolActivity(runtime.state.session_file, tool_id)) |matched| activity = matched;
+    } else if (std.mem.eql(u8, role, "bashExecution")) {
+        activity = toolActivity("bash", message);
+    } else activity = .{};
+    const failed = (error_value == .bool and error_value.bool) or text(message, "errorMessage").len > 0 or std.mem.eql(u8, text(message, "stopReason"), "error");
+    const message_timestamp = timestamp(message);
+    const stamp = if (message_timestamp != 0) message_timestamp else timestamp(value);
+    runtime.state.last_ordinal += 1;
     try runtime.store.?.putEntry(.{
         .session_file = runtime.state.session_file,
         .entry_id = id,
@@ -200,7 +264,7 @@ fn putEntry(runtime: anytype, bytes: []const u8, response_raw: storage.ContentId
         .append_ordinal = runtime.state.last_ordinal,
         .entry_type = ty,
         .raw_content_ref = raw,
-        .row = .{ .row_id = id, .kind = kind, .role = role, .status = "complete", .content_ref = content, .tool_call_id = if (tool_id.len > 0) tool_id else null, .title = text(message, "toolName"), .is_error = error_value == .bool and error_value.bool },
+        .row = .{ .row_id = id, .kind = kind, .role = role, .status = if (failed) "failed" else "complete", .content_ref = content, .tool_call_id = if (tool_id.len > 0) tool_id else null, .title = activity.slice(), .is_error = failed, .timestamp = stamp },
     });
     if (is_message) {
         const thinking = try thinkingText(a, message);
@@ -210,6 +274,23 @@ fn putEntry(runtime: anytype, bytes: []const u8, response_raw: storage.ContentId
         else
             null;
         try runtime.store.?.putEntryReasoning(runtime.state.session_file, id, reasoning);
+        const blocks = child(message, "content");
+        if (std.mem.eql(u8, role, "assistant") and blocks == .array) for (blocks.array.items) |block| {
+            if (!std.mem.eql(u8, text(block, "type"), "toolCall")) continue;
+            const call = text(block, "id");
+            if (call.len == 0 or call.len > 4096) continue;
+            const metadata_id = storage.toolMetadataId(call);
+            const caption = toolActivity(text(block, "name"), child(block, "arguments"));
+            runtime.state.last_ordinal += 1;
+            try runtime.store.?.putEntry(.{
+                .session_file = runtime.state.session_file,
+                .entry_id = &metadata_id,
+                .parent_id = id,
+                .append_ordinal = runtime.state.last_ordinal,
+                .entry_type = "tool_call",
+                .row = .{ .row_id = &metadata_id, .kind = "tool_metadata", .role = "toolCall", .title = caption.slice(), .tool_call_id = call, .timestamp = stamp },
+            });
+        };
     }
     try runtime.replace(&runtime.last_entry_id, id);
 }
@@ -272,4 +353,70 @@ fn putOversizedEntry(runtime: anytype, prefix: []const u8, raw: storage.ContentI
     try runtime.replace(&runtime.last_entry_id, id);
     try runtime.inspect(raw, "unsupported_oversized_entry", body);
     try runtime.replace(&runtime.state.attention, body);
+}
+
+test "canonical tool results retain targets and failures without polluting assistant prose" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/tool-metadata.sqlite", .{tmp.sub_path});
+    defer allocator.free(db_path);
+    const Runtime = @import("runtime.zig").Runtime;
+    var runtime: Runtime = .{
+        .allocator = allocator,
+        .io = undefined,
+        .options = undefined,
+        .options_arena = undefined,
+        .mutex = undefined,
+        .wake = undefined,
+        .state = .{ .allocator = allocator, .runtime_id = 42, .session_file = "/session.jsonl" },
+        .store = try storage.Store.init(allocator, db_path),
+    };
+    defer runtime.store.?.deinit();
+    defer allocator.free(runtime.last_entry_id);
+    try runtime.store.?.putSession(.{ .session_file = runtime.state.session_file, .session_id = "session", .project_id = "project", .leaf_id = "result" });
+    const assistant =
+        \\{"id":"assistant","type":"message","timestamp":"2026-01-01T00:00:00.123Z","message":{"role":"assistant","content":[{"type":"text","text":"Inspecting the configuration."},{"type":"toolCall","id":"read-config","name":"read","arguments":{"path":"src/config.zig"}}]}}
+    ;
+    const result =
+        \\{"id":"result","parentId":"assistant","type":"message","message":{"role":"toolResult","toolCallId":"read-config","toolName":"read","timestamp":1767225600456,"isError":true,"content":[{"type":"text","text":"Permission denied"}]}}
+    ;
+    const raw_assistant: storage.ContentId = @splat(240);
+    const raw_result: storage.ContentId = @splat(241);
+    try runtime.store.?.beginContent(raw_assistant, "utf-8", "application/json");
+    try runtime.store.?.append(raw_assistant, 0, assistant, true);
+    try runtime.store.?.beginContent(raw_result, "utf-8", "application/json");
+    try runtime.store.?.append(raw_result, 0, result, true);
+    try putEntry(&runtime, assistant, raw_assistant);
+    try putEntry(&runtime, result, raw_result);
+    try runtime.store.?.rebuildActivePath(runtime.state.session_file, "result");
+    const entries = try runtime.store.?.conversationEntries(allocator, runtime.state.session_file, false, 0, 0);
+    defer allocator.free(entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    const prose = (try runtime.store.?.readChunk(allocator, entries[0].content_id, 0)).?;
+    defer allocator.free(prose);
+    try std.testing.expectEqualStrings("Inspecting the configuration.", prose);
+    try std.testing.expectEqualStrings("read src/config.zig", entries[1].activity[0..entries[1].activity_len]);
+    try std.testing.expectEqual(.failed, entries[1].status);
+    try std.testing.expectEqual(@as(i64, 1767225600123), entries[0].timestamp);
+    try std.testing.expectEqual(@as(i64, 1767225600456), entries[1].timestamp);
+    const retained = (try runtime.store.?.readChunk(allocator, raw_assistant, 0)).?;
+    defer allocator.free(retained);
+    try std.testing.expectEqualStrings(assistant, retained);
+}
+
+test "tool activity truncation preserves UTF8 and flattens multiline commands" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(Value, allocator, "{\"command\":\"echo one\\n  echo two\"}", .{});
+    defer parsed.deinit();
+    const command = toolActivity("bash", parsed.value);
+    try std.testing.expectEqualStrings("bash echo one echo two", command.slice());
+    var buffer: [194]u8 = @splat('a');
+    buffer[191] = 0xe2;
+    buffer[192] = 0x82;
+    buffer[193] = 0xac;
+    var activity: storage.Activity = .{};
+    activity.append(&buffer);
+    try std.testing.expectEqual(@as(u8, 191), activity.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(activity.slice()));
 }

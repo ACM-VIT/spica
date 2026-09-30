@@ -90,9 +90,44 @@ pub const ConversationEntry = struct {
     content_id: ContentId,
     length: u64,
     reasoning: ?ReasoningReference = null,
+    activity: [192]u8 = [_]u8{0} ** 192,
+    activity_len: u8 = 0,
+    status: enum { complete, running, failed, unknown } = .unknown,
+    /// Unix milliseconds, or zero when the source supplies no timestamp.
+    timestamp: i64 = 0,
 };
 pub const live_ordinal_base: usize = std.math.maxInt(usize) / 2;
 
+pub const Activity = struct {
+    bytes: [192]u8 = [_]u8{0} ** 192,
+    len: u8 = 0,
+
+    pub fn append(self: *Activity, text: []const u8) void {
+        var size = @min(text.len, self.bytes.len - self.len);
+        while (size > 0 and size < text.len and (text[size] & 0xc0) == 0x80) size -= 1;
+        @memcpy(self.bytes[self.len..][0..size], text[0..size]);
+        self.len += @intCast(size);
+    }
+
+    pub fn slice(self: *const Activity) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+/// Tool-call IDs are canonical identities. Hidden derived entries use the
+/// existing entry primary key, so result linkage never scans message bodies.
+pub fn toolMetadataId(call: []const u8) [75]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(call, &digest, .{});
+    var id: [75]u8 = undefined;
+    @memcpy(id[0..11], "spica-tool:");
+    const hex = "0123456789abcdef";
+    for (digest, 0..) |byte, i| {
+        id[11 + i * 2] = hex[byte >> 4];
+        id[12 + i * 2] = hex[byte & 15];
+    }
+    return id;
+}
 
 pub const Store = struct {
     db: *c.sqlite3,
@@ -344,6 +379,20 @@ pub const Store = struct {
         try done(stmt);
     }
 
+    pub fn toolActivity(self: *Store, session_file: []const u8, call: []const u8) !?Activity {
+        const id = toolMetadataId(call);
+        const stmt = try self.prepare("SELECT title FROM entries WHERE session_file=?1 AND entry_id=?2 AND entry_type='tool_call'");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, session_file);
+        try bindText(stmt, 2, &id);
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return error.SqliteFailure;
+        var activity: Activity = .{};
+        if (c.sqlite3_column_text(stmt, 0)) |title| activity.append(std.mem.span(title));
+        return activity;
+    }
+
     pub fn pageEntries(self: *Store, allocator: std.mem.Allocator, session_file: []const u8, after_ordinal: i64, limit: u32) !RowPage {
         if (limit == 0 or limit > max_page_rows) return error.InvalidLimit;
         try field(session_file, max_key);
@@ -390,9 +439,9 @@ pub const Store = struct {
     pub fn conversationEntries(self: *Store, allocator: std.mem.Allocator, session_file: []const u8, fixture_mode: bool, runtime: u64, generation: i64) ![]ConversationEntry {
         try field(session_file, max_key);
         const stmt = try self.prepare(if (fixture_mode)
-            "SELECT e.append_ordinal,e.role,e.content_ref,o.total_length,r.content_ref,r.length FROM entries e JOIN content_objects o ON o.content_id=e.content_ref LEFT JOIN entry_reasoning r ON r.session_file=e.session_file AND r.entry_id=e.entry_id WHERE e.session_file=?1 AND e.entry_type='message' ORDER BY e.append_ordinal"
+            "SELECT e.append_ordinal,e.role,e.content_ref,o.total_length,r.content_ref,r.length,e.title,e.status,e.is_error,e.timestamp FROM entries e JOIN content_objects o ON o.content_id=e.content_ref LEFT JOIN entry_reasoning r ON r.session_file=e.session_file AND r.entry_id=e.entry_id WHERE e.session_file=?1 AND e.entry_type='message' ORDER BY e.append_ordinal"
         else
-            "SELECT p.ordinal,e.role,e.content_ref,o.total_length,r.content_ref,r.length FROM sessions s JOIN active_path p ON p.session_file=s.session_file AND p.leaf_id=s.leaf_id JOIN entries e ON e.session_file=p.session_file AND e.entry_id=p.entry_id JOIN content_objects o ON o.content_id=e.content_ref LEFT JOIN entry_reasoning r ON r.session_file=e.session_file AND r.entry_id=e.entry_id WHERE s.session_file=?1 AND ((e.entry_type='message' AND e.role IN ('user','assistant','toolResult','bashExecution')) OR (e.kind='unsupported_oversized_entry' AND e.status='display_budget')) ORDER BY p.ordinal");
+            "SELECT p.ordinal,e.role,e.content_ref,o.total_length,r.content_ref,r.length,e.title,e.status,e.is_error,e.timestamp FROM sessions s JOIN active_path p ON p.session_file=s.session_file AND p.leaf_id=s.leaf_id JOIN entries e ON e.session_file=p.session_file AND e.entry_id=p.entry_id JOIN content_objects o ON o.content_id=e.content_ref LEFT JOIN entry_reasoning r ON r.session_file=e.session_file AND r.entry_id=e.entry_id WHERE s.session_file=?1 AND ((e.entry_type='message' AND e.role IN ('user','assistant','toolResult','bashExecution')) OR (e.kind='unsupported_oversized_entry' AND e.status='display_budget')) ORDER BY p.ordinal");
         defer _ = c.sqlite3_finalize(stmt);
         try bindText(stmt, 1, session_file);
         var entries: std.ArrayList(ConversationEntry) = .empty;
@@ -404,17 +453,22 @@ pub const Store = struct {
             const bytes = c.sqlite3_column_text(stmt, 1);
             const role = if (bytes) |p| std.mem.span(p) else "";
             const reasoning = try columnId(stmt, 4);
+            const metadata = conversationMetadata(stmt, 6);
             try entries.append(allocator, .{
                 .ordinal = @intCast(c.sqlite3_column_int64(stmt, 0)),
                 .role = if (std.mem.eql(u8, role, "user")) .user else if (std.mem.eql(u8, role, "assistant")) .assistant else if (std.mem.eql(u8, role, "toolResult")) .tool else if (std.mem.eql(u8, role, "bashExecution")) .bash else .system,
                 .content_id = (try columnId(stmt, 2)) orelse return error.CorruptCache,
                 .length = @intCast(c.sqlite3_column_int64(stmt, 3)),
                 .reasoning = if (reasoning) |id| .{ .content_ref = id, .length = @intCast(c.sqlite3_column_int64(stmt, 5)) } else null,
+                .activity = metadata.activity,
+                .activity_len = metadata.activity_len,
+                .status = metadata.status,
+                .timestamp = metadata.timestamp,
             });
         }
         if (!fixture_mode and runtime != 0) {
             if (runtime > std.math.maxInt(i64)) return error.LengthOverflow;
-            const live = try self.prepare("SELECT l.local_sequence,l.content_index,l.role,l.content_ref,o.total_length FROM live_rows l JOIN content_objects o ON o.content_id=l.content_ref WHERE l.runtime=?1 AND l.run_generation=?2 AND l.kind!='thinking' ORDER BY l.local_sequence,l.content_index");
+            const live = try self.prepare("SELECT l.local_sequence,l.content_index,l.role,l.content_ref,o.total_length,l.title,l.status,l.is_error,l.timestamp FROM live_rows l JOIN content_objects o ON o.content_id=l.content_ref WHERE l.runtime=?1 AND l.run_generation=?2 AND l.kind!='thinking' ORDER BY l.local_sequence,l.content_index");
             defer _ = c.sqlite3_finalize(live);
             try bindInt(live, 1, @intCast(runtime));
             try bindInt(live, 2, generation);
@@ -426,17 +480,21 @@ pub const Store = struct {
                 const role = if (bytes) |p| std.mem.span(p) else "";
                 const sequence: usize = @intCast(c.sqlite3_column_int64(live, 0));
                 const index: usize = @intCast(c.sqlite3_column_int64(live, 1));
+                const metadata = conversationMetadata(live, 5);
                 try entries.append(allocator, .{
                     .ordinal = live_ordinal_base + sequence * 512 + index,
                     .role = if (std.mem.eql(u8, role, "user")) .user else if (std.mem.eql(u8, role, "assistant")) .assistant else if (std.mem.eql(u8, role, "toolResult")) .tool else if (std.mem.eql(u8, role, "bashExecution")) .bash else .system,
                     .content_id = (try columnId(live, 3)) orelse return error.CorruptCache,
                     .length = @intCast(c.sqlite3_column_int64(live, 4)),
+                    .activity = metadata.activity,
+                    .activity_len = metadata.activity_len,
+                    .status = metadata.status,
+                    .timestamp = metadata.timestamp,
                 });
             }
         }
         return entries.toOwnedSlice(allocator);
     }
-
 
     pub fn putEntryReasoning(self: *Store, session_file: []const u8, entry_id: []const u8, reference: ?ReasoningReference) !void {
         try field(session_file, max_key);
@@ -508,7 +566,6 @@ pub const Store = struct {
         try bindInt(stmt, 3, sequence);
         try done(stmt);
     }
-
 
     pub fn clearLiveGeneration(self: *Store, runtime: u64, generation: i64) !void {
         if (runtime > std.math.maxInt(i64)) return error.LengthOverflow;
@@ -642,6 +699,25 @@ pub const Store = struct {
         if (c.sqlite3_exec(self.db, sql, null, null, null) != c.SQLITE_OK) return error.SqliteFailure;
     }
 };
+
+fn conversationMetadata(stmt: *c.sqlite3_stmt, start: c_int) ConversationEntry {
+    var metadata: ConversationEntry = .{ .ordinal = 0, .role = .system, .content_id = undefined, .length = 0 };
+    var activity: Activity = .{};
+    if (c.sqlite3_column_text(stmt, start)) |title| activity.append(std.mem.span(title));
+    metadata.activity = activity.bytes;
+    metadata.activity_len = activity.len;
+    const status = if (c.sqlite3_column_text(stmt, start + 1)) |s| std.mem.span(s) else "";
+    metadata.status = if (c.sqlite3_column_int(stmt, start + 2) != 0 or std.mem.eql(u8, status, "failed"))
+        .failed
+    else if (std.mem.eql(u8, status, "running") or std.mem.eql(u8, status, "streaming"))
+        .running
+    else if (std.mem.eql(u8, status, "complete"))
+        .complete
+    else
+        .unknown;
+    metadata.timestamp = c.sqlite3_column_int64(stmt, start + 3);
+    return metadata;
+}
 
 fn field(value: []const u8, max: usize) !void {
     if (value.len > max or std.mem.indexOfScalar(u8, value, 0) != null) return error.FieldTooLarge;
