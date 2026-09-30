@@ -49,7 +49,7 @@ typedef struct {
 typedef struct {
     unsigned index;
     uint16_t face, raster_x, raster_y, style;
-    uint16_t bucket;
+    uint16_t bucket, phase;
     SDL_Texture *texture;
     int left, top, width, height;
     size_t bytes;
@@ -214,12 +214,13 @@ static unsigned long stream_read(FT_Stream stream, unsigned long offset,
     if (SDL_SeekIO(io, (Sint64)offset, SDL_IO_SEEK_SET) < 0) return count ? 0 : 1;
     return count ? (unsigned long)SDL_ReadIO(io, buffer, count) : 0;
 }
-static unsigned glyph_hash(unsigned face, unsigned raster_x, unsigned raster_y, unsigned style, unsigned index) {
+static unsigned glyph_hash(unsigned face, unsigned raster_x, unsigned raster_y, unsigned style, unsigned index, unsigned phase) {
     uint32_t key = index * 2654435761u;
     key ^= face * 2246822519u;
     key ^= raster_x * 3266489917u;
     key ^= raster_y * 374761393u;
     key ^= style * 668265263u;
+    key ^= phase * 1274126177u;
     return (key ^ (key >> 16)) & 1023u;
 }
 static void rebuild_glyph_slots(SpicaText *t) {
@@ -228,7 +229,7 @@ static void rebuild_glyph_slots(SpicaText *t) {
     for (unsigned i = 0; i < GLYPH_LIMIT; ++i) {
         Glyph *g = &t->glyphs[i];
         if (!g->valid) continue;
-        unsigned bucket = glyph_hash(g->face, g->raster_x, g->raster_y, g->style, g->index);
+        unsigned bucket = glyph_hash(g->face, g->raster_x, g->raster_y, g->style, g->index, g->phase);
         while (t->glyph_slots[bucket]) bucket = (bucket + 1) & 1023u;
         g->bucket = (uint16_t)bucket;
         t->glyph_slots[bucket] = (uint16_t)(i + 1);
@@ -843,18 +844,20 @@ bool spica_text_layout_line(const SpicaTextLayout *layout, size_t index, SpicaTe
     *out = layout->lines[index].info;
     return true;
 }
-static Glyph *glyph(SpicaText *t, unsigned face, unsigned size, unsigned style, unsigned index) {
+static Glyph *glyph(SpicaText *t, unsigned face, unsigned size, unsigned style, unsigned index, unsigned phase) {
     style &= SPICA_TEXT_BOLD | SPICA_TEXT_ITALIC;
+    Face *f = &t->faces[face];
+    if (!FT_IS_SCALABLE(f->face)) phase = 0;
     unsigned raster_x = (unsigned)fmaxf(1, roundf(size * t->render_scale_x * 64));
     unsigned raster_y = (unsigned)fmaxf(1, roundf(size * t->render_scale_y * 64));
     if (t->tombstones > 256) rebuild_glyph_slots(t);
-    unsigned bucket = glyph_hash(face, raster_x, raster_y, style, index);
+    unsigned bucket = glyph_hash(face, raster_x, raster_y, style, index, phase);
     while (t->glyph_slots[bucket]) {
         unsigned id = t->glyph_slots[bucket];
         if (id != UINT16_MAX) {
             Glyph *g = &t->glyphs[id - 1];
             if (g->face == face && g->raster_x == raster_x && g->raster_y == raster_y &&
-                g->style == style && g->index == index) {
+                g->style == style && g->index == index && g->phase == phase) {
                 g->used = ++t->clock;
                 return g;
             }
@@ -864,8 +867,11 @@ static Glyph *glyph(SpicaText *t, unsigned face, unsigned size, unsigned style, 
     Glyph *slot = NULL;
     for (unsigned i = 0; i < GLYPH_LIMIT; ++i)
         if (!t->glyphs[i].valid) { slot = &t->glyphs[i]; break; }
-    Face *f = &t->faces[face];
-    if (!activate(f, raster_x, raster_y, style) || FT_Load_Glyph(f->face, index, FT_LOAD_RENDER | FT_LOAD_COLOR)) {
+    if (!activate(f, raster_x, raster_y, style)) return NULL;
+    FT_Vector offset = { (FT_Pos)phase * 16, 0 };
+    FT_Set_Transform(f->face, NULL, &offset);
+    /* Vertical light hinting preserves the shaped horizontal advances. */
+    if (FT_Load_Glyph(f->face, index, FT_LOAD_RENDER | FT_LOAD_COLOR | FT_LOAD_TARGET_LIGHT)) {
         error("glyph rasterization failed"); return NULL;
     }
     FT_GlyphSlot ft = f->face->glyph;
@@ -911,12 +917,12 @@ static Glyph *glyph(SpicaText *t, unsigned face, unsigned size, unsigned style, 
             !SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR)) { SDL_DestroyTexture(texture); return NULL; }
     }
     *slot = (Glyph){ .index = index, .face = (uint16_t)face,
-        .raster_x = (uint16_t)raster_x, .raster_y = (uint16_t)raster_y, .style = (uint16_t)style,
+        .raster_x = (uint16_t)raster_x, .raster_y = (uint16_t)raster_y, .style = (uint16_t)style, .phase = (uint16_t)phase,
         .texture = texture, .left = ft->bitmap_left, .top = ft->bitmap_top,
         .width = (int)b->width, .height = (int)b->rows, .bytes = bytes,
-        .used = ++t->clock, .scale_x = f->raster_scale_x / t->render_scale_x,
-        .scale_y = f->raster_scale_y / t->render_scale_y, .valid = true, .colored = b->pixel_mode == FT_PIXEL_MODE_BGRA };
-    bucket = glyph_hash(face, raster_x, raster_y, style, index);
+        .used = ++t->clock, .scale_x = f->raster_scale_x,
+        .scale_y = f->raster_scale_y, .valid = true, .colored = b->pixel_mode == FT_PIXEL_MODE_BGRA };
+    bucket = glyph_hash(face, raster_x, raster_y, style, index, phase);
     while (t->glyph_slots[bucket] && t->glyph_slots[bucket] != UINT16_MAX)
         bucket = (bucket + 1) & 1023u;
     if (t->glyph_slots[bucket] == UINT16_MAX) --t->tombstones;
@@ -925,6 +931,66 @@ static Glyph *glyph(SpicaText *t, unsigned face, unsigned size, unsigned style, 
     t->glyph_bytes += bytes;
     return slot;
 }
+typedef struct {
+    int logical_w, logical_h;
+    SDL_RendererLogicalPresentation presentation;
+    float scale_x, scale_y;
+    SDL_Rect viewport, clip;
+    bool viewport_set, clipped;
+} RasterView;
+
+static bool restore_view(SDL_Renderer *renderer, const RasterView *view) {
+    bool ok = view->presentation == SDL_LOGICAL_PRESENTATION_DISABLED ||
+        SDL_SetRenderLogicalPresentation(renderer, view->logical_w, view->logical_h, view->presentation);
+    if (!SDL_SetRenderScale(renderer, view->scale_x, view->scale_y)) ok = false;
+    if (!SDL_SetRenderViewport(renderer, view->viewport_set ? &view->viewport : NULL)) ok = false;
+    if (!SDL_SetRenderClipRect(renderer, view->clipped ? &view->clip : NULL)) ok = false;
+    return ok;
+}
+
+/* Raster glyphs are already device-sized. Blit in device coordinates so SDL's
+ * software renderer cannot truncate a scaled bitmap's width or position. */
+static bool device_view(SpicaText *t, RasterView *view) {
+    SDL_Renderer *renderer = t->renderer;
+    view->viewport_set = SDL_RenderViewportSet(renderer);
+    view->clipped = SDL_RenderClipEnabled(renderer);
+    if (!SDL_GetRenderLogicalPresentation(renderer, &view->logical_w, &view->logical_h, &view->presentation) ||
+        !SDL_GetRenderScale(renderer, &view->scale_x, &view->scale_y) ||
+        !SDL_GetRenderViewport(renderer, &view->viewport) ||
+        (view->clipped && !SDL_GetRenderClipRect(renderer, &view->clip))) return false;
+    SDL_FRect presentation = {0};
+    if (view->presentation != SDL_LOGICAL_PRESENTATION_DISABLED) {
+        if (!SDL_GetRenderLogicalPresentationRect(renderer, &presentation)) return false;
+    } else {
+        int width, height;
+        if (!SDL_GetCurrentRenderOutputSize(renderer, &width, &height)) return false;
+        presentation.w = (float)width;
+        presentation.h = (float)height;
+    }
+    float sx = t->render_scale_x, sy = t->render_scale_y;
+    SDL_Rect viewport = {
+        (int)floorf(presentation.x + view->viewport.x * sx),
+        (int)floorf(presentation.y + view->viewport.y * sy),
+        view->viewport_set ? (int)ceilf(view->viewport.w * sx) : (int)ceilf(presentation.w),
+        view->viewport_set ? (int)ceilf(view->viewport.h * sy) : (int)ceilf(presentation.h)
+    };
+    SDL_Rect clip = {0};
+    if (view->clipped) {
+        clip.x = (int)floorf(view->clip.x * sx);
+        clip.y = (int)floorf(view->clip.y * sy);
+        clip.w = (int)ceilf(view->clip.w * sx);
+        clip.h = (int)ceilf(view->clip.h * sy);
+    }
+    if ((view->presentation != SDL_LOGICAL_PRESENTATION_DISABLED &&
+         !SDL_SetRenderLogicalPresentation(renderer, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED)) ||
+        !SDL_SetRenderScale(renderer, 1, 1) || !SDL_SetRenderViewport(renderer, &viewport) ||
+        !SDL_SetRenderClipRect(renderer, view->clipped ? &clip : NULL)) {
+        restore_view(renderer, view);
+        return false;
+    }
+    return true;
+}
+
 bool spica_text_layout_draw_colors(SpicaText *t, const SpicaTextLayout *layout,
     float x, float y, SDL_Color color, const SpicaTextColorSpan *spans, size_t span_count) {
     if (!t || !layout || layout->owner != t || !isfinite(x) || !isfinite(y) ||
@@ -938,6 +1004,10 @@ bool spica_text_layout_draw_colors(SpicaText *t, const SpicaTextLayout *layout,
     SDL_Rect clip;
     bool clipped = SDL_RenderClipEnabled(t->renderer);
     if (clipped && !SDL_GetRenderClipRect(t->renderer, &clip)) return false;
+    RasterView view;
+    bool transformed = t->render_scale_x != 1 || t->render_scale_y != 1;
+    if (transformed && !device_view(t, &view)) return false;
+    bool ok = true;
     for (unsigned l = 0; l < layout->line_count; ++l) {
         const Line *line = &layout->lines[l];
         if (clipped && (y + line->info.y + line->info.height <= clip.y ||
@@ -946,8 +1016,15 @@ bool spica_text_layout_draw_colors(SpicaText *t, const SpicaTextLayout *layout,
             const Position *p = &layout->positions[i];
             /* Conservative ink bound avoids misses for combining/overhanging glyphs. */
             if (clipped && (x + p->x + layout->size * 4 < clip.x || x + p->x - layout->size * 4 > clip.x + clip.w)) continue;
-            Glyph *g = glyph(t, p->face, layout->size, p->style, p->index);
-            if (!g) return false;
+            float quarter = roundf((x + p->x) * t->render_scale_x * 4);
+            float origin = floorf(quarter / 4);
+            unsigned phase = (unsigned)(quarter - origin * 4);
+            if (!FT_IS_SCALABLE(t->faces[p->face].face)) {
+                origin = roundf((x + p->x) * t->render_scale_x);
+                phase = 0;
+            }
+            Glyph *g = glyph(t, p->face, layout->size, p->style, p->index, phase);
+            if (!g) { ok = false; goto finished; }
             if (!g->texture) continue;
             SDL_Color ink = color;
             size_t low = 0, high = span_count;
@@ -961,19 +1038,16 @@ bool spica_text_layout_draw_colors(SpicaText *t, const SpicaTextLayout *layout,
                 ink = (SDL_Color){ (Uint8)(rgba >> 24), (Uint8)(rgba >> 16), (Uint8)(rgba >> 8), (Uint8)rgba };
             }
             if (!SDL_SetTextureColorMod(g->texture, g->colored ? 255 : ink.r, g->colored ? 255 : ink.g, g->colored ? 255 : ink.b) ||
-                !SDL_SetTextureAlphaMod(g->texture, ink.a)) return false;
-            SDL_FRect dst = { x + p->x + g->left * g->scale_x,
-                y + line->info.y + line->info.baseline + p->y - g->top * g->scale_y,
+                !SDL_SetTextureAlphaMod(g->texture, ink.a)) { ok = false; goto finished; }
+            SDL_FRect dst = { origin + g->left * g->scale_x,
+                roundf((y + line->info.y + line->info.baseline + p->y) * t->render_scale_y) - g->top * g->scale_y,
                 g->width * g->scale_x, g->height * g->scale_y };
-            /* Fractional layout positions must not linearly filter an already
-             * antialiased bitmap a second time. Only ink placement is snapped;
-             * advances, wrapping, carets and selection remain logical floats. */
-            dst.x = roundf(dst.x * t->render_scale_x) / t->render_scale_x;
-            dst.y = roundf(dst.y * t->render_scale_y) / t->render_scale_y;
-            if (!SDL_RenderTexture(t->renderer, g->texture, NULL, &dst)) return false;
+            if (!SDL_RenderTexture(t->renderer, g->texture, NULL, &dst)) { ok = false; goto finished; }
         }
     }
-    return true;
+finished:
+    if (transformed && !restore_view(t->renderer, &view)) ok = false;
+    return ok;
 }
 bool spica_text_layout_draw(SpicaText *t, const SpicaTextLayout *layout, float x, float y, SDL_Color color) {
     return spica_text_layout_draw_colors(t, layout, x, y, color, NULL, 0);

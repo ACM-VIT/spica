@@ -115,35 +115,6 @@ fn expectSamePixels(a: *c.SDL_Surface, b: *c.SDL_Surface) !void {
     }
 }
 
-test "fractional logical origins preserve pixel-aligned antialiased glyph ink" {
-    const f = try Fixture.init();
-    defer f.deinit();
-    const layout = c.spica_text_layout_create(f.engine, "H", 1, 90, 15, false) orelse return error.Layout;
-    defer c.spica_text_layout_release(layout);
-    try f.clear();
-    try std.testing.expect(c.spica_text_layout_draw(f.engine, layout, 5, 4, white));
-    const aligned: *c.SDL_Surface = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
-    defer c.SDL_DestroySurface(aligned);
-    try f.clear();
-    try std.testing.expect(c.spica_text_layout_draw(f.engine, layout, 5.2, 4.2, white));
-    const fractional: *c.SDL_Surface = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
-    defer c.SDL_DestroySurface(fractional);
-    try expectSamePixels(aligned, fractional);
-    const bytes: [*]const u8 = @ptrCast(aligned.pixels orelse return error.Pixels);
-    var antialiased = false;
-    for (0..@as(usize, @intCast(aligned.h))) |row| {
-        for (0..@as(usize, @intCast(aligned.w))) |column| {
-            const pixel: *align(1) const u32 = @ptrCast(bytes + row * @as(usize, @intCast(aligned.pitch)) + column * 4);
-            var red: u8 = 0;
-            var green: u8 = 0;
-            var blue: u8 = 0;
-            var alpha: u8 = 0;
-            c.SDL_GetRGBA(pixel.*, c.SDL_GetPixelFormatDetails(aligned.format), null, &red, &green, &blue, &alpha);
-            if (red > 0 and red < 255) antialiased = true;
-        }
-    }
-    try std.testing.expect(antialiased);
-}
 
 test "DPR transitions rebuild raster pixels without changing wrapping or logical carets" {
     const f = try Fixture.init();
@@ -302,4 +273,77 @@ test "selection uses grapheme ligature carets and includes tab advance" {
     try std.testing.expectEqual(begin.x, rect.x);
     try std.testing.expectEqual(end.x - begin.x, rect.w);
     try std.testing.expectEqual(@as(usize, 0), c.spica_text_layout_selection_rects(layout, 2, 2, &rect, 1));
+}
+
+test "fractional zoom keeps repeated glyph ink aligned with logical advances" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const source = "iiiiiiii";
+    const layout = c.spica_text_layout_create(f.engine, source, source.len, 200, 13, false) orelse return error.Layout;
+    defer c.spica_text_layout_release(layout);
+    for ([_]f32{ 1.2, 1.35, 1.5 }) |scale| {
+        try std.testing.expect(c.SDL_SetRenderScale(f.renderer, scale, scale));
+        try std.testing.expect(c.spica_text_set_render_scale(f.engine, scale, scale));
+        try f.clear();
+        const origin: f32 = 5.1;
+        try std.testing.expect(c.spica_text_layout_draw(f.engine, layout, origin, 4, white));
+        const surface: *c.SDL_Surface = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
+        defer c.SDL_DestroySurface(surface);
+        const bytes: [*]const u8 = @ptrCast(surface.pixels orelse return error.Pixels);
+        var first_center: f32 = 0;
+        var first_caret: f32 = 0;
+        for (0..source.len) |index| {
+            var start: c.SDL_FRect = undefined;
+            var end: c.SDL_FRect = undefined;
+            try std.testing.expect(c.spica_text_layout_caret(layout, index, &start));
+            try std.testing.expect(c.spica_text_layout_caret(layout, index + 1, &end));
+            const left: usize = @intFromFloat(@floor((origin + start.x) * scale));
+            const right: usize = @intFromFloat(@floor((origin + end.x) * scale));
+            var mass: f32 = 0;
+            var moment: f32 = 0;
+            for (0..@as(usize, @intCast(surface.h))) |row| {
+                for (left..right) |column| {
+                    const pixel: *align(1) const u32 = @ptrCast(bytes + row * @as(usize, @intCast(surface.pitch)) + column * 4);
+                    var red: u8 = 0;
+                    c.SDL_GetRGBA(pixel.*, c.SDL_GetPixelFormatDetails(surface.format), null, &red, null, null, null);
+                    mass += @floatFromInt(red);
+                    moment += (@as(f32, @floatFromInt(column)) + 0.5) * @as(f32, @floatFromInt(red));
+                }
+            }
+            try std.testing.expect(mass > 0);
+            const center = moment / mass;
+            if (index == 0) {
+                first_center = center;
+                first_caret = start.x;
+            } else try std.testing.expectApproxEqAbs((start.x - first_caret) * scale, center - first_center, 0.45);
+        }
+    }
+}
+
+test "scaled text respects clip edges and following widget placement" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    try std.testing.expect(c.SDL_SetRenderLogicalPresentation(f.renderer, 512, 80, c.SDL_LOGICAL_PRESENTATION_STRETCH));
+    try std.testing.expect(c.SDL_SetRenderScale(f.renderer, 1.2, 1.2));
+    try std.testing.expect(c.spica_text_set_render_scale(f.engine, 2.4, 2.4));
+    const viewport = c.SDL_Rect{ .x = 17, .y = 7, .w = 80, .h = 50 };
+    const clip = c.SDL_Rect{ .x = 6, .y = 3, .w = 14, .h = 18 };
+    try std.testing.expect(c.SDL_SetRenderViewport(f.renderer, &viewport));
+    try std.testing.expect(c.SDL_SetRenderClipRect(f.renderer, &clip));
+    const panel = c.SDL_FRect{ .x = 0, .y = 0, .w = 80, .h = 50 };
+    try f.clear();
+    try std.testing.expect(c.SDL_SetRenderDrawColor(f.renderer, 255, 0, 0, 255));
+    try std.testing.expect(c.SDL_RenderFillRect(f.renderer, &panel));
+    const expected: *c.SDL_Surface = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
+    defer c.SDL_DestroySurface(expected);
+    try f.clear();
+    const source = "iiiiiiii";
+    const layout = c.spica_text_layout_create(f.engine, source, source.len, 100, 13, false) orelse return error.Layout;
+    defer c.spica_text_layout_release(layout);
+    try std.testing.expect(c.spica_text_layout_draw(f.engine, layout, -5, 1, white));
+    try std.testing.expect(c.SDL_SetRenderDrawColor(f.renderer, 255, 0, 0, 255));
+    try std.testing.expect(c.SDL_RenderFillRect(f.renderer, &panel));
+    const actual: *c.SDL_Surface = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
+    defer c.SDL_DestroySurface(actual);
+    try expectSamePixels(expected, actual);
 }
