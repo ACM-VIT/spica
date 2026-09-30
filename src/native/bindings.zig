@@ -5,4 +5,5 @@ pub const c = @cImport({
     @cInclude("images.h");
     @cInclude("SDL3_image/SDL_image.h");
     @cInclude("highlight.h");
+    @cInclude("fuzzy.h");
 });

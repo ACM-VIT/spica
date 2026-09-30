@@ -15,10 +15,26 @@ const fixture = @import("diagnostics/fixture.zig");
 const build_options = @import("build_options");
 const SessionCatalog = @import("core/catalog.zig");
 const Settings = @import("ui/settings.zig");
+const Library = @import("ui/library.zig");
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
-const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
-const ThreadTarget = struct { path: ?[:0]u8, cwd: [:0]u8 };
+const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
+const ThreadTarget = struct { path: ?[:0]u8, cwd: [:0]u8, archived: bool = false };
+const PendingMutation = struct {
+    id: u64,
+    kind: SessionCatalog.Mutation,
+    path: [:0]u8,
+    cwd: [:0]u8,
+    title: []u8,
+    open_after: bool,
+    automatic: bool,
+
+    fn deinit(self: *PendingMutation, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.cwd);
+        allocator.free(self.title);
+    }
+};
 const Button = struct { bounds: c.SDL_FRect, action: Action };
 
 fn folderChosen(userdata: ?*anyopaque, files: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
@@ -85,7 +101,18 @@ pub const App = struct {
     transcript: TranscriptView,
     catalog_worker: *SessionCatalog.Worker,
     catalog: ?SessionCatalog.Catalog = null,
+    library: Library.Panel,
+    library_generation: u64 = 0,
+    mutation_id: u64 = 0,
+    prior_editor_focus: bool = true,
+    pending_mutation: ?PendingMutation = null,
+    current_archived: bool = false,
+    current_member: bool = false,
+    enrollment_intent: bool = false,
+    accepted_enrollment: bool = false,
+    enrollment_failed: bool = false,
     sidebar_first: usize = 0,
+    sidebar_reveal_current: bool = false,
     pending_thread: ?ThreadTarget = null,
     resume_path: ?[:0]u8 = null,
     conversation_dirty: bool = false,
@@ -128,6 +155,8 @@ pub const App = struct {
         defer restored.deinit();
         var editor = try Composer.init(allocator);
         errdefer editor.deinit();
+        var library = try Library.Panel.init(allocator);
+        errdefer library.deinit();
         try editor.setText(restored.value().draft);
         const copy_buffer = try allocator.alloc(u8, 65537);
         errdefer allocator.free(copy_buffer);
@@ -207,6 +236,8 @@ pub const App = struct {
             .draft_writer = draft_writer,
             .transcript = TranscriptView.init(allocator),
             .chat_view = if (options.resume_file != null) .opening else .new_thread,
+            .library = library,
+            .enrollment_intent = options.resume_file != null,
             .catalog_worker = catalog_worker,
             .paths = paths,
             .options = options,
@@ -228,6 +259,8 @@ pub const App = struct {
         self.content.destroy();
         self.catalog_worker.destroy();
         if (self.catalog) |*catalog| catalog.deinit();
+        self.library.deinit();
+        if (self.pending_mutation) |*mutation| mutation.deinit(self.allocator);
         if (self.resume_path) |path| self.allocator.free(path);
         if (self.pending_thread) |target| {
             if (target.path) |path| self.allocator.free(path);
@@ -374,6 +407,8 @@ pub const App = struct {
     }
 
     fn newThreadIn(self: *App, path: []const u8) !void {
+        if (self.pending_mutation != null) return error.WorkspaceMutationPending;
+        if (self.enrollment_intent) return error.WorkspaceEnrollmentPending;
         if (self.pending_thread != null or self.closing) return error.ThreadSwitchPending;
         if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) return error.StopCurrentRunBeforeSwitchingThread;
         const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
@@ -391,24 +426,34 @@ pub const App = struct {
 
     fn openThread(self: *App, index: usize) !void {
         const catalog = self.catalog orelse return;
-        if (index >= catalog.threads.len or self.pending_thread != null) return;
-        if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) return error.StopCurrentRunBeforeSwitchingThread;
+        if (index >= catalog.threads.len) return;
         const thread = catalog.threads[index];
-        if (!thread.available) return error.SessionSourceUnavailable;
-        if (self.runtime_snapshot) |snapshot| if (std.mem.eql(u8, snapshot.session_file, thread.path)) {
+        try self.openSource(thread.path, thread.cwd, thread.title, thread.archived, thread.available);
+    }
+
+    fn openSource(self: *App, source: []const u8, project: []const u8, title_text: []const u8, archived: bool, available: bool) !void {
+        if (self.pending_thread != null or self.closing) return error.ThreadSwitchPending;
+        if (self.pending_mutation != null) return error.WorkspaceMutationPending;
+        if (self.enrollment_intent) return error.WorkspaceEnrollmentPending;
+        if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) return error.StopCurrentRunBeforeSwitchingThread;
+        if (!available) return error.SessionSourceUnavailable;
+        try SessionCatalog.validateSource(self.io, source, project);
+        if (self.runtime_snapshot) |snapshot| if (std.mem.eql(u8, snapshot.session_file, source)) {
+            self.current_archived = archived;
+            self.current_member = true;
             self.follow_bottom = true;
             self.dirty = true;
             return;
         };
         var transferred = false;
-        const path = try self.allocator.dupeZ(u8, thread.path);
+        const path = try self.allocator.dupeZ(u8, source);
         errdefer if (!transferred) self.allocator.free(path);
-        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, thread.cwd, self.allocator);
+        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, project, self.allocator);
         errdefer if (!transferred) self.allocator.free(cwd);
         try self.saveDraft();
         if (self.runtime) |runtime| if (!runtime.isFinished()) try runtime.shutdown();
-        self.pending_thread = .{ .path = path, .cwd = cwd };
-        const name = clippedLabel(thread.title);
+        self.pending_thread = .{ .path = path, .cwd = cwd, .archived = archived };
+        const name = clippedLabel(title_text);
         @memcpy(self.thread_title[0..name.len], name);
         self.thread_title_len = name.len;
         self.chat_view = .opening;
@@ -426,6 +471,12 @@ pub const App = struct {
         if (self.resume_path) |path| self.allocator.free(path);
         self.resume_path = target.path;
         self.options.resume_file = target.path;
+        self.current_archived = target.archived;
+        self.current_member = target.path != null;
+        self.enrollment_intent = false;
+        self.enrollment_failed = false;
+        self.accepted_enrollment = false;
+        self.revealCurrentFolder();
         if (target.path == null) {
             self.thread_title_len = 0;
             self.chat_view = .new_thread;
@@ -486,6 +537,12 @@ pub const App = struct {
                 return;
             }
         }
+        if (self.pending_mutation != null or self.submitted_prompt != null or (self.enrollment_intent and !self.enrollment_failed)) {
+            self.closing = true;
+            self.dirty = true;
+            self.enrollCurrent();
+            return;
+        }
         self.running = false;
     }
 
@@ -498,6 +555,7 @@ pub const App = struct {
         const runtime = self.runtime orelse return;
         if (runtime.takeSnapshot()) |incoming| {
             const previous_status = self.runtimeStatus();
+            const canonical_changed = self.runtime_snapshot == null or incoming.visible_revision != self.runtime_snapshot.?.visible_revision;
             const generation_changed = self.runtime_snapshot != null and incoming.generation != self.runtime_snapshot.?.generation;
             const session_changed = incoming.session_file.len != 0 and (self.runtime_snapshot == null or !std.mem.eql(u8, self.runtime_snapshot.?.session_file, incoming.session_file));
             const changed_error = incoming.error_message.len != 0 and (self.runtime_snapshot == null or !std.mem.eql(u8, self.runtime_snapshot.?.error_message, incoming.error_message));
@@ -537,6 +595,11 @@ pub const App = struct {
                 const id = std.fmt.bufPrint(&id_buffer, "desktop-{d}", .{submitted.token}) catch unreachable;
                 if (std.mem.eql(u8, snapshot.accepted_command_id, id)) {
                     self.submitted_prompt = null;
+                    if (!self.current_member) {
+                        self.enrollment_intent = true;
+                        self.enrollment_failed = false;
+                        self.accepted_enrollment = true;
+                    }
                     if (self.draft_revision == submitted.draft_revision) {
                         self.editor.selectAll();
                         self.editor.insert("", .paste) catch |err| {
@@ -577,13 +640,25 @@ pub const App = struct {
                 }
             }
             if (snapshot.status == .needs_force_stop and previous_status != .needs_force_stop) self.force_dialog = true;
+            if (snapshot.status == .ready and (previous_status == .streaming or canonical_changed)) self.catalog_worker.refresh();
+            self.enrollCurrent();
             self.dirty = true;
         }
-        if (self.closing and runtime.isFinished()) self.running = false;
+        if (runtime.isFinished()) {
+            self.enrollCurrent();
+            if (self.enrollment_intent and !self.enrollment_failed and self.pending_mutation == null) {
+                self.enrollment_failed = true;
+                self.report("Accepted chat has no resumable source path", error.SessionPathUnavailable);
+            }
+            if (self.closing and self.pending_mutation == null and self.submitted_prompt == null and
+                (!self.enrollment_intent or self.enrollment_failed)) self.running = false;
+        }
         if (!self.closing) self.finishThreadSwitch() catch |err| self.report("Opening thread", err);
     }
 
     fn submit(self: *App) !void {
+        if (self.current_archived) return error.RestoreArchivedChatBeforeSending;
+        if (self.pending_mutation != null or self.enrollment_intent) return error.WorkspaceEnrollmentPending;
         if (self.preedit.items.len != 0 or self.closing) return;
         const runtime = self.runtime orelse return error.StartPiFirst;
         if (self.runtimeStatus() != .ready and self.runtimeStatus() != .streaming) return error.PiNotReady;
@@ -609,6 +684,115 @@ pub const App = struct {
         self.dirty = true;
     }
 
+    fn toggleFolder(self: *App, path: []const u8) !void {
+        for (self.collapsed_folders.items, 0..) |folder, i| if (std.mem.eql(u8, path, folder)) {
+            self.allocator.free(self.collapsed_folders.orderedRemove(i));
+            return;
+        };
+        const owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned);
+        try self.collapsed_folders.append(self.allocator, owned);
+    }
+
+    fn queryLibrary(self: *App) !void {
+        if (!self.library.open) return;
+        self.library_generation += 1;
+        self.library.begin(self.library_generation);
+        self.button_count = 0;
+        self.catalog_worker.search(self.library.scope, self.library.queryBytes(), self.library.offset, self.library_generation) catch |err| {
+            self.library.fail(err);
+            return err;
+        };
+        self.dirty = true;
+    }
+
+    fn showLibrary(self: *App, scope: SessionCatalog.Scope) !void {
+        if (self.closing or self.force_dialog) return;
+        if (!self.library.open) self.prior_editor_focus = self.focused_editor;
+        self.settings_open = false;
+        self.model_menu = false;
+        self.thinking_menu = false;
+        self.dragging = false;
+        self.preedit.clearRetainingCapacity();
+        _ = c.SDL_ClearComposition(self.window);
+        self.focused_editor = false;
+        self.library.show(scope);
+        self.library.busy = self.pending_mutation != null;
+        self.button_count = 0;
+        _ = c.SDL_StartTextInput(self.window);
+        self.catalog_worker.refresh();
+        try self.queryLibrary();
+    }
+
+    fn closeLibrary(self: *App) void {
+        self.library.close();
+        _ = c.SDL_ClearComposition(self.window);
+        self.focused_editor = self.prior_editor_focus;
+        if (self.focused_editor) _ = c.SDL_StartTextInput(self.window) else _ = c.SDL_StopTextInput(self.window);
+        self.button_count = 0;
+        self.dirty = true;
+    }
+
+    fn queueMutation(self: *App, kind: SessionCatalog.Mutation, path: []const u8, cwd: []const u8, title_text: []const u8, open_after: bool, automatic: bool) !void {
+        if (self.pending_mutation != null) return error.WorkspaceMutationPending;
+        if (self.closing and !automatic) return error.ApplicationClosing;
+        if (kind == .archive and std.mem.eql(u8, path, self.currentSession()) and
+            (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null or self.pending_thread != null)) return error.StopCurrentRunBeforeArchiving;
+        if (open_after) {
+            if (self.pending_thread != null) return error.ThreadSwitchPending;
+            if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) return error.StopCurrentRunBeforeSwitchingThread;
+            try SessionCatalog.validateSource(self.io, path, cwd);
+        }
+        const owned_path = try self.allocator.dupeZ(u8, path);
+        errdefer self.allocator.free(owned_path);
+        const owned_cwd = try self.allocator.dupeZ(u8, cwd);
+        errdefer self.allocator.free(owned_cwd);
+        const owned_title = try self.allocator.dupe(u8, title_text);
+        errdefer self.allocator.free(owned_title);
+        self.mutation_id += 1;
+        try self.catalog_worker.mutate(kind, owned_path, owned_cwd, owned_title, self.mutation_id);
+        self.pending_mutation = .{ .id = self.mutation_id, .kind = kind, .path = owned_path, .cwd = owned_cwd, .title = owned_title, .open_after = open_after, .automatic = automatic };
+        self.library.busy = true;
+        self.button_count = 0;
+        self.library.invalidateTargets();
+        self.dirty = true;
+    }
+
+    fn enrollCurrent(self: *App) void {
+        if (!self.enrollment_intent or self.enrollment_failed or self.pending_mutation != null or self.pending_thread != null) return;
+        const snapshot = self.runtime_snapshot orelse return;
+        if (snapshot.session_file.len == 0 or (!self.accepted_enrollment and (snapshot.status == .starting or snapshot.status == .failed))) return;
+        if (!self.accepted_enrollment) SessionCatalog.validateSource(self.io, snapshot.session_file, self.project_path) catch |err| {
+            self.enrollment_failed = true;
+            self.report("Explicit resume source could not be enrolled", err);
+            return;
+        };
+        self.queueMutation(.enroll, snapshot.session_file, self.project_path, self.title(), false, true) catch |err| {
+            self.enrollment_failed = true;
+            self.report("Enrolling accepted chat; Ctrl/Cmd+R retries", err);
+        };
+    }
+
+    fn libraryIntent(self: *App, intent: Library.Intent) !void {
+        switch (intent) {
+            .search => try self.queryLibrary(),
+            .close => self.closeLibrary(),
+            .activate => {
+                const thread = self.library.selectedThread() orelse return;
+                if (self.library.scope == .import_pi) {
+                    try self.queueMutation(.enroll, thread.path, thread.cwd, thread.title, true, false);
+                } else {
+                    try self.openSource(thread.path, thread.cwd, thread.title, thread.archived, thread.available);
+                    self.closeLibrary();
+                }
+            },
+            .archive, .restore => {
+                const thread = self.library.selectedThread() orelse return;
+                try self.queueMutation(if (intent == .archive) .archive else .restore, thread.path, thread.cwd, thread.title, false, false);
+            },
+        }
+    }
+
     fn act(self: *App, action: Action) !void {
         switch (action) {
             .start => try self.beginRuntime(),
@@ -620,19 +804,21 @@ pub const App = struct {
                 if (self.catalog) |catalog| if (index < catalog.folders.len) try self.newThreadIn(catalog.folders[index].cwd);
             },
             .toggle_folder => |index| {
-                if (self.catalog) |catalog| if (index < catalog.folders.len) {
-                    const path = catalog.folders[index].cwd;
-                    var found: ?usize = null;
-                    for (self.collapsed_folders.items, 0..) |folder, i| if (std.mem.eql(u8, path, folder)) { found = i; break; };
-                    if (found) |i| {
-                        self.allocator.free(self.collapsed_folders.orderedRemove(i));
-                    } else {
-                        const owned = try self.allocator.dupe(u8, path);
-                        errdefer self.allocator.free(owned);
-                        try self.collapsed_folders.append(self.allocator, owned);
-                    }
+                if (self.catalog) |catalog| if (index < catalog.folders.len) try self.toggleFolder(catalog.folders[index].cwd);
+            },
+            .toggle_project_folder => |index| {
+                if (index < self.projects.items.len) try self.toggleFolder(self.projects.items[index]);
+            },
+            .toggle_current_folder => try self.toggleFolder(self.project_path),
+            .open_library => |scope| try self.showLibrary(scope),
+            .library => |choice| if (self.library.act(choice)) |intent| try self.libraryIntent(intent),
+            .archive_thread => |index| {
+                if (self.catalog) |catalog| if (index < catalog.threads.len) {
+                    const thread = catalog.threads[index];
+                    try self.queueMutation(.archive, thread.path, thread.cwd, thread.title, false, false);
                 };
             },
+            .restore_current => try self.queueMutation(.restore, self.currentSession(), self.project_path, self.title(), false, false),
             .add_project => if (!self.folder_pending) {
                 self.folder_pending = true;
                 c.SDL_ShowOpenFolderDialog(folderChosen, @ptrFromInt(self.wake_event), self.window, self.project_path.ptr, false);
@@ -787,12 +973,60 @@ pub const App = struct {
 
     fn consume(self: *App) void {
         self.consumeRuntime();
+        while (self.catalog_worker.takeMutation()) |result| {
+            if (self.pending_mutation) |value| {
+                if (result.id != value.id) {
+                    self.report("Workspace acknowledgement mismatch", error.UnexpectedMutationAcknowledgement);
+                    continue;
+                }
+                var target = value;
+                defer target.deinit(self.allocator);
+                self.pending_mutation = null;
+                self.library.busy = false;
+                self.button_count = 0;
+                self.library.invalidateTargets();
+                if (result.err) |err| {
+                    if (target.automatic) self.enrollment_failed = true;
+                    if (self.library.open) self.library.fail(err);
+                    self.report(if (target.automatic) "Enrollment failed; Ctrl/Cmd+R retries" else "Workspace change was not saved", err);
+                } else {
+                    if (target.automatic) {
+                        self.enrollment_intent = false;
+                        self.enrollment_failed = false;
+                        self.accepted_enrollment = false;
+                    }
+                    if (std.mem.eql(u8, target.path, self.currentSession())) {
+                        self.current_member = true;
+                        if (target.kind == .enroll or target.kind == .restore) self.revealCurrentFolder();
+                        self.current_archived = result.archived orelse (target.kind == .archive);
+                        if (target.kind == .enroll and self.chat_view == .new_thread) self.chat_view = .existing;
+                    }
+                    self.catalog_worker.refresh();
+                    if (target.open_after) {
+                        self.openSource(target.path, target.cwd, target.title, result.archived orelse false, true) catch |err| {
+                            self.library.fail(err);
+                            self.report("Imported chat could not be opened", err);
+                            continue;
+                        };
+                        self.closeLibrary();
+                    } else if (self.library.open) self.queryLibrary() catch |err| self.report("Refreshing chat search", err);
+                }
+                self.dirty = true;
+            }
+        }
+        if (self.catalog_worker.takeSearch()) |result| {
+            self.button_count = 0;
+            self.library.accept(result);
+            self.dirty = true;
+        }
         if (self.catalog_worker.take()) |result| switch (result) {
             .ready => |catalog| {
+                self.button_count = 0;
+                self.library.invalidateTargets();
                 if (self.catalog) |*old| old.deinit();
                 self.catalog = catalog;
                 self.catalog_error = catalog.warning;
-                if (catalog.warning) |err| self.report("History discovery is incomplete", err);
+                if (self.catalog_error) |err| self.report("Workspace library is incomplete", err);
                 self.dirty = true;
             },
             .failure => |err| {
@@ -952,6 +1186,43 @@ pub const App = struct {
         return false;
     }
 
+    fn transientCurrent(self: *const App) bool {
+        return !self.current_archived and !self.currentIndexed() and
+            (self.chat_view == .new_thread or self.enrollment_intent or self.current_member);
+    }
+
+    fn revealCurrentFolder(self: *App) void {
+        for (self.collapsed_folders.items, 0..) |folder, index| if (std.mem.eql(u8, folder, self.project_path)) {
+            self.allocator.free(self.collapsed_folders.orderedRemove(index));
+            break;
+        };
+        self.sidebar_reveal_current = true;
+    }
+
+    fn currentSidebarRow(self: *const App) ?usize {
+        var row: usize = 0;
+        const transient = self.transientCurrent();
+        if (!self.indexedFolder(self.project_path) and self.savedFolder(self.project_path)) {
+            row += 1;
+            if (transient and !self.folderCollapsed(self.project_path)) return row;
+        }
+        if (!self.indexedFolder(self.project_path) and !self.savedFolder(self.project_path)) {
+            row += 1;
+            if (transient and !self.folderCollapsed(self.project_path)) return row;
+        }
+        if (self.catalog) |catalog| for (catalog.folders) |folder| {
+            row += 1;
+            if (self.folderCollapsed(folder.cwd)) continue;
+            if (transient and std.mem.eql(u8, folder.cwd, self.project_path)) return row;
+            const count = folder.row_count - 1;
+            for (catalog.rows[folder.first_row + 1 ..][0..count], 0..) |item, offset| {
+                if (std.mem.eql(u8, catalog.threads[item.thread].path, self.currentSession())) return row + offset;
+            }
+            row += count;
+        };
+        return null;
+    }
+
     fn sidebarRows(self: *const App) usize {
         var rows: usize = 0;
         if (self.catalog) |catalog| for (catalog.folders) |folder| {
@@ -959,14 +1230,14 @@ pub const App = struct {
         };
         for (self.projects.items) |path| if (!self.indexedFolder(path)) { rows += 1; };
         if (!self.indexedFolder(self.project_path) and !self.savedFolder(self.project_path)) rows += 1;
-        if (!self.currentIndexed()) rows += 1;
+        if (self.transientCurrent() and !self.folderCollapsed(self.project_path)) rows += 1;
         return rows;
     }
 
     fn sidebarRowY(self: *const App, row: usize, height: f32) ?f32 {
         if (row < self.sidebar_first) return null;
-        const y = 144 + @as(f32, @floatFromInt(row - self.sidebar_first)) * 38;
-        return if (y + 36 <= height - 56) y else null;
+        const y = 158 + @as(f32, @floatFromInt(row - self.sidebar_first)) * 38;
+        return if (y + 36 <= height - 104) y else null;
     }
 
     fn drawFolderRow(self: *App, path: []const u8, action: Action, browse: ?Action, row: usize, height: f32) !void {
@@ -998,29 +1269,32 @@ pub const App = struct {
         try self.rectangle(width - 1, 0, 1, height, 0, colors.border);
         try self.iconButton(.sidebar, .sidebar, .{ .x = 12, .y = 9, .w = 30, .h = 30 }, colors.muted);
         try self.label("Spica", 50, 17, 15, colors.text);
-        try self.button(.new_thread, "New thread", .{ .x = 12, .y = 54, .w = width - 24, .h = 34 });
-        try self.flatButton(.add_project, "+ Add folder", .{ .x = 12, .y = 96, .w = width - 24, .h = 30 });
-        if (self.catalog == null or self.catalog_error != null or self.catalog.?.threads.len == 0) {
-            const status = if (self.catalog_error != null) "History incomplete · Ctrl+R" else if (self.catalog == null) "Loading previous chats..." else "No previous chats found";
-            try self.fitLabel(status, 20, 128, width - 40, 11, colors.muted);
-        }
-        const visible: usize = @intFromFloat(@max(1, @floor((height - 198) / 38)));
+        try self.button(.new_thread, "New thread", .{ .x = 12, .y = 46, .w = width - 24, .h = 30 });
+        try self.flatButton(.{ .open_library = .workspace }, if (builtin.os.tag == .macos) "Search chats    Cmd+K" else "Search chats    Ctrl+K", .{ .x = 12, .y = 80, .w = width - 24, .h = 30 });
+        try self.label("Projects", 20, 128, 12, colors.muted);
+        try self.flatButton(.add_project, "+ Add folder", .{ .x = width - 108, .y = 120, .w = 100, .h = 30 });
+        const visible: usize = @intFromFloat(@max(1, @floor((height - 262) / 38)));
         self.sidebar_first = @min(self.sidebar_first, self.sidebarRows() -| visible);
-        const current_missing = !self.currentIndexed();
+        if (self.sidebar_reveal_current) if (self.currentSidebarRow()) |selected_row| {
+            if (selected_row < self.sidebar_first) self.sidebar_first = selected_row;
+            if (selected_row >= self.sidebar_first + visible) self.sidebar_first = selected_row + 1 -| visible;
+            self.sidebar_reveal_current = false;
+        };
+        const current_missing = self.transientCurrent();
         var row: usize = 0;
         for (self.projects.items, 0..) |path, project_index| {
             if (self.indexedFolder(path) or !std.mem.eql(u8, path, self.project_path)) continue;
-            try self.drawFolderRow(path, .{ .new_project_thread = project_index }, null, row, height);
+            try self.drawFolderRow(path, .{ .new_project_thread = project_index }, .{ .toggle_project_folder = project_index }, row, height);
             row += 1;
-            if (current_missing and std.mem.eql(u8, path, self.project_path)) {
+            if (current_missing and !self.folderCollapsed(path) and std.mem.eql(u8, path, self.project_path)) {
                 try self.drawCurrentRow(row, height);
                 row += 1;
             }
         }
         if (!self.indexedFolder(self.project_path) and !self.savedFolder(self.project_path)) {
-            try self.drawFolderRow(self.project_path, .new_thread, null, row, height);
+            try self.drawFolderRow(self.project_path, .new_thread, .toggle_current_folder, row, height);
             row += 1;
-            if (current_missing) {
+            if (current_missing and !self.folderCollapsed(self.project_path)) {
                 try self.drawCurrentRow(row, height);
                 row += 1;
             }
@@ -1028,11 +1302,11 @@ pub const App = struct {
         if (self.catalog) |catalog| for (catalog.folders, 0..) |folder, folder_index| {
             try self.drawFolderRow(folder.cwd, .{ .new_catalog_thread = folder_index }, .{ .toggle_folder = folder_index }, row, height);
             row += 1;
+            if (self.folderCollapsed(folder.cwd)) continue;
             if (current_missing and std.mem.eql(u8, folder.cwd, self.project_path)) {
                 try self.drawCurrentRow(row, height);
                 row += 1;
             }
-            if (self.folderCollapsed(folder.cwd)) continue;
             const count = folder.row_count - 1;
             // Decode/draw/hit-test only the visible slice, not every session.
             const first = @min(count, self.sidebar_first -| row);
@@ -1043,18 +1317,21 @@ pub const App = struct {
                 const y = self.sidebarRowY(row + offset, height) orelse continue;
                 const active = std.mem.eql(u8, self.currentSession(), thread.path);
                 if (active) try self.rectangle(28, y, width - 40, 34, 6, colors.raised);
-                try self.hit(.{ .open_thread = index }, .{ .x = 28, .y = y, .w = width - 40, .h = 34 });
-                try self.fitLabel(clippedLabel(thread.title), 40, y + 9, width - 64, 13, if (active) colors.accent else if (thread.available) colors.text else colors.muted);
+                try self.hit(.{ .open_thread = index }, .{ .x = 28, .y = y, .w = width - 76, .h = 34 });
+                try self.fitLabel(clippedLabel(thread.title), 40, y + 9, width - 100, 13, if (active) colors.accent else if (thread.available) colors.text else colors.muted);
+                try self.iconButton(.{ .archive_thread = index }, .archive, .{ .x = width - 42, .y = y + 2, .w = 30, .h = 30 }, colors.muted);
             }
             row += count;
         };
         for (self.projects.items, 0..) |path, project_index| {
             if (self.indexedFolder(path) or std.mem.eql(u8, path, self.project_path)) continue;
-            try self.drawFolderRow(path, .{ .new_project_thread = project_index }, null, row, height);
+            try self.drawFolderRow(path, .{ .new_project_thread = project_index }, .{ .toggle_project_folder = project_index }, row, height);
             row += 1;
         }
-        try self.rectangle(12, height - 50, width - 24, 1, 0, colors.border);
-        try self.flatButton(.settings, "Settings", .{ .x = 12, .y = height - 42, .w = width - 24, .h = 32 });
+        try self.rectangle(12, height - 100, width - 24, 1, 0, colors.border);
+        try self.flatButton(.{ .open_library = .import_pi }, "Import Pi chat", .{ .x = 12, .y = height - 96, .w = width - 24, .h = 28 });
+        try self.flatButton(.{ .open_library = .archives }, "Archives", .{ .x = 12, .y = height - 66, .w = width - 24, .h = 28 });
+        try self.flatButton(.settings, "Settings", .{ .x = 12, .y = height - 36, .w = width - 24, .h = 28 });
     }
 
     fn paint(self: *App) !void {
@@ -1090,7 +1367,7 @@ pub const App = struct {
         const title_x = crumb_x + 40 + project_width;
         try self.label("/", title_x, 15, 13, colors.muted);
         try self.fitLabel(clippedLabel(self.title()), title_x + 20, 15, @max(0, header.x + header.width - 158 - title_x), 13, colors.muted);
-        const state: []const u8 = if (self.options.fixture) "Resource scene" else switch (self.runtimeStatus()) {
+        const state: []const u8 = if (self.options.fixture) "Resource scene" else if (self.current_archived) "Archived" else switch (self.runtimeStatus()) {
             .starting => "Starting pi",
             .ready => if (self.bashRunning()) "Running Bash" else "Ready",
             .streaming => "Working",
@@ -1164,8 +1441,12 @@ pub const App = struct {
             }
             const send_bounds = c.SDL_FRect{ .x = composer.x + composer.w - 44, .y = controls_y, .w = 32, .h = 32 };
             const working = self.runtimeStatus() == .streaming or self.bashRunning();
-            try self.rectangle(send_bounds.x, send_bounds.y, send_bounds.w, send_bounds.h, 16, if (self.runtime == null) colors.raised else colors.accent);
-            try self.iconButton(if (working) .stop else .send, if (working) .stop else .arrow_up, send_bounds, if (self.runtime == null) colors.muted else colors.text);
+            if (self.current_archived) {
+                try self.button(.restore_current, "Restore", .{ .x = composer.x + composer.w - 86, .y = controls_y, .w = 78, .h = 32 });
+            } else {
+                try self.rectangle(send_bounds.x, send_bounds.y, send_bounds.w, send_bounds.h, 16, if (self.runtime == null) colors.raised else colors.accent);
+                try self.iconButton(if (working) .stop else .send, if (working) .stop else .arrow_up, send_bounds, if (self.runtime == null) colors.muted else colors.text);
+            }
         }
         try widgets.icon(self.renderer, .folder, .{ .x = composer.x + 2, .y = composer.y + composer.h + 13, .w = 12, .h = 12 }, colors.muted);
         try self.label("Local checkout", composer.x + 22, composer.y + composer.h + 13, 11, colors.muted);
@@ -1185,6 +1466,11 @@ pub const App = struct {
         if (self.settings_open) {
             self.button_count = 0;
             try Settings.draw(self);
+        }
+        if (self.library.open) try self.library.draw(self);
+        if (self.library.open and (self.closing or self.force_dialog)) {
+            self.button_count = 0;
+            try self.drawOverlays();
         }
         if (!self.captured and self.options.capture != null and self.transcript.wanted == null and !self.content_pending and !self.conversation_dirty and (if (self.options.fixture) self.transcript.items.items.len != 0 else self.runtimeStatus() == .ready)) {
             const surface = c.SDL_RenderReadPixels(self.renderer, null) orelse return error.ScreenCapture;
@@ -1340,9 +1626,45 @@ pub const App = struct {
             self.consume();
             return;
         }
+        if (event.type == c.SDL_EVENT_KEY_DOWN and !self.closing and !self.force_dialog) {
+            const command = (event.key.mod & (c.SDL_KMOD_CTRL | c.SDL_KMOD_GUI)) != 0;
+            if (command and event.key.key == c.SDLK_K) {
+                try self.showLibrary(.workspace);
+                return;
+            }
+            if (command and event.key.key == c.SDLK_R) {
+                self.enrollment_failed = false;
+                self.enrollCurrent();
+                self.catalog_worker.refresh();
+                if (self.library.open) {
+                    try self.queryLibrary();
+                    return;
+                }
+            }
+            if (self.library.open and command and event.key.key == c.SDLK_PERIOD) {
+                try self.act(.stop);
+                return;
+            }
+        }
+        if (self.library.open and !self.closing and !self.force_dialog) switch (event.type) {
+            c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_TEXT_INPUT, c.SDL_EVENT_TEXT_EDITING,
+            c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_BUTTON_UP, c.SDL_EVENT_MOUSE_MOTION, c.SDL_EVENT_MOUSE_WHEEL, c.SDL_EVENT_WINDOW_FOCUS_LOST => {
+                if (try self.library.handle(self, event)) |intent| self.libraryIntent(intent) catch |err| {
+                    self.library.fail(err);
+                    self.report("Chat library action", err);
+                };
+                return;
+            },
+            else => {},
+        };
         switch (event.type) {
             c.SDL_EVENT_QUIT, c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => try self.requestClose(),
-            c.SDL_EVENT_WINDOW_EXPOSED, c.SDL_EVENT_WINDOW_RESIZED, c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED => self.dirty = true,
+            c.SDL_EVENT_WINDOW_EXPOSED => self.dirty = true,
+            c.SDL_EVENT_WINDOW_RESIZED, c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED => {
+                self.button_count = 0;
+                self.library.invalidateTargets();
+                self.dirty = true;
+            },
             c.SDL_EVENT_WINDOW_MINIMIZED => self.minimized = true,
             c.SDL_EVENT_WINDOW_RESTORED => {
                 self.minimized = false;
@@ -1600,13 +1922,13 @@ pub const App = struct {
                 }
             },
             c.SDL_EVENT_TEXT_INPUT => {
-                if (!self.focused_editor or self.model_menu or self.thinking_menu or self.settings_open or self.closing) return;
+                if (self.library.open or !self.focused_editor or self.model_menu or self.thinking_menu or self.settings_open or self.closing) return;
                 try self.editor.insert(std.mem.span(event.text.text), if (self.preedit.items.len != 0) .ime else .typing);
                 self.preedit.clearRetainingCapacity();
                 self.edited();
             },
             c.SDL_EVENT_TEXT_EDITING => {
-                if (!self.focused_editor or self.model_menu or self.thinking_menu or self.settings_open or self.closing) return;
+                if (self.library.open or !self.focused_editor or self.model_menu or self.thinking_menu or self.settings_open or self.closing) return;
                 const bytes = std.mem.span(event.edit.text);
                 if (bytes.len > 4096) return error.PreeditBudgetExceeded;
                 self.preedit.clearRetainingCapacity();
@@ -1617,3 +1939,38 @@ pub const App = struct {
         }
     }
 };
+
+test "new chat reveal expands only its project and archived current never makes a transient row" {
+    const allocator = std.testing.allocator;
+    var app: App = undefined;
+    app.allocator = allocator;
+    app.project_path = @constCast("/b");
+    app.projects = .empty;
+    app.collapsed_folders = .empty;
+    defer {
+        for (app.collapsed_folders.items) |path| allocator.free(path);
+        app.collapsed_folders.deinit(allocator);
+    }
+    try app.collapsed_folders.append(allocator, try allocator.dupe(u8, "/a"));
+    try app.collapsed_folders.append(allocator, try allocator.dupe(u8, "/b"));
+    app.catalog = null;
+    app.current_archived = false;
+    app.current_member = false;
+    app.enrollment_intent = false;
+    app.chat_view = .new_thread;
+    app.runtime_snapshot = null;
+    app.pending_thread = null;
+    app.options = .{};
+    try std.testing.expect(app.currentSidebarRow() == null);
+    app.revealCurrentFolder();
+    try std.testing.expect(app.folderCollapsed("/a"));
+    try std.testing.expect(!app.folderCollapsed("/b"));
+    try std.testing.expectEqual(@as(?usize, 1), app.currentSidebarRow());
+    try std.testing.expectEqual(@as(usize, 2), app.sidebarRows());
+    app.current_member = true;
+    app.current_archived = true;
+    app.chat_view = .existing;
+    try std.testing.expect(!app.transientCurrent());
+    try std.testing.expect(app.currentSidebarRow() == null);
+    try std.testing.expectEqual(@as(usize, 1), app.sidebarRows());
+}

@@ -171,7 +171,7 @@ pub const Store = struct {
         const number: c_int = if (rc_version == c.SQLITE_ROW) c.sqlite3_column_int(version, 0) else -1;
         _ = c.sqlite3_finalize(version);
         if (number < 0) return error.SqliteFailure;
-        if (number > 4) return error.UnsupportedSchema;
+        if (number > 5) return error.UnsupportedSchema;
         if (number == 0) {
             try self.exec(schema);
             try self.exec("PRAGMA user_version=3");
@@ -185,6 +185,9 @@ pub const Store = struct {
         }
         if (number < 4) {
             try self.exec("CREATE TABLE IF NOT EXISTS session_index(session_file TEXT PRIMARY KEY,cwd TEXT NOT NULL,title TEXT NOT NULL,modified INTEGER NOT NULL); PRAGMA user_version=4;");
+        }
+        if (number < 5) {
+            try self.exec("CREATE TABLE workspace_chats(session_file TEXT PRIMARY KEY,archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1))); PRAGMA user_version=5;");
         }
         try self.exec("COMMIT");
         return self;
@@ -208,6 +211,45 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         _ = c.sqlite3_close(self.db);
         self.* = undefined;
+    }
+
+    /// Membership commits are acknowledged only after FULL-synchronous COMMIT.
+    /// Discovery and runtime persistence remain membership-neutral.
+    pub fn enroll(self: *Store, entry: SessionIndexEntry) !void {
+        try self.exec("PRAGMA synchronous=FULL");
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        try self.putSessionIndex(entry);
+        const stmt = try self.prepare("INSERT INTO workspace_chats(session_file,archived) VALUES(?1,0) ON CONFLICT(session_file) DO NOTHING");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, entry.session_file);
+        try done(stmt);
+        try self.exec("COMMIT");
+    }
+
+    pub fn setArchived(self: *Store, path: []const u8, archived: bool) !void {
+        try field(path, max_key);
+        try self.exec("PRAGMA synchronous=FULL");
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {};
+        const stmt = try self.prepare("UPDATE workspace_chats SET archived=?2 WHERE session_file=?1");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, path);
+        try bindInt(stmt, 2, if (archived) 1 else 0);
+        try done(stmt);
+        if (c.sqlite3_changes(self.db) != 1) return error.NotWorkspaceMember;
+        try self.exec("COMMIT");
+    }
+
+    pub fn workspaceState(self: *Store, path: []const u8) !?bool {
+        try field(path, max_key);
+        const stmt = try self.prepare("SELECT archived FROM workspace_chats WHERE session_file=?1");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, path);
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return error.SqliteFailure;
+        return c.sqlite3_column_int(stmt, 0) != 0;
     }
 
     // Borrowed until the next SQLite call on this writer connection.
@@ -1046,7 +1088,7 @@ test "v2 migration preserves active chat and separately retained reasoning and r
         var store = try Store.init(allocator, db_path);
         defer store.deinit();
         // These are the actual v2 tables, populated before the v3-only relation.
-        try store.exec("DROP TABLE entry_reasoning; PRAGMA user_version=2;");
+        try store.exec("DROP TABLE workspace_chats; DROP TABLE session_index; DROP TABLE entry_reasoning; PRAGMA user_version=2;");
         try store.putSession(.{ .session_file = path, .session_id = "reasoning", .project_id = "project", .leaf_id = "context" });
         try store.append(body_ref, 0, body, true);
         try store.append(raw_ref, 0, raw_json, true);
@@ -1160,7 +1202,7 @@ test "discovery index migration and metadata refresh preserve resumable chat and
             .row = .{ .row_id = "answer", .kind = "message", .role = "assistant", .content_ref = body_ref },
         });
         try db.rebuildActivePath(path, "answer");
-        try db.exec("DROP TABLE session_index; PRAGMA user_version=3;");
+        try db.exec("DROP TABLE workspace_chats; DROP TABLE session_index; PRAGMA user_version=3;");
     }
     {
         var db = try Store.init(a, db_path);
@@ -1238,4 +1280,93 @@ test "session index keyset pages keep imported sessions beyond the discovery pag
     var end = try reader.pageSessionIndex(a, next.entries[1].session_file);
     defer end.deinit();
     try std.testing.expectEqual(@as(usize, 0), end.entries.len);
+}
+
+test "v4 histories remain nonmembers and archive state survives enrollment and reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/history.sqlite", .{tmp.sub_path});
+    defer a.free(db_path);
+    const entry: SessionIndexEntry = .{ .session_file = "/original/source.jsonl", .cwd = "/project", .title = "Original", .modified = 123 };
+    {
+        var db = try Store.init(a, db_path);
+        defer db.deinit();
+        try db.putSessionIndex(entry);
+        try db.exec("DROP TABLE workspace_chats; PRAGMA user_version=4");
+    }
+    {
+        var db = try Store.init(a, db_path);
+        defer db.deinit();
+        try std.testing.expectEqual(@as(?bool, null), try db.workspaceState(entry.session_file));
+        try std.testing.expectError(error.NotWorkspaceMember, db.setArchived(entry.session_file, true));
+        try db.enroll(entry);
+        try std.testing.expectEqual(@as(?bool, false), try db.workspaceState(entry.session_file));
+        try db.setArchived(entry.session_file, true);
+        try db.enroll(entry);
+        try std.testing.expectEqual(@as(?bool, true), try db.workspaceState(entry.session_file));
+    }
+    {
+        var db = try Store.init(a, db_path);
+        defer db.deinit();
+        try std.testing.expectEqual(@as(?bool, true), try db.workspaceState(entry.session_file));
+        try db.setArchived(entry.session_file, false);
+        var page = try db.pageSessionIndex(a, "");
+        defer page.deinit();
+        try std.testing.expectEqualStrings(entry.session_file, page.entries[0].session_file);
+        try std.testing.expectEqualStrings(entry.title, page.entries[0].title);
+    }
+    var reader = try Store.openReadOnly(a, db_path);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(?bool, false), try reader.workspaceState(entry.session_file));
+}
+
+test "database cutover copies uncheckpointed WAL and rejects unsupported destinations" {
+    const cutover = struct {
+        extern fn spica_database_cutover(destination: [*:0]const u8, legacy: [*:0]const u8, temporary: [*:0]const u8, directory: [*:0]const u8) c_int;
+    }.spica_database_cutover;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer a.free(directory);
+    const legacy = try std.fmt.allocPrintSentinel(a, "{s}/legacy.sqlite", .{directory}, 0);
+    defer a.free(legacy);
+    const destination = try std.fmt.allocPrintSentinel(a, "{s}/durable.sqlite", .{directory}, 0);
+    defer a.free(destination);
+    const temporary = try std.fmt.allocPrintSentinel(a, "{s}/staging.sqlite", .{directory}, 0);
+    defer a.free(temporary);
+    const path = "/outside/original.jsonl";
+    const raw: ContentId = @splat(73);
+    var source = try Store.init(a, legacy);
+    defer source.deinit();
+    try source.exec("PRAGMA wal_autocheckpoint=0");
+    try source.putSession(.{ .session_file = path, .session_id = "original", .project_id = "/project", .leaf_id = "leaf", .file_identity = "identity", .file_size = 512, .file_mtime = 99 });
+    try source.putSessionIndex(.{ .session_file = path, .cwd = "/project", .title = "Original", .modified = 99 });
+    try source.append(raw, 0, "canonical raw source", true);
+    try source.exec("DROP TABLE workspace_chats; PRAGMA user_version=4");
+    try std.testing.expectEqual(@as(c_int, 0), cutover(destination, legacy, temporary, directory));
+    {
+        var copied = try Store.init(a, destination);
+        defer copied.deinit();
+        const bytes = (try copied.readChunk(a, raw, 0)).?;
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("canonical raw source", bytes);
+        try std.testing.expectEqual(@as(?bool, null), try copied.workspaceState(path));
+        const statement = try copied.prepare("SELECT leaf_id,file_identity,file_size,file_mtime FROM sessions WHERE session_file=?1");
+        defer _ = c.sqlite3_finalize(statement);
+        try bindText(statement, 1, path);
+        try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(statement));
+        try std.testing.expectEqualStrings("leaf", std.mem.span(c.sqlite3_column_text(statement, 0).?));
+        try std.testing.expectEqualStrings("identity", std.mem.span(c.sqlite3_column_text(statement, 1).?));
+        try std.testing.expectEqual(@as(i64, 512), c.sqlite3_column_int64(statement, 2));
+        try std.testing.expectEqual(@as(i64, 99), c.sqlite3_column_int64(statement, 3));
+        try copied.exec("PRAGMA user_version=999");
+    }
+    try std.testing.expect(cutover(destination, legacy, temporary, directory) != 0);
+    var unchanged = try Store.openReadOnly(a, legacy);
+    defer unchanged.deinit();
+    const bytes = (try unchanged.readChunk(a, raw, 0)).?;
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("canonical raw source", bytes);
 }

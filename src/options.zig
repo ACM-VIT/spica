@@ -57,13 +57,22 @@ pub const help =
     \\Keep the checkout's .deps and assets directories; rebuild after moving the checkout.
     \\Project resources may run code: --trust-project opts in; --no-project-resources opts out.
     \\
-    \\The sidebar lists previous chats directly, grouped by their original project folders.
+    \\The sidebar contains only active workspace chats; historical pi sessions are not enrolled.
+    \\Import Pi chat searches nonmembers and continues the original source after durable enrollment.
+    \\The first accepted prompt enrolls a new chat; empty drafts never accumulate workspace members.
+    \\New and newly enrolled chats reveal their folder and selected row without expanding other folders.
+    \\Ctrl/Cmd+K searches titles, folders and full user/final-assistant text with RapidFuzz fuzzy matching.
+    \\Search includes archived chats; Archives uses the same search restricted to archived members.
+    \\Archive changes membership only, never source files. Opening an archived chat does not restore it.
+    \\Archived conversations retain their draft and require Restore before sending.
     \\Click a chat to reopen it; folder headers only expand/collapse their chat list.
     \\Add folder saves a folder chosen in the native browser; it does not create a chat.
     \\A folder's + creates a thread there; New thread / Ctrl+N uses the current folder.
     \\Reopening keeps the selected chat title visible while its history loads.
-    \\SQLite indexes sessions and retains imported content; pi files remain resume sources.
-    \\Indexed chats remain listed outside discovery roots; unavailable sources report an error.
+    \\Long messages and table cells render in bounded visible segments without truncating retained text.
+    \\SQLite membership and content live in app/history.sqlite; legacy cache databases migrate via backup.
+    \\Source files remain original resume sources; unavailable chats retain metadata and cached search.
+    \\Search waits for a complete ranking before allowing Open, Archive/Restore, or paging.
     \\New sessions use pi's normal configured storage, shared with the pi CLI.
     \\Stop active work before switching threads. Ctrl+P retries a failed pi startup.
     \\Switching to another folder disables trusted project resources for that runtime.
@@ -83,7 +92,7 @@ pub const help =
     \\If pi will not exit, Force requires an explicit choice (also Ctrl+Shift+Esc).
     \\Wheel and PageUp/PageDown scroll the full conversation, including previous prompts.
     \\Scrolling upward stops auto-follow; Jump to latest or clicking the current thread resumes it.
-    \\The sidebar has its own wheel scroll. Ctrl+B hides/shows it; Ctrl+R reloads theme/history.
+    \\The sidebar has its own wheel scroll. Ctrl+B hides/shows it; Ctrl/Cmd+R refreshes theme/library.
     \\Settings / Ctrl+, opens appearance: text 12–24px, UI scale 75–175%, reading width 560–1120px.
     \\Dark/light themes, appearance values, and added folders persist across restarts.
     \\UI scale changes layout and hit targets; text rasterizes at native output DPI.

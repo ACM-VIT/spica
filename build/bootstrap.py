@@ -207,6 +207,7 @@ def build_highlighting(prefix, fingerprint):
 def main():
     sdl = acquire('SDL')
     acquire('clay')
+    acquire('RapidFuzz')
     image = acquire('SDL_image')
     markdown = acquire('cmark-gfm')
     unibreak = acquire('libunibreak')

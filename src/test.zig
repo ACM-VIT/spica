@@ -1,7 +1,11 @@
 test {
+    _ = @import("app.zig");
     _ = @import("core/protocol_test.zig");
     _ = @import("core/store_test.zig");
     _ = @import("core/catalog.zig");
+    _ = @import("core/search.zig");
+    _ = @import("core/search_source.zig");
+    _ = @import("ui/library.zig");
     _ = @import("ui/theme.zig");
     _ = @import("ui/transcript.zig");
     _ = @import("text/edit.zig");

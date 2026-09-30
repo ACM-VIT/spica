@@ -3,6 +3,7 @@ const c = @import("../native/bindings.zig").c;
 const md = @import("../content/markdown.zig");
 const Theme = @import("theme.zig");
 const Highlight = @import("../content/worker.zig").Highlight;
+const Edit = @import("../text/edit.zig");
 
 const Box = struct {
     block: u32,
@@ -48,24 +49,36 @@ pub const View = struct {
                 else => continue,
             }
             var start: usize = block.text_start;
-            var end = start;
-            var cursor = start;
-            var points: usize = 0;
-            while (cursor < block.text_end) {
-                const line_end = if (std.mem.indexOfScalar(u8, document.text.items[cursor..block.text_end], '\n')) |offset| cursor + offset + 1 else block.text_end;
-                const line_points = try std.unicode.utf8CountCodepoints(document.text.items[cursor..line_end]);
-                if (block.kind != .table_cell and end > start and (points + line_points > 4096 or line_end - start > 32768)) {
-                    try self.appendSegment(document, block, index, start, end);
-                    start = cursor;
-                    points = 0;
-                }
-                points += line_points;
-                end = line_end;
-                cursor = line_end;
+            if (start == block.text_end) try self.appendSegment(document, block, index, start, start);
+            while (start < block.text_end) {
+                const end = segmentEnd(document.text.items, start, block.text_end);
+                try self.appendSegment(document, block, index, start, end);
+                start = end;
             }
-            try self.appendSegment(document, block, index, start, end);
         }
         self.reflow(document);
+    }
+
+    fn segmentEnd(text: []const u8, start: usize, limit: usize) usize {
+        var end = start;
+        var points: usize = 0;
+        var line_end = start;
+        var word_end = start;
+        while (end < limit and points < 4096) : (points += 1) {
+            const bytes = std.unicode.utf8ByteSequenceLength(text[end]) catch unreachable;
+            if (end + bytes - start > 32768) break;
+            if (Edit.whitespaceAt(text, end)) word_end = end + bytes;
+            if (text[end] == '\n') line_end = end + bytes;
+            end += bytes;
+        }
+        if (end == limit) return end;
+        if (line_end > start) return line_end;
+        if (word_end > start) return word_end;
+        var breaks: [32768]u8 = undefined;
+        const boundary = Edit.beforeLastGrapheme(text[start..end], &breaks) catch unreachable;
+        // A single cluster can itself exceed the native layout's fixed bound.
+        // Preserve every scalar even when such a cluster must be split.
+        return if (boundary != 0) start + boundary else end;
     }
 
     fn appendSegment(self: *View, document: *const md.Document, block: md.Block, index: usize, start: usize, end: usize) !void {
@@ -113,15 +126,27 @@ pub const View = struct {
             if (block.kind == .table_cell) {
                 const row = block.parent.?;
                 var end = index;
+                var columns: usize = 0;
                 var height: f32 = 0;
-                while (end < self.boxes.items.len and document.blocks.items[self.boxes.items[end].block].parent == row) : (end += 1) {
-                    height = @max(height, self.boxes.items[end].height);
+                while (end < self.boxes.items.len and document.blocks.items[self.boxes.items[end].block].parent == row) {
+                    const cell = self.boxes.items[end].block;
+                    var cell_height: f32 = 0;
+                    while (end < self.boxes.items.len and self.boxes.items[end].block == cell) : (end += 1) cell_height += self.boxes.items[end].height;
+                    height = @max(height, cell_height);
+                    columns += 1;
                 }
-                const columns: f32 = @floatFromInt(end - index);
-                for (self.boxes.items[index..end], 0..) |*box, column| {
-                    box.x = @as(f32, @floatFromInt(column)) * self.width / columns;
-                    box.width = self.width / columns - 16;
-                    box.y = y;
+                const column_count: f32 = @floatFromInt(columns);
+                var at = index;
+                for (0..columns) |column| {
+                    const cell = self.boxes.items[at].block;
+                    var cell_y = y;
+                    while (at < end and self.boxes.items[at].block == cell) : (at += 1) {
+                        const box = &self.boxes.items[at];
+                        box.x = @as(f32, @floatFromInt(column)) * self.width / column_count;
+                        box.width = self.width / column_count - 16;
+                        box.y = cell_y;
+                        cell_y += box.height;
+                    }
                 }
                 y += height;
                 index = end;
@@ -248,3 +273,77 @@ pub const View = struct {
         };
     }
 };
+
+test "large single-line Unicode paragraphs retain late text within native visible layouts" {
+    const allocator = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(allocator);
+    for (0..30000) |_| try source.appendSlice(allocator, "é ");
+    try source.appendSlice(allocator, "late-visible-sentinel");
+    var document = try md.parse(allocator, @splat(91), source.items);
+    defer document.deinit();
+    var view = View.init(allocator);
+    defer view.deinit();
+    try view.rebuild(&document, 768);
+    var end: u32 = 0;
+    for (view.boxes.items) |box| {
+        try std.testing.expectEqual(end, box.text_start);
+        const bytes = document.text.items[box.text_start..box.text_end];
+        try std.testing.expect(std.unicode.utf8ValidateSlice(bytes));
+        try std.testing.expect(try std.unicode.utf8CountCodepoints(bytes) <= 4096);
+        end = box.text_end;
+    }
+    try std.testing.expectEqual(document.text.items.len, end);
+    const sentinel_offset = std.mem.indexOf(u8, document.text.items, "late-visible-sentinel") orelse return error.LateTextMissing;
+    try std.testing.expect(sentinel_offset > 65536);
+    if (!c.spica_image_install_sdl_allocator()) return error.SDLAllocatorInstallation;
+    const surface = c.SDL_CreateSurface(800, 200, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const engine = c.spica_text_create(renderer, ".deps/install/fonts/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(engine);
+    defer view.releaseShapes();
+    const theme_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "assets/theme.json", allocator, .limited(16384));
+    defer allocator.free(theme_bytes);
+    const theme = try Theme.parse(allocator, theme_bytes);
+    for (0..view.boxes.items.len) |index| {
+        try view.prepareRegion(engine, &document, view.boxes.items[index].y, 200, theme.metrics);
+        const box = view.boxes.items[index];
+        const layout = box.layout orelse return error.VisibleSegmentMissing;
+        var line: c.SpicaTextLine = undefined;
+        try std.testing.expect(c.spica_text_layout_line(layout, c.spica_text_layout_line_count(layout) - 1, &line));
+        if (box.last) try std.testing.expect(box.text_start + line.byte_end >= sentinel_offset + "late-visible-sentinel".len);
+    }
+}
+
+test "long table cells retain one column across bounded text segments" {
+    const allocator = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(allocator);
+    try source.appendSlice(allocator, "| A | B |\n| --- | --- |\n| ");
+    for (0..12000) |_| try source.appendSlice(allocator, "猫 ");
+    try source.appendSlice(allocator, "tail-sentinel | adjacent-cell |\n");
+    var document = try md.parse(allocator, @splat(92), source.items);
+    defer document.deinit();
+    var view = View.init(allocator);
+    defer view.deinit();
+    try view.rebuild(&document, 768);
+    var previous: ?Box = null;
+    var checked = false;
+    for (view.boxes.items) |box| {
+        const block = document.blocks.items[box.block];
+        if (block.kind != .table_cell or block.text_end - block.text_start < 32768) continue;
+        if (previous) |before| {
+            try std.testing.expectEqual(before.block, box.block);
+            try std.testing.expectEqual(before.x, box.x);
+            try std.testing.expectEqual(before.width, box.width);
+            try std.testing.expectEqual(before.y + before.height, box.y);
+            try std.testing.expectEqual(before.text_end, box.text_start);
+            checked = true;
+        }
+        previous = box;
+        if (box.last) try std.testing.expect(std.mem.indexOf(u8, document.text.items[box.text_start..box.text_end], "tail-sentinel") != null);
+    }
+    try std.testing.expect(checked);
+}

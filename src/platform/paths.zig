@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+extern fn spica_database_cutover(destination: [*:0]const u8, legacy: [*:0]const u8, temporary: [*:0]const u8, directory: [*:0]const u8) c_int;
+
 pub const Paths = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -23,8 +25,21 @@ pub const Paths = struct {
         const lock_file = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
         errdefer lock_file.close(io);
         if (!try lock_file.tryLock(io, .exclusive)) return error.DataDirectoryAlreadyInUse;
-        const database = try std.fs.path.join(allocator, &.{ roots[1], "history.sqlite" });
+        const database = try std.fs.path.join(allocator, &.{ roots[0], "history.sqlite" });
         errdefer allocator.free(database);
+        const legacy = try std.fs.path.join(allocator, &.{ roots[1], "history.sqlite" });
+        defer allocator.free(legacy);
+        const temporary = try std.fs.path.join(allocator, &.{ roots[0], "history.sqlite.migrating" });
+        defer allocator.free(temporary);
+        const destination_z = try allocator.dupeZ(u8, database);
+        defer allocator.free(destination_z);
+        const legacy_z = try allocator.dupeZ(u8, legacy);
+        defer allocator.free(legacy_z);
+        const temporary_z = try allocator.dupeZ(u8, temporary);
+        defer allocator.free(temporary_z);
+        const directory_z = try allocator.dupeZ(u8, roots[0]);
+        defer allocator.free(directory_z);
+        if (spica_database_cutover(destination_z, legacy_z, temporary_z, directory_z) != 0) return error.DatabaseMigrationFailed;
         const state = try std.fs.path.join(allocator, &.{ roots[0], "workspace.json" });
         return .{ .allocator = allocator, .io = io, .data = roots[0], .cache = roots[1], .database = database, .state = state, .lock_file = lock_file };
     }
