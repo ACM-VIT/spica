@@ -49,6 +49,17 @@ pub fn nextBoundary(breaks: []const u8, offset: usize) usize {
     return at;
 }
 
+/// Unicode White_Space at a known UTF-8/grapheme boundary.
+pub fn whitespaceAt(utf8: []const u8, offset: usize) bool {
+    if (offset >= utf8.len) return false;
+    const size = std.unicode.utf8ByteSequenceLength(utf8[offset]) catch unreachable;
+    const scalar = std.unicode.utf8Decode(utf8[offset..][0..size]) catch unreachable;
+    return switch (scalar) {
+        0x09...0x0d, 0x20, 0x85, 0xa0, 0x1680, 0x2000...0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => true,
+        else => false,
+    };
+}
+
 test "delete complete combining, flag, and emoji joiner clusters" {
     var scratch: [128]u8 = undefined;
     const text = "a" ++ "e\u{301}" ++ "🇺🇸" ++ "👩‍💻";

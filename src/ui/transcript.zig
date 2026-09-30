@@ -7,6 +7,11 @@ const theme = @import("theme.zig");
 const widgets = @import("widgets.zig");
 const resident_slots = 256;
 const decoded_cache_bytes = 16 * 1024 * 1024;
+const body_padding: f32 = 16;
+const item_gap: f32 = 16;
+const footer_gap: f32 = 8;
+const footer_height: f32 = 22;
+const scrollbar_gutter: f32 = 12;
 
 fn arrayBytes(array: anytype) usize {
     return array.capacity * @sizeOf(@TypeOf(array.items[0]));
@@ -107,6 +112,7 @@ pub const View = struct {
         self.resident = [_]?usize{null} ** resident_slots;
         self.height = 0;
         self.wanted = null;
+        self.wanted_reasoning = false;
     }
     pub fn invalidateLayouts(self: *View) void {
         for (self.resident) |slot| if (slot) |index| {
@@ -171,12 +177,26 @@ pub const View = struct {
                     (if (self.bodyVisible(index)) item.body_height + 16 else @as(f32, 0));
             } else {
                 const thought_height: f32 = if (item.entry.reasoning != null) 36 + (if (item.expanded) item.reasoning_height else @as(f32, 0)) else 0;
-                item.height = if (item.entry.length == 0) thought_height else @max(56, item.body_height + thought_height + (if (item.entry.role == .user) @as(f32, 48) else 28));
+                item.height = if (item.entry.length == 0) thought_height else self.bodyTop(index) + item.body_height +
+                    (if (hasTimestamp(item)) footer_gap + footer_height else @as(f32, 0)) + body_padding + item_gap;
             }
             item.top = top;
             top += item.height;
         }
         self.height = top;
+    }
+    fn updateEntry(item: *Item, entry: storage.ConversationEntry) void {
+        if (!std.meta.eql(item.entry.content_id, entry.content_id) or item.entry.length != entry.length or
+            !std.meta.eql(item.entry.reasoning, entry.reasoning)) item.failed = false;
+        item.entry = entry;
+        if (entry.reasoning == null) {
+            item.expanded = false;
+            item.reasoning_height = 0;
+            if (item.loaded) |loaded| {
+                if (loaded.reasoning) |*reasoning| reasoning.deinit();
+                loaded.reasoning = null;
+            }
+        }
     }
     pub fn update(self: *View, entries: []const storage.ConversationEntry) !void {
         if (self.items.items.len == entries.len) {
@@ -186,12 +206,10 @@ pub const View = struct {
                 break;
             };
             if (same_order) {
-                for (self.items.items, entries) |*item, entry| {
-                    if (!std.meta.eql(item.entry.content_id, entry.content_id) or item.entry.length != entry.length) item.failed = false;
-                    item.entry = entry;
-                }
+                for (self.items.items, entries) |*item, entry| updateEntry(item, entry);
                 self.regroup();
                 self.wanted = null;
+                self.wanted_reasoning = false;
                 return;
             }
         }
@@ -205,8 +223,7 @@ pub const View = struct {
             }
             if (cursor < self.items.items.len and self.items.items[cursor].entry.ordinal == entry.ordinal) {
                 var item = self.items.items[cursor];
-                if (!std.meta.eql(item.entry.content_id, entry.content_id) or item.entry.length != entry.length) item.failed = false;
-                item.entry = entry;
+                updateEntry(&item, entry);
                 next.appendAssumeCapacity(item);
                 cursor += 1;
             } else next.appendAssumeCapacity(.{ .entry = entry, .body_height = @max(32, @as(f32, @floatFromInt(entry.length)) / 90 * 23) });
@@ -222,6 +239,7 @@ pub const View = struct {
         };
         self.regroup();
         self.wanted = null;
+        self.wanted_reasoning = false;
     }
     fn current(item: *const Item) bool {
         const loaded = item.loaded orelse return false;
@@ -236,7 +254,10 @@ pub const View = struct {
     pub fn request(self: *View, generation: u64) ?content.Request {
         const index = self.wanted orelse return null;
         const item = &self.items.items[index];
-        const ref = if (self.wanted_reasoning) item.entry.reasoning.? else storage.ReasoningReference{ .content_ref = item.entry.content_id, .length = item.entry.length };
+        const ref = if (self.wanted_reasoning)
+            item.entry.reasoning orelse return null
+        else
+            storage.ReasoningReference{ .content_ref = item.entry.content_id, .length = item.entry.length };
         return .{ .generation = generation, .ordinal = item.entry.ordinal, .content_id = ref.content_ref, .published_length = ref.length, .role = switch (item.entry.role) {
             .user => .user,
             .assistant => .assistant,
@@ -395,12 +416,15 @@ pub const View = struct {
         }
         return index + 1;
     }
+    fn hasTimestamp(item: *const Item) bool {
+        return !isTool(item) and item.entry.length != 0 and item.entry.timestamp > 0 and item.entry.timestamp <= std.math.maxInt(i64) / 1000000;
+    }
     fn bodyWidth(item: *const Item, width: f32) f32 {
-        return if (item.entry.role == .user) width * 0.8 - 32 else if (isTool(item)) width - 28 else width;
+        return @max(1, if (item.entry.role == .user) width * 0.8 - 2 * body_padding else if (isTool(item)) width - 28 else width);
     }
     fn bodyTop(self: *const View, index: usize) f32 {
         const item = &self.items.items[index];
-        if (item.entry.role == .user) return 16;
+        if (item.entry.role == .user) return body_padding;
         if (item.activity_owner) |owner| return 36 + (if (owner == index and self.items.items[owner].activity_end > owner + 1) @as(f32, 36) else 0);
         return if (item.entry.reasoning != null) 36 + (if (item.expanded) item.reasoning_height else @as(f32, 0)) else 4;
     }
@@ -413,8 +437,10 @@ pub const View = struct {
         self.disclosure_count += 1;
     }
 
-    pub fn draw(self: *View, engine: *c.SpicaText, renderer: *c.SDL_Renderer, x: f32, y: f32, width: f32, viewport_height: f32, scroll: *f32, follow_bottom: bool, metrics: theme.Metrics, palette: theme.Palette, light: bool) !void {
+    pub fn draw(self: *View, engine: *c.SpicaText, renderer: *c.SDL_Renderer, x: f32, y: f32, viewport_width: f32, viewport_height: f32, scroll: *f32, follow_bottom: bool, metrics: theme.Metrics, palette: theme.Palette, light: bool) !void {
+        const width = @max(1, viewport_width - scrollbar_gutter);
         self.wanted = null;
+        self.wanted_reasoning = false;
         self.disclosure_count = 0;
         self.draw_top = y;
         self.viewport_height = viewport_height;
@@ -462,6 +488,12 @@ pub const View = struct {
             scroll.* = if (follow_bottom) @max(0, self.height - viewport_height) else if (anchor < self.items.items.len) @max(0, self.items.items[anchor].top + offset) else 0;
         }
         self.viewport_scroll = scroll.*;
+        var previous_clip: c.SDL_Rect = undefined;
+        _ = c.SDL_GetRenderClipRect(renderer, &previous_clip);
+        var content_clip = previous_clip;
+        content_clip.w = @max(0, @min(previous_clip.x + previous_clip.w, @as(c_int, @intFromFloat(x + width))) - previous_clip.x);
+        _ = c.SDL_SetRenderClipRect(renderer, &content_clip);
+        defer _ = c.SDL_SetRenderClipRect(renderer, &previous_clip);
         var index = self.firstVisible(scroll.*);
         while (index < self.items.items.len and self.items.items[index].top <= scroll.* + viewport_height + 40) : (index = self.nextVisible(index)) {
             const item = &self.items.items[index];
@@ -471,8 +503,8 @@ pub const View = struct {
             const body_width = bodyWidth(item, width);
             if (item.entry.role == .user) {
                 const bubble_x = x + width * 0.2;
-                try widgets.panel(renderer, .{ .x = bubble_x, .y = top, .w = width * 0.8, .h = item.height - 16 }, 12, palette.raised);
-                body_x = bubble_x + 16;
+                try widgets.panel(renderer, .{ .x = bubble_x, .y = top, .w = width * 0.8, .h = item.height - item_gap }, 12, palette.raised);
+                body_x = bubble_x + body_padding;
             }
             if (item.activity_owner) |owner| {
                 const group = &self.items.items[owner];
@@ -523,7 +555,7 @@ pub const View = struct {
                 if ((visible_body or item.expanded) and !current(item)) {
                     self.wanted = index;
                     self.wanted_reasoning = false;
-                } else if (item.expanded and !currentReasoning(item)) {
+                } else if (item.expanded and item.entry.reasoning != null and !currentReasoning(item)) {
                     self.wanted = index;
                     self.wanted_reasoning = true;
                 }
@@ -546,22 +578,23 @@ pub const View = struct {
                     } else try self.caption(engine, renderer, "Formatting unavailable; source retained", body_x, body_y, body_width, 12, palette.error_color);
                 }
             } else if (visible_body or item.expanded) try self.caption(engine, renderer, if (item.failed) "Unable to load message; source retained" else "Loading…", body_x, top + self.bodyTop(index), body_width, 12, palette.muted);
-            if (!isTool(item) and item.entry.length != 0 and item.entry.timestamp > 0 and item.entry.timestamp <= std.math.maxInt(i64) / 1000000) {
+            if (hasTimestamp(item)) {
                 var date: c.SDL_DateTime = undefined;
                 if (c.SDL_TimeToDateTime(item.entry.timestamp * 1000000, &date, false)) {
                     var buffer: [64]u8 = undefined;
                     const stamp = std.fmt.bufPrint(&buffer, "{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} UTC", .{ date.year, @as(u32, @intCast(date.month)), @as(u32, @intCast(date.day)), @as(u32, @intCast(date.hour)), @as(u32, @intCast(date.minute)) }) catch unreachable;
-                    try self.caption(engine, renderer, stamp, body_x, top + item.height - 22, body_width, 10, palette.muted);
+                    try self.caption(engine, renderer, stamp, body_x, top + self.bodyTop(index) + item.body_height + footer_gap, body_width, 10, palette.muted);
                 }
             }
         }
         // Drawing can grow retained syntax-color scratch.
         try self.makeRoom(0, null);
+        _ = c.SDL_SetRenderClipRect(renderer, &previous_clip);
         if (self.height > viewport_height) {
-            const thumb_height = @max(24, viewport_height * viewport_height / self.height);
+            const thumb_height = @min(viewport_height, @max(24, viewport_height * viewport_height / self.height));
             const thumb_y = y + (viewport_height - thumb_height) * scroll.* / @max(1, self.height - viewport_height);
             _ = c.SDL_SetRenderDrawColor(renderer, palette.border.r, palette.border.g, palette.border.b, 255);
-            _ = c.SDL_RenderFillRect(renderer, &c.SDL_FRect{ .x = x + width - 3, .y = thumb_y, .w = 3, .h = thumb_height });
+            _ = c.SDL_RenderFillRect(renderer, &c.SDL_FRect{ .x = x + viewport_width - 3, .y = thumb_y, .w = 3, .h = thumb_height });
         }
     }
     fn chevron(_: *View, renderer: *c.SDL_Renderer, x: f32, y: f32, expanded: bool, color: theme.Color) !void {
@@ -605,3 +638,53 @@ pub const View = struct {
         if (!c.spica_text_layout_draw(engine, layout.?, x, y, .{ .r = color.r, .g = color.g, .b = color.b, .a = 255 })) return error.TextDraw;
     }
 };
+
+test "removing expanded reasoning preserves the answer across conversation updates" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(c.spica_image_install_sdl_allocator());
+    const surface = c.SDL_CreateSurface(640, 400, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const engine = c.spica_text_create(renderer, ".deps/install/fonts/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(engine);
+    const clip = c.SDL_Rect{ .x = 0, .y = 0, .w = 640, .h = 400 };
+    try std.testing.expect(c.SDL_SetRenderClipRect(renderer, &clip));
+    const theme_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "assets/theme.json", alloc, .limited(16384));
+    defer alloc.free(theme_bytes);
+    const appearance = try theme.parse(alloc, theme_bytes);
+    const md = @import("../content/markdown.zig");
+    const answer = "The answer is retained.";
+    const thought = "Earlier reasoning.";
+    const answer_id: storage.ContentId = @splat(1);
+    const thought_id: storage.ContentId = @splat(2);
+    const user_id: storage.ContentId = @splat(3);
+    for ([_]bool{ false, true }) |append_message| {
+        var view = View.init(alloc);
+        defer view.deinit();
+        var entries = [_]storage.ConversationEntry{
+            .{ .ordinal = 0, .role = .assistant, .content_id = answer_id, .length = answer.len, .reasoning = .{ .content_ref = thought_id, .length = thought.len } },
+            .{ .ordinal = 1, .role = .user, .content_id = user_id, .length = 12 },
+        };
+        try view.update(entries[0..1]);
+        try view.accept(renderer, .{ .generation = 1, .ordinal = 0, .document = try md.parse(alloc, answer_id, answer) });
+        view.toggle(.{ .ordinal = 0, .kind = .reasoning });
+        var scroll: f32 = 0;
+        try view.draw(engine, renderer, 0, 0, 640, 400, &scroll, false, appearance.metrics, appearance.dark, false);
+        const reasoning_request = view.request(2) orelse return error.MissingReasoningRequest;
+        try std.testing.expectEqual(thought_id, reasoning_request.content_id.?);
+        try view.accept(renderer, .{ .generation = 2, .ordinal = 0, .document = try md.parse(alloc, thought_id, thought) });
+        try view.draw(engine, renderer, 0, 0, 640, 400, &scroll, false, appearance.metrics, appearance.dark, false);
+        const expanded_height = view.items.items[0].height;
+        entries[0].reasoning = null;
+        try view.update(entries[0 .. if (append_message) @as(usize, 2) else 1]);
+        try view.draw(engine, renderer, 0, 0, 640, 400, &scroll, false, appearance.metrics, appearance.dark, false);
+        try std.testing.expect(view.items.items[0].height < expanded_height);
+        try std.testing.expect(std.mem.indexOf(u8, view.items.items[0].loaded.?.ready.document.text.items, answer) != null);
+        if (append_message) {
+            const next = view.request(3) orelse return error.MissingUserRequest;
+            try std.testing.expectEqual(user_id, next.content_id.?);
+            try std.testing.expectEqual(content.Role.user, next.role);
+        } else try std.testing.expectEqual(@as(?content.Request, null), view.request(3));
+    }
+}

@@ -14,11 +14,21 @@ const Paths = @import("platform/paths.zig").Paths;
 const fixture = @import("diagnostics/fixture.zig");
 const build_options = @import("build_options");
 const SessionCatalog = @import("core/catalog.zig");
+const Settings = @import("ui/settings.zig");
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
-const Action = union(enum) { start, new_thread, sidebar, open_thread: usize, send, stop, theme, mode, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
-const ThreadTarget = struct { path: [:0]u8, cwd: [:0]u8 };
+const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
+const ThreadTarget = struct { path: ?[:0]u8, cwd: [:0]u8 };
 const Button = struct { bounds: c.SDL_FRect, action: Action };
+
+fn folderChosen(userdata: ?*anyopaque, files: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = @intCast(@intFromPtr(userdata));
+    event.user.code = 1;
+    if (files == null) event.user.code = 2;
+    if (files != null and files[0] != null) event.user.data1 = c.SDL_strdup(files[0]);
+    if (!c.SDL_PushEvent(&event)) if (event.user.data1) |path| c.SDL_free(path);
+}
 
 pub const App = struct {
     window: *c.SDL_Window,
@@ -26,6 +36,7 @@ pub const App = struct {
     layout: Clay,
     text: *c.SpicaText,
     theme: theme_module.Theme,
+    base_metrics: theme_module.Metrics,
     editor: Composer,
     editor_layout: ?*c.SpicaTextLayout = null,
     editor_width: f32 = 0,
@@ -54,15 +65,21 @@ pub const App = struct {
     composer_bounds: c.SDL_FRect = undefined,
     thread_title: [128]u8 = undefined,
     thread_title_len: usize = 0,
+    chat_view: enum { new_thread, opening, existing } = .new_thread,
     run_started: ?u64 = null,
     run_base_revision: u64 = 0,
     run_elapsed: ?u64 = null,
-    bash_mode: bool = false,
+    appearance: Settings.Values = .{},
+    settings_open: bool = false,
+    projects: std.ArrayList([:0]u8) = .empty,
+    catalog_error: ?anyerror = null,
+    collapsed_folders: std.ArrayList([]u8) = .empty,
+    folder_pending: bool = false,
     behavior: pi.Behavior = .prompt,
     draft_revision: u64 = 0,
     submitted_prompt: ?struct { token: u64, draft_revision: u64 } = null,
     accepted_clear_revision: ?u64 = null,
-    buttons: [64]Button = undefined,
+    buttons: [256]Button = undefined,
     button_count: usize = 0,
     follow_bottom: bool = false,
     transcript: TranscriptView,
@@ -154,17 +171,42 @@ pub const App = struct {
         defer allocator.free(legacy_sessions);
         const catalog_worker = try SessionCatalog.Worker.create(io, environ, legacy_sessions, paths.database, wake_event);
         errdefer catalog_worker.destroy();
+        const saved = restored.value();
+        const appearance = Settings.Values{ .font_size = saved.font_size, .ui_scale = saved.ui_scale, .chat_width = saved.chat_width, .light = options.light or saved.light };
+        var projects: std.ArrayList([:0]u8) = .empty;
+        errdefer {
+            for (projects.items) |path| allocator.free(path);
+            projects.deinit(allocator);
+        }
+        {
+            const initial_project = try allocator.dupeZ(u8, project_path);
+            errdefer allocator.free(initial_project);
+            try projects.append(allocator, initial_project);
+        }
+        for (saved.projects) |path| {
+            var duplicate = false;
+            for (projects.items) |existing| if (std.mem.eql(u8, existing, path)) { duplicate = true; break; };
+            if (!duplicate and projects.items.len < 64) {
+                const owned = try allocator.dupeZ(u8, path);
+                errdefer allocator.free(owned);
+                try projects.append(allocator, owned);
+            }
+        }
         return .{
             .window = window,
             .renderer = renderer,
             .layout = layout,
             .text = text,
-            .theme = theme,
+            .theme = .{ .light = theme.light, .dark = theme.dark, .metrics = Settings.metrics(theme.metrics, appearance) },
+            .base_metrics = theme.metrics,
+            .appearance = appearance,
+            .projects = projects,
             .editor = editor,
             .copy_buffer = copy_buffer,
             .content = content,
             .draft_writer = draft_writer,
             .transcript = TranscriptView.init(allocator),
+            .chat_view = if (options.resume_file != null) .opening else .new_thread,
             .catalog_worker = catalog_worker,
             .paths = paths,
             .options = options,
@@ -188,7 +230,7 @@ pub const App = struct {
         if (self.catalog) |*catalog| catalog.deinit();
         if (self.resume_path) |path| self.allocator.free(path);
         if (self.pending_thread) |target| {
-            self.allocator.free(target.path);
+            if (target.path) |path| self.allocator.free(path);
             self.allocator.free(target.cwd);
         }
         _ = c.SDL_StopTextInput(self.window);
@@ -205,15 +247,19 @@ pub const App = struct {
         c.SDL_Quit();
         self.paths.deinit();
         self.allocator.free(self.project_path);
+        for (self.projects.items) |path| self.allocator.free(path);
+        self.projects.deinit(self.allocator);
+        for (self.collapsed_folders.items) |path| self.allocator.free(path);
+        self.collapsed_folders.deinit(self.allocator);
     }
 
-    fn palette(self: *App) theme_module.Palette {
+    pub fn palette(self: *App) theme_module.Palette {
         return if (self.light) self.theme.light else self.theme.dark;
     }
     fn rgba(color: theme_module.Color) c.SDL_Color {
         return .{ .r = color.r, .g = color.g, .b = color.b, .a = 255 };
     }
-    fn rectangle(self: *App, x: f32, y: f32, width: f32, height: f32, radius: f32, color: theme_module.Color) !void {
+    pub fn rectangle(self: *App, x: f32, y: f32, width: f32, height: f32, radius: f32, color: theme_module.Color) !void {
         try widgets.panel(self.renderer, .{ .x = x, .y = y, .w = width, .h = height }, radius, color);
     }
     fn labelLayout(self: *App, bytes: []const u8, size: c_uint) !*c.SpicaTextLayout {
@@ -237,7 +283,7 @@ pub const App = struct {
         return replacement.layout.?;
     }
 
-    fn label(self: *App, bytes: []const u8, x: f32, top: f32, size: c_uint, color: theme_module.Color) !void {
+    pub fn label(self: *App, bytes: []const u8, x: f32, top: f32, size: c_uint, color: theme_module.Color) !void {
         if (!c.spica_text_layout_draw(self.text, try self.labelLayout(bytes, size), x, top, rgba(color))) return error.LabelDraw;
     }
 
@@ -247,6 +293,7 @@ pub const App = struct {
     }
 
     fn fitLabel(self: *App, bytes: []const u8, x: f32, top: f32, width: f32, size: c_uint, color: theme_module.Color) !void {
+        if (width <= 0) return;
         const truncated = try self.labelWidth(bytes, size) > width;
         const suffix_width = if (truncated) try self.labelWidth("…", size) else 0;
         const clip = c.SDL_Rect{ .x = @intFromFloat(x), .y = @intFromFloat(top), .w = @intFromFloat(@max(0, width - suffix_width)), .h = @intCast(size + 8) };
@@ -258,6 +305,7 @@ pub const App = struct {
 
     fn title(self: *const App) []const u8 {
         if (self.options.fixture) return "Resource scene";
+        if (self.chat_view == .opening) return if (self.thread_title_len != 0) self.thread_title[0..self.thread_title_len] else "Opening chat...";
         if (self.runtime_snapshot) |snapshot| if (snapshot.session_name.len != 0) return clippedLabel(snapshot.session_name);
         return if (self.thread_title_len != 0) self.thread_title[0..self.thread_title_len] else "New thread";
     }
@@ -277,6 +325,11 @@ pub const App = struct {
 
     fn pumpContent(self: *App) !void {
         if (self.content_pending or self.minimized) return;
+        if (self.chat_view == .opening) {
+            if (self.pending_thread != null) return;
+            const snapshot = self.runtime_snapshot orelse return;
+            if (snapshot.visible_revision == 0) return;
+        }
         if (self.last_content_metadata) {
             if (self.transcript.request(self.generation + 1)) |request| {
                 self.generation += 1;
@@ -311,23 +364,55 @@ pub const App = struct {
         }
     }
 
+    fn addProject(self: *App, path: []const u8) !void {
+        for (self.projects.items) |existing| if (std.mem.eql(u8, existing, path)) return;
+        if (self.projects.items.len == 64) return error.ProjectLimitReached;
+        const owned = try self.allocator.dupeZ(u8, path);
+        errdefer self.allocator.free(owned);
+        try self.projects.append(self.allocator, owned);
+        self.draft_due = c.SDL_GetTicks() + 250;
+    }
+
+    fn newThreadIn(self: *App, path: []const u8) !void {
+        if (self.pending_thread != null or self.closing) return error.ThreadSwitchPending;
+        if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) return error.StopCurrentRunBeforeSwitchingThread;
+        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
+        var transferred = false;
+        errdefer if (!transferred) self.allocator.free(cwd);
+        var dir = try std.Io.Dir.cwd().openDir(self.io, cwd, .{});
+        dir.close(self.io);
+        if (self.projects.items.len < 64) try self.addProject(cwd);
+        try self.saveDraft();
+        if (self.runtime) |runtime| if (!runtime.isFinished()) try runtime.shutdown();
+        self.pending_thread = .{ .path = null, .cwd = cwd };
+        transferred = true;
+        try self.finishThreadSwitch();
+    }
+
     fn openThread(self: *App, index: usize) !void {
         const catalog = self.catalog orelse return;
         if (index >= catalog.threads.len or self.pending_thread != null) return;
         if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) return error.StopCurrentRunBeforeSwitchingThread;
         const thread = catalog.threads[index];
+        if (!thread.available) return error.SessionSourceUnavailable;
         if (self.runtime_snapshot) |snapshot| if (std.mem.eql(u8, snapshot.session_file, thread.path)) {
             self.follow_bottom = true;
             self.dirty = true;
             return;
         };
+        var transferred = false;
         const path = try self.allocator.dupeZ(u8, thread.path);
-        errdefer self.allocator.free(path);
+        errdefer if (!transferred) self.allocator.free(path);
         const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, thread.cwd, self.allocator);
-        errdefer self.allocator.free(cwd);
+        errdefer if (!transferred) self.allocator.free(cwd);
         try self.saveDraft();
         if (self.runtime) |runtime| if (!runtime.isFinished()) try runtime.shutdown();
         self.pending_thread = .{ .path = path, .cwd = cwd };
+        const name = clippedLabel(thread.title);
+        @memcpy(self.thread_title[0..name.len], name);
+        self.thread_title_len = name.len;
+        self.chat_view = .opening;
+        transferred = true;
         try self.finishThreadSwitch();
     }
 
@@ -335,11 +420,16 @@ pub const App = struct {
         const target = self.pending_thread orelse return;
         if (self.runtime) |runtime| if (!runtime.isFinished()) return;
         self.pending_thread = null;
+        if (!std.mem.eql(u8, self.project_path, target.cwd)) self.options.trust_project = false;
         self.allocator.free(self.project_path);
         self.project_path = target.cwd;
         if (self.resume_path) |path| self.allocator.free(path);
         self.resume_path = target.path;
         self.options.resume_file = target.path;
+        if (target.path == null) {
+            self.thread_title_len = 0;
+            self.chat_view = .new_thread;
+        } else self.chat_view = .opening;
         self.transcript.clear();
         self.scroll = 0;
         self.follow_bottom = true;
@@ -416,7 +506,16 @@ pub const App = struct {
             self.runtime_snapshot = incoming;
             const snapshot = &self.runtime_snapshot.?;
             if (session_changed or generation_changed) {
-                self.thread_title_len = 0;
+                if (self.chat_view != .opening) self.thread_title_len = 0;
+                if (snapshot.session_name.len == 0 and self.thread_title_len == 0) if (self.catalog) |catalog| {
+                    for (catalog.threads) |thread| {
+                        if (!std.mem.eql(u8, thread.path, snapshot.session_file)) continue;
+                        const name = clippedLabel(thread.title);
+                        @memcpy(self.thread_title[0..name.len], name);
+                        self.thread_title_len = name.len;
+                        break;
+                    }
+                };
                 self.run_started = null;
                 self.run_elapsed = null;
                 self.behavior = .prompt;
@@ -491,7 +590,7 @@ pub const App = struct {
         if (self.bashRunning()) return error.PiBusy;
         const text = self.editor.textBytes();
         if (text.len == 0) return;
-        if (self.thread_title_len == 0 and !self.bash_mode) {
+        if (self.thread_title_len == 0) {
             const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
             const first = std.mem.trim(u8, clippedLabel(text[0..end]), " \t\r");
             if (first.len != 0 and (self.runtime_snapshot == null or self.runtime_snapshot.?.session_name.len == 0)) try runtime.setSessionName(first);
@@ -502,14 +601,10 @@ pub const App = struct {
         self.run_base_revision = if (self.runtime_snapshot) |snapshot| snapshot.visible_revision else 0;
         self.run_elapsed = null;
         self.error_len = 0;
-        if (self.bash_mode) {
-            try runtime.bash(text);
-        } else {
-            if (self.submitted_prompt != null) return error.PromptAcknowledgementPending;
-            const behavior: pi.Behavior = if (self.runtimeStatus() == .ready) .prompt else if (self.behavior == .prompt) .follow_up else self.behavior;
-            const token = try runtime.sendPrompt(text, behavior);
-            self.submitted_prompt = .{ .token = token, .draft_revision = self.draft_revision };
-        }
+        if (self.submitted_prompt != null) return error.PromptAcknowledgementPending;
+        const behavior: pi.Behavior = if (self.runtimeStatus() == .ready) .prompt else if (self.behavior == .prompt) .follow_up else self.behavior;
+        const token = try runtime.sendPrompt(text, behavior);
+        self.submitted_prompt = .{ .token = token, .draft_revision = self.draft_revision };
         self.follow_bottom = true;
         self.dirty = true;
     }
@@ -517,10 +612,51 @@ pub const App = struct {
     fn act(self: *App, action: Action) !void {
         switch (action) {
             .start => try self.beginRuntime(),
-            .new_thread => {
-                if (self.runtime) |runtime| {
-                    if (runtime.isFinished()) try self.beginRuntime() else if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) return error.PiBusy else try runtime.newSession();
-                } else try self.beginRuntime();
+            .new_thread => try self.newThreadIn(self.project_path),
+            .new_project_thread => |index| {
+                if (index < self.projects.items.len) try self.newThreadIn(self.projects.items[index]);
+            },
+            .new_catalog_thread => |index| {
+                if (self.catalog) |catalog| if (index < catalog.folders.len) try self.newThreadIn(catalog.folders[index].cwd);
+            },
+            .toggle_folder => |index| {
+                if (self.catalog) |catalog| if (index < catalog.folders.len) {
+                    const path = catalog.folders[index].cwd;
+                    var found: ?usize = null;
+                    for (self.collapsed_folders.items, 0..) |folder, i| if (std.mem.eql(u8, path, folder)) { found = i; break; };
+                    if (found) |i| {
+                        self.allocator.free(self.collapsed_folders.orderedRemove(i));
+                    } else {
+                        const owned = try self.allocator.dupe(u8, path);
+                        errdefer self.allocator.free(owned);
+                        try self.collapsed_folders.append(self.allocator, owned);
+                    }
+                };
+            },
+            .add_project => if (!self.folder_pending) {
+                self.folder_pending = true;
+                c.SDL_ShowOpenFolderDialog(folderChosen, @ptrFromInt(self.wake_event), self.window, self.project_path.ptr, false);
+            },
+            .settings => {
+                self.settings_open = !self.settings_open;
+                self.model_menu = false;
+                self.thinking_menu = false;
+                self.focused_editor = !self.settings_open;
+                if (self.settings_open) _ = c.SDL_StopTextInput(self.window) else _ = c.SDL_StartTextInput(self.window);
+            },
+            .appearance => |choice| {
+                if (choice == .close) {
+                    self.settings_open = false;
+                    self.focused_editor = true;
+                    _ = c.SDL_StartTextInput(self.window);
+                } else {
+                    Settings.apply(&self.appearance, choice);
+                    self.light = self.appearance.light;
+                    self.theme.metrics = Settings.metrics(self.base_metrics, self.appearance);
+                    self.transcript.invalidateLayouts();
+                    self.editor_changed = true;
+                    self.draft_due = c.SDL_GetTicks() + 250;
+                }
             },
             .sidebar => self.sidebar_visible = !self.sidebar_visible,
             .open_thread => |index| try self.openThread(index),
@@ -530,9 +666,9 @@ pub const App = struct {
             },
             .theme => {
                 self.light = !self.light;
+                self.appearance.light = self.light;
                 self.draft_due = c.SDL_GetTicks() + 250;
             },
-            .mode => self.bash_mode = !self.bash_mode,
             .behavior => self.behavior = if (self.behavior == .steer) .follow_up else .steer,
             .latest => {
                 self.follow_bottom = true;
@@ -572,7 +708,7 @@ pub const App = struct {
         self.dirty = true;
     }
 
-    fn button(self: *App, action: Action, text: []const u8, bounds: c.SDL_FRect) !void {
+    pub fn button(self: *App, action: Action, text: []const u8, bounds: c.SDL_FRect) !void {
         if (self.button_count == self.buttons.len) return error.ButtonBudget;
         self.buttons[self.button_count] = .{ .action = action, .bounds = bounds };
         self.button_count += 1;
@@ -655,10 +791,14 @@ pub const App = struct {
             .ready => |catalog| {
                 if (self.catalog) |*old| old.deinit();
                 self.catalog = catalog;
-                self.sidebar_first = @min(self.sidebar_first, catalog.threads.len -| 1);
+                self.catalog_error = catalog.warning;
+                if (catalog.warning) |err| self.report("History discovery is incomplete", err);
                 self.dirty = true;
             },
-            .failure => |err| self.report("Discovering pi threads", err),
+            .failure => |err| {
+                self.catalog_error = err;
+                self.report("Discovering pi threads", err);
+            },
         };
         if (self.draft_writer.takeError()) |err| self.report("Draft could not be saved", err);
         if (self.content.take()) |result_value| {
@@ -690,6 +830,12 @@ pub const App = struct {
                         }
                     };
                     self.transcript.update(value.entries) catch |err| self.report("Updating conversation", err);
+                    if (self.pending_thread == null) if (self.runtime_snapshot) |snapshot| {
+                        if (self.chat_view == .opening and snapshot.visible_revision != 0 and
+                            std.mem.eql(u8, snapshot.session_file, self.options.resume_file orelse ""))
+                            self.chat_view = .existing;
+                        if (self.chat_view == .new_thread and value.entries.len != 0) self.chat_view = .existing;
+                    };
                     value.deinit();
                 },
                 .ready => |ready| self.transcript.accept(self.renderer, ready) catch |err| self.report("Rendering message", err),
@@ -700,7 +846,9 @@ pub const App = struct {
 
     fn saveDraft(self: *App) !void {
         const bytes = self.editor.textBytes();
-        try self.draft_writer.submit(.{ .draft = bytes, .light = self.light });
+        var projects: [64][]const u8 = undefined;
+        for (self.projects.items, 0..) |path, index| projects[index] = path;
+        try self.draft_writer.submit(.{ .draft = bytes, .light = self.light, .font_size = self.appearance.font_size, .ui_scale = self.appearance.ui_scale, .chat_width = self.appearance.chat_width, .projects = projects[0..self.projects.items.len] });
         self.draft_due = null;
     }
 
@@ -764,10 +912,149 @@ pub const App = struct {
         defer self.allocator.free(bytes);
         const next = try theme_module.parse(self.allocator, bytes);
         self.theme = next;
+        self.base_metrics = next.metrics;
+        self.theme.metrics = Settings.metrics(next.metrics, self.appearance);
         self.transcript.invalidateLayouts();
         self.editor_width = 0;
         self.error_len = 0;
         self.dirty = true;
+    }
+
+    fn currentSession(self: *const App) []const u8 {
+        if (self.pending_thread) |target| if (target.path) |path| return path;
+        if (self.chat_view == .opening) return self.options.resume_file orelse "";
+        if (self.runtime_snapshot) |snapshot| if (snapshot.session_file.len != 0) return snapshot.session_file;
+        return self.options.resume_file orelse "";
+    }
+
+    fn currentIndexed(self: *const App) bool {
+        const current = self.currentSession();
+        if (self.catalog) |catalog| for (catalog.threads) |thread| {
+            if (std.mem.eql(u8, current, thread.path)) return true;
+        };
+        return false;
+    }
+
+    fn indexedFolder(self: *const App, path: []const u8) bool {
+        if (self.catalog) |catalog| for (catalog.folders) |folder| {
+            if (std.mem.eql(u8, path, folder.cwd)) return true;
+        };
+        return false;
+    }
+
+    fn savedFolder(self: *const App, path: []const u8) bool {
+        for (self.projects.items) |project| if (std.mem.eql(u8, project, path)) return true;
+        return false;
+    }
+
+    fn folderCollapsed(self: *const App, path: []const u8) bool {
+        for (self.collapsed_folders.items) |folder| if (std.mem.eql(u8, folder, path)) return true;
+        return false;
+    }
+
+    fn sidebarRows(self: *const App) usize {
+        var rows: usize = 0;
+        if (self.catalog) |catalog| for (catalog.folders) |folder| {
+            rows += if (self.folderCollapsed(folder.cwd)) 1 else folder.row_count;
+        };
+        for (self.projects.items) |path| if (!self.indexedFolder(path)) { rows += 1; };
+        if (!self.indexedFolder(self.project_path) and !self.savedFolder(self.project_path)) rows += 1;
+        if (!self.currentIndexed()) rows += 1;
+        return rows;
+    }
+
+    fn sidebarRowY(self: *const App, row: usize, height: f32) ?f32 {
+        if (row < self.sidebar_first) return null;
+        const y = 144 + @as(f32, @floatFromInt(row - self.sidebar_first)) * 38;
+        return if (y + 36 <= height - 56) y else null;
+    }
+
+    fn drawFolderRow(self: *App, path: []const u8, action: Action, browse: ?Action, row: usize, height: f32) !void {
+        const y = self.sidebarRowY(row, height) orelse return;
+        const colors = self.palette();
+        const width = self.shell.sidebar.width;
+        const active = std.mem.eql(u8, path, self.project_path);
+        try widgets.icon(self.renderer, .folder, .{ .x = 20, .y = y + 10, .w = 14, .h = 14 }, if (active) colors.accent else colors.muted);
+        // Browsing only expands/collapses; the separate plus creates a thread.
+        if (browse) |choice| try self.hit(choice, .{ .x = 10, .y = y, .w = width - 52, .h = 34 });
+        const name = std.fs.path.basename(path);
+        try self.fitLabel(clippedLabel(if (name.len == 0) path else name), 42, y + 9, width - 86, 13, colors.text);
+        try self.iconButton(action, .plus, .{ .x = width - 42, .y = y + 2, .w = 30, .h = 30 }, colors.muted);
+    }
+
+    fn drawCurrentRow(self: *App, row: usize, height: f32) !void {
+        const y = self.sidebarRowY(row, height) orelse return;
+        const width = self.shell.sidebar.width;
+        const colors = self.palette();
+        try self.rectangle(28, y, width - 40, 34, 6, colors.raised);
+        try self.hit(.latest, .{ .x = 28, .y = y, .w = width - 40, .h = 34 });
+        try self.fitLabel(clippedLabel(self.title()), 40, y + 9, width - 64, 13, colors.accent);
+    }
+
+    fn drawSidebar(self: *App, height: f32) !void {
+        const colors = self.palette();
+        const width = self.shell.sidebar.width;
+        try self.rectangle(0, 0, width, height, 0, colors.panel);
+        try self.rectangle(width - 1, 0, 1, height, 0, colors.border);
+        try self.iconButton(.sidebar, .sidebar, .{ .x = 12, .y = 9, .w = 30, .h = 30 }, colors.muted);
+        try self.label("Spica", 50, 17, 15, colors.text);
+        try self.button(.new_thread, "New thread", .{ .x = 12, .y = 54, .w = width - 24, .h = 34 });
+        try self.flatButton(.add_project, "+ Add folder", .{ .x = 12, .y = 96, .w = width - 24, .h = 30 });
+        if (self.catalog == null or self.catalog_error != null or self.catalog.?.threads.len == 0) {
+            const status = if (self.catalog_error != null) "History incomplete · Ctrl+R" else if (self.catalog == null) "Loading previous chats..." else "No previous chats found";
+            try self.fitLabel(status, 20, 128, width - 40, 11, colors.muted);
+        }
+        const visible: usize = @intFromFloat(@max(1, @floor((height - 198) / 38)));
+        self.sidebar_first = @min(self.sidebar_first, self.sidebarRows() -| visible);
+        const current_missing = !self.currentIndexed();
+        var row: usize = 0;
+        for (self.projects.items, 0..) |path, project_index| {
+            if (self.indexedFolder(path) or !std.mem.eql(u8, path, self.project_path)) continue;
+            try self.drawFolderRow(path, .{ .new_project_thread = project_index }, null, row, height);
+            row += 1;
+            if (current_missing and std.mem.eql(u8, path, self.project_path)) {
+                try self.drawCurrentRow(row, height);
+                row += 1;
+            }
+        }
+        if (!self.indexedFolder(self.project_path) and !self.savedFolder(self.project_path)) {
+            try self.drawFolderRow(self.project_path, .new_thread, null, row, height);
+            row += 1;
+            if (current_missing) {
+                try self.drawCurrentRow(row, height);
+                row += 1;
+            }
+        }
+        if (self.catalog) |catalog| for (catalog.folders, 0..) |folder, folder_index| {
+            try self.drawFolderRow(folder.cwd, .{ .new_catalog_thread = folder_index }, .{ .toggle_folder = folder_index }, row, height);
+            row += 1;
+            if (current_missing and std.mem.eql(u8, folder.cwd, self.project_path)) {
+                try self.drawCurrentRow(row, height);
+                row += 1;
+            }
+            if (self.folderCollapsed(folder.cwd)) continue;
+            const count = folder.row_count - 1;
+            // Decode/draw/hit-test only the visible slice, not every session.
+            const first = @min(count, self.sidebar_first -| row);
+            const end = @min(count, (self.sidebar_first + visible) -| row);
+            for (catalog.rows[folder.first_row + 1 + first .. folder.first_row + 1 + end], first..) |item, offset| {
+                const index = item.thread;
+                const thread = catalog.threads[index];
+                const y = self.sidebarRowY(row + offset, height) orelse continue;
+                const active = std.mem.eql(u8, self.currentSession(), thread.path);
+                if (active) try self.rectangle(28, y, width - 40, 34, 6, colors.raised);
+                try self.hit(.{ .open_thread = index }, .{ .x = 28, .y = y, .w = width - 40, .h = 34 });
+                try self.fitLabel(clippedLabel(thread.title), 40, y + 9, width - 64, 13, if (active) colors.accent else if (thread.available) colors.text else colors.muted);
+            }
+            row += count;
+        };
+        for (self.projects.items, 0..) |path, project_index| {
+            if (self.indexedFolder(path) or std.mem.eql(u8, path, self.project_path)) continue;
+            try self.drawFolderRow(path, .{ .new_project_thread = project_index }, null, row, height);
+            row += 1;
+        }
+        try self.rectangle(12, height - 50, width - 24, 1, 0, colors.border);
+        try self.flatButton(.settings, "Settings", .{ .x = 12, .y = height - 42, .w = width - 24, .h = 32 });
     }
 
     fn paint(self: *App) !void {
@@ -775,52 +1062,32 @@ pub const App = struct {
         var width: c_int = 1280;
         var height: c_int = 800;
         _ = c.SDL_GetWindowSize(self.window, &width, &height);
-        if (!c.SDL_SetRenderLogicalPresentation(self.renderer, width, height, c.SDL_LOGICAL_PRESENTATION_STRETCH)) return error.LogicalPresentation;
+        const scale = @as(f32, @floatFromInt(self.appearance.ui_scale)) / 100;
         var pixel_width: c_int = width;
         var pixel_height: c_int = height;
         if (!c.SDL_GetRenderOutputSize(self.renderer, &pixel_width, &pixel_height)) return error.RenderOutputSize;
-        if (!c.spica_text_set_render_scale(self.text, @as(f32, @floatFromInt(pixel_width)) / @as(f32, @floatFromInt(width)), @as(f32, @floatFromInt(pixel_height)) / @as(f32, @floatFromInt(height)))) return error.TextRenderScale;
+        const scale_x = @as(f32, @floatFromInt(pixel_width)) / @as(f32, @floatFromInt(width)) * scale;
+        const scale_y = @as(f32, @floatFromInt(pixel_height)) / @as(f32, @floatFromInt(height)) * scale;
+        if (!c.SDL_SetRenderLogicalPresentation(self.renderer, 0, 0, c.SDL_LOGICAL_PRESENTATION_DISABLED) or
+            !c.SDL_SetRenderScale(self.renderer, scale_x, scale_y)) return error.RenderScale;
+        if (!c.spica_text_set_render_scale(self.text, scale_x, scale_y)) return error.TextRenderScale;
+        width = @intFromFloat(@as(f32, @floatFromInt(width)) / scale);
+        height = @intFromFloat(@as(f32, @floatFromInt(height)) / scale);
         self.layout.resize(@floatFromInt(width), @floatFromInt(height));
         const colors = self.palette();
-        self.shell = self.layout.shell(if (self.sidebar_visible) @min(self.theme.metrics.sidebar_width, @as(f32, @floatFromInt(width)) * 0.28) else 0, self.theme.metrics.header_height, 202);
-        const sidebar = self.shell.sidebar;
+        self.shell = self.layout.shell(if (self.sidebar_visible) @min(268, @as(f32, @floatFromInt(width)) * 0.34) else 0, self.theme.metrics.header_height, @min(202, @as(f32, @floatFromInt(height)) * 0.4));
         const header = self.shell.header;
         const conversation = self.shell.conversation;
-        const project = clippedLabel(std.fs.path.basename(self.project_path));
-        try self.rectangle(0, 0, @floatFromInt(width), @floatFromInt(height), 0, colors.canvas);
-        if (self.sidebar_visible) {
-            try self.rectangle(sidebar.x, sidebar.y, sidebar.width, sidebar.height, 0, colors.panel);
-            try self.iconButton(.sidebar, .sidebar, .{ .x = 12, .y = 9, .w = 30, .h = 30 }, colors.muted);
-            try self.label("Spica", 50, 17, 15, colors.text);
-            try self.iconButton(.new_thread, .plus, .{ .x = sidebar.width - 42, .y = 9, .w = 30, .h = 30 }, colors.muted);
-            try widgets.icon(self.renderer, .folder, .{ .x = 22, .y = 84, .w = 14, .h = 14 }, colors.muted);
-            try self.label("All projects", 46, 84, 13, colors.muted);
-            try self.rectangle(10, 112, sidebar.width - 20, 66, 7, colors.raised);
-            try self.hit(.latest, .{ .x = 10, .y = 112, .w = sidebar.width - 20, .h = 66 });
-            try self.fitLabel(clippedLabel(self.title()), 22, 125, sidebar.width - 44, 13, colors.text);
-            try self.fitLabel(project, 22, 151, sidebar.width - 44, 11, colors.muted);
-            if (self.catalog) |catalog| {
-                const sidebar_clip = c.SDL_Rect{ .x = 10, .y = 188, .w = @intFromFloat(sidebar.width - 20), .h = @max(0, height - 244) };
-                _ = c.SDL_SetRenderClipRect(self.renderer, &sidebar_clip);
-                var row_y: f32 = 188;
-                var index = self.sidebar_first;
-                while (index < catalog.threads.len and row_y + 58 <= @as(f32, @floatFromInt(height)) - 56) : (index += 1) {
-                    const thread = catalog.threads[index];
-                    const selected = if (self.runtime_snapshot) |snapshot| std.mem.eql(u8, snapshot.session_file, thread.path) else false;
-                    if (selected) try self.rectangle(10, row_y, sidebar.width - 20, 54, 6, colors.raised);
-                    try self.hit(.{ .open_thread = index }, .{ .x = 10, .y = row_y, .w = sidebar.width - 20, .h = 54 });
-                    try self.fitLabel(clippedLabel(thread.title), 22, row_y + 8, sidebar.width - 44, 13, colors.text);
-                    try self.fitLabel(clippedLabel(thread.cwd), 22, row_y + 32, sidebar.width - 44, 10, colors.muted);
-                    row_y += 58;
-                }
-                _ = c.SDL_SetRenderClipRect(self.renderer, null);
-            }
-            try self.iconButton(.theme, .theme, .{ .x = 12, .y = @as(f32, @floatFromInt(height)) - 42, .w = 30, .h = 30 }, colors.muted);
-        } else try self.iconButton(.sidebar, .sidebar, .{ .x = header.x + 12, .y = 7, .w = 30, .h = 30 }, colors.muted);
+        const displayed_project = if (self.pending_thread) |target| target.cwd else self.project_path;
+        const project = clippedLabel(std.fs.path.basename(displayed_project));
+        if (!c.SDL_SetRenderDrawColor(self.renderer, colors.canvas.r, colors.canvas.g, colors.canvas.b, 255) or
+            !c.SDL_RenderClear(self.renderer)) return error.ClearFrame;
+        if (self.sidebar_visible) try self.drawSidebar(@floatFromInt(height)) else try self.iconButton(.sidebar, .sidebar, .{ .x = header.x + 12, .y = 7, .w = 30, .h = 30 }, colors.muted);
         const crumb_x = header.x + (if (self.sidebar_visible) @as(f32, 22) else 52);
         try widgets.icon(self.renderer, .folder, .{ .x = crumb_x, .y = 15, .w = 14, .h = 14 }, colors.accent);
-        try self.label(project, crumb_x + 24, 15, 13, colors.text);
-        const title_x = crumb_x + 40 + try self.labelWidth(project, 13);
+        const project_width = @min(try self.labelWidth(project, 13), header.width * 0.32);
+        try self.fitLabel(project, crumb_x + 24, 15, project_width, 13, colors.text);
+        const title_x = crumb_x + 40 + project_width;
         try self.label("/", title_x, 15, 13, colors.muted);
         try self.fitLabel(clippedLabel(self.title()), title_x + 20, 15, @max(0, header.x + header.width - 158 - title_x), 13, colors.muted);
         const state: []const u8 = if (self.options.fixture) "Resource scene" else switch (self.runtimeStatus()) {
@@ -836,17 +1103,31 @@ pub const App = struct {
         try self.label(state, header.x + header.width - 138, 16, 11, if (self.runtimeStatus() == .failed) colors.error_color else if (self.runtimeStatus() == .streaming) colors.accent else colors.muted);
         if (!self.options.fixture and self.pending_thread == null and (self.runtime == null or self.runtime.?.isFinished())) try self.button(.start, "Retry", .{ .x = header.x + header.width - 86, .y = 8, .w = 68, .h = 28 });
 
-        const content_width = @min(self.theme.metrics.chat_max_width, conversation.width - 64);
+        const content_width = @max(160, @min(self.theme.metrics.chat_max_width, conversation.width - 40));
         const content_x = conversation.x + (conversation.width - content_width) / 2;
-        const body_top = conversation.y + 24;
-        const viewport_height = conversation.height - 34;
+        const body_top = conversation.y + 20;
+        const viewport_height = @max(24, conversation.height - 56);
         const clip = c.SDL_Rect{ .x = @intFromFloat(content_x), .y = @intFromFloat(body_top), .w = @intFromFloat(content_width), .h = @intFromFloat(viewport_height) };
         _ = c.SDL_SetRenderClipRect(self.renderer, &clip);
-        try self.transcript.draw(self.text, self.renderer, content_x, body_top, content_width, viewport_height, &self.scroll, self.follow_bottom, self.theme.metrics, colors, self.light);
-        for (self.transcript.disclosures[0..self.transcript.disclosure_count]) |disclosure| try self.hit(.{ .disclosure = disclosure.toggle }, disclosure.bounds);
+        if (self.chat_view != .opening) {
+            try self.transcript.draw(self.text, self.renderer, content_x, body_top, content_width, viewport_height, &self.scroll, self.follow_bottom, self.theme.metrics, colors, self.light);
+            for (self.transcript.disclosures[0..self.transcript.disclosure_count]) |disclosure| try self.hit(.{ .disclosure = disclosure.toggle }, disclosure.bounds);
+        }
         _ = c.SDL_SetRenderClipRect(self.renderer, null);
+        if (!self.options.fixture and (self.chat_view == .opening or
+            (self.transcript.items.items.len == 0 and !self.content_pending and !self.conversation_dirty and self.runtimeStatus() == .ready)))
+        {
+            const empty_y = body_top + @min(96, viewport_height * 0.2);
+            try self.label(if (self.chat_view == .opening) self.title() else if (self.chat_view == .existing) "No messages in this chat" else "New thread", content_x + 16, empty_y, @intFromFloat(self.theme.metrics.body_px + 5), colors.text);
+            try self.fitLabel(clippedLabel(displayed_project), content_x + 16, empty_y + 38, content_width - 32, 13, colors.muted);
+            const description = if (self.chat_view == .opening)
+                (if (self.runtimeStatus() == .failed) "Unable to open chat." else "Opening chat...")
+            else if (self.chat_view == .existing) "This saved chat has no messages."
+            else "Describe what you want to build or change.";
+            try self.fitLabel(description, content_x + 16, empty_y + 64, content_width - 32, 13, colors.muted);
+        }
         if (!self.follow_bottom and self.transcript.height > viewport_height) try self.flatButton(.latest, "Jump to latest", .{ .x = content_x + content_width - 128, .y = conversation.y + conversation.height - 33, .w = 128, .h = 28 });
-        self.composer_bounds = .{ .x = content_x, .y = @as(f32, @floatFromInt(height)) - 194, .w = content_width, .h = 144 };
+        self.composer_bounds = .{ .x = content_x, .y = self.shell.composer.y + 8, .w = content_width, .h = @min(144, self.shell.composer.height - 44) };
         const composer = self.composer_bounds;
         const fill = theme_module.Color{
             .r = @intCast((@as(u16, colors.canvas.r) * 3 + colors.raised.r) / 4),
@@ -855,9 +1136,9 @@ pub const App = struct {
         };
         try self.rectangle(composer.x, composer.y, composer.w, composer.h, 14, colors.border);
         try self.rectangle(composer.x + 1, composer.y + 1, composer.w - 2, composer.h - 2, 13, fill);
-        self.editor_bounds = .{ .x = composer.x + 4, .y = composer.y + 4, .w = composer.w - 8, .h = 92 };
+        self.editor_bounds = .{ .x = composer.x + 4, .y = composer.y + 4, .w = composer.w - 8, .h = composer.h - 52 };
         try self.drawEditor();
-        const controls_y = composer.y + 104;
+        const controls_y = composer.y + composer.h - 40;
         var model_name: []const u8 = "Select model";
         if (self.runtime_snapshot) |snapshot| {
             if (snapshot.model.len != 0) model_name = snapshot.model;
@@ -866,7 +1147,7 @@ pub const App = struct {
                 break;
             };
         }
-        const model_width = @min(220, try self.labelWidth(clippedLabel(model_name), 13) + 34);
+        const model_width = @min(@min(220, composer.w * 0.43), try self.labelWidth(clippedLabel(model_name), 13) + 34);
         self.model_bounds = .{ .x = composer.x + 8, .y = controls_y, .w = model_width, .h = 30 };
         try self.flatButton(.models, model_name, self.model_bounds);
         try widgets.icon(self.renderer, .chevron_down, .{ .x = self.model_bounds.x + model_width - 19, .y = controls_y + 9, .w = 12, .h = 12 }, colors.muted);
@@ -878,9 +1159,9 @@ pub const App = struct {
         }
         if (!self.options.fixture) {
             const mode_x = self.thinking_bounds.x + (if (thinking.len == 0) @as(f32, 0) else 84);
-            if (!self.bash_mode and self.runtimeStatus() == .streaming) {
+            if (self.runtimeStatus() == .streaming and mode_x + 100 < composer.x + composer.w - 48) {
                 try self.flatButton(.behavior, if (self.behavior == .steer) "Steer" else "Follow-up", .{ .x = mode_x, .y = controls_y, .w = 96, .h = 30 });
-            } else try self.flatButton(.mode, if (self.bash_mode) "Bash" else "Prompt", .{ .x = mode_x, .y = controls_y, .w = 70, .h = 30 });
+            }
             const send_bounds = c.SDL_FRect{ .x = composer.x + composer.w - 44, .y = controls_y, .w = 32, .h = 32 };
             const working = self.runtimeStatus() == .streaming or self.bashRunning();
             try self.rectangle(send_bounds.x, send_bounds.y, send_bounds.w, send_bounds.h, 16, if (self.runtime == null) colors.raised else colors.accent);
@@ -888,7 +1169,7 @@ pub const App = struct {
         }
         try widgets.icon(self.renderer, .folder, .{ .x = composer.x + 2, .y = composer.y + composer.h + 13, .w = 12, .h = 12 }, colors.muted);
         try self.label("Local checkout", composer.x + 22, composer.y + composer.h + 13, 11, colors.muted);
-        try self.label(project, composer.x + composer.w - try self.labelWidth(project, 11), composer.y + composer.h + 13, 11, colors.muted);
+        try self.fitLabel(project, composer.x + 130, composer.y + composer.h + 13, @max(0, composer.w - 130), 11, colors.muted);
         if (self.error_len != 0) {
             try self.fitLabel(clippedLabel(self.error_text[0..self.error_len]), composer.x, composer.y - 25, composer.w, 12, colors.error_color);
         } else if (self.runtime_snapshot) |snapshot| {
@@ -901,6 +1182,10 @@ pub const App = struct {
             }
         }
         try self.drawOverlays();
+        if (self.settings_open) {
+            self.button_count = 0;
+            try Settings.draw(self);
+        }
         if (!self.captured and self.options.capture != null and self.transcript.wanted == null and !self.content_pending and !self.conversation_dirty and (if (self.options.fixture) self.transcript.items.items.len != 0 else self.runtimeStatus() == .ready)) {
             const surface = c.SDL_RenderReadPixels(self.renderer, null) orelse return error.ScreenCapture;
             defer c.SDL_DestroySurface(surface);
@@ -924,13 +1209,20 @@ pub const App = struct {
         try self.ensureEditorLayout(bounds.w);
         const clip = c.SDL_Rect{ .x = @intFromFloat(bounds.x + 8), .y = @intFromFloat(bounds.y + 8), .w = @intFromFloat(bounds.w - 16), .h = @intFromFloat(bounds.h - 16) };
         _ = c.SDL_SetRenderClipRect(self.renderer, &clip);
+        defer _ = c.SDL_SetRenderClipRect(self.renderer, null);
+        var caret: c.SDL_FRect = undefined;
+        var has_caret = false;
         if (self.editor_layout) |layout| {
-            var caret: c.SDL_FRect = undefined;
-            if (c.spica_text_layout_caret(layout, self.editor.caret - self.editor_start, &caret)) {
+            has_caret = c.spica_text_layout_caret(layout, self.editor.caret - self.editor_start, &caret);
+            if (has_caret) {
                 self.editor_scroll = @max(0, @min(self.editor_scroll, caret.y));
                 if (caret.y + caret.h > self.editor_scroll + bounds.h - 20) self.editor_scroll = caret.y + caret.h - (bounds.h - 20);
-                if (self.focused_editor and self.editor.len != 0) try self.rectangle(bounds.x + 12 + caret.x, bounds.y + 10 + caret.y - self.editor_scroll, 1, caret.h, 0, colors.text);
-                const input_area = c.SDL_Rect{ .x = @intFromFloat(bounds.x + 12 + caret.x), .y = @intFromFloat(bounds.y + 10 + caret.y - self.editor_scroll), .w = 1, .h = @intFromFloat(caret.h) };
+                var input_x: f32 = 0;
+                var input_y: f32 = 0;
+                var input_bottom: f32 = 0;
+                if (!c.SDL_RenderCoordinatesToWindow(self.renderer, bounds.x + 12 + caret.x, bounds.y + 10 + caret.y - self.editor_scroll, &input_x, &input_y) or
+                    !c.SDL_RenderCoordinatesToWindow(self.renderer, bounds.x + 12 + caret.x, bounds.y + 10 + caret.y - self.editor_scroll + caret.h, null, &input_bottom)) return error.InputCoordinates;
+                const input_area = c.SDL_Rect{ .x = @intFromFloat(input_x), .y = @intFromFloat(input_y), .w = 2, .h = @intFromFloat(@max(1, input_bottom - input_y)) };
                 _ = c.SDL_SetTextInputArea(self.window, &input_area, 0);
             }
             const selected = self.editor.selection();
@@ -947,10 +1239,10 @@ pub const App = struct {
                 if (!c.SDL_SetRenderDrawBlendMode(self.renderer, c.SDL_BLENDMODE_BLEND) or !c.SDL_SetRenderDrawColor(self.renderer, colors.accent.r, colors.accent.g, colors.accent.b, 60) or !c.SDL_RenderFillRects(self.renderer, &rects, @intCast(count))) return error.SelectionDraw;
             }
             if (!c.spica_text_layout_draw(self.text, layout, bounds.x + 12, bounds.y + 10 - self.editor_scroll, rgba(colors.text))) return error.EditorDraw;
-            if (self.editor.len == 0) try self.label(if (self.bash_mode) "Run a command" else "Ask for changes or send a follow-up", bounds.x + 12, bounds.y + 10, 15, colors.muted);
+            if (self.editor.len == 0) try self.label("Ask for changes or send a follow-up", bounds.x + 12, bounds.y + 10, @intFromFloat(self.theme.metrics.body_px), colors.muted);
         }
         if (self.preedit.items.len != 0) try self.label(clippedLabel(self.preedit.items), bounds.x + 12, bounds.y + 66, 15, colors.accent);
-        _ = c.SDL_SetRenderClipRect(self.renderer, null);
+        if (self.focused_editor and has_caret) try self.rectangle(bounds.x + 12 + caret.x, bounds.y + 10 + caret.y - self.editor_scroll, 2, caret.h, 0, colors.text);
     }
 
     fn retainOwnedProcessOnError(self: *App) void {
@@ -1025,8 +1317,26 @@ pub const App = struct {
         if (!c.SDL_SetClipboardText(@ptrCast(self.copy_buffer.ptr))) return error.ClipboardWrite;
     }
 
-    fn handle(self: *App, event: *const c.SDL_Event) !void {
+    fn handle(self: *App, incoming: *const c.SDL_Event) !void {
+        var logical = incoming.*;
+        if (!c.SDL_ConvertEventToRenderCoordinates(self.renderer, &logical)) return error.InputCoordinates;
+        const event = &logical;
         if (event.type == self.wake_event) {
+            if (event.user.code == 2) {
+                self.folder_pending = false;
+                return error.FolderPickerUnavailable;
+            }
+            if (event.user.code == 1) {
+                self.folder_pending = false;
+                if (event.user.data1) |path| {
+                    defer c.SDL_free(path);
+                    const chosen = std.mem.span(@as([*:0]const u8, @ptrCast(path)));
+                    const canonical = try std.Io.Dir.cwd().realPathFileAlloc(self.io, chosen, self.allocator);
+                    defer self.allocator.free(canonical);
+                    try self.addProject(canonical);
+                }
+                self.dirty = true;
+            }
             self.consume();
             return;
         }
@@ -1040,15 +1350,18 @@ pub const App = struct {
                 self.requestConversation();
             },
             c.SDL_EVENT_MOUSE_WHEEL => {
+                if ((c.SDL_GetModState() & (c.SDL_KMOD_CTRL | c.SDL_KMOD_GUI)) != 0 and event.wheel.y != 0) {
+                    const direction = event.wheel.y * (if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) @as(f32, -1) else 1);
+                    try self.act(.{ .appearance = if (direction > 0) .scale_larger else .scale_smaller });
+                    return;
+                }
+                if (self.settings_open) return;
                 if (self.model_menu) {
                     const last = if (self.runtime_snapshot) |snapshot| snapshot.models.len -| 1 else 0;
                     self.model_first = if (event.wheel.y > 0) self.model_first -| 1 else @min(last, self.model_first + 1);
                 } else if (!self.closing) {
-                    var mouse_x: f32 = 0;
-                    var mouse_y: f32 = 0;
-                    _ = c.SDL_GetMouseState(&mouse_x, &mouse_y);
-                    if (self.sidebar_visible and mouse_x < self.shell.sidebar.width) {
-                        const last = if (self.catalog) |catalog| catalog.threads.len -| 1 else 0;
+                    if (self.sidebar_visible and event.wheel.mouse_x < self.shell.sidebar.width) {
+                        const last = self.sidebarRows() -| 1;
                         self.sidebar_first = if (event.wheel.y > 0) self.sidebar_first -| 1 else @min(last, self.sidebar_first + 1);
                     } else {
                         self.follow_bottom = false;
@@ -1069,7 +1382,7 @@ pub const App = struct {
                         return;
                     }
                 }
-                if (self.closing or self.force_dialog) return;
+                if (self.closing or self.force_dialog or self.settings_open) return;
                 if (self.model_menu or self.thinking_menu) {
                     self.model_menu = false;
                     self.thinking_menu = false;
@@ -1087,7 +1400,7 @@ pub const App = struct {
                 self.dirty = true;
             },
             c.SDL_EVENT_MOUSE_BUTTON_UP => self.dragging = false,
-            c.SDL_EVENT_MOUSE_MOTION => if (self.dragging) {
+            c.SDL_EVENT_MOUSE_MOTION => if (self.dragging and !self.settings_open) {
                 if (self.editor_layout) |layout| self.editor.setCaret(self.editor_start + c.spica_text_layout_hit_test(layout, event.motion.x - self.editor_bounds.x - 12, event.motion.y - self.editor_bounds.y - 10 + self.editor_scroll), true);
                 self.dirty = true;
             },
@@ -1100,6 +1413,39 @@ pub const App = struct {
                 }
                 if (self.closing or self.force_dialog) {
                     if (event.key.key == c.SDLK_ESCAPE) try self.act(.wait);
+                    return;
+                }
+                if (command) {
+                    switch (event.key.key) {
+                        c.SDLK_PLUS, c.SDLK_EQUALS, c.SDLK_KP_PLUS => {
+                            try self.act(.{ .appearance = .scale_larger });
+                            return;
+                        },
+                        c.SDLK_MINUS, c.SDLK_UNDERSCORE, c.SDLK_KP_MINUS => {
+                            try self.act(.{ .appearance = .scale_smaller });
+                            return;
+                        },
+                        c.SDLK_0, c.SDLK_KP_0 => {
+                            try self.act(.{ .appearance = .scale_reset });
+                            return;
+                        },
+                        else => {},
+                    }
+                }
+                if (command and event.key.key == c.SDLK_COMMA) {
+                    try self.act(.settings);
+                    return;
+                }
+                if (self.settings_open) {
+                    if (event.key.key == c.SDLK_ESCAPE) try self.act(.{ .appearance = .close });
+                    return;
+                }
+                if (command and event.key.key == c.SDLK_N) {
+                    try self.act(.new_thread);
+                    return;
+                }
+                if (command and event.key.key == c.SDLK_B) {
+                    try self.act(.sidebar);
                     return;
                 }
                 if (self.thinking_menu) {
@@ -1130,10 +1476,6 @@ pub const App = struct {
                     try self.act(.start);
                     return;
                 }
-                if (command and event.key.key == c.SDLK_B and !self.options.fixture) {
-                    try self.act(.mode);
-                    return;
-                }
                 if (command and event.key.key == c.SDLK_M and !self.options.fixture) {
                     try self.act(.models);
                     return;
@@ -1162,6 +1504,7 @@ pub const App = struct {
                 }
                 if (command and event.key.key == c.SDLK_L) {
                     self.light = !self.light;
+                    self.appearance.light = self.light;
                     self.dirty = true;
                     self.draft_due = c.SDL_GetTicks() + 250;
                     return;
@@ -1220,6 +1563,14 @@ pub const App = struct {
                             self.editor.moveWord(.forward, shift);
                             self.dirty = true;
                         },
+                        c.SDLK_BACKSPACE => {
+                            try self.editor.deleteWord(.backward);
+                            self.edited();
+                        },
+                        c.SDLK_DELETE => {
+                            try self.editor.deleteWord(.forward);
+                            self.edited();
+                        },
                         else => {},
                     }
                 } else switch (event.key.key) {
@@ -1249,13 +1600,13 @@ pub const App = struct {
                 }
             },
             c.SDL_EVENT_TEXT_INPUT => {
-                if (!self.focused_editor or self.model_menu or self.closing) return;
+                if (!self.focused_editor or self.model_menu or self.thinking_menu or self.settings_open or self.closing) return;
                 try self.editor.insert(std.mem.span(event.text.text), if (self.preedit.items.len != 0) .ime else .typing);
                 self.preedit.clearRetainingCapacity();
                 self.edited();
             },
             c.SDL_EVENT_TEXT_EDITING => {
-                if (!self.focused_editor or self.model_menu or self.closing) return;
+                if (!self.focused_editor or self.model_menu or self.thinking_menu or self.settings_open or self.closing) return;
                 const bytes = std.mem.span(event.edit.text);
                 if (bytes.len > 4096) return error.PreeditBudgetExceeded;
                 self.preedit.clearRetainingCapacity();

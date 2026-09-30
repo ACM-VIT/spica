@@ -57,14 +57,20 @@ pub const help =
     \\Keep the checkout's .deps and assets directories; rebuild after moving the checkout.
     \\Project resources may run code: --trust-project opts in; --no-project-resources opts out.
     \\
-    \\The sidebar discovers existing pi threads across project folders and legacy Spica sessions.
-    \\Select a thread to resume it in its own folder; + creates a new session without deleting history.
+    \\The sidebar lists previous chats directly, grouped by their original project folders.
+    \\Click a chat to reopen it; folder headers only expand/collapse their chat list.
+    \\Add folder saves a folder chosen in the native browser; it does not create a chat.
+    \\A folder's + creates a thread there; New thread / Ctrl+N uses the current folder.
+    \\Reopening keeps the selected chat title visible while its history loads.
+    \\SQLite indexes sessions and retains imported content; pi files remain resume sources.
+    \\Indexed chats remain listed outside discovery roots; unavailable sources report an error.
     \\New sessions use pi's normal configured storage, shared with the pi CLI.
     \\Stop active work before switching threads. Ctrl+P retries a failed pi startup.
+    \\Switching to another folder disables trusted project resources for that runtime.
     \\The first prompt's first line names an unnamed pi session; explicit resume keeps it.
     \\Enter sends; Shift+Enter inserts a newline; Ctrl+Enter also sends.
     \\While running, input is a follow-up; click that control to choose steering instead.
-    \\Ctrl+B switches Prompt/Bash; Ctrl+M opens actual configured models.
+    \\The composer only sends prompts, never direct shell commands. Ctrl+M opens configured models.
     \\Thinking choices come from pi; each assistant's Reasoning disclosure keeps its answer visible.
     \\Prompts use bubbles; answers stay plain. Timestamps are source times in UTC, not estimated durations.
     \\File reads, changes and commands collapse into activity summaries; failed calls remain visible.
@@ -77,8 +83,15 @@ pub const help =
     \\If pi will not exit, Force requires an explicit choice (also Ctrl+Shift+Esc).
     \\Wheel and PageUp/PageDown scroll the full conversation, including previous prompts.
     \\Scrolling upward stops auto-follow; Jump to latest or clicking the current thread resumes it.
-    \\The sidebar has its own wheel scroll. Ctrl+L switches light/dark; Ctrl+R reloads theme/history.
+    \\The sidebar has its own wheel scroll. Ctrl+B hides/shows it; Ctrl+R reloads theme/history.
+    \\Settings / Ctrl+, opens appearance: text 12–24px, UI scale 75–175%, reading width 560–1120px.
+    \\Dark/light themes, appearance values, and added folders persist across restarts.
+    \\UI scale changes layout and hit targets; text rasterizes at native output DPI.
+    \\Ctrl+Plus/Minus or Ctrl+wheel zooms; Ctrl+0 resets UI scale to 100%.
+    \\Ctrl+L also switches dark/light. Settings has Reset and Done; Escape closes it.
     \\Composer supports Unicode multiline editing, selection, undo and durable drafts.
+    \\Ctrl+Left/Right moves by word; add Shift to select. Ctrl+Backspace/Delete removes a word.
+    \\Home/End moves to visual line edges; Ctrl+Home/End moves to document edges.
     \\
     \\Resource scene: disk-backed Markdown, code, tables, mixed scripts, and PNG.
     \\No pi process is launched by the resource scene; there is no prompt replay.

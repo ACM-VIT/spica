@@ -138,8 +138,8 @@ pub const Composer = struct {
         self.move(direction, extend, false);
     }
 
-    /// Moves by Unicode word-segmentation boundaries (including punctuation
-    /// and whitespace segments), filtered through grapheme boundaries.
+    /// Moves to the next word start or previous word start, treating whitespace
+    /// as a separator rather than a separate stop. Punctuation remains segmented.
     pub fn moveWord(self: *Composer, direction: Direction, extend: bool) void {
         self.move(direction, extend, true);
     }
@@ -150,15 +150,39 @@ pub const Composer = struct {
             self.setCaret(if (direction == .backward) range.start else range.end, false);
             return;
         }
-        const breaks = if (word) self.storage.words[0..self.len] else self.storage.graphemes[0..self.len];
-        var at = if (direction == .backward) edit.previousBoundary(breaks, self.caret) else edit.nextBoundary(breaks, self.caret);
-        if (word) {
-            const graphemes = self.storage.graphemes[0..self.len];
-            while (!edit.isBoundary(graphemes, at)) {
-                at = if (direction == .backward) edit.previousBoundary(breaks, at) else edit.nextBoundary(breaks, at);
-            }
-        }
+        const at = if (word) self.wordBoundary(direction) else if (direction == .backward)
+            edit.previousBoundary(self.storage.graphemes[0..self.len], self.caret)
+        else
+            edit.nextBoundary(self.storage.graphemes[0..self.len], self.caret);
         self.setCaret(at, extend);
+    }
+
+    fn wordSegmentBoundary(self: *const Composer, direction: Direction, offset: usize) usize {
+        const words = self.storage.words[0..self.len];
+        const graphemes = self.storage.graphemes[0..self.len];
+        var at = if (direction == .backward) edit.previousBoundary(words, offset) else edit.nextBoundary(words, offset);
+        while (!edit.isBoundary(graphemes, at)) {
+            at = if (direction == .backward) edit.previousBoundary(words, at) else edit.nextBoundary(words, at);
+        }
+        return at;
+    }
+
+    fn wordBoundary(self: *const Composer, direction: Direction) usize {
+        const text = self.textBytes();
+        const graphemes = self.storage.graphemes[0..self.len];
+        var at = self.caret;
+        if (direction == .forward) {
+            if (at < self.len and !edit.whitespaceAt(text, at)) at = self.wordSegmentBoundary(.forward, at);
+            while (at < self.len and edit.whitespaceAt(text, at)) at = edit.nextBoundary(graphemes, at);
+        } else {
+            while (at > 0) {
+                const previous = edit.previousBoundary(graphemes, at);
+                if (!edit.whitespaceAt(text, previous)) break;
+                at = previous;
+            }
+            if (at > 0) at = self.wordSegmentBoundary(.backward, at);
+        }
+        return at;
     }
 
     pub fn insert(self: *Composer, bytes: []const u8, kind: GroupKind) !void {
@@ -175,6 +199,15 @@ pub const Composer = struct {
     pub fn deleteForward(self: *Composer) !void {
         var range = self.selection();
         if (range.start == range.end) range.end = edit.nextBoundary(self.storage.graphemes[0..self.len], self.caret);
+        try self.replace(range, "", .paste);
+    }
+
+    pub fn deleteWord(self: *Composer, direction: Direction) !void {
+        var range = self.selection();
+        if (range.start == range.end) {
+            const at = self.wordBoundary(direction);
+            if (direction == .backward) range.start = at else range.end = at;
+        }
         try self.replace(range, "", .paste);
     }
 
@@ -507,7 +540,7 @@ test "contiguous typing groups while paste and IME commits are atomic" {
     try expectText(&composer, "e\u{301}\ntwo\nlines日本語");
 }
 
-test "logical bidi copy and Unicode word movement preserve complete clusters" {
+test "logical bidi copy and grapheme selection preserve complete clusters" {
     var composer = try Composer.init(std.testing.allocator);
     defer composer.deinit();
     const text = "hello שלום e\u{301}世界";
@@ -515,17 +548,67 @@ test "logical bidi copy and Unicode word movement preserve complete clusters" {
     composer.selectAll();
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings(text, try composer.copySelection(&buffer));
-    composer.setCaret(0, false);
-    composer.moveWord(.forward, false);
-    try std.testing.expectEqual(@as(usize, 5), composer.caret);
-    composer.moveWord(.forward, false);
-    try std.testing.expectEqual(@as(usize, 6), composer.caret);
-    composer.moveWord(.forward, true);
-    try std.testing.expectEqualStrings("שלום", try composer.copySelection(&buffer));
     composer.setCaret("hello שלום e".len, false);
     try std.testing.expectEqual(@as(usize, "hello שלום ".len), composer.caret);
     composer.moveGrapheme(.forward, true);
     try std.testing.expectEqualStrings("e\u{301}", try composer.copySelection(&buffer));
+}
+
+test "word movement skips Unicode whitespace without splitting combining or emoji clusters" {
+    var composer = try Composer.init(std.testing.allocator);
+    defer composer.deinit();
+    const prefix = "\t\u{a0}";
+    const text = prefix ++ "e\u{301}  שלום\n👩‍💻\u{3000}";
+    try composer.setText(text);
+    composer.setCaret(0, false);
+    composer.moveWord(.forward, false);
+    try std.testing.expectEqual(@as(usize, prefix.len), composer.caret);
+    composer.moveWord(.forward, true);
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("e\u{301}  ", try composer.copySelection(&buffer));
+    composer.moveWord(.forward, false);
+    try std.testing.expectEqual(@as(usize, (prefix ++ "e\u{301}  ").len), composer.caret);
+    composer.setCaret(text.len, false);
+    composer.moveWord(.backward, true);
+    try std.testing.expectEqualStrings("👩‍💻\u{3000}", try composer.copySelection(&buffer));
+    composer.moveWord(.backward, true);
+    try std.testing.expectEqualStrings("שלום\n👩‍💻\u{3000}", try composer.copySelection(&buffer));
+    composer.setCaret(0, false);
+    composer.moveWord(.backward, true);
+    try std.testing.expectEqual(@as(usize, 0), composer.caret);
+}
+
+test "word deletion restores Unicode text and reversed selections on undo" {
+    var composer = try Composer.init(std.testing.allocator);
+    defer composer.deinit();
+    const text = "e\u{301} \t👩‍💻\nשלום";
+    const word_end = "e\u{301} \t".len;
+    try composer.setText(text);
+    composer.setCaret(0, false);
+    try composer.deleteWord(.forward);
+    try expectText(&composer, "👩‍💻\nשלום");
+    try std.testing.expect(composer.undo());
+    try expectText(&composer, text);
+    try std.testing.expectEqual(@as(usize, 0), composer.caret);
+    composer.setCaret(word_end, false);
+    try composer.deleteWord(.backward);
+    try expectText(&composer, "👩‍💻\nשלום");
+    try std.testing.expect(composer.undo());
+    try std.testing.expectEqual(@as(usize, word_end), composer.caret);
+    composer.setCaret(text.len, false);
+    composer.moveWord(.backward, true);
+    const before = composer.selection();
+    try composer.deleteWord(.forward);
+    try expectText(&composer, "e\u{301} \t👩‍💻\n");
+    try std.testing.expect(composer.undo());
+    try expectText(&composer, text);
+    try std.testing.expectEqual(before.start, composer.caret);
+    try std.testing.expectEqual(before.end, composer.anchor);
+    try std.testing.expect(composer.redo());
+    try expectText(&composer, "e\u{301} \t👩‍💻\n");
+    composer.setCaret(0, false);
+    try composer.deleteWord(.backward);
+    try expectText(&composer, "e\u{301} \t👩‍💻\n");
 }
 
 test "rejected UTF8 and byte limits leave document selection and undo intact" {

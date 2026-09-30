@@ -3,6 +3,7 @@ test {
     _ = @import("core/store_test.zig");
     _ = @import("core/catalog.zig");
     _ = @import("ui/theme.zig");
+    _ = @import("ui/transcript.zig");
     _ = @import("text/edit.zig");
     _ = @import("text/composer.zig");
     _ = @import("native/markdown_test.zig");
