@@ -461,7 +461,6 @@ pub const View = struct {
             self.reflow();
             scroll.* = if (follow_bottom) @max(0, self.height - viewport_height) else if (anchor < self.items.items.len) @max(0, self.items.items[anchor].top + offset) else 0;
         }
-        try self.makeRoom(0, null);
         self.viewport_scroll = scroll.*;
         var index = self.firstVisible(scroll.*);
         while (index < self.items.items.len and self.items.items[index].top <= scroll.* + viewport_height + 40) : (index = self.nextVisible(index)) {
@@ -556,6 +555,8 @@ pub const View = struct {
                 }
             }
         }
+        // Drawing can grow retained syntax-color scratch.
+        try self.makeRoom(0, null);
         if (self.height > viewport_height) {
             const thumb_height = @max(24, viewport_height * viewport_height / self.height);
             const thumb_y = y + (viewport_height - thumb_height) * scroll.* / @max(1, self.height - viewport_height);
