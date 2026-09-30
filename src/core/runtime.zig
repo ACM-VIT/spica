@@ -892,6 +892,11 @@ pub const Runtime = struct {
             self.stop_requested = false;
             self.state.status = .streaming;
             try self.replace(&self.state.error_message, "");
+        } else if (std.mem.eql(u8, ty, "agent_end")) {
+            // A completed run can immediately yield to queued work. Ask Pi for
+            // authoritative activity instead of leaving streaming latched or
+            // prematurely enabling thread switches.
+            if (!self.closing) try self.requestState();
         } else if (std.mem.eql(u8, ty, "agent_settled")) {
             self.state.status = if (self.closing) .stopping else .ready;
             if (!self.closing) try self.requestState();
@@ -1226,3 +1231,37 @@ const Sink = struct {
         };
     }
 };
+
+test "completed agents reconcile idle state without unlocking queued active work" {
+    const allocator = std.testing.allocator;
+    const mutex = native.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer native.SDL_DestroyMutex(mutex);
+    var runtime: Runtime = .{
+        .allocator = allocator,
+        .io = undefined,
+        .options = .{ .database_path = "", .project_path = "", .node_path = "", .pi_entrypoint = "", .wake_event = native.SDL_EVENT_USER },
+        .options_arena = undefined,
+        .mutex = mutex,
+        .wake = undefined,
+        .state = try copySnapshot(allocator, .{ .allocator = allocator, .status = .streaming }),
+    };
+    defer runtime.state.deinit();
+    defer if (runtime.snapshot) |*snapshot| snapshot.deinit();
+    defer runtime.outgoing.deinit(allocator);
+    const events = [_][]const u8{
+        \\{"type":"agent_end","messages":[]}
+        ,
+        \\{"type":"response","command":"get_state","id":1,"success":true,"data":{"isStreaming":true}}
+        ,
+        \\{"type":"agent_end","messages":[]}
+        ,
+        \\{"type":"response","command":"get_state","id":1,"success":true,"data":{"isStreaming":false}}
+        ,
+    };
+    for (events, 0..) |bytes, index| {
+        const parsed = try std.json.parseFromSlice(Value, allocator, bytes, .{});
+        defer parsed.deinit();
+        try runtime.event(parsed.value, @splat(0));
+        try std.testing.expectEqual(if (index == events.len - 1) Status.ready else Status.streaming, runtime.snapshot.?.status);
+    }
+}

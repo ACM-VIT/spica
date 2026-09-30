@@ -75,6 +75,7 @@ pub const help =
     \\Search waits for a complete ranking before allowing Open, Archive/Restore, or paging.
     \\New sessions use pi's normal configured storage, shared with the pi CLI.
     \\Stop active work before switching threads. Ctrl+P retries a failed pi startup.
+    \\Agent completion refreshes Pi's activity state; queued active work still blocks thread switching.
     \\Switching to another folder disables trusted project resources for that runtime.
     \\The first prompt's first line names an unnamed pi session; explicit resume keeps it.
     \\Enter sends; Shift+Enter inserts a newline; Ctrl+Enter also sends.
