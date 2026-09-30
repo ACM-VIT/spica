@@ -66,17 +66,23 @@ pub const help =
     \\While running, input is a follow-up; click that control to choose steering instead.
     \\Ctrl+B switches Prompt/Bash; Ctrl+M opens actual configured models.
     \\Thinking choices come from pi; each assistant's Reasoning disclosure keeps its answer visible.
+    \\Prompts use bubbles; answers stay plain. Timestamps are source times in UTC, not estimated durations.
+    \\File reads, changes and commands collapse into activity summaries; failed calls remain visible.
+    \\Expand an activity group, then a named tool to read its output; reasoning has its own disclosure.
+    \\Collapsed output is not decoded or shaped. Decoded text, metadata and thumbnails share a 16 MiB cache.
+    \\Offscreen entries are evicted first; text layouts and glyphs have separate hard budgets.
     \\Ctrl+. clears queues and aborts agent/Bash work. Close requests graceful shutdown.
     \\Cancelled queue text stays on disk; an empty editor recovers one cancelled message.
     \\Large multiline tool output uses visible text segments, not an unbounded layout.
     \\If pi will not exit, Force requires an explicit choice (also Ctrl+Shift+Esc).
     \\Wheel and PageUp/PageDown scroll the full conversation, including previous prompts.
-    \\Scrolling upward stops auto-follow; scrolling to the bottom or clicking the current thread resumes it.
+    \\Scrolling upward stops auto-follow; Jump to latest or clicking the current thread resumes it.
     \\The sidebar has its own wheel scroll. Ctrl+L switches light/dark; Ctrl+R reloads theme/history.
     \\Composer supports Unicode multiline editing, selection, undo and durable drafts.
     \\
     \\Resource scene: disk-backed Markdown, code, tables, mixed scripts, and PNG.
     \\No pi process is launched by the resource scene; there is no prompt replay.
     \\External Linux baseline: tools/measure_process.py --pid PID --label LABEL --output FILE
+    \\Measure the desktop and its pi/Node child separately; the desktop RSS is not total application cost.
     \\
 ;

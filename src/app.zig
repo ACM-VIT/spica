@@ -16,7 +16,7 @@ const build_options = @import("build_options");
 const SessionCatalog = @import("core/catalog.zig");
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
-const Action = union(enum) { start, new_thread, sidebar, open_thread: usize, send, stop, theme, mode, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, reasoning: usize, force_stop, wait };
+const Action = union(enum) { start, new_thread, sidebar, open_thread: usize, send, stop, theme, mode, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
 const ThreadTarget = struct { path: [:0]u8, cwd: [:0]u8 };
 const Button = struct { bounds: c.SDL_FRect, action: Action };
 
@@ -552,8 +552,8 @@ pub const App = struct {
                 try (self.runtime orelse return error.PiNotReady).setThinkingLevel(snapshot.thinking_levels[index]);
                 self.thinking_menu = false;
             },
-            .reasoning => |ordinal| {
-                self.transcript.toggle(ordinal);
+            .disclosure => |target| {
+                self.transcript.toggle(target);
                 self.follow_bottom = false;
             },
             .select_model => |index| {
@@ -822,7 +822,18 @@ pub const App = struct {
         try self.label(project, crumb_x + 24, 15, 13, colors.text);
         const title_x = crumb_x + 40 + try self.labelWidth(project, 13);
         try self.label("/", title_x, 15, 13, colors.muted);
-        try self.fitLabel(clippedLabel(self.title()), title_x + 20, 15, @max(0, header.x + header.width - 110 - title_x), 13, colors.muted);
+        try self.fitLabel(clippedLabel(self.title()), title_x + 20, 15, @max(0, header.x + header.width - 158 - title_x), 13, colors.muted);
+        const state: []const u8 = if (self.options.fixture) "Resource scene" else switch (self.runtimeStatus()) {
+            .starting => "Starting pi",
+            .ready => if (self.bashRunning()) "Running Bash" else "Ready",
+            .streaming => "Working",
+            .stopping => "Stopping",
+            .needs_force_stop => "Needs Force",
+            .failed => "Pi failed",
+            .exited => "Pi exited",
+            .stopped => "Stopped",
+        };
+        try self.label(state, header.x + header.width - 138, 16, 11, if (self.runtimeStatus() == .failed) colors.error_color else if (self.runtimeStatus() == .streaming) colors.accent else colors.muted);
         if (!self.options.fixture and self.pending_thread == null and (self.runtime == null or self.runtime.?.isFinished())) try self.button(.start, "Retry", .{ .x = header.x + header.width - 86, .y = 8, .w = 68, .h = 28 });
 
         const content_width = @min(self.theme.metrics.chat_max_width, conversation.width - 64);
@@ -832,8 +843,9 @@ pub const App = struct {
         const clip = c.SDL_Rect{ .x = @intFromFloat(content_x), .y = @intFromFloat(body_top), .w = @intFromFloat(content_width), .h = @intFromFloat(viewport_height) };
         _ = c.SDL_SetRenderClipRect(self.renderer, &clip);
         try self.transcript.draw(self.text, self.renderer, content_x, body_top, content_width, viewport_height, &self.scroll, self.follow_bottom, self.theme.metrics, colors, self.light);
-        for (self.transcript.disclosures[0..self.transcript.disclosure_count]) |disclosure| try self.hit(.{ .reasoning = disclosure.ordinal }, disclosure.bounds);
+        for (self.transcript.disclosures[0..self.transcript.disclosure_count]) |disclosure| try self.hit(.{ .disclosure = disclosure.toggle }, disclosure.bounds);
         _ = c.SDL_SetRenderClipRect(self.renderer, null);
+        if (!self.follow_bottom and self.transcript.height > viewport_height) try self.flatButton(.latest, "Jump to latest", .{ .x = content_x + content_width - 128, .y = conversation.y + conversation.height - 33, .w = 128, .h = 28 });
         self.composer_bounds = .{ .x = content_x, .y = @as(f32, @floatFromInt(height)) - 194, .w = content_width, .h = 144 };
         const composer = self.composer_bounds;
         const fill = theme_module.Color{
@@ -880,7 +892,13 @@ pub const App = struct {
         if (self.error_len != 0) {
             try self.fitLabel(clippedLabel(self.error_text[0..self.error_len]), composer.x, composer.y - 25, composer.w, 12, colors.error_color);
         } else if (self.runtime_snapshot) |snapshot| {
-            if (snapshot.attention.len != 0) try self.fitLabel(clippedLabel(snapshot.attention), composer.x, composer.y - 25, composer.w, 12, colors.muted);
+            if (snapshot.attention.len != 0) {
+                try self.fitLabel(clippedLabel(snapshot.attention), composer.x, composer.y - 25, composer.w, 12, colors.muted);
+            } else if (snapshot.status == .streaming or self.bashRunning()) {
+                var buffer: [128]u8 = undefined;
+                const progress = std.fmt.bufPrint(&buffer, "{s}{s}{d} queued", .{ if (self.bashRunning()) "Running Bash" else "Working", " · ", snapshot.queued_count }) catch unreachable;
+                try self.fitLabel(progress, composer.x, composer.y - 25, composer.w - 140, 12, colors.accent);
+            }
         }
         try self.drawOverlays();
         if (!self.captured and self.options.capture != null and self.transcript.wanted == null and !self.content_pending and !self.conversation_dirty and (if (self.options.fixture) self.transcript.items.items.len != 0 else self.runtimeStatus() == .ready)) {
