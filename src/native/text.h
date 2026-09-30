@@ -34,6 +34,14 @@ bool spica_text_set_monospace(SpicaText *engine, const char *font_path);
 bool spica_text_add_fallback(SpicaText *engine, const char *font_path, long face_index);
 void spica_text_destroy(SpicaText *engine);
 bool spica_text_get_stats(const SpicaText *engine, SpicaTextStats *out);
+/* Logical-coordinate-to-output-pixel factors, independently per axis. Default
+ * 1/1; use output pixels / logical presentation dimensions for SDL STRETCH.
+ * Call when the renderer output scale changes, before drawing. Factors must
+ * be finite and in (0,4]; textures are evicted, retained layouts and all caret /
+ * hit-test / selection coordinates stay unchanged. Rasterization uses device
+ * sizes at 26.6 precision; antialiased ink origins snap to output-pixel edges.
+ * Intended for a zero-origin SDL viewport / STRETCH logical presentation. */
+bool spica_text_set_render_scale(SpicaText *engine, float scale_x, float scale_y);
 /* Compatibility labels: 15 px, y is baseline. Prefer retained layouts. */
 bool spica_text_draw(SpicaText *engine, const char *utf8, size_t length,
                      float x, float baseline, SDL_Color color);
@@ -64,4 +72,12 @@ bool spica_text_layout_draw_colors(SpicaText *engine, const SpicaTextLayout *lay
  * Ligature interior carets are distributed across constituent graphemes. */
 size_t spica_text_layout_hit_test(const SpicaTextLayout *layout, float x, float y);
 bool spica_text_layout_caret(const SpicaTextLayout *layout, size_t byte_offset, SDL_FRect *out);
+/* Allocation-free visual spans for a logical [start_byte,end_byte) selection.
+ * Partial graphemes expand to caret edges; ligatures use distributed interior
+ * carets. Adjacent spans merge per line; bidi gaps stay separate; tabs count,
+ * newline-only ranges have no ink span. Rectangles are logical, layout-relative.
+ * Returns total required count, writing at most capacity entries; NULL out is
+ * a count-only query. Invalid/empty ranges return zero, end clamps to length. */
+size_t spica_text_layout_selection_rects(const SpicaTextLayout *layout,
+    size_t start_byte, size_t end_byte, SDL_FRect *out, size_t capacity);
 #endif

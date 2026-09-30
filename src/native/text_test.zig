@@ -101,3 +101,205 @@ test "glyph cache eviction preserves an older retained layout's rendered pixels"
         try std.testing.expectEqualSlices(u8, lhs[a .. a + bytes], rhs[b .. b + bytes]);
     }
 }
+
+fn expectSamePixels(a: *c.SDL_Surface, b: *c.SDL_Surface) !void {
+    try std.testing.expectEqual(a.w, b.w);
+    try std.testing.expectEqual(a.h, b.h);
+    const lhs: [*]const u8 = @ptrCast(a.pixels orelse return error.Pixels);
+    const rhs: [*]const u8 = @ptrCast(b.pixels orelse return error.Pixels);
+    for (0..@as(usize, @intCast(a.h))) |row| {
+        const start_a = row * @as(usize, @intCast(a.pitch));
+        const start_b = row * @as(usize, @intCast(b.pitch));
+        const bytes = @as(usize, @intCast(a.w)) * 4;
+        try std.testing.expectEqualSlices(u8, lhs[start_a .. start_a + bytes], rhs[start_b .. start_b + bytes]);
+    }
+}
+
+test "fractional logical origins preserve pixel-aligned antialiased glyph ink" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const layout = c.spica_text_layout_create(f.engine, "H", 1, 90, 15, false) orelse return error.Layout;
+    defer c.spica_text_layout_release(layout);
+    try f.clear();
+    try std.testing.expect(c.spica_text_layout_draw(f.engine, layout, 5, 4, white));
+    const aligned: *c.SDL_Surface = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
+    defer c.SDL_DestroySurface(aligned);
+    try f.clear();
+    try std.testing.expect(c.spica_text_layout_draw(f.engine, layout, 5.2, 4.2, white));
+    const fractional: *c.SDL_Surface = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
+    defer c.SDL_DestroySurface(fractional);
+    try expectSamePixels(aligned, fractional);
+    const bytes: [*]const u8 = @ptrCast(aligned.pixels orelse return error.Pixels);
+    var antialiased = false;
+    for (0..@as(usize, @intCast(aligned.h))) |row| {
+        for (0..@as(usize, @intCast(aligned.w))) |column| {
+            const pixel: *align(1) const u32 = @ptrCast(bytes + row * @as(usize, @intCast(aligned.pitch)) + column * 4);
+            var red: u8 = 0;
+            var green: u8 = 0;
+            var blue: u8 = 0;
+            var alpha: u8 = 0;
+            c.SDL_GetRGBA(pixel.*, c.SDL_GetPixelFormatDetails(aligned.format), null, &red, &green, &blue, &alpha);
+            if (red > 0 and red < 255) antialiased = true;
+        }
+    }
+    try std.testing.expect(antialiased);
+}
+
+test "DPR transitions rebuild raster pixels without changing wrapping or logical carets" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const source = "office a\u{301} xyz\nmore";
+    const retained = c.spica_text_layout_create(f.engine, source, source.len, 90, 15, false) orelse return error.Layout;
+    defer c.spica_text_layout_release(retained);
+    try f.clear();
+    try std.testing.expect(c.spica_text_layout_draw(f.engine, retained, 5, 4, white));
+    const original = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
+    defer c.SDL_DestroySurface(original);
+    for ([_]f32{ 1.5, 2, 1 }) |scale| {
+        try std.testing.expect(c.SDL_SetRenderScale(f.renderer, scale, scale));
+        try std.testing.expect(c.spica_text_set_render_scale(f.engine, scale, scale));
+        var stats: c.SpicaTextStats = undefined;
+        try std.testing.expect(c.spica_text_get_stats(f.engine, &stats));
+        try std.testing.expectEqual(@as(usize, 0), stats.glyph_bytes);
+        const fresh = c.spica_text_layout_create(f.engine, source, source.len, 90, 15, false) orelse return error.Layout;
+        defer c.spica_text_layout_release(fresh);
+        const count = c.spica_text_layout_line_count(retained);
+        try std.testing.expectEqual(count, c.spica_text_layout_line_count(fresh));
+        for (0..count) |index| {
+            var before: c.SpicaTextLine = undefined;
+            var after: c.SpicaTextLine = undefined;
+            try std.testing.expect(c.spica_text_layout_line(retained, index, &before));
+            try std.testing.expect(c.spica_text_layout_line(fresh, index, &after));
+            try std.testing.expectEqual(before.byte_start, after.byte_start);
+            try std.testing.expectEqual(before.byte_end, after.byte_end);
+            try std.testing.expectEqual(before.width, after.width);
+            try std.testing.expectEqual(before.y, after.y);
+            try std.testing.expectEqual(before.height, after.height);
+        }
+        for (0..source.len + 1) |byte| {
+            var before: c.SDL_FRect = undefined;
+            var after: c.SDL_FRect = undefined;
+            try std.testing.expect(c.spica_text_layout_caret(retained, byte, &before));
+            try std.testing.expect(c.spica_text_layout_caret(fresh, byte, &after));
+            try std.testing.expectEqual(before.x, after.x);
+            try std.testing.expectEqual(before.y, after.y);
+            try std.testing.expectEqual(before.h, after.h);
+        }
+        try f.clear();
+        try std.testing.expect(c.spica_text_layout_draw(f.engine, retained, 5, 4, white));
+        const old_pixels = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
+        defer c.SDL_DestroySurface(old_pixels);
+        try f.clear();
+        try std.testing.expect(c.spica_text_layout_draw(f.engine, fresh, 5, 4, white));
+        const new_pixels = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
+        defer c.SDL_DestroySurface(new_pixels);
+        try expectSamePixels(old_pixels, new_pixels);
+        if (scale == 1) try expectSamePixels(original, old_pixels);
+    }
+}
+
+test "bitmap color ZWJ emoji and adjacent flag have distinct logical advances" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const font = "/usr/share/fonts/noto/NotoColorEmoji.ttf";
+    const io = c.SDL_IOFromFile(font, "rb") orelse return error.SkipZigTest;
+    _ = c.SDL_CloseIO(io);
+    try std.testing.expect(c.spica_text_add_fallback(f.engine, font, 0));
+    const woman = "👩‍💻";
+    const flag = "🇮🇳";
+    const source = woman ++ flag;
+    const first = c.spica_text_layout_create(f.engine, woman, woman.len, 200, 15, false) orelse return error.Layout;
+    defer c.spica_text_layout_release(first);
+    const second = c.spica_text_layout_create(f.engine, flag, flag.len, 200, 15, false) orelse return error.Layout;
+    defer c.spica_text_layout_release(second);
+    const joined = c.spica_text_layout_create(f.engine, source, source.len, 200, 15, false) orelse return error.Layout;
+    defer c.spica_text_layout_release(joined);
+    var a: c.SpicaTextLine = undefined;
+    var b: c.SpicaTextLine = undefined;
+    var together: c.SpicaTextLine = undefined;
+    try std.testing.expect(c.spica_text_layout_line(first, 0, &a));
+    try std.testing.expect(c.spica_text_layout_line(second, 0, &b));
+    try std.testing.expect(c.spica_text_layout_line(joined, 0, &together));
+    try std.testing.expect(a.width > 7.5 and a.width < 30);
+    try std.testing.expect(b.width > 7.5 and b.width < 30);
+    try std.testing.expectApproxEqAbs(a.width + b.width, together.width, 1.0 / 64.0);
+    var middle: c.SDL_FRect = undefined;
+    var end: c.SDL_FRect = undefined;
+    var inside: c.SDL_FRect = undefined;
+    try std.testing.expect(c.spica_text_layout_caret(joined, woman.len, &middle));
+    try std.testing.expect(c.spica_text_layout_caret(joined, source.len, &end));
+    try std.testing.expect(c.spica_text_layout_caret(joined, 7, &inside));
+    try std.testing.expectEqual(@as(f32, 0), inside.x);
+    try std.testing.expectApproxEqAbs(a.width, middle.x, 1.0 / 64.0);
+    try std.testing.expectApproxEqAbs(b.width, end.x - middle.x, 1.0 / 64.0);
+    try std.testing.expectEqual(woman.len, c.spica_text_layout_hit_test(joined, middle.x, 1));
+    for ([_]f32{ 1, 1.5, 2 }) |scale| {
+        try std.testing.expect(c.SDL_SetRenderScale(f.renderer, scale, scale));
+        try std.testing.expect(c.spica_text_set_render_scale(f.engine, scale, scale));
+        try f.clear();
+        try std.testing.expect(c.spica_text_layout_draw(f.engine, joined, 5, 4, white));
+        const adjacent = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
+        defer c.SDL_DestroySurface(adjacent);
+        try f.clear();
+        try std.testing.expect(c.spica_text_layout_draw(f.engine, first, 5, 4, white));
+        try std.testing.expect(c.spica_text_layout_draw(f.engine, second, 5 + a.width, 4, white));
+        const separate = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
+        defer c.SDL_DestroySurface(separate);
+        try expectSamePixels(adjacent, separate);
+    }
+}
+
+test "selection geometry keeps bidi gaps and respects output capacity" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const source = "ab\u{202e}CD\u{202c}ef";
+    const layout = c.spica_text_layout_create(f.engine, source, source.len, 200, 15, false) orelse return error.Layout;
+    defer c.spica_text_layout_release(layout);
+    var rects: [2]c.SDL_FRect = undefined;
+    try std.testing.expectEqual(@as(usize, 2), c.spica_text_layout_selection_rects(layout, 1, 6, &rects, rects.len));
+    try std.testing.expect(rects[0].w > 0 and rects[1].w > 0);
+    try std.testing.expect(rects[0].x + rects[0].w < rects[1].x);
+    try std.testing.expectEqual(@as(usize, 2), c.spica_text_layout_selection_rects(layout, 1, 6, null, 0));
+    var bounded = [_]c.SDL_FRect{ rects[1], .{ .x = -1, .y = -1, .w = -1, .h = -1 } };
+    try std.testing.expectEqual(@as(usize, 2), c.spica_text_layout_selection_rects(layout, 1, 6, &bounded, 1));
+    try std.testing.expectEqual(rects[0].x, bounded[0].x);
+    try std.testing.expectEqual(rects[0].w, bounded[0].w);
+    try std.testing.expectEqual(@as(f32, -1), bounded[1].x);
+    try std.testing.expectEqual(@as(f32, -1), bounded[1].w);
+    try std.testing.expect(c.spica_text_set_render_scale(f.engine, 1.5, 1.5));
+    var scaled: [2]c.SDL_FRect = undefined;
+    try std.testing.expectEqual(@as(usize, 2), c.spica_text_layout_selection_rects(layout, 1, 6, &scaled, scaled.len));
+    for (rects, scaled) |a, b| {
+        try std.testing.expectEqual(a.x, b.x);
+        try std.testing.expectEqual(a.y, b.y);
+        try std.testing.expectEqual(a.w, b.w);
+        try std.testing.expectEqual(a.h, b.h);
+    }
+}
+
+test "selection uses grapheme ligature carets and includes tab advance" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const source = "office a\u{301}\tb";
+    const layout = c.spica_text_layout_create(f.engine, source, source.len, 200, 15, false) orelse return error.Layout;
+    defer c.spica_text_layout_release(layout);
+    var rect: c.SDL_FRect = undefined;
+    var begin: c.SDL_FRect = undefined;
+    var end: c.SDL_FRect = undefined;
+    try std.testing.expect(c.spica_text_layout_caret(layout, 2, &begin));
+    try std.testing.expect(c.spica_text_layout_caret(layout, 3, &end));
+    try std.testing.expectEqual(@as(usize, 1), c.spica_text_layout_selection_rects(layout, 2, 3, &rect, 1));
+    try std.testing.expectEqual(begin.x, rect.x);
+    try std.testing.expectEqual(end.x - begin.x, rect.w);
+    try std.testing.expect(c.spica_text_layout_caret(layout, 7, &begin));
+    try std.testing.expect(c.spica_text_layout_caret(layout, 10, &end));
+    try std.testing.expectEqual(@as(usize, 1), c.spica_text_layout_selection_rects(layout, 8, 9, &rect, 1));
+    try std.testing.expectEqual(begin.x, rect.x);
+    try std.testing.expectEqual(end.x - begin.x, rect.w);
+    try std.testing.expect(c.spica_text_layout_caret(layout, 10, &begin));
+    try std.testing.expect(c.spica_text_layout_caret(layout, 11, &end));
+    try std.testing.expectEqual(@as(usize, 1), c.spica_text_layout_selection_rects(layout, 10, 11, &rect, 1));
+    try std.testing.expectEqual(begin.x, rect.x);
+    try std.testing.expectEqual(end.x - begin.x, rect.w);
+    try std.testing.expectEqual(@as(usize, 0), c.spica_text_layout_selection_rects(layout, 2, 2, &rect, 1));
+}

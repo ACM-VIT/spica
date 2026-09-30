@@ -4,7 +4,7 @@
 #include FT_TRUETYPE_TABLES_H
 #include FT_MODULE_H
 #include FT_MULTIPLE_MASTERS_H
-#include <hb-ft.h>
+#include <hb-ot.h>
 #include <hb.h>
 #include <fribidi.h>
 #include <linebreak.h>
@@ -43,18 +43,18 @@ typedef struct {
     unsigned weight_axis, axis_count;
     FT_Fixed coordinates[16];
     bool variable_bold, registered, tables_failed;
-    unsigned active_size, active_style;
-    float raster_scale;
+    unsigned active_x, active_y, active_style;
+    float raster_scale_x, raster_scale_y;
 } Face;
 typedef struct {
     unsigned index;
-    uint16_t face, size, style;
+    uint16_t face, raster_x, raster_y, style;
     uint16_t bucket;
     SDL_Texture *texture;
     int left, top, width, height;
     size_t bytes;
     uint64_t used;
-    float scale;
+    float scale_x, scale_y;
     bool valid, colored;
 } Glyph;
 typedef struct {
@@ -63,7 +63,7 @@ typedef struct {
     float x, y, advance;
     uint32_t cluster;
 } Position;
-typedef struct { uint32_t byte; float x; uint16_t line; } Caret;
+typedef struct { uint32_t byte; float x; uint16_t line; bool joins_next; } Caret;
 typedef struct {
     SpicaTextLine info;
     uint32_t first, count;
@@ -94,6 +94,7 @@ struct SpicaText {
     hb_buffer_t *buffer;
     Face faces[FACE_LIMIT];
     unsigned mono;
+    float render_scale_x, render_scale_y;
     Glyph glyphs[GLYPH_LIMIT];
     uint16_t glyph_slots[1024];
     unsigned tombstones;
@@ -202,6 +203,7 @@ static bool reset_tables(Face *f) {
     hb_face_set_upem(face, f->face->units_per_EM ? f->face->units_per_EM : 2048);
     hb_face_set_glyph_count(face, (unsigned)f->face->num_glyphs);
     hb_font_set_face(f->font, face);
+    hb_ot_font_set_funcs(f->font);
     hb_face_destroy(face);
     f->tables_failed = false;
     return true;
@@ -212,10 +214,11 @@ static unsigned long stream_read(FT_Stream stream, unsigned long offset,
     if (SDL_SeekIO(io, (Sint64)offset, SDL_IO_SEEK_SET) < 0) return count ? 0 : 1;
     return count ? (unsigned long)SDL_ReadIO(io, buffer, count) : 0;
 }
-static unsigned glyph_hash(unsigned face, unsigned size, unsigned style, unsigned index) {
+static unsigned glyph_hash(unsigned face, unsigned raster_x, unsigned raster_y, unsigned style, unsigned index) {
     uint32_t key = index * 2654435761u;
     key ^= face * 2246822519u;
-    key ^= size * 3266489917u;
+    key ^= raster_x * 3266489917u;
+    key ^= raster_y * 374761393u;
     key ^= style * 668265263u;
     return (key ^ (key >> 16)) & 1023u;
 }
@@ -225,7 +228,7 @@ static void rebuild_glyph_slots(SpicaText *t) {
     for (unsigned i = 0; i < GLYPH_LIMIT; ++i) {
         Glyph *g = &t->glyphs[i];
         if (!g->valid) continue;
-        unsigned bucket = glyph_hash(g->face, g->size, g->style, g->index);
+        unsigned bucket = glyph_hash(g->face, g->raster_x, g->raster_y, g->style, g->index);
         while (t->glyph_slots[bucket]) bucket = (bucket + 1) & 1023u;
         g->bucket = (uint16_t)bucket;
         t->glyph_slots[bucket] = (uint16_t)(i + 1);
@@ -279,7 +282,7 @@ static int open_face(SpicaText *t, const char *path, long index, bool registered
     if (FT_Select_Charmap(f->face, FT_ENCODING_UNICODE)) goto fail;
     if (FT_Set_Pixel_Sizes(f->face, 0, 15) &&
         (!f->face->num_fixed_sizes || FT_Select_Size(f->face, 0))) goto fail;
-    f->font = hb_ft_font_create_referenced(f->face);
+    f->font = hb_font_create(hb_face_get_empty());
     if (!f->font || f->font == hb_font_get_empty()) goto fail;
     if (!reset_tables(f)) goto fail;
     /* Variation support is explicit; no synthesized bold/italic outlines. */
@@ -314,30 +317,39 @@ static bool face_style(const Face *f, unsigned style) {
     return (!(style & SPICA_TEXT_ITALIC) || (f->face->style_flags & FT_STYLE_FLAG_ITALIC)) &&
            (!(style & SPICA_TEXT_BOLD) || (f->face->style_flags & FT_STYLE_FLAG_BOLD) || f->variable_bold);
 }
-static bool activate(Face *f, unsigned size, unsigned style) {
+static bool select_style(Face *f, unsigned style) {
     style &= SPICA_TEXT_BOLD | SPICA_TEXT_ITALIC;
-    if (f->active_size == size && f->active_style == style) return true;
     if (!face_style(f, style)) return error("requested font style is unavailable");
+    if (f->active_style == style) return true;
     if (f->variable_bold) {
         f->coordinates[f->weight_axis] = style & SPICA_TEXT_BOLD ? f->bold_weight : f->normal_weight;
         if (FT_Set_Var_Design_Coordinates(f->face, f->axis_count, f->coordinates))
             return error("font variation selection failed");
+        hb_variation_t weight = { HB_TAG('w','g','h','t'), f->coordinates[f->weight_axis] / 65536.0f };
+        hb_font_set_variations(f->font, &weight, 1);
     }
-    f->raster_scale = 1.0f;
-    if (FT_Set_Pixel_Sizes(f->face, 0, size)) {
+    f->active_x = f->active_y = 0;
+    f->active_style = style;
+    return true;
+}
+static bool activate(Face *f, unsigned raster_x, unsigned raster_y, unsigned style) {
+    if (!select_style(f, style)) return false;
+    if (f->active_x == raster_x && f->active_y == raster_y) return true;
+    f->raster_scale_x = f->raster_scale_y = 1.0f;
+    /* 26.6 device-pixel sizes preserve fractional DPR instead of stretching
+     * a logical-size bitmap. HarfBuzz shaping never mutates this FT size. */
+    if (FT_Set_Char_Size(f->face, (FT_F26Dot6)raster_x, (FT_F26Dot6)raster_y, 72, 72)) {
         if (!f->face->num_fixed_sizes) return error("font size selection failed");
         unsigned best = 0;
         for (int i = 1; i < f->face->num_fixed_sizes; ++i)
-            if (abs(f->face->available_sizes[i].y_ppem - (int)size * 64) <
-                abs(f->face->available_sizes[best].y_ppem - (int)size * 64)) best = (unsigned)i;
+            if (abs(f->face->available_sizes[i].y_ppem - (int)raster_y) <
+                abs(f->face->available_sizes[best].y_ppem - (int)raster_y)) best = (unsigned)i;
         if (FT_Select_Size(f->face, (int)best)) return error("bitmap strike selection failed");
-        f->raster_scale = (float)size * 64.0f / f->face->available_sizes[best].y_ppem;
+        f->raster_scale_x = (float)raster_x / f->face->available_sizes[best].x_ppem;
+        f->raster_scale_y = (float)raster_y / f->face->available_sizes[best].y_ppem;
     }
-    hb_ft_font_changed(f->font);
-    hb_ft_font_set_load_flags(f->font, FT_LOAD_DEFAULT | FT_LOAD_COLOR);
-    hb_font_set_scale(f->font, (int)size * 64, (int)size * 64);
-    f->active_size = size;
-    f->active_style = style;
+    f->active_x = raster_x;
+    f->active_y = raster_y;
     return true;
 }
 static bool ignorable(uint32_t c) {
@@ -455,6 +467,7 @@ SpicaText *spica_text_create(SDL_Renderer *renderer, const char *font_path) {
     SpicaText *t = calloc(1, sizeof(*t));
     if (!t) return error("engine allocation failed"), NULL;
     t->renderer = renderer;
+    t->render_scale_x = t->render_scale_y = 1.0f;
     t->mono = FACE_LIMIT;
     t->memory = (struct FT_MemoryRec_){ .user = t, .alloc = font_alloc, .free = font_free, .realloc = font_realloc };
     if (FT_New_Library(&t->memory, &t->library)) goto fail;
@@ -491,6 +504,18 @@ void spica_text_destroy(SpicaText *t) {
     if (t->fontconfig) SDL_UnloadObject(t->fontconfig);
 #endif
     free(t);
+}
+bool spica_text_set_render_scale(SpicaText *t, float scale_x, float scale_y) {
+    if (!t || !isfinite(scale_x) || !isfinite(scale_y) ||
+        scale_x <= 0 || scale_y <= 0 || scale_x > 4 || scale_y > 4)
+        return error("render scale must be finite and in (0, 4]");
+    if (t->render_scale_x == scale_x && t->render_scale_y == scale_y) return true;
+    for (unsigned i = 0; i < GLYPH_LIMIT; ++i) clear_glyph(t, &t->glyphs[i]);
+    memset(t->glyph_slots, 0, sizeof(t->glyph_slots));
+    t->tombstones = 0;
+    t->render_scale_x = scale_x;
+    t->render_scale_y = scale_y;
+    return true;
 }
 bool spica_text_get_stats(const SpicaText *t, SpicaTextStats *out) {
     if (!t || !out) return false;
@@ -559,7 +584,10 @@ static bool shape(SpicaText *t, Run run, unsigned line_start, unsigned line_end,
                   unsigned *count, hb_glyph_info_t **info, hb_glyph_position_t **positions) {
     Face *f = &t->faces[run.face];
     if (f->tables_failed && !reset_tables(f)) return false;
-    if (!activate(f, size, run.style)) return false;
+    if (!select_style(f, run.style)) return false;
+    /* Table-based advances are independent of FT bitmap-strike metrics.
+     * FT_Get_Advance is not supported by every bitmap-only color font. */
+    hb_font_set_scale(f->font, (int)size * 64, (int)size * 64);
     hb_buffer_clear_contents(t->buffer);
     hb_buffer_set_cluster_level(t->buffer, HB_BUFFER_CLUSTER_LEVEL_MONOTONE_GRAPHEMES);
     hb_buffer_set_direction(t->buffer, run.level & 1 ? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
@@ -624,8 +652,8 @@ static bool line_shape(SpicaText *t, unsigned paragraph_start, unsigned start, u
             float tab = size * 2.4f;
             float next = (floorf(x / tab) + 1) * tab;
             if (*caret_count + 2 > CARET_LIMIT) return error("caret limit exceeded");
-            t->carets[(*caret_count)++] = (Caret){ t->offsets[run.start], x, (uint16_t)line_index };
-            t->carets[(*caret_count)++] = (Caret){ t->offsets[run.end], next, (uint16_t)line_index };
+            t->carets[(*caret_count)++] = (Caret){ t->offsets[run.start], x, (uint16_t)line_index, true };
+            t->carets[(*caret_count)++] = (Caret){ t->offsets[run.end], next, (uint16_t)line_index, false };
             x = next;
             continue;
         }
@@ -662,20 +690,22 @@ static bool line_shape(SpicaText *t, unsigned paragraph_start, unsigned start, u
                 float fraction = (float)part++ / graphemes;
                 t->carets[(*caret_count)++] = (Caret){ t->offsets[c],
                     run.level & 1 ? x - (x - begin) * fraction : begin + (x - begin) * fraction,
-                    (uint16_t)line_index };
+                    (uint16_t)line_index, c != next };
             }
             g = finish;
         }
-        Face *f = &t->faces[run.face];
-        float ascent = f->face->size->metrics.ascender / 64.0f * f->raster_scale;
-        float descent = -f->face->size->metrics.descender / 64.0f * f->raster_scale;
+        hb_font_extents_t extents;
+        if (!hb_font_get_h_extents(t->faces[run.face].font, &extents))
+            return error("font has no horizontal line metrics");
+        float ascent = extents.ascender / 64.0f;
+        float descent = -extents.descender / 64.0f;
         if (ascent > line->info.baseline) line->info.baseline = ascent;
         if (ascent + descent + size * .15f > line->info.height)
             line->info.height = ascent + descent + size * .15f;
     }
     if (!runs) {
         if (*caret_count >= CARET_LIMIT) return error("caret limit exceeded");
-        t->carets[(*caret_count)++] = (Caret){ t->offsets[start], 0, (uint16_t)line_index };
+        t->carets[(*caret_count)++] = (Caret){ t->offsets[start], 0, (uint16_t)line_index, false };
     }
     line->count = *glyph_count - line->first;
     line->info.width = x;
@@ -815,13 +845,16 @@ bool spica_text_layout_line(const SpicaTextLayout *layout, size_t index, SpicaTe
 }
 static Glyph *glyph(SpicaText *t, unsigned face, unsigned size, unsigned style, unsigned index) {
     style &= SPICA_TEXT_BOLD | SPICA_TEXT_ITALIC;
+    unsigned raster_x = (unsigned)fmaxf(1, roundf(size * t->render_scale_x * 64));
+    unsigned raster_y = (unsigned)fmaxf(1, roundf(size * t->render_scale_y * 64));
     if (t->tombstones > 256) rebuild_glyph_slots(t);
-    unsigned bucket = glyph_hash(face, size, style, index);
+    unsigned bucket = glyph_hash(face, raster_x, raster_y, style, index);
     while (t->glyph_slots[bucket]) {
         unsigned id = t->glyph_slots[bucket];
         if (id != UINT16_MAX) {
             Glyph *g = &t->glyphs[id - 1];
-            if (g->face == face && g->size == size && g->style == style && g->index == index) {
+            if (g->face == face && g->raster_x == raster_x && g->raster_y == raster_y &&
+                g->style == style && g->index == index) {
                 g->used = ++t->clock;
                 return g;
             }
@@ -832,7 +865,7 @@ static Glyph *glyph(SpicaText *t, unsigned face, unsigned size, unsigned style, 
     for (unsigned i = 0; i < GLYPH_LIMIT; ++i)
         if (!t->glyphs[i].valid) { slot = &t->glyphs[i]; break; }
     Face *f = &t->faces[face];
-    if (!activate(f, size, style) || FT_Load_Glyph(f->face, index, FT_LOAD_RENDER | FT_LOAD_COLOR)) {
+    if (!activate(f, raster_x, raster_y, style) || FT_Load_Glyph(f->face, index, FT_LOAD_RENDER | FT_LOAD_COLOR)) {
         error("glyph rasterization failed"); return NULL;
     }
     FT_GlyphSlot ft = f->face->glyph;
@@ -877,11 +910,13 @@ static Glyph *glyph(SpicaText *t, unsigned face, unsigned size, unsigned style, 
             !SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND) ||
             !SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR)) { SDL_DestroyTexture(texture); return NULL; }
     }
-    *slot = (Glyph){ .index = index, .face = (uint16_t)face, .size = (uint16_t)size, .style = (uint16_t)style,
+    *slot = (Glyph){ .index = index, .face = (uint16_t)face,
+        .raster_x = (uint16_t)raster_x, .raster_y = (uint16_t)raster_y, .style = (uint16_t)style,
         .texture = texture, .left = ft->bitmap_left, .top = ft->bitmap_top,
         .width = (int)b->width, .height = (int)b->rows, .bytes = bytes,
-        .used = ++t->clock, .scale = f->raster_scale, .valid = true, .colored = b->pixel_mode == FT_PIXEL_MODE_BGRA };
-    bucket = glyph_hash(face, size, style, index);
+        .used = ++t->clock, .scale_x = f->raster_scale_x / t->render_scale_x,
+        .scale_y = f->raster_scale_y / t->render_scale_y, .valid = true, .colored = b->pixel_mode == FT_PIXEL_MODE_BGRA };
+    bucket = glyph_hash(face, raster_x, raster_y, style, index);
     while (t->glyph_slots[bucket] && t->glyph_slots[bucket] != UINT16_MAX)
         bucket = (bucket + 1) & 1023u;
     if (t->glyph_slots[bucket] == UINT16_MAX) --t->tombstones;
@@ -927,9 +962,14 @@ bool spica_text_layout_draw_colors(SpicaText *t, const SpicaTextLayout *layout,
             }
             if (!SDL_SetTextureColorMod(g->texture, g->colored ? 255 : ink.r, g->colored ? 255 : ink.g, g->colored ? 255 : ink.b) ||
                 !SDL_SetTextureAlphaMod(g->texture, ink.a)) return false;
-            SDL_FRect dst = { x + p->x + g->left * g->scale,
-                y + line->info.y + line->info.baseline + p->y - g->top * g->scale,
-                g->width * g->scale, g->height * g->scale };
+            SDL_FRect dst = { x + p->x + g->left * g->scale_x,
+                y + line->info.y + line->info.baseline + p->y - g->top * g->scale_y,
+                g->width * g->scale_x, g->height * g->scale_y };
+            /* Fractional layout positions must not linearly filter an already
+             * antialiased bitmap a second time. Only ink placement is snapped;
+             * advances, wrapping, carets and selection remain logical floats. */
+            dst.x = roundf(dst.x * t->render_scale_x) / t->render_scale_x;
+            dst.y = roundf(dst.y * t->render_scale_y) / t->render_scale_y;
             if (!SDL_RenderTexture(t->renderer, g->texture, NULL, &dst)) return false;
         }
     }
@@ -962,6 +1002,40 @@ bool spica_text_layout_caret(const SpicaTextLayout *layout, size_t byte, SDL_FRe
     const SpicaTextLine *line = &layout->lines[best->line].info;
     *out = (SDL_FRect){ best->x, line->y, 1, line->height };
     return true;
+}
+size_t spica_text_layout_selection_rects(const SpicaTextLayout *layout, size_t start_byte,
+    size_t end_byte, SDL_FRect *out, size_t capacity) {
+    if (!layout || start_byte >= end_byte || start_byte >= layout->length) return 0;
+    if (end_byte > layout->length) end_byte = layout->length;
+    size_t count = 0;
+    SDL_FRect span = {0};
+    bool pending = false;
+    for (unsigned i = 0; i + 1 < layout->caret_count; ++i) {
+        const Caret *a = &layout->carets[i], *b = &layout->carets[i + 1];
+        /* Run/cluster endpoints can have two visual positions. Only original
+         * grapheme edges connect them; never bridge an unrelated bidi run. */
+        if (!a->joins_next || a->byte >= end_byte || b->byte <= start_byte) continue;
+        float left = fminf(a->x, b->x), right = fmaxf(a->x, b->x);
+        if (right <= left) continue;
+        const SpicaTextLine *line = &layout->lines[a->line].info;
+        if (pending && span.y == line->y && left <= span.x + span.w && right >= span.x) {
+            float end = fmaxf(span.x + span.w, right);
+            span.x = fminf(span.x, left);
+            span.w = end - span.x;
+            continue;
+        }
+        if (pending) {
+            if (out && count < capacity) out[count] = span;
+            ++count;
+        }
+        span = (SDL_FRect){ left, line->y, right - left, line->height };
+        pending = true;
+    }
+    if (pending) {
+        if (out && count < capacity) out[count] = span;
+        ++count;
+    }
+    return count;
 }
 bool spica_text_draw(SpicaText *t, const char *utf8, size_t length, float x, float baseline, SDL_Color color) {
     if (!t || (!utf8 && length)) return error("invalid label");

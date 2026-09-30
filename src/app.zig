@@ -26,6 +26,7 @@ pub const App = struct {
     editor_start: usize = 0,
     editor_end: usize = 0,
     editor_scroll: f32 = 0,
+    preferred_caret_x: ?f32 = null,
     editor_changed: bool = true,
     copy_buffer: []u8,
     preedit: std.ArrayList(u8) = .empty,
@@ -216,7 +217,57 @@ pub const App = struct {
         try self.draft_writer.submit(.{ .draft = bytes, .selected_message = self.selected_message, .light = self.light });
         self.draft_due = null;
     }
+
+    fn clippedLabel(bytes: []const u8) []const u8 {
+        var end = @min(bytes.len, 128);
+        while (end < bytes.len and end > 0 and (bytes[end] & 0xc0) == 0x80) end -= 1;
+        return bytes[0..end];
+    }
+
+    fn ensureEditorLayout(self: *App, editor_width: f32) !void {
+        if (editor_width <= 24) return;
+        if (self.editor_changed or self.editor_width != editor_width or self.editor.caret < self.editor_start or self.editor.caret > self.editor_end) {
+            if (self.editor_layout) |layout| c.spica_text_layout_release(layout);
+            self.editor_layout = null;
+            const bytes = self.editor.textBytes();
+            const range = self.editor.viewportRange(8192);
+            if (range.start != self.editor_start) self.editor_scroll = 0;
+            self.editor_start = range.start;
+            self.editor_end = range.end;
+            const slice = bytes[range.start..range.end];
+            self.editor_layout = c.spica_text_layout_create(self.text, slice.ptr, slice.len, editor_width - 24, @intFromFloat(self.theme.metrics.body_px), false) orelse return error.EditorLayout;
+            self.editor_width = editor_width;
+            self.editor_changed = false;
+        }
+    }
+
+    fn moveVertical(self: *App, down: bool, extend: bool) !void {
+        try self.ensureEditorLayout(self.editor_width);
+        const layout = self.editor_layout orelse return;
+        var caret: c.SDL_FRect = undefined;
+        if (!c.spica_text_layout_caret(layout, self.editor.caret - self.editor_start, &caret)) return;
+        const x = self.preferred_caret_x orelse caret.x;
+        self.preferred_caret_x = x;
+        const y = caret.y + (if (down) @as(f32, 1.5) else -0.5) * caret.h;
+        self.editor.setCaret(self.editor_start + c.spica_text_layout_hit_test(layout, x, y), extend);
+        self.dirty = true;
+    }
+
+    fn moveLineEdge(self: *App, end: bool, whole: bool, extend: bool) !void {
+        if (!whole) try self.ensureEditorLayout(self.editor_width);
+        if (whole) {
+            self.editor.setCaret(if (end) self.editor.len else 0, extend);
+        } else if (self.editor_layout) |layout| {
+            var caret: c.SDL_FRect = undefined;
+            if (c.spica_text_layout_caret(layout, self.editor.caret - self.editor_start, &caret)) {
+                self.editor.setCaret(self.editor_start + c.spica_text_layout_hit_test(layout, if (end) 1000000 else 0, caret.y + caret.h * 0.5), extend);
+            }
+        }
+        self.preferred_caret_x = null;
+        self.dirty = true;
+    }
     fn edited(self: *App) void {
+        self.preferred_caret_x = null;
         self.editor_changed = true;
         self.draft_due = c.SDL_GetTicks() + 250;
         self.dirty = true;
@@ -237,6 +288,10 @@ pub const App = struct {
         var height: c_int = 800;
         _ = c.SDL_GetWindowSize(self.window, &width, &height);
         if (!c.SDL_SetRenderLogicalPresentation(self.renderer, width, height, c.SDL_LOGICAL_PRESENTATION_STRETCH)) return error.LogicalPresentation;
+        var pixel_width: c_int = width;
+        var pixel_height: c_int = height;
+        if (!c.SDL_GetRenderOutputSize(self.renderer, &pixel_width, &pixel_height)) return error.RenderOutputSize;
+        if (!c.spica_text_set_render_scale(self.text, @as(f32, @floatFromInt(pixel_width)) / @as(f32, @floatFromInt(width)), @as(f32, @floatFromInt(pixel_height)) / @as(f32, @floatFromInt(height)))) return error.TextRenderScale;
         self.layout.resize(@floatFromInt(width), @floatFromInt(height));
         const colors = self.palette();
         self.shell = self.layout.shell(@min(self.theme.metrics.sidebar_width, @as(f32, @floatFromInt(width)) * 0.28), 64, 176);
@@ -290,19 +345,7 @@ pub const App = struct {
         try self.rectangle(editor_x, editor_y, editor_width, 100, 10, colors.border);
         try self.rectangle(editor_x + 1, editor_y + 1, editor_width - 2, 98, 9, colors.raised);
         try self.label("Draft · no runtime attached", editor_x + 12, composer.y + 10, 11, colors.muted);
-        if (self.editor_changed or self.editor_width != editor_width or self.editor.caret < self.editor_start or self.editor.caret > self.editor_end) {
-            if (self.editor_layout) |layout| c.spica_text_layout_release(layout);
-            self.editor_layout = null;
-            const bytes = self.editor.textBytes();
-            const range = self.editor.viewportRange(8192);
-            if (range.start != self.editor_start) self.editor_scroll = 0;
-            self.editor_start = range.start;
-            self.editor_end = range.end;
-            const slice = bytes[range.start..range.end];
-            self.editor_layout = c.spica_text_layout_create(self.text, slice.ptr, slice.len, editor_width - 24, @intFromFloat(self.theme.metrics.body_px), false) orelse return error.EditorLayout;
-            self.editor_width = editor_width;
-            self.editor_changed = false;
-        }
+        try self.ensureEditorLayout(editor_width);
         const editor_clip = c.SDL_Rect{ .x = @intFromFloat(editor_x + 8), .y = @intFromFloat(editor_y + 8), .w = @intFromFloat(editor_width - 16), .h = 84 };
         _ = c.SDL_SetRenderClipRect(self.renderer, &editor_clip);
         if (self.editor_layout) |layout| {
@@ -314,13 +357,26 @@ pub const App = struct {
                 const input_area = c.SDL_Rect{ .x = @intFromFloat(editor_x + 12 + caret.x), .y = @intFromFloat(editor_y + 10 + caret.y - self.editor_scroll), .w = 1, .h = @intFromFloat(caret.h) };
                 _ = c.SDL_SetTextInputArea(self.window, &input_area, 0);
             }
+            const selected = self.editor.selection();
+            const selection_start = @max(selected.start, self.editor_start);
+            const selection_end = @min(selected.end, self.editor_end);
+            if (selection_start < selection_end) {
+                var rects: [8192]c.SDL_FRect = undefined;
+                const count = c.spica_text_layout_selection_rects(layout, selection_start - self.editor_start, selection_end - self.editor_start, &rects, rects.len);
+                if (count > rects.len) return error.SelectionGeometryBudget;
+                for (rects[0..count]) |*rect| {
+                    rect.x += editor_x + 12;
+                    rect.y += editor_y + 10 - self.editor_scroll;
+                }
+                if (!c.SDL_SetRenderDrawBlendMode(self.renderer, c.SDL_BLENDMODE_BLEND) or !c.SDL_SetRenderDrawColor(self.renderer, colors.accent.r, colors.accent.g, colors.accent.b, 60) or !c.SDL_RenderFillRects(self.renderer, &rects, @intCast(count))) return error.SelectionDraw;
+            }
             if (!c.spica_text_layout_draw(self.text, layout, editor_x + 12, editor_y + 10 - self.editor_scroll, rgba(colors.text))) return error.EditorDraw;
             if (self.editor.len == 0) try self.label("Write a draft...", editor_x + 12, editor_y + 10, 15, colors.muted);
         }
-        if (self.preedit.items.len != 0) try self.label(self.preedit.items[0..@min(128, self.preedit.items.len)], editor_x + 12, editor_y + 66, 15, colors.accent);
+        if (self.preedit.items.len != 0) try self.label(clippedLabel(self.preedit.items), editor_x + 12, editor_y + 66, 15, colors.accent);
         _ = c.SDL_SetRenderClipRect(self.renderer, null);
         var status_buffer: [128]u8 = undefined;
-        const status = if (self.error_len != 0) self.error_text[0..@min(self.error_len, 128)] else if (self.options.fixture) try std.fmt.bufPrint(&status_buffer, "Message {d}/{d} · PageUp/PageDown · Wheel to scroll", .{ self.selected_message + 1, fixture.message_count }) else "Enter: newline · Ctrl+R: reload theme · Ctrl+Z: undo";
+        const status = if (self.error_len != 0) clippedLabel(self.error_text[0..self.error_len]) else if (self.options.fixture) try std.fmt.bufPrint(&status_buffer, "Message {d}/{d} · PageUp/PageDown · Wheel to scroll", .{ self.selected_message + 1, fixture.message_count }) else "Enter: newline · Ctrl+R: reload theme · Ctrl+Z: undo";
         try self.label(status, editor_x, composer.y + 145, 11, if (self.error_len != 0) colors.error_color else colors.muted);
         if (!self.captured and self.options.capture != null and (!self.options.fixture or self.document != null)) {
             const surface = c.SDL_RenderReadPixels(self.renderer, null) orelse return error.ScreenCapture;
@@ -381,6 +437,7 @@ pub const App = struct {
                 const inside = event.button.x >= self.shell.composer.x + 28 and event.button.y >= self.shell.composer.y + 34 and event.button.y <= self.shell.composer.y + 134;
                 self.focused_editor = inside;
                 if (inside) {
+                    self.preferred_caret_x = null;
                     _ = c.SDL_StartTextInput(self.window);
                     if (self.editor_layout) |layout| self.editor.setCaret(self.editor_start + c.spica_text_layout_hit_test(layout, event.button.x - self.shell.composer.x - 40, event.button.y - self.shell.composer.y - 44 + self.editor_scroll), (c.SDL_GetModState() & c.SDL_KMOD_SHIFT) != 0);
                     self.dragging = true;
@@ -403,6 +460,9 @@ pub const App = struct {
                 if (!self.focused_editor) return;
                 if (event.key.key == c.SDLK_ESCAPE) { self.preedit.clearRetainingCapacity(); _ = c.SDL_ClearComposition(self.window); self.dirty = true; return; }
                 if (self.preedit.items.len != 0) return;
+                if (event.key.key == c.SDLK_UP or event.key.key == c.SDLK_DOWN) { try self.moveVertical(event.key.key == c.SDLK_DOWN, shift); return; }
+                if (event.key.key == c.SDLK_HOME or event.key.key == c.SDLK_END) { try self.moveLineEdge(event.key.key == c.SDLK_END, command, shift); return; }
+                self.preferred_caret_x = null;
                 if (command) {
                     switch (event.key.key) {
                         c.SDLK_A => { self.editor.selectAll(); self.dirty = true; },
@@ -425,8 +485,6 @@ pub const App = struct {
                     c.SDLK_DELETE => { try self.editor.deleteForward(); self.edited(); },
                     c.SDLK_LEFT => { self.editor.moveGrapheme(.backward, shift); self.dirty = true; },
                     c.SDLK_RIGHT => { self.editor.moveGrapheme(.forward, shift); self.dirty = true; },
-                    c.SDLK_HOME => { self.editor.setCaret(0, shift); self.dirty = true; },
-                    c.SDLK_END => { self.editor.setCaret(self.editor.len, shift); self.dirty = true; },
                     c.SDLK_RETURN, c.SDLK_KP_ENTER => { try self.editor.insert("\n", .paste); self.edited(); },
                     else => {},
                 }
