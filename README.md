@@ -34,7 +34,7 @@ zig build
 ./zig-out/bin/spica --project /path/to/project
 ```
 
-Use **Settings → Connect a provider**, or **Connect a provider** in the model picker, to choose a provider and its sign-in method. Spica shows Pi's API-key/setup prompts or a browser sign-in link; Escape cancels authentication. Credentials stay in Pi's normal credential store, shared with the Pi CLI. Models refresh after connection without replacing the current chat. Connecting requires an idle Pi runtime.
+Use **Settings → Connect a provider**, or **Connect a provider** in the model picker, to choose a provider and its sign-in method. For browser sign-in, use **Open browser**; paste a code or redirect URL only if needed. API keys and authorization codes are masked; Escape cancels authentication. Credentials stay in Pi's normal credential store, shared with the Pi CLI. Models refresh after connection without replacing the current chat. Connecting requires an idle Pi runtime.
 
 In the provider list, the wheel scrolls without changing the selected provider. Click a row to select it, then use **Connect** or **Enter** to continue. Arrow keys and Page Up/Down change selection and keep it visible.
 

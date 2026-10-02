@@ -138,58 +138,77 @@ pub const Panel = struct {
         const canvas_w = app.shell.sidebar.width + app.shell.conversation.width;
         const canvas_h = app.shell.header.height + app.shell.conversation.height + app.shell.composer.height;
         const w = @min(@as(f32, 620), @max(@as(f32, 0), canvas_w - 24));
-        const h = @min(@as(f32, 540), @max(@as(f32, 0), canvas_h - 24));
+        const inner = @max(1, w - 40);
+        const state = self.kind(ui);
+        const heading = if (ui.title.len != 0 and !self.pending and self.failure == null) ui.title else "Connect a provider";
+        const title_layout = c.spica_text_layout_create(app.text, heading.ptr, heading.len, inner, 19, false) orelse return error.ProviderTextLayout;
+        defer c.spica_text_layout_release(title_layout);
+        const title_h = c.spica_text_layout_height(title_layout);
+        const message = if (state == .select) "" else self.failure orelse if (self.pending) "Waiting for Pi…" else ui.message;
+        const message_layout = if (message.len != 0) c.spica_text_layout_create(app.text, message.ptr, message.len, inner, 14, false) orelse return error.ProviderTextLayout else null;
+        defer if (message_layout) |layout| c.spica_text_layout_release(layout);
+        const message_h = if (message_layout) |layout| c.spica_text_layout_height(layout) else 0;
+        const error_layout = if (self.input_error) |message_text| c.spica_text_layout_create(app.text, message_text.ptr, message_text.len, inner, 12, false) orelse return error.ProviderTextLayout else null;
+        defer if (error_layout) |layout| c.spica_text_layout_release(layout);
+        const error_h = if (error_layout) |layout| c.spica_text_layout_height(layout) + 8 else 0;
+        // The browser link is only needed as recovery when launching it fails.
+        const url_layout = if (ui.url.len != 0 and error_layout != null) c.spica_text_layout_create(app.text, ui.url.ptr, ui.url.len, inner, 12, false) orelse return error.ProviderTextLayout else null;
+        defer if (url_layout) |layout| c.spica_text_layout_release(layout);
+        const url_h = if (url_layout) |layout| c.spica_text_layout_height(layout) + 12 else 0;
+        const content_h = if (state == .select)
+            @as(f32, @floatFromInt(@max(1, @min(ui.options.len, 10)))) * 38
+        else
+            message_h + (if (state == .input) @as(f32, 60) else 0) + error_h + url_h;
+        const h = @min(title_h + content_h + 106, @min(@as(f32, 540), @max(@as(f32, 0), canvas_h - 24)));
         const x = (canvas_w - w) / 2;
         const y = (canvas_h - h) / 2;
         const left = x + 20;
-        const inner = @max(1, w - 40);
         const footer = y + h - 50;
-        const state = self.kind(ui);
+        const body_top = y + 20 + title_h + 18;
         try app.rectangle(0, 0, canvas_w, canvas_h, 0, colors.canvas);
         try app.rectangle(x, y, w, h, 10, colors.border);
         try app.rectangle(x + 1, y + 1, w - 2, h - 2, 9, colors.panel);
-        _ = try text(app, if (ui.title.len != 0 and !self.pending and self.failure == null) ui.title else "Connect a provider", left, y + 18, inner, 19, colors.text);
-        const body_top = y + 60;
-        const clip = c.SDL_Rect{ .x = @intFromFloat(left), .y = @intFromFloat(body_top), .w = @intFromFloat(inner), .h = @intFromFloat(@max(1, footer - body_top - 10)) };
+        if (!c.spica_text_layout_draw(app.text, title_layout, left, y + 20, .{ .r = colors.text.r, .g = colors.text.g, .b = colors.text.b, .a = 255 })) return error.ProviderTextDraw;
+        const clip = c.SDL_Rect{ .x = @intFromFloat(left), .y = @intFromFloat(body_top), .w = @intFromFloat(inner), .h = @intFromFloat(@max(1, footer - body_top - 12)) };
         _ = c.SDL_SetRenderClipRect(app.renderer, &clip);
         defer _ = c.SDL_SetRenderClipRect(app.renderer, null);
         if (state == .select) {
-            self.visible = @min(@as(usize, 24), @max(@as(usize, 1), @as(usize, @intFromFloat(@max(0, footer - body_top - 34) / 38))));
+            self.visible = @min(@as(usize, 24), @max(@as(usize, 1), @as(usize, @intFromFloat(@max(0, footer - body_top - 12) / 38))));
             self.selected = @min(self.selected, ui.options.len -| 1);
             self.first = @min(self.first, ui.options.len -| self.visible);
-            _ = try text(app, "Wheel scrolls · click to select · Enter connects", left, body_top, inner, 13, colors.muted);
             const end = @min(ui.options.len, self.first + self.visible);
             for (ui.options[self.first..end], self.first..) |option, index| {
-                const row_y = body_top + 30 + @as(f32, @floatFromInt(index - self.first)) * 38;
+                const row_y = body_top + @as(f32, @floatFromInt(index - self.first)) * 38;
                 const bounds = c.SDL_FRect{ .x = left, .y = row_y, .w = inner, .h = 34 };
                 if (index == self.selected) try app.rectangle(left, row_y, inner, 34, 5, colors.raised);
                 self.targets[self.target_count] = .{ .action = .{ .select = index }, .bounds = bounds };
                 self.target_count += 1;
                 _ = try text(app, option, left + 10, row_y + 8, inner - 20, 13, colors.text);
             }
-            if (ui.options.len == 0) _ = try text(app, "No providers are available.", left, body_top + 38, inner, 13, colors.muted);
+            if (ui.options.len == 0) _ = try text(app, "No providers available", left, body_top, inner, 13, colors.muted);
         } else {
-            const message = self.failure orelse if (self.pending) "Waiting for Pi…" else ui.message;
-            const message_h = try text(app, message, left, body_top, inner, 14, if (state == .failed) colors.error_color else colors.text);
+            const message_color = if (state == .failed) colors.error_color else colors.text;
+            if (message_layout) |layout| if (!c.spica_text_layout_draw(app.text, layout, left, body_top, .{ .r = message_color.r, .g = message_color.g, .b = message_color.b, .a = 255 })) return error.ProviderTextDraw;
+            var next_y = body_top + message_h;
             if (state == .input) {
-                const input_y = @min(footer - 92, body_top + message_h + 18);
+                const input_y = next_y + 18;
                 try app.rectangle(left, input_y, inner, 42, 6, colors.border);
                 try app.rectangle(left + 1, input_y + 1, inner - 2, 40, 5, colors.raised);
                 const masked: [96]u8 = @splat('*');
-                const display = if (self.input_len == 0) (if (ui.placeholder.len != 0) ui.placeholder else "Enter a value") else if (ui.secret) masked[0..@min(masked.len, self.input_len)] else self.input[0..self.input_len];
+                const display = if (self.input_len == 0) ui.placeholder else if (ui.secret) masked[0..@min(masked.len, self.input_len)] else self.input[0..self.input_len];
                 const input_clip = c.SDL_Rect{ .x = @intFromFloat(left + 8), .y = @intFromFloat(input_y + 4), .w = @intFromFloat(@max(1, inner - 16)), .h = 34 };
                 _ = c.SDL_SetRenderClipRect(app.renderer, &input_clip);
                 _ = try text(app, display, left + 10, input_y + 12, 100000, 14, if (self.input_len == 0) colors.muted else colors.text);
                 _ = c.SDL_SetRenderClipRect(app.renderer, &clip);
-                if (self.input_error) |message_text| _ = try text(app, message_text, left, input_y + 48, inner, 12, colors.error_color);
                 const area = c.SDL_Rect{ .x = @intFromFloat(left), .y = @intFromFloat(input_y), .w = @intFromFloat(inner), .h = 42 };
                 _ = c.SDL_SetTextInputArea(app.window, &area, 0);
-            } else if (ui.url.len != 0 and self.failure == null and !self.pending) {
-                _ = try text(app, ui.url, left, body_top + message_h + 18, inner, 12, colors.accent);
+                next_y = input_y + 42;
             }
-            if (state != .input) if (self.input_error) |message_text| {
-                _ = try text(app, message_text, left, footer - 30, inner, 12, colors.error_color);
-            };
+            if (error_layout) |layout| {
+                if (!c.spica_text_layout_draw(app.text, layout, left, next_y + 8, .{ .r = colors.error_color.r, .g = colors.error_color.g, .b = colors.error_color.b, .a = 255 })) return error.ProviderTextDraw;
+                next_y += error_h;
+            }
+            if (url_layout) |layout| if (!c.spica_text_layout_draw(app.text, layout, left, next_y + 12, .{ .r = colors.accent.r, .g = colors.accent.g, .b = colors.accent.b, .a = 255 })) return error.ProviderTextDraw;
         }
         _ = c.SDL_SetRenderClipRect(app.renderer, null);
         const finished = state == .done or state == .failed;

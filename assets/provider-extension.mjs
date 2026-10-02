@@ -19,7 +19,7 @@ async function sdk() {
 function authentication(ui, registry, createRuntime, getDeviceId) {
     let active;
     let promptPending = false;
-    const notify = (kind, fields = {}) => ui.notify(JSON.stringify({ spica_provider: true, kind, pending: promptPending, title: titlePrefix + "Authentication", ...fields }));
+    const notify = (kind, fields = {}) => ui.notify(JSON.stringify({ spica_provider: true, kind, pending: promptPending, title: "Connect a provider", ...fields }));
     const cancel = () => active?.abort();
     async function connect() {
         if (active) return;
@@ -38,14 +38,19 @@ function authentication(ui, registry, createRuntime, getDeviceId) {
             signal.throwIfAborted();
             const providers = runtime.getProviders().filter((provider) => provider.auth.oauth || provider.auth.apiKey?.login)
                 .sort((a, b) => a.name.localeCompare(b.name));
-            const labels = providers.map((provider) => `${provider.name} (${provider.id}) — ${runtime.getProviderAuthStatus(provider.id).configured ? "configured" : "not connected"}`);
+            const nameCounts = new Map();
+            for (const provider of providers) nameCounts.set(provider.name, (nameCounts.get(provider.name) || 0) + 1);
+            const labels = providers.map((provider) => {
+                const name = nameCounts.get(provider.name) > 1 ? `${provider.name} (${provider.id})` : provider.name;
+                return name + (runtime.getProviderAuthStatus(provider.id).configured ? " · Configured" : "");
+            });
             const choice = await ui.select(titlePrefix + "Choose a provider", labels, { signal });
             if (choice === undefined) { controller.abort(); signal.throwIfAborted(); }
             const provider = providers[labels.indexOf(choice)];
             if (!provider) throw new Error("Invalid provider selection");
             const methods = [];
             if (provider.auth.oauth) methods.push({ type: "oauth", label: provider.auth.oauth.loginLabel || `Browser OAuth — ${provider.auth.oauth.name}` });
-            if (provider.auth.apiKey?.login) methods.push({ type: "api_key", label: `API key / setup — ${provider.auth.apiKey.name}` });
+            if (provider.auth.apiKey?.login) methods.push({ type: "api_key", label: provider.auth.apiKey.name });
             const methodLabel = await ui.select(titlePrefix + provider.name, methods.map((method) => method.label), { signal });
             if (methodLabel === undefined) { controller.abort(); signal.throwIfAborted(); }
             const method = methods.find((entry) => entry.label === methodLabel);
@@ -64,7 +69,8 @@ function authentication(ui, registry, createRuntime, getDeviceId) {
                             answer = prompt.options[options.indexOf(selected)]?.id;
                         } else {
                             const secret = prompt.type === "secret" || prompt.type === "manual_code";
-                            answer = await ui.input(titlePrefix + (secret ? "[secret] " : "") + prompt.message, prompt.placeholder || "", { signal: promptSignal });
+                            const message = prompt.type === "manual_code" ? "Authorization code or redirect URL" : prompt.message;
+                            answer = await ui.input(titlePrefix + (secret ? "[secret] " : "") + message, prompt.placeholder || "", { signal: promptSignal });
                         }
                     } finally {
                         promptPending = false;
@@ -91,10 +97,10 @@ function authentication(ui, registry, createRuntime, getDeviceId) {
             signal.throwIfAborted();
             const refreshed = await registry.refresh({ allowNetwork: false, signal });
             if (refreshed.aborted) signal.throwIfAborted();
-            notify("done", { message: `${provider.name} connected. Models refreshed.`, url: "" });
+            notify("done", { message: `${provider.name} connected`, url: "" });
         } catch {
             // SDK errors can contain request headers or user-entered credentials.
-            notify(controller.signal.aborted ? "closed" : "failed", { message: controller.signal.aborted ? "Authentication cancelled." : "Authentication failed. Credentials were not displayed; retry or check provider configuration.", url: "" });
+            notify(controller.signal.aborted ? "closed" : "failed", { message: controller.signal.aborted ? "Sign-in cancelled" : "Sign-in failed. Try again.", url: "" });
         } finally {
             if (active === controller) active = undefined;
         }

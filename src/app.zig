@@ -424,7 +424,7 @@ pub const App = struct {
     }
 
     fn report(self: *App, operation: []const u8, err: anyerror) void {
-        const text = std.fmt.bufPrint(&self.error_text, "{s}: {s}", .{ operation, @errorName(err) }) catch "Error message exceeds display budget";
+        const text = std.fmt.bufPrint(&self.error_text, "{s}: {s}", .{ operation, @errorName(err) }) catch "Error details unavailable";
         self.error_len = text.len;
         self.formatting_error = false;
         std.log.err("{s}", .{text});
@@ -834,7 +834,7 @@ pub const App = struct {
                 snapshot.provider_ui.kind != .done and snapshot.provider_ui.kind != .failed)
             {
                 self.providers.active = false;
-                self.providers.fail("Pi exited during provider connection. Close this panel and restart Pi.");
+                self.providers.fail("Pi exited. Restart Pi to sign in.");
                 _ = c.SDL_ClearComposition(self.window);
                 _ = c.SDL_StopTextInput(self.window);
             }
@@ -1276,27 +1276,27 @@ pub const App = struct {
         _ = c.SDL_StopTextInput(self.window);
         self.dirty = true;
         if (self.options.fixture) {
-            self.providers.fail("Provider connection is unavailable in fixture mode.");
+            self.providers.fail("Sign-in unavailable in demo mode");
             return;
         }
         if (self.pending_thread != null or self.closing or self.runtime_retiring) {
-            self.providers.fail("Wait for the current chat to finish opening or closing.");
+            self.providers.fail("Wait for the chat to finish opening or closing.");
             return;
         }
         if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) {
-            self.providers.fail("Stop the current run before connecting a provider.");
+            self.providers.fail("Stop the current run to sign in.");
             return;
         }
         if (self.runtimeStatus() != .ready) {
-            self.providers.fail("Pi is not ready. Start Pi and wait for it to become ready, then retry.");
+            self.providers.fail("Pi isn't ready. Start Pi, then retry.");
             return;
         }
         const runtime = self.runtime orelse {
-            self.providers.fail("Start Pi before connecting a provider.");
+            self.providers.fail("Start Pi to sign in.");
             return;
         };
         runtime.connectProvider() catch {
-            self.providers.fail("Could not start provider connection. Retry when Pi is ready.");
+            self.providers.fail("Couldn't start sign-in. Retry when Pi is ready.");
             return;
         };
         self.providers.active = true;
@@ -1354,7 +1354,7 @@ pub const App = struct {
                     return;
                 };
                 runtime.respondProvider(ui.id, value) catch {
-                    self.providers.fail("Could not send the provider response. Retry the connection.");
+                    self.providers.fail("Couldn't send the response. Retry sign-in.");
                     return;
                 };
                 self.providers.pending = true;
@@ -1535,7 +1535,7 @@ pub const App = struct {
                     try self.label(clippedLabel(model.provider), x + 12, row_y + 23, 10, colors.muted);
                     _ = c.SDL_SetRenderClipRect(self.renderer, null);
                 }
-            } else try self.label("Start pi to discover models", x + 12, y + 16, 13, colors.muted);
+            } else try self.label("Models unavailable", x + 12, y + 16, 13, colors.muted);
             const connect_selected = if (self.runtime_snapshot) |snapshot| self.model_first == snapshot.models.len else true;
             if (connect_selected) try self.rectangle(x + 8, y + 216, width - 16, 34, 5, colors.raised);
             try self.flatButton(.connect_provider, "Connect a provider", .{ .x = x + 8, .y = y + 216, .w = width - 16, .h = 34 });
@@ -1551,13 +1551,19 @@ pub const App = struct {
             }
         }
         if (self.closing or self.force_dialog) {
-            const x = self.shell.conversation.x + 36;
-            try self.rectangle(x, 110, self.shell.conversation.width - 72, 166, 10, colors.panel);
-            try self.label(if (self.force_dialog) "Pi has not exited" else "Closing pi gracefully...", x + 20, 130, 18, colors.text);
-            try self.label("The window stays alive until its owned process exits.", x + 20, 164, 13, colors.muted);
+            const canvas_width = self.shell.sidebar.width + self.shell.conversation.width;
+            const canvas_height = self.shell.header.height + self.shell.conversation.height + self.shell.composer.height;
+            const width = @min(@as(f32, 420), canvas_width - 32);
+            const height: f32 = if (self.force_dialog) 164 else 100;
+            const x = (canvas_width - width) / 2;
+            const y = (canvas_height - height) / 2;
+            try self.rectangle(x, y, width, height, 10, colors.panel);
+            try self.label(if (self.force_dialog) "Pi has not exited" else "Closing...", x + 20, y + 18, 18, colors.text);
+            try self.label(if (self.force_dialog) "Force stops Pi and its running tasks." else "Spica will close when Pi exits.", x + 20, y + 50, 13, colors.muted);
             if (self.force_dialog) {
-                try self.button(.wait, "Wait", .{ .x = x + 20, .y = 213, .w = 80, .h = 34 });
-                try self.button(.force_stop, "Force owned tree · Ctrl+Shift+Esc", .{ .x = x + 114, .y = 213, .w = 258, .h = 34 });
+                try self.label("Unsaved work may be lost.", x + 20, y + 70, 13, colors.muted);
+                try self.button(.wait, "Wait", .{ .x = x + 20, .y = y + 110, .w = 80, .h = 34 });
+                try self.button(.force_stop, "Force", .{ .x = x + 114, .y = y + 110, .w = 76, .h = 34 });
             }
         }
     }
@@ -1897,9 +1903,9 @@ pub const App = struct {
         try self.iconButton(.sidebar, .sidebar, .{ .x = 12, .y = 9, .w = 30, .h = 30 }, colors.muted);
         try self.label("Spica", 50, 17, 15, colors.text);
         try self.button(.new_thread, "New thread", .{ .x = 12, .y = 46, .w = width - 24, .h = 30 });
-        try self.flatButton(.{ .open_library = .workspace }, if (builtin.os.tag == .macos) "Search chats    Cmd+K" else "Search chats    Ctrl+K", .{ .x = 12, .y = 80, .w = width - 24, .h = 30 });
+        try self.flatButton(.{ .open_library = .workspace }, "Search chats", .{ .x = 12, .y = 80, .w = width - 24, .h = 30 });
         try self.label("Projects", 20, 128, 12, colors.muted);
-        try self.flatButton(.add_project, "+ Add folder", .{ .x = width - 108, .y = 120, .w = 100, .h = 30 });
+        try self.flatButton(.add_project, "Add folder", .{ .x = width - 108, .y = 120, .w = 100, .h = 30 });
         const visible: usize = @intFromFloat(@max(1, @floor((height - 262) / 38)));
         self.sidebar_first = @min(self.sidebar_first, self.sidebarRows() -| visible);
         if (self.sidebar_reveal_current) if (self.currentSidebarRow()) |selected_row| {
@@ -2033,12 +2039,10 @@ pub const App = struct {
             (self.transcript.items.items.len == 0 and !self.content_pending and !self.conversation_dirty and self.runtimeStatus() == .ready)))
         {
             const empty_y = body_top + @min(96, viewport_height * 0.2);
-            try self.label(if (self.chat_view == .opening) self.title() else if (self.chat_view == .existing) "No messages in this chat" else "New thread", content_x + 16, empty_y, @intFromFloat(self.theme.metrics.body_px + 5), colors.text);
-            try self.fitLabel(clippedLabel(displayed_project), content_x + 16, empty_y + 38, content_width - 32, 13, colors.muted);
-            const description = if (self.chat_view == .opening)
-                (if (self.runtimeStatus() == .failed) "Unable to open chat." else "Opening chat...")
-            else if (self.chat_view == .existing) "This saved chat has no messages." else "Describe what you want to build or change.";
-            try self.fitLabel(description, content_x + 16, empty_y + 64, content_width - 32, 13, colors.muted);
+            const message = if (self.chat_view == .opening)
+                (if (self.runtimeStatus() == .failed) "Unable to open chat" else "Opening chat...")
+            else if (self.chat_view == .existing) "No messages" else "New thread";
+            try self.label(message, content_x + 16, empty_y, @intFromFloat(self.theme.metrics.body_px + 5), colors.text);
         }
         if (!self.follow_bottom and self.transcript.height > viewport_height) try self.flatButton(.latest, "Jump to latest", .{ .x = content_x + content_width - 128, .y = conversation.y + conversation.height - 33, .w = 128, .h = 28 });
         self.composer_bounds = .{ .x = content_x, .y = self.shell.composer.y + 8, .w = content_width, .h = @min(144, self.shell.composer.height - 44) };
@@ -2086,8 +2090,7 @@ pub const App = struct {
             }
         }
         try widgets.icon(self.renderer, .folder, .{ .x = composer.x + 2, .y = composer.y + composer.h + 13, .w = 12, .h = 12 }, colors.muted);
-        try self.label("Local checkout", composer.x + 22, composer.y + composer.h + 13, 11, colors.muted);
-        try self.fitLabel(project, composer.x + 130, composer.y + composer.h + 13, @max(0, composer.w - 130), 11, colors.muted);
+        try self.fitLabel(clippedLabel(displayed_project), composer.x + 22, composer.y + composer.h + 13, @max(0, composer.w - 22), 11, colors.muted);
         if (self.error_len != 0) {
             try self.fitLabel(clippedLabel(self.error_text[0..self.error_len]), composer.x, composer.y - 25, composer.w, 12, colors.error_color);
         } else if (self.runtime_snapshot) |snapshot| {
@@ -2163,7 +2166,7 @@ pub const App = struct {
                 if (!c.SDL_SetRenderDrawBlendMode(self.renderer, c.SDL_BLENDMODE_BLEND) or !c.SDL_SetRenderDrawColor(self.renderer, colors.accent.r, colors.accent.g, colors.accent.b, 60) or !c.SDL_RenderFillRects(self.renderer, &rects, @intCast(count))) return error.SelectionDraw;
             }
             if (!c.spica_text_layout_draw(self.text, layout, bounds.x + 12, bounds.y + 10 - self.editor_scroll, rgba(colors.text))) return error.EditorDraw;
-            if (self.editor.len == 0) try self.label("Ask for changes or send a follow-up", bounds.x + 12, bounds.y + 10, @intFromFloat(self.theme.metrics.body_px), colors.muted);
+            if (self.editor.len == 0) try self.label("Message", bounds.x + 12, bounds.y + 10, @intFromFloat(self.theme.metrics.body_px), colors.muted);
         }
         if (self.preedit.items.len != 0) try self.label(clippedLabel(self.preedit.items), bounds.x + 12, bounds.y + 66, 15, colors.accent);
         if (self.focused_editor and has_caret) try self.rectangle(bounds.x + 12 + caret.x, bounds.y + 10 + caret.y - self.editor_scroll, 2, caret.h, 0, colors.text);
@@ -2180,14 +2183,14 @@ pub const App = struct {
             if (self.needsForceStop() and !prompted) {
                 prompted = true;
                 const buttons = [_]c.SDL_MessageBoxButtonData{
-                    .{ .flags = c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, .buttonID = 0, .text = "Keep waiting" },
-                    .{ .flags = 0, .buttonID = 1, .text = "Force owned process tree" },
+                    .{ .flags = c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, .buttonID = 0, .text = "Wait" },
+                    .{ .flags = 0, .buttonID = 1, .text = "Force" },
                 };
                 const dialog = c.SDL_MessageBoxData{
                     .flags = c.SDL_MESSAGEBOX_ERROR,
                     .window = self.window,
                     .title = "Spica — UI failure",
-                    .message = "Pi has not exited. Spica will retain ownership until it exits.\nCtrl+Shift+Esc reopens this choice.",
+                    .message = "Pi has not exited. Spica will close when Pi exits.\nForce stops Pi and its running tasks. Unsaved work may be lost.",
                     .numbuttons = buttons.len,
                     .buttons = &buttons,
                     .colorScheme = null,

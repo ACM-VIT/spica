@@ -259,7 +259,9 @@ pub const Panel = struct {
         const canvas_w = app.shell.sidebar.width + app.shell.conversation.width;
         const canvas_h = app.shell.header.height + app.shell.conversation.height + app.shell.composer.height;
         const w = @min(@as(f32, 720), @max(@as(f32, 0), canvas_w - 24));
-        const h = @min(@as(f32, 600), @max(@as(f32, 0), canvas_h - 24));
+        const count = if (self.page) |page| page.threads.len else 0;
+        const content_h = 186 + @as(f32, @floatFromInt(count)) * row_height;
+        const h = @min(content_h, @min(@as(f32, 600), @max(@as(f32, 0), canvas_h - 24)));
         const x = (canvas_w - w) / 2;
         const y = (canvas_h - h) / 2;
         const left = x + 12;
@@ -268,7 +270,7 @@ pub const Panel = struct {
         try app.rectangle(0, 0, canvas_w, canvas_h, 0, colors.canvas);
         try app.rectangle(x, y, w, h, 9, colors.border);
         try app.rectangle(x + 1, y + 1, w - 2, h - 2, 8, colors.panel);
-        try app.label("Chat library", left, y + 10, 17, colors.text);
+        try app.label("Library", left, y + 10, 17, colors.text);
         try self.button(app, .close, "Close", .{ .x = x + w - 74, .y = y + 7, .w = 62, .h = 28 });
         const tab_w = (inner - 12) / 3;
         const scopes = [_]catalog.Scope{ .workspace, .archives, .import_pi };
@@ -286,7 +288,7 @@ pub const Panel = struct {
         const status: []const u8 = if (current_error) |err|
             try std.fmt.bufPrint(&status_buffer, "Error: {s}", .{@errorName(err)})
         else if (self.busy)
-            "Saving workspace change..."
+            "Saving..."
         else if (self.waiting)
             "Searching..."
         else if (self.page) |page|
@@ -296,7 +298,6 @@ pub const Panel = struct {
         try clippedLabel(app, status, left, y + 118, inner, 12, colors.muted);
         self.results_bounds = .{ .x = left, .y = y + 140, .w = inner, .h = @max(0, footer_y - (y + 140) - 6) };
         self.visible = @max(1, @as(usize, @intFromFloat(@floor(self.results_bounds.h / row_height))));
-        const count = if (self.page) |page| page.threads.len else 0;
         self.first = @min(self.first, count -| self.visible);
         var clip = Clip.push(app.renderer, self.results_bounds);
         defer clip.restore(app.renderer);
@@ -311,8 +312,8 @@ pub const Panel = struct {
                 try clippedLabel(app, thread.title, left + 8, top + 5, inner - 16 - badge_w, 14, colors.text);
                 if (badge.len != 0) try app.label(badge, left + inner - 100, top + 6, 11, colors.muted);
                 try clippedLabel(app, if (thread.cwd.len != 0) thread.cwd else thread.path, left + 8, top + 24, inner - 16, 11, colors.muted);
-                const excerpt = if (thread.snippet.len != 0) thread.snippet else if (!thread.available) "Source unavailable; cached result" else thread.path;
-                try clippedLabel(app, excerpt, left + 8, top + 42, inner - 16, 11, colors.muted);
+                const excerpt = if (thread.snippet.len != 0) thread.snippet else if (!thread.available) "Source unavailable; cached result" else if (thread.cwd.len != 0) thread.path else "";
+                if (excerpt.len != 0) try clippedLabel(app, excerpt, left + 8, top + 42, inner - 16, 11, colors.muted);
                 if (!self.waiting and !self.busy and page.generation == self.generation and page.scope == self.scope and page.offset == self.offset and bounds.y + bounds.h <= self.results_bounds.y + self.results_bounds.h) self.addTarget(.{ .select = index }, bounds);
             }
         }
@@ -379,7 +380,7 @@ pub const Panel = struct {
             const n = c.spica_text_layout_selection_rects(layout, range.start, range.start + self.preedit_len, &rects, rects.len);
             if (n > rects.len) return error.LibrarySelectionBudget;
             for (rects[0..n]) |rect| try app.rectangle(tx + rect.x, ty + rect.y + rect.h - 1, rect.w, 1, 0, colors.accent);
-        } else if (self.editor.len == 0) try app.label(if (self.scope == .import_pi) "Search Pi titles and folders" else "Search titles, folders and messages", bounds.x + 8, ty, 13, colors.muted);
+        } else if (self.editor.len == 0) try app.label("Search", bounds.x + 8, ty, 13, colors.muted);
         try app.rectangle(tx + caret.x, ty + caret.y, 1, caret.h, 0, colors.text);
         var input_x: f32 = 0;
         var input_y: f32 = 0;

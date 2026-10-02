@@ -461,7 +461,7 @@ pub const Runtime = struct {
                     polling.exit_fd = -1;
                     if (!reported_reap_failure) {
                         reported_reap_failure = true;
-                        self.replace(&self.state.error_message, "Child reap failed; process ownership retained for explicit retry") catch {};
+                        self.replace(&self.state.error_message, "Couldn't finish Pi shutdown") catch {};
                         self.publish() catch {};
                     }
                 }
@@ -522,7 +522,7 @@ pub const Runtime = struct {
                 var status: c_int = 0;
                 if (p.spica_process_reap(&self.process, &status) != 1) return error.ProcessWait;
                 self.state.status = .exited;
-                if (!self.closing) try self.replace(&self.state.error_message, "Pi exited unexpectedly; pending draft is recoverable");
+                if (!self.closing) try self.replace(&self.state.error_message, "Pi exited unexpectedly; draft retained");
                 try self.publish();
                 return;
             }
@@ -552,7 +552,7 @@ pub const Runtime = struct {
             },
             .bytes => |queued| {
                 if (self.process.pid == 0 or self.process.input < 0) {
-                    try self.replace(&self.state.error_message, "Pi is not accepting commands; unsent draft retained");
+                    try self.replace(&self.state.error_message, "Pi unavailable; draft retained");
                     if (queued.command_id) |token| try self.rejectUnsent(token);
                     try self.publish();
                 } else {
@@ -577,7 +577,7 @@ pub const Runtime = struct {
             .force => {
                 if (p.spica_process_force(&self.process) != 0) {
                     self.state.status = .needs_force_stop;
-                    try self.replace(&self.state.error_message, "Force termination failed; owned process retained. Retry Force explicitly.");
+                    try self.replace(&self.state.error_message, "Couldn't stop Pi. Try Force again.");
                     try self.publish();
                 }
             },
@@ -711,7 +711,7 @@ pub const Runtime = struct {
             }
         }
         try self.offerRecovery(draft.string);
-        try self.replace(&self.state.attention, "Cancelled queued messages retained in protocol cache");
+        try self.replace(&self.state.attention, "Queued messages cancelled; input retained");
     }
 
     fn recoverDrafts(self: *Runtime) !void {
@@ -902,7 +902,7 @@ pub const Runtime = struct {
                 self.state.models = owned_models;
                 if (models == .array and models.array.items.len > 256) {
                     try self.inspect(raw, "model_display_budget", "Available model list exceeds first-pass display budget; complete list retained");
-                    try self.replace(&self.state.attention, "Available model list exceeds first-pass display budget");
+                    try self.replace(&self.state.attention, "Showing the first 256 models");
                 }
             } else if (std.mem.eql(u8, command_name, "get_available_thinking_levels")) {
                 const levels = child(data, "levels");
@@ -932,7 +932,7 @@ pub const Runtime = struct {
                 try self.requestState();
             } else if (std.mem.eql(u8, command_name, "new_session")) {
                 if (boolean(data, "cancelled")) {
-                    try self.replace(&self.state.attention, "New session was cancelled; current thread retained");
+                    try self.replace(&self.state.attention, "New chat cancelled");
                 } else {
                     const generation = try std.math.add(i64, self.state.generation, 1);
                     try self.store.?.clearLiveGeneration(self.state.runtime_id, self.state.generation);
@@ -1104,7 +1104,7 @@ pub const Runtime = struct {
         } else if (std.mem.eql(u8, ty, "extension_ui_request")) {
             if (!try self.providerRequest(value)) {
                 try self.inspect(raw, "pending_extension_request", string(value, "method"));
-                try self.replace(&self.state.attention, "Extension request pending: inspect retained protocol record; no response was invented");
+                try self.replace(&self.state.attention, "Extension input isn't supported");
             }
         } else if (std.mem.eql(u8, ty, "extension_error")) {
             try self.replace(&self.state.error_message, string(value, "error"));
@@ -1165,7 +1165,7 @@ pub const Runtime = struct {
         try self.setProviderUi(.{
             .kind = if (select) .select else .input,
             .id = string(value, "id"),
-            .title = title,
+            .title = if (select) title[prefix.len..] else if (self.state.provider_ui.url.len != 0) "Sign in" else "Connect a provider",
             .message = if (secret) title[prefix.len + "[secret] ".len ..] else title[prefix.len..],
             .placeholder = string(value, "placeholder"),
             .url = self.state.provider_ui.url,
@@ -1347,7 +1347,7 @@ const Sink = struct {
                 else => {
                     self.runtime.entries_again = false;
                     try self.runtime.inspect(self.id, "unsupported_entries_shape", @errorName(err));
-                    try self.runtime.replace(&self.runtime.state.attention, "Unsupported canonical entry shape retained for inspection");
+                    try self.runtime.replace(&self.runtime.state.attention, "Couldn't display chat history; raw data saved");
                     try self.runtime.publish();
                     return;
                 },
@@ -1361,7 +1361,7 @@ const Sink = struct {
         }
         if (source.length > record_limit) {
             try self.runtime.inspect(self.id, "unsupported_oversized_record", "Record exceeds bounded reducer; complete raw bytes retained");
-            try self.runtime.replace(&self.runtime.state.attention, "Oversized protocol record retained on disk for inspection");
+            try self.runtime.replace(&self.runtime.state.attention, "Pi response too large to display; raw data saved");
             try self.runtime.publish();
             return;
         }
@@ -1378,7 +1378,7 @@ const Sink = struct {
             error.OutOfMemory, error.SqliteFailure => return err,
             else => {
                 try self.runtime.inspect(self.id, "unsupported_protocol_fields", @errorName(err));
-                try self.runtime.replace(&self.runtime.state.attention, "Unsupported protocol fields retained for inspection");
+                try self.runtime.replace(&self.runtime.state.attention, "Unsupported Pi response; raw data saved");
                 try self.runtime.publish();
             },
         };
