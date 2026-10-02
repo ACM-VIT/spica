@@ -20,6 +20,7 @@ pub const Panel = struct {
     selected: usize = 0,
     first: usize = 0,
     visible: usize = 1,
+    wheel_remainder: f32 = 0,
     input: [input_limit]u8 = @splat(0),
     input_len: usize = 0,
     input_error: ?[]const u8 = null,
@@ -74,6 +75,7 @@ pub const Panel = struct {
         self.failure = null;
         self.selected = 0;
         self.first = 0;
+        self.wheel_remainder = 0;
         self.target_count = 0;
         _ = c.SDL_ClearComposition(app.window);
         if (ui.kind == .closed) {
@@ -98,6 +100,17 @@ pub const Panel = struct {
         self.first = @min(self.first, count -| self.visible);
         if (self.selected < self.first) self.first = self.selected;
         if (self.selected >= self.first + self.visible) self.first = self.selected + 1 -| self.visible;
+    }
+
+    fn scroll(self: *Panel, count: usize, delta: f32) void {
+        self.wheel_remainder += delta;
+        const rows = @trunc(std.math.clamp(self.wheel_remainder, -@as(f32, @floatFromInt(count)), @as(f32, @floatFromInt(count))));
+        self.wheel_remainder -= rows;
+        const step: usize = @intFromFloat(@abs(rows));
+        const previous = self.first;
+        self.first = if (rows > 0) self.first -| step else @min(count -| self.visible, self.first +| step);
+        if (self.first != previous) self.target_count = 0;
+        if ((rows > 0 and self.first == 0) or (rows < 0 and self.first == count -| self.visible)) self.wheel_remainder = 0;
     }
 
     fn button(self: *Panel, app: anytype, intent: Intent, caption: []const u8, bounds: c.SDL_FRect) !void {
@@ -142,8 +155,9 @@ pub const Panel = struct {
         defer _ = c.SDL_SetRenderClipRect(app.renderer, null);
         if (state == .select) {
             self.visible = @min(@as(usize, 24), @max(@as(usize, 1), @as(usize, @intFromFloat(@max(0, footer - body_top - 34) / 38))));
-            self.ensureVisible(ui.options.len);
-            _ = try text(app, "Choose a provider · arrows and Enter, or click", left, body_top, inner, 13, colors.muted);
+            self.selected = @min(self.selected, ui.options.len -| 1);
+            self.first = @min(self.first, ui.options.len -| self.visible);
+            _ = try text(app, "Wheel scrolls · click to select · Enter connects", left, body_top, inner, 13, colors.muted);
             const end = @min(ui.options.len, self.first + self.visible);
             for (ui.options[self.first..end], self.first..) |option, index| {
                 const row_y = body_top + 30 + @as(f32, @floatFromInt(index - self.first)) * 38;
@@ -215,7 +229,7 @@ pub const Panel = struct {
                         switch (target.action) {
                             .select => |index| {
                                 self.selected = index;
-                                return .respond;
+                                return null;
                             },
                             .intent => |intent| return intent,
                         }
@@ -224,8 +238,7 @@ pub const Panel = struct {
             },
             c.SDL_EVENT_MOUSE_WHEEL => if (state == .select) {
                 const direction = event.wheel.y * (if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) @as(f32, -1) else 1);
-                if (direction > 0) self.selected -|= 1 else if (direction < 0) self.selected = @min(ui.options.len -| 1, self.selected + 1);
-                self.ensureVisible(ui.options.len);
+                self.scroll(ui.options.len, direction);
             },
             c.SDL_EVENT_KEY_DOWN => {
                 const command = (event.key.mod & (c.SDL_KMOD_CTRL | c.SDL_KMOD_GUI)) != 0;
@@ -238,6 +251,7 @@ pub const Panel = struct {
                     },
                     c.SDLK_UP, c.SDLK_DOWN, c.SDLK_PAGEUP, c.SDLK_PAGEDOWN, c.SDLK_HOME, c.SDLK_END => if (state == .select) {
                         const step: usize = if (event.key.key == c.SDLK_PAGEUP or event.key.key == c.SDLK_PAGEDOWN) self.visible else 1;
+                        self.wheel_remainder = 0;
                         self.selected = switch (event.key.key) {
                             c.SDLK_HOME => 0,
                             c.SDLK_END => ui.options.len -| 1,
@@ -272,3 +286,54 @@ pub const Panel = struct {
         return null;
     }
 };
+
+test "provider wheel scroll preserves selection and accumulates fractional movement" {
+    var panel = Panel{ .selected = 1, .visible = 3 };
+    panel.scroll(10, -0.5);
+    try std.testing.expectEqual(@as(usize, 0), panel.first);
+    panel.scroll(10, -2.5);
+    try std.testing.expectEqual(@as(usize, 3), panel.first);
+    try std.testing.expectEqual(@as(usize, 1), panel.selected);
+    panel.scroll(10, -100);
+    try std.testing.expectEqual(@as(usize, 7), panel.first);
+    panel.scroll(10, 1);
+    try std.testing.expectEqual(@as(usize, 6), panel.first);
+    panel.scroll(10, 100);
+    try std.testing.expectEqual(@as(usize, 0), panel.first);
+    panel.scroll(0, -1);
+    try std.testing.expectEqual(@as(usize, 0), panel.first);
+}
+
+test "provider click selects without submitting and keyboard navigation reveals selection" {
+    var app = struct { dirty: bool = false, window: *c.SDL_Window = undefined }{};
+    var panel = Panel{ .visible = 2 };
+    const ui = ProviderUi{ .kind = .select, .options = &.{ "Anthropic", "OpenAI", "OpenRouter", "Google" } };
+    panel.targets[0] = .{ .bounds = .{ .x = 10, .y = 10, .w = 200, .h = 34 }, .action = .{ .select = 2 } };
+    panel.target_count = 1;
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    event.button.x = 20;
+    event.button.y = 20;
+    try std.testing.expect(try panel.handle(&app, ui, &event) == null);
+    try std.testing.expectEqual(@as(usize, 2), panel.selected);
+    event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_MOUSE_WHEEL;
+    event.wheel.y = 2;
+    event.wheel.direction = c.SDL_MOUSEWHEEL_FLIPPED;
+    _ = try panel.handle(&app, ui, &event);
+    try std.testing.expectEqual(@as(usize, 2), panel.first);
+    try std.testing.expectEqual(@as(usize, 2), panel.selected);
+    event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_HOME;
+    _ = try panel.handle(&app, ui, &event);
+    try std.testing.expectEqual(@as(usize, 0), panel.first);
+    try std.testing.expectEqual(@as(usize, 0), panel.selected);
+    event.key.key = c.SDLK_END;
+    _ = try panel.handle(&app, ui, &event);
+    try std.testing.expectEqual(@as(usize, 2), panel.first);
+    try std.testing.expectEqual(@as(usize, 3), panel.selected);
+    event.key.key = c.SDLK_RETURN;
+    try std.testing.expectEqual(Intent.respond, (try panel.handle(&app, ui, &event)).?);
+}
