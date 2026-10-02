@@ -18,8 +18,71 @@ const Settings = @import("ui/settings.zig");
 const Library = @import("ui/library.zig");
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
-const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
+const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
 const ThreadTarget = struct { path: ?[:0]u8, cwd: [:0]u8, archived: bool = false };
+const SubmittedPrompt = struct { token: u64, draft_revision: u64 };
+const ChatView = enum { new_thread, opening, existing };
+const ModelRestore = struct {
+    provider: []u8,
+    model: []u8,
+    thinking: []u8,
+
+    fn deinit(self: *ModelRestore, allocator: std.mem.Allocator) void {
+        allocator.free(self.provider);
+        allocator.free(self.model);
+        allocator.free(self.thinking);
+    }
+};
+
+// Inactive chats retain only runtime metadata and bounded draft text. The single
+// viewport, text layouts, and composer undo storage stay with the active chat.
+const ParkedChat = struct {
+    id: u64,
+    runtime: ?*pi.Runtime,
+    snapshot: ?pi.Snapshot,
+    cwd: [:0]u8,
+    path: ?[:0]u8,
+    trust: ?bool,
+    model_restore: ?ModelRestore = null,
+    draft: []u8,
+    caret: usize,
+    anchor: usize,
+    draft_revision: u64,
+    submitted: ?SubmittedPrompt,
+    accepted_clear_revision: ?u64,
+    cleared_draft: ?[]u8 = null,
+    title: [128]u8,
+    title_len: usize,
+    view: ChatView,
+    archived: bool,
+    member: bool,
+    enrollment_intent: bool,
+    accepted_enrollment: bool,
+    enrollment_failed: bool,
+    run_started: ?u64,
+    run_base_revision: u64,
+    run_elapsed: ?u64,
+    behavior: pi.Behavior,
+    error_text: [512]u8,
+    error_len: usize,
+    scroll: f32,
+    retiring: bool = false,
+
+    fn session(self: *const ParkedChat) []const u8 {
+        if (self.snapshot) |snapshot| if (snapshot.session_file.len != 0) return snapshot.session_file;
+        return self.path orelse "";
+    }
+
+    fn deinit(self: *ParkedChat, allocator: std.mem.Allocator) void {
+        if (self.runtime) |runtime| runtime.destroy() catch |err| std.log.err("Parked runtime shutdown invariant: {s}", .{@errorName(err)});
+        if (self.snapshot) |*snapshot| snapshot.deinit();
+        allocator.free(self.cwd);
+        if (self.path) |path| allocator.free(path);
+        allocator.free(self.draft);
+        if (self.cleared_draft) |draft| allocator.free(draft);
+        if (self.model_restore) |*settings| settings.deinit(allocator);
+    }
+};
 const PendingMutation = struct {
     id: u64,
     kind: SessionCatalog.Mutation,
@@ -28,6 +91,7 @@ const PendingMutation = struct {
     title: []u8,
     open_after: bool,
     automatic: bool,
+    owner_id: ?u64 = null,
 
     fn deinit(self: *PendingMutation, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -69,6 +133,12 @@ pub const App = struct {
     draft_writer: *Draft.Writer,
     runtime: ?*pi.Runtime = null,
     runtime_snapshot: ?pi.Snapshot = null,
+    parked_chats: std.ArrayList(ParkedChat) = .empty,
+    chat_id: u64 = 1,
+    next_chat_id: u64 = 2,
+    model_restore: ?ModelRestore = null,
+    runtime_retiring: bool = false,
+    accepted_draft: ?[]u8 = null,
     closing: bool = false,
     force_dialog: bool = false,
     model_menu: bool = false,
@@ -81,7 +151,7 @@ pub const App = struct {
     composer_bounds: c.SDL_FRect = undefined,
     thread_title: [128]u8 = undefined,
     thread_title_len: usize = 0,
-    chat_view: enum { new_thread, opening, existing } = .new_thread,
+    chat_view: ChatView = .new_thread,
     run_started: ?u64 = null,
     run_base_revision: u64 = 0,
     run_elapsed: ?u64 = null,
@@ -93,7 +163,7 @@ pub const App = struct {
     folder_pending: bool = false,
     behavior: pi.Behavior = .prompt,
     draft_revision: u64 = 0,
-    submitted_prompt: ?struct { token: u64, draft_revision: u64 } = null,
+    submitted_prompt: ?SubmittedPrompt = null,
     accepted_clear_revision: ?u64 = null,
     buttons: [256]Button = undefined,
     button_count: usize = 0,
@@ -254,6 +324,10 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         if (self.runtime) |runtime| runtime.destroy() catch |err| std.log.err("Runtime shutdown invariant: {s}", .{@errorName(err)});
         if (self.runtime_snapshot) |*snapshot| snapshot.deinit();
+        for (self.parked_chats.items) |*chat| chat.deinit(self.allocator);
+        self.parked_chats.deinit(self.allocator);
+        if (self.model_restore) |*settings| settings.deinit(self.allocator);
+        if (self.accepted_draft) |draft| self.allocator.free(draft);
         self.saveDraft() catch |err| std.log.err("final draft queue: {s}", .{@errorName(err)});
         self.draft_writer.destroy();
         self.content.destroy();
@@ -347,7 +421,7 @@ pub const App = struct {
         const text = std.fmt.bufPrint(&self.error_text, "{s}: {s}", .{ operation, @errorName(err) }) catch "Error message exceeds display budget";
         self.error_len = text.len;
         self.formatting_error = false;
-        std.log.err("{s}; SDL: {s}", .{ text, c.SDL_GetError() });
+        std.log.err("{s}", .{text});
         self.dirty = true;
     }
 
@@ -407,10 +481,8 @@ pub const App = struct {
     }
 
     fn newThreadIn(self: *App, path: []const u8) !void {
-        if (self.pending_mutation != null) return error.WorkspaceMutationPending;
-        if (self.enrollment_intent) return error.WorkspaceEnrollmentPending;
+        if (self.pending_mutation) |mutation| if (!mutation.automatic) return error.WorkspaceMutationPending;
         if (self.pending_thread != null or self.closing) return error.ThreadSwitchPending;
-        if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) return error.StopCurrentRunBeforeSwitchingThread;
         const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
         var transferred = false;
         errdefer if (!transferred) self.allocator.free(cwd);
@@ -418,7 +490,6 @@ pub const App = struct {
         dir.close(self.io);
         if (self.projects.items.len < 64) try self.addProject(cwd);
         try self.saveDraft();
-        if (self.runtime) |runtime| if (!runtime.isFinished()) try runtime.shutdown();
         self.pending_thread = .{ .path = null, .cwd = cwd };
         transferred = true;
         try self.finishThreadSwitch();
@@ -433,64 +504,194 @@ pub const App = struct {
 
     fn openSource(self: *App, source: []const u8, project: []const u8, title_text: []const u8, archived: bool, available: bool) !void {
         if (self.pending_thread != null or self.closing) return error.ThreadSwitchPending;
-        if (self.pending_mutation != null) return error.WorkspaceMutationPending;
-        if (self.enrollment_intent) return error.WorkspaceEnrollmentPending;
-        if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) return error.StopCurrentRunBeforeSwitchingThread;
-        if (!available) return error.SessionSourceUnavailable;
-        try SessionCatalog.validateSource(self.io, source, project);
-        if (self.runtime_snapshot) |snapshot| if (std.mem.eql(u8, snapshot.session_file, source)) {
+        if (self.pending_mutation) |mutation| if (!mutation.automatic) return error.WorkspaceMutationPending;
+        if (std.mem.eql(u8, self.currentSession(), source)) {
             self.current_archived = archived;
             self.current_member = true;
             self.follow_bottom = true;
             self.dirty = true;
             return;
-        };
+        }
+        for (self.parked_chats.items, 0..) |chat, index| {
+            if (!std.mem.eql(u8, chat.session(), source)) continue;
+            try self.saveDraft();
+            try self.activateParked(index);
+            self.current_archived = archived;
+            self.current_member = true;
+            self.revealCurrentFolder();
+            return;
+        }
+        if (!available) return error.SessionSourceUnavailable;
+        try SessionCatalog.validateSource(self.io, source, project);
         var transferred = false;
         const path = try self.allocator.dupeZ(u8, source);
         errdefer if (!transferred) self.allocator.free(path);
         const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, project, self.allocator);
         errdefer if (!transferred) self.allocator.free(cwd);
         try self.saveDraft();
-        if (self.runtime) |runtime| if (!runtime.isFinished()) try runtime.shutdown();
         self.pending_thread = .{ .path = path, .cwd = cwd, .archived = archived };
+        transferred = true;
+        try self.finishThreadSwitch();
         const name = clippedLabel(title_text);
         @memcpy(self.thread_title[0..name.len], name);
         self.thread_title_len = name.len;
-        self.chat_view = .opening;
-        transferred = true;
-        try self.finishThreadSwitch();
+    }
+
+    fn parkCurrent(self: *App) !void {
+        const draft = try self.allocator.dupe(u8, self.editor.textBytes());
+        errdefer self.allocator.free(draft);
+        const path: ?[:0]u8 = if (self.resume_path) |owned| owned else if (self.options.resume_file) |source| try self.allocator.dupeZ(u8, source) else null;
+        errdefer if (self.resume_path == null) if (path) |owned| self.allocator.free(owned);
+        try self.parked_chats.append(self.allocator, .{
+            .id = self.chat_id,
+            .runtime = self.runtime,
+            .snapshot = self.runtime_snapshot,
+            .cwd = self.project_path,
+            .path = path,
+            .trust = self.options.trust_project,
+            .draft = draft,
+            .caret = self.editor.caret,
+            .anchor = self.editor.anchor,
+            .draft_revision = self.draft_revision,
+            .submitted = self.submitted_prompt,
+            .accepted_clear_revision = self.accepted_clear_revision,
+            .cleared_draft = self.accepted_draft,
+            .model_restore = self.model_restore,
+            .title = self.thread_title,
+            .title_len = self.thread_title_len,
+            .view = self.chat_view,
+            .archived = self.current_archived,
+            .member = self.current_member,
+            .enrollment_intent = self.enrollment_intent,
+            .accepted_enrollment = self.accepted_enrollment,
+            .enrollment_failed = self.enrollment_failed,
+            .run_started = self.run_started,
+            .run_base_revision = self.run_base_revision,
+            .run_elapsed = self.run_elapsed,
+            .behavior = self.behavior,
+            .error_text = self.error_text,
+            .error_len = self.error_len,
+            .scroll = self.scroll,
+            .retiring = self.runtime_retiring,
+        });
+        self.runtime = null;
+        self.runtime_snapshot = null;
+        self.resume_path = null;
+        self.accepted_draft = null;
+        self.model_restore = null;
+        self.runtime_retiring = false;
+    }
+
+    fn resetChatViewport(self: *App) void {
+        self.transcript.clear();
+        self.generation += 1;
+        self.content_pending = false;
+        self.pending_ordinal = null;
+        self.conversation_dirty = false;
+        self.model_menu = false;
+        self.thinking_menu = false;
+        self.preedit.clearRetainingCapacity();
+        _ = c.SDL_ClearComposition(self.window);
+        self.dragging = false;
+        self.editor_scroll = 0;
+        self.editor_start = 0;
+        self.editor_end = 0;
+        self.editor_width = 0;
+        self.preferred_caret_x = null;
+        self.editor_changed = true;
+        self.button_count = 0;
+        self.draft_due = c.SDL_GetTicks() + 250;
+        self.dirty = true;
+    }
+
+    fn activateParked(self: *App, index: usize) !void {
+        // Reserve before transferring ownership; a failed allocation leaves the
+        // active chat and every runtime intact.
+        try self.parkCurrent();
+        const chat = self.parked_chats.orderedRemove(index);
+        defer self.allocator.free(chat.draft);
+        self.chat_id = chat.id;
+        self.runtime = chat.runtime;
+        self.runtime_snapshot = chat.snapshot;
+        self.project_path = chat.cwd;
+        self.resume_path = chat.path;
+        self.options.resume_file = chat.path;
+        self.options.trust_project = chat.trust;
+        self.model_restore = chat.model_restore;
+        self.accepted_draft = chat.cleared_draft;
+        self.runtime_retiring = chat.retiring;
+        try self.editor.setText(chat.draft);
+        self.editor.setCaret(chat.anchor, false);
+        self.editor.setCaret(chat.caret, true);
+        self.draft_revision = chat.draft_revision;
+        self.submitted_prompt = chat.submitted;
+        self.accepted_clear_revision = chat.accepted_clear_revision;
+        self.thread_title = chat.title;
+        self.thread_title_len = chat.title_len;
+        self.chat_view = chat.view;
+        self.current_archived = chat.archived;
+        self.current_member = chat.member;
+        self.enrollment_intent = chat.enrollment_intent;
+        self.accepted_enrollment = chat.accepted_enrollment;
+        self.enrollment_failed = chat.enrollment_failed;
+        self.run_started = chat.run_started;
+        self.run_base_revision = chat.run_base_revision;
+        self.run_elapsed = chat.run_elapsed;
+        self.behavior = chat.behavior;
+        self.error_text = chat.error_text;
+        self.error_len = chat.error_len;
+        self.formatting_error = false;
+        self.scroll = chat.scroll;
+        self.follow_bottom = false;
+        self.resetChatViewport();
+        if (chat.retiring) {
+            // Shutdown cannot be reversed. Keep ownership until exit before
+            // starting its replacement, so this session never has two writers.
+            self.dirty = true;
+        } else if (self.runtime == null or self.runtime.?.isFinished()) {
+            try self.beginRuntime();
+        }
+        self.requestConversation();
     }
 
     fn finishThreadSwitch(self: *App) !void {
         const target = self.pending_thread orelse return;
-        if (self.runtime) |runtime| if (!runtime.isFinished()) return;
+        const trust = self.options.trust_project != null and self.options.trust_project.? and std.mem.eql(u8, self.project_path, target.cwd);
+        try self.parkCurrent();
         self.pending_thread = null;
-        if (!std.mem.eql(u8, self.project_path, target.cwd)) self.options.trust_project = false;
-        self.allocator.free(self.project_path);
+        self.chat_id = self.next_chat_id;
+        self.next_chat_id += 1;
         self.project_path = target.cwd;
-        if (self.resume_path) |path| self.allocator.free(path);
         self.resume_path = target.path;
         self.options.resume_file = target.path;
+        self.options.trust_project = trust;
         self.current_archived = target.archived;
         self.current_member = target.path != null;
         self.enrollment_intent = false;
         self.enrollment_failed = false;
         self.accepted_enrollment = false;
-        self.revealCurrentFolder();
-        if (target.path == null) {
-            self.thread_title_len = 0;
-            self.chat_view = .new_thread;
-        } else self.chat_view = .opening;
-        self.transcript.clear();
+        self.submitted_prompt = null;
+        self.accepted_clear_revision = null;
+        self.draft_revision = 0;
+        try self.editor.setText("");
+        self.thread_title_len = 0;
+        self.chat_view = if (target.path == null) .new_thread else .opening;
+        self.run_started = null;
+        self.run_elapsed = null;
+        self.run_base_revision = 0;
+        self.behavior = .prompt;
+        self.error_len = 0;
+        self.formatting_error = false;
         self.scroll = 0;
         self.follow_bottom = true;
-        self.generation += 1;
-        self.content_pending = false;
+        self.resetChatViewport();
+        self.revealCurrentFolder();
         try self.beginRuntime();
     }
 
     fn runtimeStatus(self: *const App) pi.Status {
-        return if (self.runtime_snapshot) |snapshot| snapshot.status else .stopped;
+        const status = if (self.runtime_snapshot) |snapshot| snapshot.status else .stopped;
+        return if (self.runtime_retiring and status == .ready) .stopping else status;
     }
 
     fn bashRunning(self: *const App) bool {
@@ -504,6 +705,15 @@ pub const App = struct {
             try runtime.destroy();
             self.runtime = null;
         }
+        if (self.model_restore == null) if (self.runtime_snapshot) |snapshot| {
+            const provider = try self.allocator.dupe(u8, snapshot.provider);
+            errdefer self.allocator.free(provider);
+            const model = try self.allocator.dupe(u8, snapshot.model);
+            errdefer self.allocator.free(model);
+            const thinking = try self.allocator.dupe(u8, snapshot.thinking_level);
+            self.model_restore = .{ .provider = provider, .model = model, .thinking = thinking };
+        };
+        self.runtime_retiring = false;
         if (self.runtime_snapshot) |*snapshot| snapshot.deinit();
         self.runtime_snapshot = null;
         self.model_menu = false;
@@ -523,27 +733,63 @@ pub const App = struct {
         self.dirty = true;
     }
 
-    fn requestClose(self: *App) !void {
-        if (self.runtime) |runtime| {
-            if (!runtime.isFinished()) {
-                if (!self.closing) {
-                    try self.saveDraft();
-                    try runtime.shutdown();
-                    self.closing = true;
-                    self.focused_editor = false;
-                    _ = c.SDL_StopTextInput(self.window);
-                    self.dirty = true;
-                }
-                return;
+    fn ownedRuntimesFinished(self: *const App) bool {
+        if (self.runtime) |runtime| if (!runtime.isFinished()) return false;
+        for (self.parked_chats.items) |chat| if (chat.runtime) |runtime| if (!runtime.isFinished()) return false;
+        return true;
+    }
+
+    fn shutdownOwned(self: *App) !void {
+        var failure: ?anyerror = null;
+        if (self.runtime) |runtime| if (!runtime.isFinished()) {
+            runtime.shutdown() catch |err| { failure = err; };
+        };
+        for (self.parked_chats.items) |*chat| if (chat.runtime) |runtime| if (!runtime.isFinished()) {
+            runtime.shutdown() catch |err| { failure = err; };
+            chat.retiring = true;
+        };
+        if (failure) |err| return err;
+    }
+
+    fn needsForceStop(self: *const App) bool {
+        if (self.runtime) |runtime| if (!runtime.isFinished() and self.runtimeStatus() == .needs_force_stop) return true;
+        for (self.parked_chats.items) |chat| if (chat.runtime) |runtime| if (!runtime.isFinished()) {
+            if (chat.snapshot) |snapshot| if (snapshot.status == .needs_force_stop) return true;
+        };
+        return false;
+    }
+
+    fn forceOwned(self: *App) !void {
+        var failure: ?anyerror = null;
+        if (self.runtime) |runtime| if (!runtime.isFinished() and (self.closing or self.runtimeStatus() == .needs_force_stop)) {
+            runtime.forceTerminate() catch |err| { failure = err; };
+        };
+        for (self.parked_chats.items) |chat| if (chat.runtime) |runtime| if (!runtime.isFinished()) {
+            if (self.closing or (chat.snapshot != null and chat.snapshot.?.status == .needs_force_stop)) {
+                runtime.forceTerminate() catch |err| { failure = err; };
             }
-        }
-        if (self.pending_mutation != null or self.submitted_prompt != null or (self.enrollment_intent and !self.enrollment_failed)) {
+        };
+        if (failure) |err| return err;
+    }
+
+    fn closeSettled(self: *const App) bool {
+        if (!self.ownedRuntimesFinished() or self.pending_mutation != null or self.submitted_prompt != null or
+            (self.enrollment_intent and !self.enrollment_failed)) return false;
+        for (self.parked_chats.items) |chat| if (chat.submitted != null or (chat.enrollment_intent and !chat.enrollment_failed)) return false;
+        return true;
+    }
+
+    fn requestClose(self: *App) !void {
+        if (!self.closing) {
+            try self.saveDraft();
             self.closing = true;
+            self.focused_editor = false;
+            _ = c.SDL_StopTextInput(self.window);
             self.dirty = true;
-            self.enrollCurrent();
-            return;
+            try self.shutdownOwned();
         }
-        self.running = false;
+        self.enrollCurrent();
+        if (self.closeSettled()) self.running = false;
     }
 
     fn requestLatest(self: *App) void {
@@ -563,6 +809,13 @@ pub const App = struct {
             if (self.runtime_snapshot) |*old| old.deinit();
             self.runtime_snapshot = incoming;
             const snapshot = &self.runtime_snapshot.?;
+            if (snapshot.status == .ready) if (self.model_restore) |settings| {
+                self.model_restore = null;
+                var owned = settings;
+                defer owned.deinit(self.allocator);
+                if (settings.model.len != 0) runtime.setModel(settings.provider, settings.model) catch |err| self.report("Restoring chat model", err);
+                if (settings.thinking.len != 0) runtime.setThinkingLevel(settings.thinking) catch |err| self.report("Restoring chat thinking level", err);
+            };
             if (session_changed or generation_changed) {
                 if (self.chat_view != .opening) self.thread_title_len = 0;
                 if (snapshot.session_name.len == 0 and self.thread_title_len == 0) if (self.catalog) |catalog| {
@@ -574,9 +827,11 @@ pub const App = struct {
                         break;
                     }
                 };
-                self.run_started = null;
-                self.run_elapsed = null;
-                self.behavior = .prompt;
+                if (generation_changed) {
+                    self.run_started = null;
+                    self.run_elapsed = null;
+                    self.behavior = .prompt;
+                }
                 self.generation += 1;
                 self.content_pending = false;
                 self.transcript.clear();
@@ -601,6 +856,12 @@ pub const App = struct {
                         self.accepted_enrollment = true;
                     }
                     if (self.draft_revision == submitted.draft_revision) {
+                        const saved = self.allocator.dupe(u8, self.editor.textBytes()) catch |err| {
+                            self.report("Retaining accepted draft", err);
+                            return;
+                        };
+                        if (self.accepted_draft) |old| self.allocator.free(old);
+                        self.accepted_draft = saved;
                         self.editor.selectAll();
                         self.editor.insert("", .paste) catch |err| {
                             self.report("Clearing accepted draft", err);
@@ -631,7 +892,12 @@ pub const App = struct {
                 self.options.resume_file = path;
             }
             if (changed_error and snapshot.visible_length == 0 and snapshot.status == .ready and self.run_started != null and self.accepted_clear_revision == self.draft_revision and self.editor.len == 0) {
-                if (self.editor.undo()) self.edited();
+                if (self.editor.undo()) {
+                    self.edited();
+                } else if (self.accepted_draft) |draft| {
+                    self.editor.setText(draft) catch |err| self.report("Recovering rejected input", err);
+                    self.edited();
+                }
             }
             if (self.run_started) |started| {
                 if (snapshot.status == .ready and snapshot.visible_revision > self.run_base_revision and std.mem.eql(u8, snapshot.content_status, "complete")) {
@@ -645,20 +911,188 @@ pub const App = struct {
             self.dirty = true;
         }
         if (runtime.isFinished()) {
+            self.submitted_prompt = null;
             self.enrollCurrent();
             if (self.enrollment_intent and !self.enrollment_failed and self.pending_mutation == null) {
                 self.enrollment_failed = true;
                 self.report("Accepted chat has no resumable source path", error.SessionPathUnavailable);
             }
-            if (self.closing and self.pending_mutation == null and self.submitted_prompt == null and
-                (!self.enrollment_intent or self.enrollment_failed)) self.running = false;
+            if (self.runtime_retiring and !self.closing) self.beginRuntime() catch |err| self.report("Restarting parked chat", err);
         }
         if (!self.closing) self.finishThreadSwitch() catch |err| self.report("Opening thread", err);
+    }
+    fn parkedFailure(chat: *ParkedChat, operation: []const u8, err: anyerror) void {
+        const text = std.fmt.bufPrint(&chat.error_text, "{s}: {s}", .{ operation, @errorName(err) }) catch "Background chat error";
+        chat.error_len = text.len;
+        std.log.err("{s}", .{text});
+    }
+
+    fn replaceParkedDraft(self: *App, chat: *ParkedChat, text: []const u8) !void {
+        if (text.len > @import("text/composer.zig").max_bytes) return error.TextTooLarge;
+        const draft = try self.allocator.dupe(u8, text);
+        self.allocator.free(chat.draft);
+        chat.draft = draft;
+        chat.caret = text.len;
+        chat.anchor = text.len;
+        chat.draft_revision += 1;
+    }
+
+    fn consumeParkedSnapshot(self: *App, chat: *ParkedChat, incoming: pi.Snapshot) !void {
+        const old = chat.snapshot;
+        const previous_status: pi.Status = if (old) |snapshot| snapshot.status else .stopped;
+        const canonical_changed = old == null or incoming.visible_revision != old.?.visible_revision;
+        const recovery_changed = incoming.recovery_revision != 0 and (old == null or incoming.recovery_revision != old.?.recovery_revision);
+        const changed_error = incoming.error_message.len != 0 and (old == null or !std.mem.eql(u8, old.?.error_message, incoming.error_message));
+        const generation_changed = old != null and incoming.generation != old.?.generation;
+        if (chat.snapshot) |*snapshot| snapshot.deinit();
+        chat.snapshot = incoming;
+        if (incoming.status == .ready) if (chat.model_restore) |settings| {
+            chat.model_restore = null;
+            var owned = settings;
+            defer owned.deinit(self.allocator);
+            const runtime = chat.runtime.?;
+            if (settings.model.len != 0) runtime.setModel(settings.provider, settings.model) catch |err| parkedFailure(chat, "Restoring chat model", err);
+            if (settings.thinking.len != 0) runtime.setThinkingLevel(settings.thinking) catch |err| parkedFailure(chat, "Restoring chat thinking level", err);
+        };
+        if (generation_changed) {
+            chat.run_started = null;
+            chat.run_elapsed = null;
+            chat.behavior = .prompt;
+            chat.scroll = 0;
+        }
+        if (changed_error) {
+            const text = clippedLabel(incoming.error_message);
+            @memcpy(chat.error_text[0..text.len], text);
+            chat.error_len = text.len;
+            std.log.err("Background pi: {s}", .{incoming.error_message});
+        }
+        if (chat.submitted) |submitted| {
+            var buffer: [32]u8 = undefined;
+            const id = std.fmt.bufPrint(&buffer, "desktop-{d}", .{submitted.token}) catch unreachable;
+            if (std.mem.eql(u8, incoming.accepted_command_id, id)) {
+                chat.submitted = null;
+                if (!chat.member) {
+                    chat.enrollment_intent = true;
+                    chat.accepted_enrollment = true;
+                    chat.enrollment_failed = false;
+                }
+                if (chat.draft_revision == submitted.draft_revision) {
+                    const cleared = try self.allocator.dupe(u8, chat.draft);
+                    errdefer self.allocator.free(cleared);
+                    try self.replaceParkedDraft(chat, "");
+                    if (chat.cleared_draft) |draft| self.allocator.free(draft);
+                    chat.cleared_draft = cleared;
+                    chat.accepted_clear_revision = chat.draft_revision;
+                }
+            } else if (std.mem.eql(u8, incoming.rejected_command_id, id) or chat.runtime.?.isFinished()) {
+                chat.submitted = null;
+            }
+        }
+        if (recovery_changed and incoming.pending_draft.len != 0 and chat.draft.len == 0 and chat.submitted == null) {
+            try self.replaceParkedDraft(chat, incoming.pending_draft);
+        }
+        if (incoming.session_file.len != 0 and (chat.path == null or !std.mem.eql(u8, chat.path.?, incoming.session_file))) {
+            const path = try self.allocator.dupeZ(u8, incoming.session_file);
+            if (chat.path) |previous| self.allocator.free(previous);
+            chat.path = path;
+        }
+        if (changed_error and incoming.visible_length == 0 and incoming.status == .ready and chat.run_started != null and
+            chat.accepted_clear_revision == chat.draft_revision and chat.draft.len == 0)
+        {
+            if (chat.cleared_draft) |draft| try self.replaceParkedDraft(chat, draft);
+        }
+        if (chat.run_started) |started| {
+            if (incoming.status == .ready and incoming.visible_revision > chat.run_base_revision and std.mem.eql(u8, incoming.content_status, "complete")) {
+                chat.run_elapsed = c.SDL_GetTicks() - started;
+                chat.run_started = null;
+            }
+        }
+        if (incoming.status == .needs_force_stop and previous_status != .needs_force_stop) self.force_dialog = true;
+        if (incoming.status == .ready and (previous_status == .streaming or canonical_changed)) self.catalog_worker.refresh();
+        // The recovery revision, not its copied text, is needed for subsequent
+        // snapshots. The recovered text now belongs to this chat's draft.
+        if (chat.snapshot) |*snapshot| {
+            self.allocator.free(snapshot.pending_draft);
+            snapshot.pending_draft = "";
+        }
+        self.dirty = true;
+    }
+
+    fn enrollParked(self: *App, chat: *ParkedChat) void {
+        if (!chat.enrollment_intent or chat.enrollment_failed or self.pending_mutation != null) return;
+        const snapshot = chat.snapshot orelse return;
+        if (snapshot.session_file.len == 0 or (!chat.accepted_enrollment and (snapshot.status == .starting or snapshot.status == .failed))) return;
+        if (!chat.accepted_enrollment) SessionCatalog.validateSource(self.io, snapshot.session_file, chat.cwd) catch |err| {
+            chat.enrollment_failed = true;
+            parkedFailure(chat, "Explicit resume source could not be enrolled", err);
+            return;
+        };
+        const title_text = if (snapshot.session_name.len != 0) snapshot.session_name else chat.title[0..chat.title_len];
+        self.queueMutation(.enroll, snapshot.session_file, chat.cwd, title_text, false, true) catch |err| {
+            chat.enrollment_failed = true;
+            parkedFailure(chat, "Enrolling accepted chat; Ctrl/Cmd+R retries", err);
+            return;
+        };
+        self.pending_mutation.?.owner_id = chat.id;
+    }
+
+    fn consumeParked(self: *App) void {
+        var idle_count: usize = 0;
+        // Keep a small most-recent idle pool. Busy chats are never retired for
+        // resource pressure; compact drafts outlive an idle child process.
+        var index = self.parked_chats.items.len;
+        while (index != 0) {
+            index -= 1;
+            const chat = &self.parked_chats.items[index];
+            if (chat.runtime) |runtime| {
+                if (runtime.takeSnapshot()) |snapshot| self.consumeParkedSnapshot(chat, snapshot) catch |err| parkedFailure(chat, "Updating background chat", err);
+                self.enrollParked(chat);
+                if (runtime.isFinished()) {
+                    chat.submitted = null;
+                    if (chat.enrollment_intent and !chat.enrollment_failed and self.pending_mutation == null and
+                        (chat.snapshot == null or chat.snapshot.?.session_file.len == 0))
+                    {
+                        chat.enrollment_failed = true;
+                        parkedFailure(chat, "Accepted chat has no resumable source path", error.SessionPathUnavailable);
+                    }
+                    runtime.destroy() catch |err| {
+                        parkedFailure(chat, "Releasing background runtime", err);
+                        continue;
+                    };
+                    chat.runtime = null;
+                    chat.retiring = false;
+                    if (chat.snapshot) |*snapshot| {
+                        for (snapshot.models) |model| {
+                            self.allocator.free(model.provider);
+                            self.allocator.free(model.id);
+                            self.allocator.free(model.name);
+                        }
+                        self.allocator.free(snapshot.models);
+                        snapshot.models = &.{};
+                        for (snapshot.thinking_levels) |level| self.allocator.free(level);
+                        self.allocator.free(snapshot.thinking_levels);
+                        snapshot.thinking_levels = &.{};
+                    }
+                } else if (!self.closing and !chat.retiring and chat.submitted == null and chat.run_started == null and !chat.enrollment_intent and chat.model_restore == null) {
+                    if (chat.snapshot) |snapshot| if (snapshot.status == .ready and !snapshot.bash_running and snapshot.queued_count == 0) {
+                        idle_count += 1;
+                        if (idle_count > 4) {
+                            runtime.shutdown() catch |err| {
+                                parkedFailure(chat, "Retiring idle chat", err);
+                                continue;
+                            };
+                            chat.retiring = true;
+                        }
+                    };
+                }
+            } else self.enrollParked(chat);
+        }
     }
 
     fn submit(self: *App) !void {
         if (self.current_archived) return error.RestoreArchivedChatBeforeSending;
-        if (self.pending_mutation != null or self.enrollment_intent) return error.WorkspaceEnrollmentPending;
+        if (self.enrollment_intent) return error.WorkspaceEnrollmentPending;
+        if (self.pending_mutation) |mutation| if (!mutation.automatic or mutation.owner_id == self.chat_id) return error.WorkspaceEnrollmentPending;
         if (self.preedit.items.len != 0 or self.closing) return;
         const runtime = self.runtime orelse return error.StartPiFirst;
         if (self.runtimeStatus() != .ready and self.runtimeStatus() != .streaming) return error.PiNotReady;
@@ -717,7 +1151,7 @@ pub const App = struct {
         _ = c.SDL_ClearComposition(self.window);
         self.focused_editor = false;
         self.library.show(scope);
-        self.library.busy = self.pending_mutation != null;
+        self.library.busy = if (self.pending_mutation) |mutation| !mutation.automatic else false;
         self.button_count = 0;
         _ = c.SDL_StartTextInput(self.window);
         self.catalog_worker.refresh();
@@ -738,9 +1172,13 @@ pub const App = struct {
         if (self.closing and !automatic) return error.ApplicationClosing;
         if (kind == .archive and std.mem.eql(u8, path, self.currentSession()) and
             (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null or self.pending_thread != null)) return error.StopCurrentRunBeforeArchiving;
+        if (kind == .archive) for (self.parked_chats.items) |chat| {
+            if (!std.mem.eql(u8, path, chat.session())) continue;
+            if (chat.submitted != null) return error.StopCurrentRunBeforeArchiving;
+            if (chat.snapshot) |snapshot| if (snapshot.status == .streaming or snapshot.bash_running) return error.StopCurrentRunBeforeArchiving;
+        };
         if (open_after) {
             if (self.pending_thread != null) return error.ThreadSwitchPending;
-            if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) return error.StopCurrentRunBeforeSwitchingThread;
             try SessionCatalog.validateSource(self.io, path, cwd);
         }
         const owned_path = try self.allocator.dupeZ(u8, path);
@@ -751,8 +1189,8 @@ pub const App = struct {
         errdefer self.allocator.free(owned_title);
         self.mutation_id += 1;
         try self.catalog_worker.mutate(kind, owned_path, owned_cwd, owned_title, self.mutation_id);
-        self.pending_mutation = .{ .id = self.mutation_id, .kind = kind, .path = owned_path, .cwd = owned_cwd, .title = owned_title, .open_after = open_after, .automatic = automatic };
-        self.library.busy = true;
+        self.pending_mutation = .{ .id = self.mutation_id, .kind = kind, .path = owned_path, .cwd = owned_cwd, .title = owned_title, .open_after = open_after, .automatic = automatic, .owner_id = if (automatic) self.chat_id else null };
+        self.library.busy = !automatic;
         self.button_count = 0;
         self.library.invalidateTargets();
         self.dirty = true;
@@ -797,6 +1235,14 @@ pub const App = struct {
         switch (action) {
             .start => try self.beginRuntime(),
             .new_thread => try self.newThreadIn(self.project_path),
+            .open_parked => |index| {
+                if (self.closing or self.pending_thread != null) return error.ThreadSwitchPending;
+                if (self.pending_mutation) |mutation| if (!mutation.automatic) return error.WorkspaceMutationPending;
+                if (index >= self.parked_chats.items.len) return error.StaleThreadChoice;
+                try self.saveDraft();
+                try self.activateParked(index);
+                self.revealCurrentFolder();
+            },
             .new_project_thread => |index| {
                 if (index < self.projects.items.len) try self.newThreadIn(self.projects.items[index]);
             },
@@ -869,6 +1315,7 @@ pub const App = struct {
                 self.model_menu = false;
             },
             .select_thinking => |index| {
+                if (self.runtime_retiring) return error.PiNotReady;
                 const snapshot = self.runtime_snapshot orelse return error.PiNotReady;
                 if (index >= snapshot.thinking_levels.len) return error.StaleThinkingChoice;
                 try (self.runtime orelse return error.PiNotReady).setThinkingLevel(snapshot.thinking_levels[index]);
@@ -879,14 +1326,15 @@ pub const App = struct {
                 self.follow_bottom = false;
             },
             .select_model => |index| {
+                if (self.runtime_retiring) return error.PiNotReady;
                 const snapshot = self.runtime_snapshot orelse return error.PiNotReady;
                 if (index >= snapshot.models.len) return error.StaleModelChoice;
                 const model = snapshot.models[index];
                 try (self.runtime orelse return error.PiNotReady).setModel(model.provider, model.id);
                 self.model_menu = false;
             },
-            .force_stop => if (self.runtime) |runtime| {
-                try runtime.forceTerminate();
+            .force_stop => {
+                try self.forceOwned();
                 self.force_dialog = false;
             },
             .wait => self.force_dialog = false,
@@ -973,6 +1421,7 @@ pub const App = struct {
 
     fn consume(self: *App) void {
         self.consumeRuntime();
+        self.consumeParked();
         while (self.catalog_worker.takeMutation()) |result| {
             if (self.pending_mutation) |value| {
                 if (result.id != value.id) {
@@ -986,14 +1435,35 @@ pub const App = struct {
                 self.button_count = 0;
                 self.library.invalidateTargets();
                 if (result.err) |err| {
-                    if (target.automatic) self.enrollment_failed = true;
-                    if (self.library.open) self.library.fail(err);
-                    self.report(if (target.automatic) "Enrollment failed; Ctrl/Cmd+R retries" else "Workspace change was not saved", err);
-                } else {
                     if (target.automatic) {
+                        if (target.owner_id == self.chat_id) self.enrollment_failed = true;
+                        for (self.parked_chats.items) |*chat| if (target.owner_id == chat.id) {
+                            chat.enrollment_failed = true;
+                            const message = std.fmt.bufPrint(&chat.error_text, "Enrollment failed: {s}; Ctrl/Cmd+R retries", .{@errorName(err)}) catch "Enrollment failed";
+                            chat.error_len = message.len;
+                        };
+                    }
+                    if (self.library.open) self.library.fail(err);
+                    if (!target.automatic or target.owner_id == self.chat_id) {
+                        self.report(if (target.automatic) "Enrollment failed; Ctrl/Cmd+R retries" else "Workspace change was not saved", err);
+                    } else std.log.err("Background enrollment failed: {s}", .{@errorName(err)});
+                } else {
+                    if (target.automatic and target.owner_id == self.chat_id) {
                         self.enrollment_intent = false;
                         self.enrollment_failed = false;
                         self.accepted_enrollment = false;
+                    }
+                    for (self.parked_chats.items) |*chat| {
+                        if (target.automatic and target.owner_id == chat.id) {
+                            chat.enrollment_intent = false;
+                            chat.enrollment_failed = false;
+                            chat.accepted_enrollment = false;
+                        }
+                        if (std.mem.eql(u8, target.path, chat.session())) {
+                            chat.member = true;
+                            chat.archived = result.archived orelse (target.kind == .archive);
+                            if (target.kind == .enroll and chat.view == .new_thread) chat.view = .existing;
+                        }
                     }
                     if (std.mem.eql(u8, target.path, self.currentSession())) {
                         self.current_member = true;
@@ -1014,6 +1484,7 @@ pub const App = struct {
                 self.dirty = true;
             }
         }
+        if (self.closing and self.closeSettled()) self.running = false;
         if (self.catalog_worker.takeSearch()) |result| {
             self.button_count = 0;
             self.library.accept(result);
@@ -1231,7 +1702,16 @@ pub const App = struct {
         for (self.projects.items) |path| if (!self.indexedFolder(path)) { rows += 1; };
         if (!self.indexedFolder(self.project_path) and !self.savedFolder(self.project_path)) rows += 1;
         if (self.transientCurrent() and !self.folderCollapsed(self.project_path)) rows += 1;
+        for (self.parked_chats.items) |*chat| if (self.transientParked(chat)) { rows += 1; };
         return rows;
+    }
+
+    fn transientParked(self: *const App, chat: *const ParkedChat) bool {
+        if (chat.archived) return false;
+        if (self.catalog) |catalog| for (catalog.threads) |thread| {
+            if (std.mem.eql(u8, thread.path, chat.session())) return false;
+        };
+        return true;
     }
 
     fn sidebarRowY(self: *const App, row: usize, height: f32) ?f32 {
@@ -1327,6 +1807,17 @@ pub const App = struct {
             if (self.indexedFolder(path) or std.mem.eql(u8, path, self.project_path)) continue;
             try self.drawFolderRow(path, .{ .new_project_thread = project_index }, .{ .toggle_project_folder = project_index }, row, height);
             row += 1;
+        }
+        for (self.parked_chats.items, 0..) |*chat, index| {
+            if (!self.transientParked(chat)) continue;
+            const parked_row = row;
+            row += 1;
+            const y = self.sidebarRowY(parked_row, height) orelse continue;
+            const text = if (chat.snapshot) |snapshot|
+                (if (snapshot.session_name.len != 0) snapshot.session_name else if (chat.title_len != 0) chat.title[0..chat.title_len] else "New thread")
+            else if (chat.title_len != 0) chat.title[0..chat.title_len] else "New thread";
+            try self.hit(.{ .open_parked = index }, .{ .x = 28, .y = y, .w = width - 40, .h = 34 });
+            try self.fitLabel(clippedLabel(text), 40, y + 9, width - 68, 13, colors.text);
         }
         try self.rectangle(12, height - 100, width - 24, 1, 0, colors.border);
         try self.flatButton(.{ .open_library = .import_pi }, "Import Pi chat", .{ .x = 12, .y = height - 96, .w = width - 24, .h = 28 });
@@ -1532,14 +2023,14 @@ pub const App = struct {
     }
 
     fn retainOwnedProcessOnError(self: *App) void {
-        const runtime = self.runtime orelse return;
-        if (runtime.isFinished()) return;
+        if (self.ownedRuntimesFinished()) return;
         self.closing = true;
-        runtime.shutdown() catch |err| std.log.err("Shutdown after UI failure: {s}", .{@errorName(err)});
+        self.shutdownOwned() catch |err| std.log.err("Shutdown after UI failure: {s}", .{@errorName(err)});
         var prompted = false;
-        while (!runtime.isFinished()) {
+        while (!self.ownedRuntimesFinished()) {
             self.consumeRuntime();
-            if (self.runtimeStatus() == .needs_force_stop and !prompted) {
+            self.consumeParked();
+            if (self.needsForceStop() and !prompted) {
                 prompted = true;
                 const buttons = [_]c.SDL_MessageBoxButtonData{
                     .{ .flags = c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, .buttonID = 0, .text = "Keep waiting" },
@@ -1555,7 +2046,7 @@ pub const App = struct {
                     .colorScheme = null,
                 };
                 var choice: c_int = 0;
-                if (c.SDL_ShowMessageBox(&dialog, &choice) and choice == 1) runtime.forceTerminate() catch |err| std.log.err("Explicit force: {s}", .{@errorName(err)});
+                if (c.SDL_ShowMessageBox(&dialog, &choice) and choice == 1) self.forceOwned() catch |err| std.log.err("Explicit force: {s}", .{@errorName(err)});
             }
             var event: c.SDL_Event = undefined;
             if (c.SDL_WaitEventTimeout(&event, 1000)) {
@@ -1634,6 +2125,7 @@ pub const App = struct {
             }
             if (command and event.key.key == c.SDLK_R) {
                 self.enrollment_failed = false;
+                for (self.parked_chats.items) |*chat| chat.enrollment_failed = false;
                 self.enrollCurrent();
                 self.catalog_worker.refresh();
                 if (self.library.open) {
@@ -1729,7 +2221,7 @@ pub const App = struct {
             c.SDL_EVENT_KEY_DOWN => {
                 const command = (event.key.mod & (c.SDL_KMOD_CTRL | c.SDL_KMOD_GUI)) != 0;
                 const shift = (event.key.mod & c.SDL_KMOD_SHIFT) != 0;
-                if (command and shift and event.key.key == c.SDLK_ESCAPE and self.runtimeStatus() == .needs_force_stop) {
+                if (command and shift and event.key.key == c.SDLK_ESCAPE and self.needsForceStop()) {
                     try self.act(.force_stop);
                     return;
                 }
@@ -1954,6 +2446,7 @@ test "new chat reveal expands only its project and archived current never makes 
     try app.collapsed_folders.append(allocator, try allocator.dupe(u8, "/a"));
     try app.collapsed_folders.append(allocator, try allocator.dupe(u8, "/b"));
     app.catalog = null;
+    app.parked_chats = .empty;
     app.current_archived = false;
     app.current_member = false;
     app.enrollment_intent = false;
@@ -1973,4 +2466,75 @@ test "new chat reveal expands only its project and archived current never makes 
     try std.testing.expect(!app.transientCurrent());
     try std.testing.expect(app.currentSidebarRow() == null);
     try std.testing.expectEqual(@as(usize, 1), app.sidebarRows());
+}
+
+test "background prompt acknowledgements clear only the submitted chat revision" {
+    const allocator = std.testing.allocator;
+    var app: App = undefined;
+    app.allocator = allocator;
+    app.dirty = false;
+    app.force_dialog = false;
+    app.editor = try Composer.init(allocator);
+    defer app.editor.deinit();
+    try app.editor.setText("active chat draft");
+    for ([_]bool{ false, true }) |edited_after_send| {
+        const text = if (edited_after_send) "new background draft" else "submitted prompt";
+        var chat = ParkedChat{
+            .id = 7,
+            .runtime = null,
+            .snapshot = null,
+            .cwd = try allocator.dupeZ(u8, "/project"),
+            .path = null,
+            .trust = false,
+            .draft = try allocator.dupe(u8, text),
+            .caret = text.len,
+            .anchor = text.len,
+            .draft_revision = if (edited_after_send) 2 else 1,
+            .submitted = .{ .token = 11, .draft_revision = 1 },
+            .accepted_clear_revision = null,
+            .title = undefined,
+            .title_len = 0,
+            .view = .new_thread,
+            .archived = false,
+            .member = false,
+            .enrollment_intent = false,
+            .accepted_enrollment = false,
+            .enrollment_failed = false,
+            .run_started = null,
+            .run_base_revision = 0,
+            .run_elapsed = null,
+            .behavior = .prompt,
+            .error_text = undefined,
+            .error_len = 0,
+            .scroll = 0,
+        };
+        defer chat.deinit(allocator);
+        const snapshot = pi.Snapshot{
+            .allocator = allocator,
+            .status = .streaming,
+            .accepted_command_id = try allocator.dupe(u8, "desktop-11"),
+            .role = try allocator.dupe(u8, "assistant"),
+            .kind = try allocator.dupe(u8, "message"),
+        };
+        try app.consumeParkedSnapshot(&chat, snapshot);
+        try std.testing.expect(chat.submitted == null);
+        try std.testing.expect(chat.enrollment_intent and chat.accepted_enrollment);
+        try std.testing.expectEqualStrings(if (edited_after_send) text else "", chat.draft);
+        if (!edited_after_send) {
+            try std.testing.expectEqualStrings(text, chat.cleared_draft.?);
+            try std.testing.expectEqual(chat.draft_revision, chat.accepted_clear_revision.?);
+        }
+        try std.testing.expectEqualStrings("active chat draft", app.editor.textBytes());
+        const recovery = pi.Snapshot{
+            .allocator = allocator,
+            .status = .streaming,
+            .recovery_revision = 1,
+            .pending_draft = try allocator.dupe(u8, "recovered background input"),
+            .role = try allocator.dupe(u8, "assistant"),
+            .kind = try allocator.dupe(u8, "message"),
+        };
+        try app.consumeParkedSnapshot(&chat, recovery);
+        try std.testing.expectEqualStrings(if (edited_after_send) text else "recovered background input", chat.draft);
+        try std.testing.expectEqualStrings("active chat draft", app.editor.textBytes());
+    }
 }

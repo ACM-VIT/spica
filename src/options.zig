@@ -74,8 +74,10 @@ pub const help =
     \\Source files remain original resume sources; unavailable chats retain metadata and cached search.
     \\Search waits for a complete ranking before allowing Open, Archive/Restore, or paging.
     \\New sessions use pi's normal configured storage, shared with the pi CLI.
-    \\Stop active work before switching threads. Ctrl+P retries a failed pi startup.
-    \\Agent completion refreshes Pi's activity state; queued active work still blocks thread switching.
+    \\Switch chats or create a new thread while prompts run; background chats keep their own Pi process.
+    \\Returning to a running chat reconnects its existing process and restores its draft.
+    \\Stop applies to the selected chat; closing Spica shuts down all owned chat processes.
+    \\Ctrl+P retries a failed pi startup.
     \\Switching to another folder disables trusted project resources for that runtime.
     \\The first prompt's first line names an unnamed pi session; explicit resume keeps it.
     \\Enter sends; Shift+Enter inserts a newline; Ctrl+Enter also sends.

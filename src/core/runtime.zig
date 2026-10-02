@@ -895,7 +895,7 @@ pub const Runtime = struct {
         } else if (std.mem.eql(u8, ty, "agent_end")) {
             // A completed run can immediately yield to queued work. Ask Pi for
             // authoritative activity instead of leaving streaming latched or
-            // prematurely enabling thread switches.
+            // prematurely treating a follow-up as a fresh prompt.
             if (!self.closing) try self.requestState();
         } else if (std.mem.eql(u8, ty, "agent_settled")) {
             self.state.status = if (self.closing) .stopping else .ready;
@@ -1232,7 +1232,7 @@ const Sink = struct {
     }
 };
 
-test "completed agents reconcile idle state without unlocking queued active work" {
+test "completed agents reconcile idle state while queued work remains streaming" {
     const allocator = std.testing.allocator;
     const mutex = native.SDL_CreateMutex() orelse return error.MutexCreation;
     defer native.SDL_DestroyMutex(mutex);
