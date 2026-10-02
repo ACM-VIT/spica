@@ -23,7 +23,7 @@ Import continues the original Pi session; archiving does not delete it.
 
 **Linux only for now. macOS and Windows testing has not been added; support is unverified.**
 
-Requires Zig **0.16.0**, Node.js **22.19.0+**, npm, Python **3.12+**, CMake, Make, a C/C++ toolchain, pkg-config, SQLite development files with FTS5, and X11/Wayland development libraries for SDL3.
+Requires Zig **0.16.0**, Node.js **22.19.0+**, npm, Python **3.12+**, CMake, Make, a C/C++ toolchain, pkg-config, SQLite development files with FTS5 support, and the platform-specific development libraries required by SDL3.
 
 From the repository root:
 
