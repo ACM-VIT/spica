@@ -171,7 +171,7 @@ pub const Store = struct {
         const number: c_int = if (rc_version == c.SQLITE_ROW) c.sqlite3_column_int(version, 0) else -1;
         _ = c.sqlite3_finalize(version);
         if (number < 0) return error.SqliteFailure;
-        if (number > 5) return error.UnsupportedSchema;
+        if (number > 6) return error.UnsupportedSchema;
         if (number == 0) {
             try self.exec(schema);
             try self.exec("PRAGMA user_version=3");
@@ -188,6 +188,10 @@ pub const Store = struct {
         }
         if (number < 5) {
             try self.exec("CREATE TABLE workspace_chats(session_file TEXT PRIMARY KEY,archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1))); PRAGMA user_version=5;");
+        }
+        if (number < 6) {
+            try self.exec(live_entry_links_schema);
+            try self.exec("PRAGMA user_version=6");
         }
         try self.exec("COMMIT");
         return self;
@@ -573,10 +577,11 @@ pub const Store = struct {
         }
         if (!fixture_mode and runtime != 0) {
             if (runtime > std.math.maxInt(i64)) return error.LengthOverflow;
-            const live = try self.prepare("SELECT l.local_sequence,l.content_index,l.role,l.content_ref,o.total_length,l.title,l.status,l.is_error,l.timestamp FROM live_rows l JOIN content_objects o ON o.content_id=l.content_ref WHERE l.runtime=?1 AND l.run_generation=?2 AND l.kind!='thinking' ORDER BY l.local_sequence,l.content_index");
+            const live = try self.prepare("SELECT l.local_sequence,l.content_index,l.role,l.content_ref,o.total_length,l.title,l.status,l.is_error,l.timestamp FROM live_rows l JOIN content_objects o ON o.content_id=l.content_ref WHERE l.runtime=?1 AND l.run_generation=?2 AND l.kind!='thinking' AND NOT EXISTS (SELECT 1 FROM live_entry_links k JOIN sessions s ON s.session_file=k.session_file JOIN active_path p ON p.session_file=s.session_file AND p.leaf_id=s.leaf_id AND p.entry_id=k.entry_id WHERE k.runtime=l.runtime AND k.run_generation=l.run_generation AND k.local_sequence=l.local_sequence AND k.content_index=l.content_index AND k.session_file=?3) ORDER BY l.local_sequence,l.content_index");
             defer _ = c.sqlite3_finalize(live);
             try bindInt(live, 1, @intCast(runtime));
             try bindInt(live, 2, generation);
+            try bindText(live, 3, session_file);
             while (true) {
                 const rc = c.sqlite3_step(live);
                 if (rc == c.SQLITE_DONE) break;
@@ -635,6 +640,35 @@ pub const Store = struct {
         const length = c.sqlite3_column_int64(stmt, 1);
         if (length < 0) return error.CorruptCache;
         return .{ .content_ref = (try columnId(stmt, 0)) orelse return error.CorruptCache, .length = @intCast(length) };
+    }
+
+    /// Associate one completed live message with its canonical identity. Timestamp,
+    /// role and full content must agree; equal text alone never retires a prompt.
+    /// The unique canonical key makes repeated entry imports idempotent, including
+    /// legitimate equal prompts sharing a millisecond timestamp.
+    pub fn linkLiveEntry(self: *Store, session_file: []const u8, entry_id: []const u8, runtime: u64, generation: i64) !void {
+        try field(session_file, max_key);
+        try field(entry_id, max_key);
+        if (runtime > std.math.maxInt(i64)) return error.LengthOverflow;
+        const stmt = try self.prepare(
+            "INSERT INTO live_entry_links(runtime,run_generation,local_sequence,content_index,session_file,entry_id) " ++
+                "SELECT l.runtime,l.run_generation,l.local_sequence,l.content_index,e.session_file,e.entry_id FROM entries e " ++
+                "JOIN content_objects canonical ON canonical.content_id=e.content_ref " ++
+                "JOIN live_rows l ON l.runtime=?3 AND l.run_generation=?4 AND l.role=e.role AND l.timestamp=e.timestamp " ++
+                "JOIN content_objects live ON live.content_id=l.content_ref " ++
+                "WHERE e.session_file=?1 AND e.entry_id=?2 AND e.entry_type='message' AND e.role IN ('user','assistant') AND e.timestamp>0 " ++
+                "AND l.kind='message' AND l.status IN ('complete','failed') AND canonical.sealed=1 AND live.sealed=1 " ++
+                "AND canonical.total_length=live.total_length AND canonical.next_index=live.next_index " ++
+                "AND NOT EXISTS (SELECT 1 FROM content_chunks x LEFT JOIN content_chunks y ON y.content_id=l.content_ref AND y.chunk_index=x.chunk_index WHERE x.content_id=e.content_ref AND (y.payload IS NULL OR x.payload!=y.payload)) " ++
+                "AND NOT EXISTS (SELECT 1 FROM live_entry_links k WHERE k.runtime=l.runtime AND k.run_generation=l.run_generation AND ((k.local_sequence=l.local_sequence AND k.content_index=l.content_index) OR (k.session_file=e.session_file AND k.entry_id=e.entry_id))) " ++
+                "ORDER BY l.local_sequence,l.content_index LIMIT 1",
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, session_file);
+        try bindText(stmt, 2, entry_id);
+        try bindInt(stmt, 3, @intCast(runtime));
+        try bindInt(stmt, 4, generation);
+        try done(stmt);
     }
 
     pub fn putLiveRow(self: *Store, row: LiveRow) !void {
@@ -891,6 +925,9 @@ fn columnId(stmt: *c.sqlite3_stmt, index: c_int) !?ContentId {
     return id;
 }
 
+const live_entry_links_schema =
+    "CREATE TABLE live_entry_links(runtime INTEGER NOT NULL,run_generation INTEGER NOT NULL,local_sequence INTEGER NOT NULL,content_index INTEGER NOT NULL,session_file TEXT NOT NULL,entry_id TEXT NOT NULL,PRIMARY KEY(runtime,run_generation,local_sequence,content_index),UNIQUE(runtime,run_generation,session_file,entry_id),FOREIGN KEY(runtime,run_generation,local_sequence,content_index) REFERENCES live_rows(runtime,run_generation,local_sequence,content_index) ON DELETE CASCADE,FOREIGN KEY(session_file,entry_id) REFERENCES entries(session_file,entry_id) ON DELETE CASCADE);";
+
 const reasoning_schema =
     "CREATE TABLE entry_reasoning(session_file TEXT NOT NULL,entry_id TEXT NOT NULL,content_ref BLOB NOT NULL CHECK(length(content_ref)=16),length INTEGER NOT NULL CHECK(length>=0),PRIMARY KEY(session_file,entry_id),FOREIGN KEY(session_file,entry_id) REFERENCES entries(session_file,entry_id) ON DELETE CASCADE);";
 
@@ -1088,7 +1125,7 @@ test "v2 migration preserves active chat and separately retained reasoning and r
         var store = try Store.init(allocator, db_path);
         defer store.deinit();
         // These are the actual v2 tables, populated before the v3-only relation.
-        try store.exec("DROP TABLE workspace_chats; DROP TABLE session_index; DROP TABLE entry_reasoning; PRAGMA user_version=2;");
+        try store.exec("DROP TABLE live_entry_links; DROP TABLE workspace_chats; DROP TABLE session_index; DROP TABLE entry_reasoning; PRAGMA user_version=2;");
         try store.putSession(.{ .session_file = path, .session_id = "reasoning", .project_id = "project", .leaf_id = "context" });
         try store.append(body_ref, 0, body, true);
         try store.append(raw_ref, 0, raw_json, true);
@@ -1202,7 +1239,7 @@ test "discovery index migration and metadata refresh preserve resumable chat and
             .row = .{ .row_id = "answer", .kind = "message", .role = "assistant", .content_ref = body_ref },
         });
         try db.rebuildActivePath(path, "answer");
-        try db.exec("DROP TABLE workspace_chats; DROP TABLE session_index; PRAGMA user_version=3;");
+        try db.exec("DROP TABLE live_entry_links; DROP TABLE workspace_chats; DROP TABLE session_index; PRAGMA user_version=3;");
     }
     {
         var db = try Store.init(a, db_path);
@@ -1293,7 +1330,7 @@ test "v4 histories remain nonmembers and archive state survives enrollment and r
         var db = try Store.init(a, db_path);
         defer db.deinit();
         try db.putSessionIndex(entry);
-        try db.exec("DROP TABLE workspace_chats; PRAGMA user_version=4");
+        try db.exec("DROP TABLE live_entry_links; DROP TABLE workspace_chats; PRAGMA user_version=4");
     }
     {
         var db = try Store.init(a, db_path);
@@ -1344,7 +1381,7 @@ test "database cutover copies uncheckpointed WAL and rejects unsupported destina
     try source.putSession(.{ .session_file = path, .session_id = "original", .project_id = "/project", .leaf_id = "leaf", .file_identity = "identity", .file_size = 512, .file_mtime = 99 });
     try source.putSessionIndex(.{ .session_file = path, .cwd = "/project", .title = "Original", .modified = 99 });
     try source.append(raw, 0, "canonical raw source", true);
-    try source.exec("DROP TABLE workspace_chats; PRAGMA user_version=4");
+    try source.exec("DROP TABLE live_entry_links; DROP TABLE workspace_chats; PRAGMA user_version=4");
     try std.testing.expectEqual(@as(c_int, 0), cutover(destination, legacy, temporary, directory));
     {
         var copied = try Store.init(a, destination);
@@ -1369,4 +1406,53 @@ test "database cutover copies uncheckpointed WAL and rejects unsupported destina
     const bytes = (try unchanged.readChunk(a, raw, 0)).?;
     defer a.free(bytes);
     try std.testing.expectEqualStrings("canonical raw source", bytes);
+}
+
+test "v5 migration preserves messages and links expire with their live generation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/v5-overlap.sqlite", .{tmp.sub_path});
+    defer a.free(db_path);
+    const path = "/project/migration-session.jsonl";
+    const canonical: ContentId = @splat(81);
+    const live: ContentId = @splat(82);
+    {
+        var store = try Store.init(a, db_path);
+        defer store.deinit();
+        try store.putSession(.{ .session_file = path, .session_id = "migration", .project_id = "/project", .leaf_id = "prompt" });
+        try store.append(canonical, 0, "Repeat", true);
+        try store.append(live, 0, "Repeat", true);
+        try store.putEntry(.{
+            .session_file = path,
+            .entry_id = "prompt",
+            .append_ordinal = 0,
+            .entry_type = "message",
+            .row = .{ .row_id = "prompt", .kind = "message", .role = "user", .status = "complete", .timestamp = 100, .content_ref = canonical },
+        });
+        try store.rebuildActivePath(path, "prompt");
+        try store.putLiveRow(.{ .runtime = 7, .run_generation = 1, .local_sequence = 1, .content_index = 0, .row = .{ .row_id = "live-user", .kind = "message", .role = "user", .status = "complete", .timestamp = 100, .content_ref = live } });
+        try store.exec("DROP TABLE live_entry_links; PRAGMA user_version=5");
+    }
+    var store = try Store.init(a, db_path);
+    defer store.deinit();
+    try store.linkLiveEntry(path, "prompt", 7, 1);
+    const migrated = try store.conversationEntries(a, path, false, 7, 1);
+    defer a.free(migrated);
+    try std.testing.expectEqual(@as(usize, 1), migrated.len);
+    try std.testing.expectEqualSlices(u8, &canonical, &migrated[0].content_id);
+    const body = (try store.readChunk(a, migrated[0].content_id, 0)).?;
+    defer a.free(body);
+    try std.testing.expectEqualStrings("Repeat", body);
+    try store.clearLiveGeneration(7, 1);
+    // Reusing the tuple demonstrates that its link was cascaded away; no old
+    // association may hide a distinct prompt in the new live state.
+    try store.putLiveRow(.{ .runtime = 7, .run_generation = 1, .local_sequence = 1, .content_index = 0, .row = .{ .row_id = "live-user", .kind = "message", .role = "user", .status = "complete", .timestamp = 200, .content_ref = live } });
+    try store.linkLiveEntry(path, "prompt", 7, 1);
+    const repeated = try store.conversationEntries(a, path, false, 7, 1);
+    defer a.free(repeated);
+    try std.testing.expectEqual(@as(usize, 2), repeated.len);
+    try std.testing.expectEqual(@as(i64, 100), repeated[0].timestamp);
+    try std.testing.expectEqual(@as(i64, 200), repeated[1].timestamp);
+    try std.testing.expectEqualSlices(u8, &live, &repeated[1].content_id);
 }

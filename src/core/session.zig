@@ -266,6 +266,7 @@ fn putEntry(runtime: anytype, bytes: []const u8, response_raw: storage.ContentId
         .raw_content_ref = raw,
         .row = .{ .row_id = id, .kind = kind, .role = role, .status = if (failed) "failed" else "complete", .content_ref = content, .tool_call_id = if (tool_id.len > 0) tool_id else null, .title = activity.slice(), .is_error = failed, .timestamp = stamp },
     });
+    if (is_message) try runtime.store.?.linkLiveEntry(runtime.state.session_file, id, runtime.state.runtime_id, runtime.state.generation);
     if (is_message) {
         const thinking = try thinkingText(a, message);
         defer a.free(thinking);
@@ -419,4 +420,94 @@ test "tool activity truncation preserves UTF8 and flattens multiline commands" {
     activity.append(&buffer);
     try std.testing.expectEqual(@as(u8, 191), activity.len);
     try std.testing.expect(std.unicode.utf8ValidateSlice(activity.slice()));
+}
+
+test "streaming canonical overlap preserves repeated equal prompts and live assistant" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/overlap.sqlite", .{tmp.sub_path});
+    defer a.free(db_path);
+    const Runtime = @import("runtime.zig").Runtime;
+    var runtime: Runtime = .{
+        .allocator = a,
+        .io = undefined,
+        .options = .{ .database_path = db_path, .project_path = "/project", .node_path = "", .pi_entrypoint = "", .wake_event = 0 },
+        .options_arena = undefined,
+        .mutex = undefined,
+        .wake = undefined,
+        .state = .{ .allocator = a, .runtime_id = 42, .status = .streaming, .session_file = "/session.jsonl", .role = "", .kind = "", .content_status = "" },
+        .store = try storage.Store.init(a, db_path),
+    };
+    defer runtime.store.?.deinit();
+    defer {
+        a.free(runtime.last_entry_id);
+        a.free(runtime.leaf_id);
+        a.free(runtime.state.role);
+        a.free(runtime.state.kind);
+        a.free(runtime.state.content_status);
+    }
+    try runtime.persistSession();
+    const stamps = [_]i64{ 100, 100, 200 };
+    var prompt_ids: [3]storage.ContentId = undefined;
+    for (stamps, 0..) |stamp, i| {
+        prompt_ids[i] = try runtime.content("Again", "text/markdown");
+        try runtime.store.?.putLiveRow(.{
+            .runtime = 42,
+            .run_generation = 1,
+            .local_sequence = @intCast(i + 1),
+            .content_index = 0,
+            .row = .{ .row_id = "live-user", .kind = "message", .role = "user", .status = "complete", .timestamp = stamp, .content_ref = prompt_ids[i] },
+        });
+    }
+    const assistant = try runtime.content("Working", "text/markdown");
+    try runtime.store.?.putLiveRow(.{
+        .runtime = 42,
+        .run_generation = 1,
+        .local_sequence = 4,
+        .content_index = 0,
+        .row = .{ .row_id = "live-assistant", .kind = "message", .role = "assistant", .status = "streaming", .timestamp = 300, .content_ref = assistant },
+    });
+    const responses = [_][]const u8{
+        \\{"data":{"entries":[{"id":"first","type":"message","message":{"role":"user","timestamp":100,"content":"Again"}}],"leafId":"first"}}
+        ,
+        // Re-importing the same canonical ID cannot consume the second equal
+        // prompt, even when both prompts have the same timestamp.
+        \\{"data":{"entries":[{"id":"first","type":"message","message":{"role":"user","timestamp":100,"content":"Again"}}],"leafId":"first"}}
+        ,
+        \\{"data":{"entries":[{"id":"second","parentId":"first","type":"message","message":{"role":"user","timestamp":100,"content":"Again"}}],"leafId":"second"}}
+        ,
+        \\{"data":{"entries":[{"id":"third","parentId":"second","type":"message","message":{"role":"user","timestamp":200,"content":"Again"}}],"leafId":"third"}}
+        ,
+    };
+    var reader = try storage.Store.openReadOnly(a, db_path);
+    defer reader.deinit();
+    const Source = struct {
+        fn next(_: *@This()) !?[]const u8 {
+            return null;
+        }
+    };
+    var source: Source = .{};
+    for (responses, 0..) |response, step| {
+        try reconcile(&runtime, &source, response);
+        const transcript = try reader.conversationEntries(a, runtime.state.session_file, false, 42, 1);
+        defer a.free(transcript);
+        try std.testing.expectEqual(@as(usize, 4), transcript.len);
+        for (transcript[0..3]) |entry| {
+            try std.testing.expectEqual(.user, entry.role);
+            const body = (try reader.readChunk(a, entry.content_id, 0)).?;
+            defer a.free(body);
+            try std.testing.expectEqualStrings("Again", body);
+        }
+        const canonical_count: usize = if (step < 2) 1 else step;
+        for (transcript[0..canonical_count], 0..) |entry, ordinal| try std.testing.expectEqual(ordinal, entry.ordinal);
+        for (transcript[canonical_count..3], canonical_count..) |entry, i| {
+            try std.testing.expectEqual(storage.live_ordinal_base + (i + 1) * 512, entry.ordinal);
+            try std.testing.expectEqualSlices(u8, &prompt_ids[i], &entry.content_id);
+        }
+        try std.testing.expectEqual(.assistant, transcript[3].role);
+        try std.testing.expectEqual(storage.live_ordinal_base + 4 * 512, transcript[3].ordinal);
+        try std.testing.expectEqualSlices(u8, &assistant, &transcript[3].content_id);
+        try std.testing.expectEqual(.running, transcript[3].status);
+    }
 }

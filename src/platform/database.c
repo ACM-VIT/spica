@@ -20,7 +20,7 @@ static int validate(sqlite3 *database) {
     if (rc == SQLITE_OK) rc = final;
     statement = NULL;
     if (rc == SQLITE_OK) rc = sqlite3_prepare_v2(database, "PRAGMA user_version", -1, &statement, NULL);
-    if (rc == SQLITE_OK && (sqlite3_step(statement) != SQLITE_ROW || sqlite3_column_int(statement, 0) > 5)) rc = SQLITE_ERROR;
+    if (rc == SQLITE_OK && (sqlite3_step(statement) != SQLITE_ROW || sqlite3_column_int(statement, 0) > 6)) rc = SQLITE_ERROR;
     final = sqlite3_finalize(statement);
     return rc == SQLITE_OK ? final : rc;
 }
