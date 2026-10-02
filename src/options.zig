@@ -50,7 +50,7 @@ pub const help =
     \\
     \\Software is the lower-residency default. Neither backend has passed the 32 MiB gate.
     \\Pi starts automatically. Project resources are disabled unless --trust-project is given.
-    \\The real-process first-pass demo is Linux-only, pinned to pi 0.87.1.
+    \\The real-process application is Linux-only, pinned to Pi 1.0.0.
     \\Executable defaults match a system Node and npm installation.
     \\Use --node and --pi-entry for another installation. --resume is explicit, not replay.
     \\Checkout demo libraries, fonts and themes resolve independently of the launch directory.

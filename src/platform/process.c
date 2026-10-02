@@ -149,7 +149,7 @@ int spica_process_version(SpicaProcess *p,const char *node,const char *entry){
    if(reaped<0)break;
    if(reaped==1){
     while(n<sizeof(out)){long r=spica_process_read(p->output,out+n,sizeof(out)-n);if(r<=0)break;n+=(size_t)r;}
-    result=WIFEXITED(status)&&WEXITSTATUS(status)==0&&((n==7&&out[6]=='\n')||(n==8&&out[6]=='\r'&&out[7]=='\n'))&&!memcmp(out,"0.87.1",6)?0:-1;
+    result=WIFEXITED(status)&&WEXITSTATUS(status)==0&&((n==6&&out[5]=='\n')||(n==7&&out[5]=='\r'&&out[6]=='\n'))&&!memcmp(out,"1.0.0",5)?0:-1;
     break;
    }
   }

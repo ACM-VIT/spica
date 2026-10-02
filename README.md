@@ -29,7 +29,7 @@ Requires Zig **0.16.0**, Node.js **22.19.0+**, npm, Python 3, CMake, Make, a C/C
 From the repository root:
 
 ```sh
-npm install -g @earendil-works/pi-coding-agent@0.87.1
+npm install -g @earendil-works/pi-coding-agent@1.0.0
 zig build deps
 zig build
 ./zig-out/bin/spica --project /path/to/project
