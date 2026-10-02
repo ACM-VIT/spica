@@ -45,11 +45,6 @@ first-time setup, formatting commands, and the client-side pre-push checks.
 Contributors must install **Lefthook 2.1.16** and run `lefthook install` once per clone.
 Formatting, compilation/type checking, and regressions must pass before pushing.
 
-## Known Limits
-
-- Memory use is not fully bounded: visited-chat state stays resident, up to four inactive idle Pi processes are kept warm, and running chats keep their own processes. The 32 MiB memory target has not been met.
-- Drafts survive chat switching, but only the active application's draft is persisted across restarts.
-
 ---
 
 <div align="center">
