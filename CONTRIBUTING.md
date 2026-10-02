@@ -48,7 +48,7 @@ zig build test
 ./zig-out/bin/spica --project /path/to/project
 ```
 
-Configure provider credentials through Pi to use models. Building and running regressions does not require provider credentials or model calls.
+Use Settings → Connect a provider to configure models through Pi-managed authentication. Building and running regressions does not require provider credentials or model calls. For authentication smoke checks, set `PI_CODING_AGENT_DIR` to an isolated temporary directory so test credentials cannot replace your real Pi credentials.
 Spica defaults to `/usr/bin/node` and `/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`.
 Use `--node /path/to/node` and `--pi-entry /path/to/cli.js` when those installations differ.
 Keep `.deps/` and `assets/` with the checkout and rebuild after moving it.

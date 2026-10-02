@@ -55,13 +55,13 @@ pub fn draw(app: anytype) !void {
     const canvas_width = app.shell.sidebar.width + app.shell.conversation.width;
     const canvas_height = app.shell.header.height + app.shell.conversation.height + app.shell.composer.height;
     const width = @min(@as(f32, 500), @max(@as(f32, 0), canvas_width - 32));
-    const height = @min(@as(f32, 360), @max(@as(f32, 0), canvas_height - 32));
+    const height = @min(@as(f32, 430), @max(@as(f32, 0), canvas_height - 32));
     const x = (canvas_width - width) / 2;
     const y = (canvas_height - height) / 2;
     const left = x + 20;
     const right = x + width - 20;
-    const row_step = (height - 146) / 4;
-    const theme_y = y + 96;
+    const row_step = (height - 180) / 4;
+    const theme_y = y + 128;
     const font_y = theme_y + row_step;
     const scale_y = font_y + row_step;
     const width_y = scale_y + row_step;
@@ -70,9 +70,10 @@ pub fn draw(app: anytype) !void {
     try app.rectangle(0, 0, canvas_width, canvas_height, 0, colors.canvas);
     try app.rectangle(x, y, width, height, 10, colors.border);
     try app.rectangle(x + 1, y + 1, width - 2, height - 2, 9, colors.panel);
-    try app.label("Appearance", left, y + 18, 19, colors.text);
+    try app.label("Settings", left, y + 18, 19, colors.text);
     try app.label("UI scale changes interface size.", left, y + 48, 13, colors.muted);
     try app.label("Hardware DPI remains automatic.", left, y + 66, 13, colors.muted);
+    try app.button(.connect_provider, "Connect a provider", .{ .x = left, .y = y + 86, .w = 172, .h = 34 });
 
     try app.label("Theme", left, theme_y + 8, 13, colors.text);
     try app.button(.{ .appearance = .dark }, if (app.appearance.light) "Dark" else "Dark (on)", .{ .x = right - 182, .y = theme_y, .w = 86, .h = 34 });

@@ -34,7 +34,9 @@ zig build
 ./zig-out/bin/spica --project /path/to/project
 ```
 
-Configure provider credentials through Pi. Dependencies are pinned in [`deps.lock.json`](./deps.lock.json); keep `.deps/` and `assets/` with the checkout and rebuild after moving it.
+Use **Settings → Connect a provider**, or **Connect a provider** in the model picker, to choose a provider and its sign-in method. Spica shows Pi's API-key/setup prompts or a browser sign-in link; Escape cancels authentication. Credentials stay in Pi's normal credential store, shared with the Pi CLI. Models refresh after connection without replacing the current chat. Connecting requires an idle Pi runtime.
+
+Dependencies are pinned in [`deps.lock.json`](./deps.lock.json); keep `.deps/` and `assets/` with the checkout and rebuild after moving it.
 
 Spica defaults to `/usr/bin/node` and `/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`. Use `--node` and `--pi-entry` if your installation differs.
 

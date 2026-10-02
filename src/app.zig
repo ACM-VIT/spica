@@ -16,9 +16,10 @@ const build_options = @import("build_options");
 const SessionCatalog = @import("core/catalog.zig");
 const Settings = @import("ui/settings.zig");
 const Library = @import("ui/library.zig");
+const Providers = @import("ui/providers.zig");
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
-const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
+const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, connect_provider, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
 const ThreadTarget = struct { path: ?[:0]u8, cwd: [:0]u8, archived: bool = false };
 const SubmittedPrompt = struct { token: u64, draft_revision: u64 };
 const ChatView = enum { new_thread, opening, existing };
@@ -157,6 +158,7 @@ pub const App = struct {
     run_elapsed: ?u64 = null,
     appearance: Settings.Values = .{},
     settings_open: bool = false,
+    providers: Providers.Panel = .{},
     projects: std.ArrayList([:0]u8) = .empty,
     catalog_error: ?anyerror = null,
     collapsed_folders: std.ArrayList([]u8) = .empty,
@@ -326,6 +328,7 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         if (self.runtime) |runtime| runtime.destroy() catch |err| std.log.err("Runtime shutdown invariant: {s}", .{@errorName(err)});
+        self.providers.wipe();
         if (self.runtime_snapshot) |*snapshot| snapshot.deinit();
         for (self.parked_chats.items) |*chat| chat.deinit(self.allocator);
         self.parked_chats.deinit(self.allocator);
@@ -792,6 +795,11 @@ pub const App = struct {
 
     fn requestClose(self: *App) !void {
         if (!self.closing) {
+            if (self.providers.open) {
+                self.providers.wipe();
+                if (self.runtime) |runtime| runtime.cancelProvider() catch {};
+                self.providers.close();
+            }
             try self.saveDraft();
             self.closing = true;
             self.focused_editor = false;
@@ -820,6 +828,16 @@ pub const App = struct {
             if (self.runtime_snapshot) |*old| old.deinit();
             self.runtime_snapshot = incoming;
             const snapshot = &self.runtime_snapshot.?;
+            self.providers.observe(self, snapshot.provider_ui);
+            if (self.providers.open and self.providers.failure == null and
+                (snapshot.status == .failed or snapshot.status == .stopped or snapshot.status == .exited) and
+                snapshot.provider_ui.kind != .done and snapshot.provider_ui.kind != .failed)
+            {
+                self.providers.active = false;
+                self.providers.fail("Pi exited during provider connection. Close this panel and restart Pi.");
+                _ = c.SDL_ClearComposition(self.window);
+                _ = c.SDL_StopTextInput(self.window);
+            }
             if (snapshot.status == .ready) if (self.model_restore) |settings| {
                 self.model_restore = null;
                 var owned = settings;
@@ -1242,7 +1260,117 @@ pub const App = struct {
         }
     }
 
+    fn providerUi(self: *const App) pi.ProviderUi {
+        return if (self.runtime_snapshot) |snapshot| snapshot.provider_ui else .{ .kind = .closed };
+    }
+
+    fn connectProvider(self: *App) void {
+        self.providers.begin();
+        self.settings_open = false;
+        self.model_menu = false;
+        self.thinking_menu = false;
+        self.focused_editor = false;
+        self.dragging = false;
+        self.preedit.clearRetainingCapacity();
+        _ = c.SDL_ClearComposition(self.window);
+        _ = c.SDL_StopTextInput(self.window);
+        self.dirty = true;
+        if (self.options.fixture) {
+            self.providers.fail("Provider connection is unavailable in fixture mode.");
+            return;
+        }
+        if (self.pending_thread != null or self.closing or self.runtime_retiring) {
+            self.providers.fail("Wait for the current chat to finish opening or closing.");
+            return;
+        }
+        if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) {
+            self.providers.fail("Stop the current run before connecting a provider.");
+            return;
+        }
+        if (self.runtimeStatus() != .ready) {
+            self.providers.fail("Pi is not ready. Start Pi and wait for it to become ready, then retry.");
+            return;
+        }
+        const runtime = self.runtime orelse {
+            self.providers.fail("Start Pi before connecting a provider.");
+            return;
+        };
+        runtime.connectProvider() catch {
+            self.providers.fail("Could not start provider connection. Retry when Pi is ready.");
+            return;
+        };
+        self.providers.active = true;
+    }
+
+    fn closeProvider(self: *App) void {
+        self.providers.close();
+        self.focused_editor = true;
+        _ = c.SDL_ClearComposition(self.window);
+        _ = c.SDL_StartTextInput(self.window);
+        self.dirty = true;
+    }
+
+    fn providerIntent(self: *App, intent: Providers.Intent) !void {
+        switch (intent) {
+            .cancel => {
+                self.providers.wipe();
+                _ = c.SDL_ClearComposition(self.window);
+                if (self.providers.active) if (self.runtime) |runtime| runtime.cancelProvider() catch {
+                    self.providers.input_error = "Could not cancel provider connection. Try Cancel again.";
+                    self.dirty = true;
+                    return;
+                };
+                self.providers.active = false;
+                self.closeProvider();
+            },
+            .close => {
+                if (self.providers.active) try self.providerIntent(.cancel) else self.closeProvider();
+            },
+            .retry => {
+                if (self.providers.active) {
+                    try self.providerIntent(.cancel);
+                    if (self.providers.active) return;
+                }
+                self.connectProvider();
+            },
+            .url => {
+                const ui = self.providerUi();
+                if (ui.url.len == 0) return;
+                const url = try self.allocator.dupeZ(u8, ui.url);
+                defer self.allocator.free(url);
+                if (!c.SDL_OpenURL(url.ptr)) self.providers.input_error = "Could not open the browser. Open the displayed URL manually.";
+            },
+            .respond => {
+                if (self.providers.pending or self.providers.failure != null) return;
+                const ui = self.providerUi();
+                const value = switch (ui.kind) {
+                    .input => self.providers.input[0..self.providers.input_len],
+                    .select => if (self.providers.selected < ui.options.len) ui.options[self.providers.selected] else return,
+                    else => return,
+                };
+                defer self.providers.wipe();
+                const runtime = self.runtime orelse {
+                    self.providers.fail("Pi exited during provider connection.");
+                    return;
+                };
+                runtime.respondProvider(ui.id, value) catch {
+                    self.providers.fail("Could not send the provider response. Retry the connection.");
+                    return;
+                };
+                self.providers.pending = true;
+                self.providers.target_count = 0;
+                _ = c.SDL_ClearComposition(self.window);
+                _ = c.SDL_StopTextInput(self.window);
+            },
+        }
+        self.dirty = true;
+    }
+
     fn act(self: *App, action: Action) !void {
+        if (self.providers.open) switch (action) {
+            .force_stop, .wait => {},
+            else => return error.ProviderConnectionInProgress,
+        };
         switch (action) {
             .start => try self.beginRuntime(),
             .new_thread => try self.newThreadIn(self.project_path),
@@ -1280,6 +1408,7 @@ pub const App = struct {
                 self.folder_pending = true;
                 c.SDL_ShowOpenFolderDialog(folderChosen, @ptrFromInt(self.wake_event), self.window, self.project_path.ptr, false);
             },
+            .connect_provider => self.connectProvider(),
             .settings => {
                 self.settings_open = !self.settings_open;
                 self.model_menu = false;
@@ -1395,8 +1524,8 @@ pub const App = struct {
             try self.rectangle(x + 1, y + 1, width - 2, 258, 7, colors.panel);
             if (self.runtime_snapshot) |snapshot| {
                 if (snapshot.models.len == 0) try self.label("No configured models", x + 12, y + 16, 13, colors.muted);
-                self.model_first = @min(self.model_first, snapshot.models.len -| 1);
-                const end = @min(snapshot.models.len, self.model_first + 6);
+                self.model_first = @min(self.model_first, snapshot.models.len);
+                const end = @min(snapshot.models.len, self.model_first + 5);
                 for (snapshot.models[self.model_first..end], self.model_first..) |model, index| {
                     const row_y = y + 8 + @as(f32, @floatFromInt(index - self.model_first)) * 40;
                     const row_clip = c.SDL_Rect{ .x = @intFromFloat(x + 8), .y = @intFromFloat(row_y), .w = @intFromFloat(width - 16), .h = 38 };
@@ -1407,6 +1536,9 @@ pub const App = struct {
                     _ = c.SDL_SetRenderClipRect(self.renderer, null);
                 }
             } else try self.label("Start pi to discover models", x + 12, y + 16, 13, colors.muted);
+            const connect_selected = if (self.runtime_snapshot) |snapshot| self.model_first == snapshot.models.len else true;
+            if (connect_selected) try self.rectangle(x + 8, y + 216, width - 16, 34, 5, colors.raised);
+            try self.flatButton(.connect_provider, "Connect a provider", .{ .x = x + 8, .y = y + 216, .w = width - 16, .h = 34 });
         }
         if (self.thinking_menu) {
             if (self.runtime_snapshot) |snapshot| {
@@ -1977,6 +2109,7 @@ pub const App = struct {
             self.button_count = 0;
             try self.drawOverlays();
         }
+        if (self.providers.open and !self.closing and !self.force_dialog) try self.providers.draw(self, self.providerUi());
         if (!self.captured and self.options.capture != null and self.transcript.wanted == null and !self.content_pending and !self.conversation_dirty and (if (self.options.fixture) self.transcript.items.items.len != 0 else self.runtimeStatus() == .ready)) {
             const surface = c.SDL_RenderReadPixels(self.renderer, null) orelse return error.ScreenCapture;
             defer c.SDL_DestroySurface(surface);
@@ -2131,6 +2264,13 @@ pub const App = struct {
             self.consume();
             return;
         }
+        if (self.providers.open and !self.closing and !self.force_dialog) switch (event.type) {
+            c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_TEXT_INPUT, c.SDL_EVENT_TEXT_EDITING, c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_BUTTON_UP, c.SDL_EVENT_MOUSE_MOTION, c.SDL_EVENT_MOUSE_WHEEL, c.SDL_EVENT_WINDOW_FOCUS_LOST => {
+                if (try self.providers.handle(self, self.providerUi(), event)) |intent| try self.providerIntent(intent);
+                return;
+            },
+            else => {},
+        };
         if (event.type == c.SDL_EVENT_KEY_DOWN and !self.closing and !self.force_dialog) {
             const command = (event.key.mod & (c.SDL_KMOD_CTRL | c.SDL_KMOD_GUI)) != 0;
             if (command and event.key.key == c.SDLK_K) {
@@ -2184,7 +2324,7 @@ pub const App = struct {
                 }
                 if (self.settings_open) return;
                 if (self.model_menu) {
-                    const last = if (self.runtime_snapshot) |snapshot| snapshot.models.len -| 1 else 0;
+                    const last = if (self.runtime_snapshot) |snapshot| snapshot.models.len else 0;
                     self.model_first = if (event.wheel.y > 0) self.model_first -| 1 else @min(last, self.model_first + 1);
                 } else if (!self.closing) {
                     if (self.sidebar_visible and event.wheel.mouse_x < self.shell.sidebar.width) {
@@ -2292,11 +2432,13 @@ pub const App = struct {
                         self.dirty = true;
                     }
                     if (event.key.key == c.SDLK_DOWN) {
-                        const last = if (self.runtime_snapshot) |snapshot| snapshot.models.len -| 1 else 0;
+                        const last = if (self.runtime_snapshot) |snapshot| snapshot.models.len else 0;
                         self.model_first = @min(last, self.model_first + 1);
                         self.dirty = true;
                     }
-                    if (event.key.key == c.SDLK_RETURN) try self.act(.{ .select_model = self.model_first });
+                    if (event.key.key == c.SDLK_RETURN) {
+                        if (self.runtime_snapshot == null or self.model_first >= self.runtime_snapshot.?.models.len) try self.act(.connect_provider) else try self.act(.{ .select_model = self.model_first });
+                    }
                     return;
                 }
                 if (command and event.key.key == c.SDLK_P) {
