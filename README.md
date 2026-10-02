@@ -57,7 +57,7 @@ Native source archives and fonts are pinned in [`deps.lock.json`](./deps.lock.js
 
 ### Prerequisites
 
-The current real-process application is supported on **Linux**.
+The current real-process application is supported on **Linux**. macOS and Windows testing has not been added yet; their build and runtime support is not verified. The setup instructions below target Linux.
 
 Install:
 
@@ -156,7 +156,7 @@ Exercise UI changes in the actual application with isolated data. Measure the de
 
 ## Current Limitations
 
-- The real Pi process integration is Linux-only; other platforms are not advertised as supported.
+- The real Pi process integration is currently Linux-only. macOS and Windows testing still needs to be added, including dependency builds, regression tests, and native application checks for rendering, input, Pi process ownership, storage migration, and chat navigation. Neither platform is currently verified or advertised as supported.
 - Software rendering is the default. Neither renderer has passed the project's 32 MiB memory target.
 - Up to four inactive idle Pi processes are kept warm, in addition to the selected chat. Busy chats remain alive, so concurrent work increases resource use.
 - Visited-chat metadata and drafts currently remain in memory for the application session. This state is not yet a bounded disk-backed cache for thousands of visited chats.
