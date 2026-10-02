@@ -23,7 +23,7 @@ Import continues the original Pi session; archiving does not delete it.
 
 **Linux only for now. macOS and Windows testing has not been added; support is unverified.**
 
-Requires Zig **0.16.0**, Node.js **22.19.0+**, npm, Python 3, CMake, Make, a C/C++ toolchain, pkg-config, SQLite development files with FTS5, and X11/Wayland development libraries for SDL3.
+Requires Zig **0.16.0**, Node.js **22.19.0+**, npm, Python **3.12+**, CMake, Make, a C/C++ toolchain, pkg-config, SQLite development files with FTS5, and X11/Wayland development libraries for SDL3.
 
 From the repository root:
 
@@ -40,31 +40,10 @@ Spica defaults to `/usr/bin/node` and `/usr/lib/node_modules/@earendil-works/pi-
 
 ## Development
 
-```sh
-zig build test
-./zig-out/bin/spica --help
-```
-
-### Formatting and Git hooks
-
-Use Zig **0.16.0**, clang-format **22.1.8**, and [Lefthook **2.1.16**](https://github.com/evilmartians/lefthook/releases/tag/v2.1.16).
-Install Lefthook using its platform release or package manager and make it available on `PATH`.
-clang-format can also be installed with `python3 -m pip install clang-format==22.1.8` in a virtual environment.
-
-```sh
-lefthook install
-python3 tools/format.py          # format owned Zig, C, headers, and C++ files
-python3 tools/format.py --check  # check without rewriting
-lefthook run pre-push           # formatting, build, and regressions
-```
-
-Pre-push checks formatting, runs `zig build`, and runs `zig build test`; it never auto-formats.
-Run `zig build deps` first on a fresh checkout. Hooks do not install native dependencies.
-Checks run locally only through the pre-push hook; no GitHub Actions workflow is configured.
-
-Enable format-on-save with `zig fmt` for Zig and clang-format for C/C++ in your editor.
-The C/C++ style is defined in `.clang-format`; external/generated dependencies are excluded.
-These are formatting checks, not a clang-tidy/static-analysis setup.
+Read [CONTRIBUTING.md](./CONTRIBUTING.md) before making changes. It lists required tools,
+first-time setup, formatting commands, and the client-side pre-push checks.
+Contributors must install **Lefthook 2.1.16** and run `lefthook install` once per clone.
+Formatting, compilation/type checking, and regressions must pass before pushing.
 
 ## Known Limits
 
