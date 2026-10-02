@@ -1,0 +1,10 @@
+min_version: 2.1.0
+
+pre-push:
+  commands:
+    formatting:
+      run: python3 tools/format.py --check
+    build:
+      run: zig build
+    regressions:
+      run: zig build test
