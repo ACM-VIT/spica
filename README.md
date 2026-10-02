@@ -6,10 +6,6 @@
 
 <p>A native desktop client for <a href="https://github.com/earendil-works/pi">Pi</a>, built with Zig and SDL3.</p>
 
-<a href="https://acmvit.in/">
-  <img alt="Made by ACM-VIT" src="https://img.shields.io/badge/MADE%20BY-ACM%20VIT-orange?style=flat-square&logo=acm" />
-</a>
-
 </div>
 
 ## Features
@@ -19,6 +15,9 @@
 - Markdown, code highlighting, images, and Unicode editing.
 
 Import continues the original Pi session; archiving does not delete it.
+
+<img width="1813" height="1187" alt="image" src="https://github.com/user-attachments/assets/6892b4eb-ef3a-43cf-a70c-c642789d5347" />
+
 
 ## Setup
 
@@ -38,21 +37,6 @@ zig build
 Configure provider credentials through Pi. Dependencies are pinned in [`deps.lock.json`](./deps.lock.json); keep `.deps/` and `assets/` with the checkout and rebuild after moving it.
 
 Spica defaults to `/usr/bin/node` and `/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`. Use `--node` and `--pi-entry` if your installation differs.
-
-## Controls
-
-| Action | Control |
-| --- | --- |
-| New chat | Ctrl+N / folder **+** |
-| Search chats | Ctrl+K |
-| Import / archive browser | Sidebar |
-| Send / newline | Enter / Shift+Enter |
-| Stop selected chat | Ctrl+. |
-| Model / appearance | Ctrl+M / Ctrl+, |
-
-Restore an archived chat before sending. Switching chats leaves work running; closing Spica shuts down all its chat processes.
-
-Project resources are disabled by default because they can execute code. Enable them only for trusted projects with `--trust-project`. Use `--data-dir` for isolated application data.
 
 ## Development
 
