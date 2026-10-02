@@ -17,7 +17,10 @@ pub const Paths = struct {
             try std.fs.path.join(allocator, &.{ root, "app" }),
             try std.fs.path.join(allocator, &.{ root, "cache" }),
         } else try defaultRoots(allocator, environ);
-        errdefer { allocator.free(roots[0]); allocator.free(roots[1]); }
+        errdefer {
+            allocator.free(roots[0]);
+            allocator.free(roots[1]);
+        }
         try std.Io.Dir.cwd().createDirPath(io, roots[0]);
         try std.Io.Dir.cwd().createDirPath(io, roots[1]);
         const lock_path = try std.fs.path.join(allocator, &.{ roots[0], "instance.lock" });
@@ -54,7 +57,10 @@ pub const Paths = struct {
     }
 
     fn variable(allocator: std.mem.Allocator, environ: std.process.Environ, key: []const u8) !?[]u8 {
-        return environ.getAlloc(allocator, key) catch |err| switch (err) { error.EnvironmentVariableMissing => null, else => return err };
+        return environ.getAlloc(allocator, key) catch |err| switch (err) {
+            error.EnvironmentVariableMissing => null,
+            else => return err,
+        };
     }
 
     fn defaultRoots(allocator: std.mem.Allocator, environ: std.process.Environ) ![2][]u8 {

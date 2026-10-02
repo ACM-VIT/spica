@@ -40,9 +40,9 @@ typedef struct {
  * javascript,python} with the platform .dll/.dylib/.so extension.
  * Unsupported languages return no job; render readable, uncolored monospace
  * with the original language label. */
-SpicaHighlightResult spica_highlight_parse(const char *source, size_t length,
-    const char *language, const char *grammar_directory, size_t arena_limit,
-    SpicaHighlight **out);
+SpicaHighlightResult spica_highlight_parse(const char *source, size_t length, const char *language,
+                                           const char *grammar_directory, size_t arena_limit,
+                                           SpicaHighlight **out);
 const SpicaHighlightSpan *spica_highlight_spans(const SpicaHighlight *job);
 size_t spica_highlight_span_count(const SpicaHighlight *job);
 /* Includes the borrowed source bytes reserved against this job's limit. */

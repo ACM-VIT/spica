@@ -159,7 +159,6 @@ pub const View = struct {
         self.height = y;
     }
 
-
     pub fn releaseShapes(self: *View) void {
         for (self.boxes.items) |*box| {
             if (box.layout) |layout| c.spica_text_layout_release(layout);

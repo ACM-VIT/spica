@@ -677,7 +677,7 @@ test "removing expanded reasoning preserves the answer across conversation updat
         try view.draw(engine, renderer, 0, 0, 640, 400, &scroll, false, appearance.metrics, appearance.dark, false);
         const expanded_height = view.items.items[0].height;
         entries[0].reasoning = null;
-        try view.update(entries[0 .. if (append_message) @as(usize, 2) else 1]);
+        try view.update(entries[0..if (append_message) @as(usize, 2) else 1]);
         try view.draw(engine, renderer, 0, 0, 640, 400, &scroll, false, appearance.metrics, appearance.dark, false);
         try std.testing.expect(view.items.items[0].height < expanded_height);
         try std.testing.expect(std.mem.indexOf(u8, view.items.items[0].loaded.?.ready.document.text.items, answer) != null);

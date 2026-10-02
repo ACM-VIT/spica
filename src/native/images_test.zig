@@ -1,5 +1,7 @@
 const std = @import("std");
-const c = @cImport({ @cInclude("images.h"); });
+const c = @cImport({
+    @cInclude("images.h");
+});
 
 // A 1x1 opaque red RGBA PNG with a stored zlib block and valid checksums.
 const tiny_png = [_]u8{
@@ -87,11 +89,10 @@ test "animated GIF returns red first frame without upscaling" {
     try std.testing.expect(c.spica_image_install_sdl_allocator());
     // Two 1x1 frames: opaque red, then black. Shared two-entry color table.
     const gif = [_]u8{
-        'G', 'I', 'F', '8', '9', 'a', 1, 0, 1, 0, 0x80, 0, 0,
-        255, 0, 0, 0, 0, 0,
-        0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0,
-        0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x4c, 0x01, 0,
-        0x3b,
+        'G', 'I', 'F', '8', '9', 'a',  1,    0,    1,    0, 0x80, 0, 0,
+        255, 0,   0,   0,   0,   0,    0x2c, 0,    0,    0, 0,    1, 0,
+        1,   0,   0,   2,   2,   0x44, 0x01, 0,    0x2c, 0, 0,    0, 0,
+        1,   0,   1,   0,   0,   2,    2,    0x4c, 0x01, 0, 0x3b,
     };
     var output: c.SpicaImageResult = undefined;
     try expectStatus(c.SPICA_IMAGE_OK, decode(&gif, &output));

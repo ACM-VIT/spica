@@ -255,8 +255,12 @@ pub const Composer = struct {
         }
         if (self.group_count == max_groups) self.evictOldest();
         self.storage.history[self.group_count] = .{
-            .start = range.start, .removed = removed, .inserted = inserted,
-            .before = before, .after = after, .kind = kind,
+            .start = range.start,
+            .removed = removed,
+            .inserted = inserted,
+            .before = before,
+            .after = after,
+            .kind = kind,
         };
         self.group_count += 1;
         self.applied_groups = self.group_count;
@@ -670,7 +674,7 @@ test "fragmentation failure is atomic and retained undo remains usable" {
     var composer = try Composer.init(std.testing.allocator);
     defer composer.deinit();
     try composer.setText("ab");
-    for (0 .. max_pieces - 2) |_| {
+    for (0..max_pieces - 2) |_| {
         composer.setCaret(1, false);
         try composer.insert("x", .paste);
     }

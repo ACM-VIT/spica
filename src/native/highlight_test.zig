@@ -1,14 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const c = @cImport({ @cInclude("highlight.h"); });
+const c = @cImport({
+    @cInclude("highlight.h");
+});
 const grammar_directory = ".deps/install/" ++ @tagName(builtin.os.tag) ++
     "-" ++ @tagName(builtin.cpu.arch) ++ "/lib";
 const budget = 8 * 1024 * 1024;
 
 fn parse(source: []const u8, language: [:0]const u8) !*c.SpicaHighlight {
     var job: ?*c.SpicaHighlight = null;
-    try std.testing.expectEqual(@as(c_uint, c.SPICA_HIGHLIGHT_OK),
-        c.spica_highlight_parse(source.ptr, source.len, language, grammar_directory, budget, &job));
+    try std.testing.expectEqual(@as(c_uint, c.SPICA_HIGHLIGHT_OK), c.spica_highlight_parse(source.ptr, source.len, language, grammar_directory, budget, &job));
     return job orelse error.MissingHighlight;
 }
 
@@ -98,11 +99,9 @@ test "arena and capture exhaustion preserve source and do not poison following s
     const source = "def greet():\n    return 'unchanged'\n";
     var job: ?*c.SpicaHighlight = null;
     // Borrowing avoids a source copy, but still charges its bytes to the cap.
-    try std.testing.expectEqual(@as(c_uint, c.SPICA_HIGHLIGHT_BUDGET_EXCEEDED),
-        c.spica_highlight_parse(source, source.len, "python", "/absent/grammars", source.len, &job));
+    try std.testing.expectEqual(@as(c_uint, c.SPICA_HIGHLIGHT_BUDGET_EXCEEDED), c.spica_highlight_parse(source, source.len, "python", "/absent/grammars", source.len, &job));
     try std.testing.expect(job == null);
-    try std.testing.expectEqual(@as(c_uint, c.SPICA_HIGHLIGHT_BUDGET_EXCEEDED),
-        c.spica_highlight_parse(source, source.len, "python", grammar_directory, 128, &job));
+    try std.testing.expectEqual(@as(c_uint, c.SPICA_HIGHLIGHT_BUDGET_EXCEEDED), c.spica_highlight_parse(source, source.len, "python", grammar_directory, 128, &job));
     try std.testing.expect(job == null);
     // This input has over 16K captures and a large real syntax tree. Exhaustion
     // must fail the whole job, not return silently truncated token colors.
@@ -113,8 +112,7 @@ test "arena and capture exhaustion preserve source and do not poison following s
     while (offset + line.len <= hostile.len) : (offset += line.len)
         @memcpy(hostile[offset..][0..line.len], line);
     @memset(hostile[offset..], ' ');
-    try std.testing.expectEqual(@as(c_uint, c.SPICA_HIGHLIGHT_BUDGET_EXCEEDED),
-        c.spica_highlight_parse(hostile.ptr, hostile.len, "zig", grammar_directory, budget, &job));
+    try std.testing.expectEqual(@as(c_uint, c.SPICA_HIGHLIGHT_BUDGET_EXCEEDED), c.spica_highlight_parse(hostile.ptr, hostile.len, "zig", grammar_directory, budget, &job));
     try std.testing.expect(job == null);
     try std.testing.expectEqualStrings("const x = 1;\n", hostile[0..line.len]);
     const recovered = try parse(source, "python");
@@ -126,7 +124,6 @@ test "arena and capture exhaustion preserve source and do not poison following s
 test "unsupported language is uncolored without loading an arbitrary grammar" {
     const source = "fn readable() { return 1; }";
     var job: ?*c.SpicaHighlight = null;
-    try std.testing.expectEqual(@as(c_uint, c.SPICA_HIGHLIGHT_UNSUPPORTED),
-        c.spica_highlight_parse(source, source.len, "rust", "/absent/grammars", budget, &job));
+    try std.testing.expectEqual(@as(c_uint, c.SPICA_HIGHLIGHT_UNSUPPORTED), c.spica_highlight_parse(source, source.len, "rust", "/absent/grammars", budget, &job));
     try std.testing.expect(job == null);
 }

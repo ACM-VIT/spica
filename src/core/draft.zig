@@ -45,10 +45,15 @@ pub const Restored = struct {
             .projects = raw.projects,
         };
     }
-    pub fn deinit(self: *Restored) void { if (self.parsed) |parsed| parsed.deinit(); }
+    pub fn deinit(self: *Restored) void {
+        if (self.parsed) |parsed| parsed.deinit();
+    }
 };
 pub fn restore(io: std.Io, path: []const u8) !Restored {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(512 * 1024)) catch |err| switch (err) { error.FileNotFound => return .{}, else => return err };
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(512 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
     defer allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(RawState, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     errdefer parsed.deinit();

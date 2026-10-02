@@ -11,7 +11,10 @@
  * content-worker thread count toward its current job. The header lets a free
  * on another thread release a previously charged allocation safely. */
 typedef union {
-    struct { size_t size; bool charged; } record;
+    struct {
+        size_t size;
+        bool charged;
+    } record;
     max_align_t alignment;
 } Allocation;
 #if defined(_MSC_VER)
@@ -34,21 +37,24 @@ static bool charge(size_t bytes) {
         }
     } while (!atomic_compare_exchange_weak(&charged_live, &live, live + bytes));
     size_t peak = atomic_load(&peak_live);
-    while (live + bytes > peak &&
-           !atomic_compare_exchange_weak(&peak_live, &peak, live + bytes)) {}
+    while (live + bytes > peak && !atomic_compare_exchange_weak(&peak_live, &peak, live + bytes)) {
+    }
     return true;
 }
 
 static void *image_allocate(size_t size, bool charged) {
     if (size > SIZE_MAX - sizeof(Allocation)) {
-        if (charged) atomic_store(&hit_limit, true);
+        if (charged)
+            atomic_store(&hit_limit, true);
         return NULL;
     }
     size_t total = sizeof(Allocation) + size;
-    if (charged && !charge(total)) return NULL;
+    if (charged && !charge(total))
+        return NULL;
     Allocation *block = malloc(total);
     if (!block) {
-        if (charged) atomic_fetch_sub(&charged_live, total);
+        if (charged)
+            atomic_fetch_sub(&charged_live, total);
         return NULL;
     }
     block->record.size = total;
@@ -56,23 +62,24 @@ static void *image_allocate(size_t size, bool charged) {
     return block + 1;
 }
 
-static void *SDLCALL image_malloc(size_t size) {
-    return image_allocate(size, active_job);
-}
+static void *SDLCALL image_malloc(size_t size) { return image_allocate(size, active_job); }
 
 static void *SDLCALL image_calloc(size_t count, size_t size) {
     if (size && count > SIZE_MAX / size) {
-        if (active_job) atomic_store(&hit_limit, true);
+        if (active_job)
+            atomic_store(&hit_limit, true);
         return NULL;
     }
     size_t bytes = count * size;
     void *ptr = image_malloc(bytes);
-    if (ptr) memset(ptr, 0, bytes);
+    if (ptr)
+        memset(ptr, 0, bytes);
     return ptr;
 }
 
 static void SDLCALL image_free(void *ptr) {
-    if (!ptr) return;
+    if (!ptr)
+        return;
     Allocation *block = (Allocation *)ptr - 1;
     if (block->record.charged)
         atomic_fetch_sub(&charged_live, block->record.size);
@@ -80,26 +87,34 @@ static void SDLCALL image_free(void *ptr) {
 }
 
 static void *SDLCALL image_realloc(void *ptr, size_t size) {
-    if (!ptr) return image_malloc(size);
-    if (!size) { image_free(ptr); return NULL; }
+    if (!ptr)
+        return image_malloc(size);
+    if (!size) {
+        image_free(ptr);
+        return NULL;
+    }
     if (size > SIZE_MAX - sizeof(Allocation)) {
-        if (active_job) atomic_store(&hit_limit, true);
+        if (active_job)
+            atomic_store(&hit_limit, true);
         return NULL;
     }
     Allocation *old = (Allocation *)ptr - 1;
     /* A growing realloc may keep both blocks live inside libc. Charge that
      * overlap explicitly rather than relying on an in-place realloc. */
     size_t before = old->record.size - sizeof(Allocation);
-    if (size <= before) return ptr; /* Keep capacity; no copy or hidden overlap. */
+    if (size <= before)
+        return ptr; /* Keep capacity; no copy or hidden overlap. */
     void *replacement = image_allocate(size, active_job || old->record.charged);
-    if (!replacement) return NULL;
+    if (!replacement)
+        return NULL;
     memcpy(replacement, ptr, before);
     image_free(ptr);
     return replacement;
 }
 
 bool spica_image_install_sdl_allocator(void) {
-    if (hooks_installed) return true;
+    if (hooks_installed)
+        return true;
     SDL_malloc_func m, original_m;
     SDL_calloc_func c, original_c;
     SDL_realloc_func r, original_r;
@@ -117,82 +132,109 @@ bool spica_image_install_sdl_allocator(void) {
 static uint32_t be16(const uint8_t *p) { return ((uint32_t)p[0] << 8) | p[1]; }
 static uint32_t be32(const uint8_t *p) { return (be16(p) << 16) | be16(p + 2); }
 static uint32_t le16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
-static uint32_t le24(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16); }
+static uint32_t le24(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+}
 
 /* Return an advertised size without invoking any decoder allocation. The
  * decoder still validates the complete file; this is only a budget preflight. */
-static SpicaImageStatus dimensions(const uint8_t *p, size_t n,
-                                   int *width, int *height, const char **mime,
-                                   const char **type) {
+static SpicaImageStatus dimensions(const uint8_t *p, size_t n, int *width, int *height,
+                                   const char **mime, const char **type) {
     uint32_t w = 0, h = 0;
     if (n >= 8 && !memcmp(p, "\x89PNG\r\n\x1a\n", 8)) {
-        *mime = "image/png"; *type = "PNG";
-        if (n < 24 || be32(p + 8) != 13 || memcmp(p + 12, "IHDR", 4)) return SPICA_IMAGE_CORRUPT;
-        w = be32(p + 16); h = be32(p + 20);
+        *mime = "image/png";
+        *type = "PNG";
+        if (n < 24 || be32(p + 8) != 13 || memcmp(p + 12, "IHDR", 4))
+            return SPICA_IMAGE_CORRUPT;
+        w = be32(p + 16);
+        h = be32(p + 20);
     } else if (n >= 6 && (!memcmp(p, "GIF87a", 6) || !memcmp(p, "GIF89a", 6))) {
-        *mime = "image/gif"; *type = "GIF";
-        if (n < 10) return SPICA_IMAGE_CORRUPT;
-        w = le16(p + 6); h = le16(p + 8);
+        *mime = "image/gif";
+        *type = "GIF";
+        if (n < 10)
+            return SPICA_IMAGE_CORRUPT;
+        w = le16(p + 6);
+        h = le16(p + 8);
     } else if (n >= 12 && !memcmp(p, "RIFF", 4) && !memcmp(p + 8, "WEBP", 4)) {
-        *mime = "image/webp"; *type = "WEBP";
-        if (n < 30) return SPICA_IMAGE_CORRUPT;
+        *mime = "image/webp";
+        *type = "WEBP";
+        if (n < 30)
+            return SPICA_IMAGE_CORRUPT;
         if (!memcmp(p + 12, "VP8X", 4)) {
-            w = le24(p + 24) + 1; h = le24(p + 27) + 1;
+            w = le24(p + 24) + 1;
+            h = le24(p + 27) + 1;
         } else if (!memcmp(p + 12, "VP8L", 4)) {
-            if (n < 25 || p[20] != 0x2f) return SPICA_IMAGE_CORRUPT;
+            if (n < 25 || p[20] != 0x2f)
+                return SPICA_IMAGE_CORRUPT;
             w = 1 + (uint32_t)p[21] + (((uint32_t)p[22] & 0x3f) << 8);
-            h = 1 + ((uint32_t)p[22] >> 6) + ((uint32_t)p[23] << 2) + (((uint32_t)p[24] & 0xf) << 10);
+            h = 1 + ((uint32_t)p[22] >> 6) + ((uint32_t)p[23] << 2) +
+                (((uint32_t)p[24] & 0xf) << 10);
         } else if (!memcmp(p + 12, "VP8 ", 4)) {
             if (n < 30 || p[23] != 0x9d || p[24] != 0x01 || p[25] != 0x2a)
                 return SPICA_IMAGE_CORRUPT;
-            w = le16(p + 26) & 0x3fff; h = le16(p + 28) & 0x3fff;
-        } else return SPICA_IMAGE_CORRUPT;
+            w = le16(p + 26) & 0x3fff;
+            h = le16(p + 28) & 0x3fff;
+        } else
+            return SPICA_IMAGE_CORRUPT;
     } else if (n >= 2 && p[0] == 0xff && p[1] == 0xd8) {
-        *mime = "image/jpeg"; *type = "JPG";
+        *mime = "image/jpeg";
+        *type = "JPG";
         size_t offset = 2;
         while (offset < n) {
-            if (p[offset++] != 0xff) return SPICA_IMAGE_CORRUPT;
-            while (offset < n && p[offset] == 0xff) ++offset;
-            if (offset >= n) return SPICA_IMAGE_CORRUPT;
+            if (p[offset++] != 0xff)
+                return SPICA_IMAGE_CORRUPT;
+            while (offset < n && p[offset] == 0xff)
+                ++offset;
+            if (offset >= n)
+                return SPICA_IMAGE_CORRUPT;
             uint8_t marker = p[offset++];
-            if (marker == 0xd9 || marker == 0xda) return SPICA_IMAGE_CORRUPT;
-            if (marker == 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
-            if (n - offset < 2) return SPICA_IMAGE_CORRUPT;
+            if (marker == 0xd9 || marker == 0xda)
+                return SPICA_IMAGE_CORRUPT;
+            if (marker == 0x01 || (marker >= 0xd0 && marker <= 0xd7))
+                continue;
+            if (n - offset < 2)
+                return SPICA_IMAGE_CORRUPT;
             size_t segment = be16(p + offset);
-            if (segment < 2 || segment > n - offset) return SPICA_IMAGE_CORRUPT;
-            if ((marker >= 0xc0 && marker <= 0xc3) ||
-                (marker >= 0xc5 && marker <= 0xc7) ||
-                (marker >= 0xc9 && marker <= 0xcb) ||
-                (marker >= 0xcd && marker <= 0xcf)) {
-                if (segment < 7) return SPICA_IMAGE_CORRUPT;
-                h = be16(p + offset + 3); w = be16(p + offset + 5);
+            if (segment < 2 || segment > n - offset)
+                return SPICA_IMAGE_CORRUPT;
+            if ((marker >= 0xc0 && marker <= 0xc3) || (marker >= 0xc5 && marker <= 0xc7) ||
+                (marker >= 0xc9 && marker <= 0xcb) || (marker >= 0xcd && marker <= 0xcf)) {
+                if (segment < 7)
+                    return SPICA_IMAGE_CORRUPT;
+                h = be16(p + offset + 3);
+                w = be16(p + offset + 5);
                 break;
             }
             offset += segment;
         }
-    } else return SPICA_IMAGE_UNSUPPORTED;
-    if (!w || !h) return SPICA_IMAGE_CORRUPT;
+    } else
+        return SPICA_IMAGE_UNSUPPORTED;
+    if (!w || !h)
+        return SPICA_IMAGE_CORRUPT;
     if (w > INT_MAX || h > INT_MAX || (uint64_t)w * h > SPICA_IMAGE_JOB_LIMIT / 4)
         return SPICA_IMAGE_BUDGET_EXCEEDED;
-    *width = (int)w; *height = (int)h;
+    *width = (int)w;
+    *height = (int)h;
     return SPICA_IMAGE_OK;
 }
 
-SpicaImageStatus spica_image_decode(const uint8_t *source, size_t length,
-                                    int max_width, int max_height,
-                                    size_t thumbnail_limit,
-                                    SpicaImageResult *out) {
-    if (!out) return SPICA_IMAGE_INVALID_ARGUMENT;
-    *out = (SpicaImageResult){0};
-    if (!source || !length || max_width <= 0 || max_height <= 0 ||
-        !thumbnail_limit || thumbnail_limit > SPICA_IMAGE_JOB_LIMIT)
+SpicaImageStatus spica_image_decode(const uint8_t *source, size_t length, int max_width,
+                                    int max_height, size_t thumbnail_limit, SpicaImageResult *out) {
+    if (!out)
         return SPICA_IMAGE_INVALID_ARGUMENT;
-    if (!hooks_installed) return SPICA_IMAGE_SDL_ALLOCATOR_UNAVAILABLE;
+    *out = (SpicaImageResult){0};
+    if (!source || !length || max_width <= 0 || max_height <= 0 || !thumbnail_limit ||
+        thumbnail_limit > SPICA_IMAGE_JOB_LIMIT)
+        return SPICA_IMAGE_INVALID_ARGUMENT;
+    if (!hooks_installed)
+        return SPICA_IMAGE_SDL_ALLOCATOR_UNAVAILABLE;
     int width = 0, height = 0;
     const char *mime = NULL, *type = NULL;
     SpicaImageStatus status = dimensions(source, length, &width, &height, &mime, &type);
-    if (status != SPICA_IMAGE_OK) return status;
-    out->source_width = width; out->source_height = height;
+    if (status != SPICA_IMAGE_OK)
+        return status;
+    out->source_width = width;
+    out->source_height = height;
     out->mime_type = mime;
 
     /* Aspect-preserving, integer-only, downscale-or-original fit. */
@@ -205,17 +247,21 @@ SpicaImageStatus spica_image_decode(const uint8_t *source, size_t length,
             target_height = max_height;
             target_width = (int)((uint64_t)width * max_height / height);
         }
-        if (!target_width) target_width = 1;
-        if (!target_height) target_height = 1;
+        if (!target_width)
+            target_width = 1;
+        if (!target_height)
+            target_height = 1;
     }
     if ((uint64_t)target_width * target_height > thumbnail_limit / 4)
         return SPICA_IMAGE_BUDGET_EXCEEDED;
     size_t bytes = (size_t)target_width * target_height * 4;
     /* SDL_IOFromConstMem takes size_t, but decoder paths may cast lengths
      * or seek through signed offsets. Reject inputs outside int range. */
-    if (length > INT_MAX) return SPICA_IMAGE_BUDGET_EXCEEDED;
+    if (length > INT_MAX)
+        return SPICA_IMAGE_BUDGET_EXCEEDED;
     /* Caller-owned encoded bytes are resident for the complete job too. */
-    if (length > SPICA_IMAGE_JOB_LIMIT) return SPICA_IMAGE_BUDGET_EXCEEDED;
+    if (length > SPICA_IMAGE_JOB_LIMIT)
+        return SPICA_IMAGE_BUDGET_EXCEEDED;
 
     SDL_IOStream *io = NULL;
     SDL_Surface *surface = NULL, *destination = NULL;
@@ -226,19 +272,23 @@ SpicaImageStatus spica_image_decode(const uint8_t *source, size_t length,
      * its allocations charged in later jobs until SDL actually frees them. */
     atomic_store(&peak_live, atomic_load(&charged_live));
     active_job = true;
-    if (!charge(length)) goto failure;
+    if (!charge(length))
+        goto failure;
     source_charged = true;
     io = SDL_IOFromConstMem(source, length);
-    if (!io) goto failure;
+    if (!io)
+        goto failure;
     surface = IMG_LoadTyped_IO(io, false, type);
-    if (!surface) goto failure;
+    if (!surface)
+        goto failure;
     if (surface->w != width || surface->h != height || !surface->pixels || surface->pitch <= 0) {
         status = SPICA_IMAGE_CORRUPT;
         goto cleanup;
     }
     /* Pixel allocation is manually charged alongside SDL allocations; output
      * is detached from the job before handoff and freed by release(). */
-    if (!charge(bytes)) goto failure;
+    if (!charge(bytes))
+        goto failure;
     pixels = malloc(bytes);
     if (!pixels) {
         atomic_fetch_sub(&charged_live, bytes);
@@ -246,21 +296,27 @@ SpicaImageStatus spica_image_decode(const uint8_t *source, size_t length,
         goto cleanup;
     }
     memset(pixels, 0, bytes);
-    destination = SDL_CreateSurfaceFrom(target_width, target_height,
-                                         SDL_PIXELFORMAT_RGBA32, pixels, target_width * 4);
-    if (!destination) goto failure;
+    destination = SDL_CreateSurfaceFrom(target_width, target_height, SDL_PIXELFORMAT_RGBA32, pixels,
+                                        target_width * 4);
+    if (!destination)
+        goto failure;
     if (!SDL_SetSurfaceBlendMode(surface, SDL_BLENDMODE_NONE) ||
-        !SDL_BlitSurfaceScaled(surface, NULL, destination, NULL, SDL_SCALEMODE_LINEAR)) goto failure;
-    SDL_DestroySurface(destination); destination = NULL;
-    SDL_DestroySurface(surface); surface = NULL;
-    SDL_CloseIO(io); io = NULL;
+        !SDL_BlitSurfaceScaled(surface, NULL, destination, NULL, SDL_SCALEMODE_LINEAR))
+        goto failure;
+    SDL_DestroySurface(destination);
+    destination = NULL;
+    SDL_DestroySurface(surface);
+    surface = NULL;
+    SDL_CloseIO(io);
+    io = NULL;
     SDL_CleanupTLS();
     atomic_fetch_sub(&charged_live, length);
     atomic_fetch_sub(&charged_live, bytes);
     active_job = false;
     out->pixels = pixels;
     out->byte_length = bytes;
-    out->width = target_width; out->height = target_height;
+    out->width = target_width;
+    out->height = target_height;
     out->stride = target_width * 4;
     out->peak_tracked_bytes = atomic_load(&peak_live);
     return SPICA_IMAGE_OK;
@@ -268,18 +324,26 @@ SpicaImageStatus spica_image_decode(const uint8_t *source, size_t length,
 failure:
     status = atomic_load(&hit_limit) ? SPICA_IMAGE_BUDGET_EXCEEDED : SPICA_IMAGE_DECODER_ERROR;
 cleanup:
-    if (destination) SDL_DestroySurface(destination);
-    if (surface) SDL_DestroySurface(surface);
-    if (io) SDL_CloseIO(io);
+    if (destination)
+        SDL_DestroySurface(destination);
+    if (surface)
+        SDL_DestroySurface(surface);
+    if (io)
+        SDL_CloseIO(io);
     SDL_CleanupTLS();
-    if (source_charged) atomic_fetch_sub(&charged_live, length);
-    if (pixels) { free(pixels); atomic_fetch_sub(&charged_live, bytes); }
+    if (source_charged)
+        atomic_fetch_sub(&charged_live, length);
+    if (pixels) {
+        free(pixels);
+        atomic_fetch_sub(&charged_live, bytes);
+    }
     active_job = false;
     return status;
 }
 
 void spica_image_release(SpicaImageResult *result) {
-    if (!result) return;
+    if (!result)
+        return;
     free(result->pixels);
     *result = (SpicaImageResult){0};
 }

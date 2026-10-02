@@ -20,12 +20,12 @@ typedef enum {
 
 typedef struct {
     /* The caller owns source bytes throughout this call; failure never alters them. */
-    uint8_t *pixels;             /* RGBA32 (native byte order), tightly packed. */
+    uint8_t *pixels; /* RGBA32 (native byte order), tightly packed. */
     size_t byte_length;
     int width, height, stride;
     int source_width, source_height;
-    const char *mime_type;       /* Static string; no allocation or release. */
-    size_t peak_tracked_bytes;   /* Encoded bytes + codec/SDL heaps + result. */
+    const char *mime_type;     /* Static string; no allocation or release. */
+    size_t peak_tracked_bytes; /* Encoded bytes + codec/SDL heaps + result. */
 } SpicaImageResult;
 
 /* MUST be called before any other SDL call/SDL allocation, on application
@@ -43,10 +43,8 @@ bool spica_image_install_sdl_allocator(void);
  * Calls are serialized on a dedicated content worker; no other SDL allocations
  * may be made on that thread during the call. Its SDL TLS is cleaned afterward.
  * A successful result owns only display-sized pixels, never a full surface. */
-SpicaImageStatus spica_image_decode(const uint8_t *source, size_t length,
-                                    int max_width, int max_height,
-                                    size_t thumbnail_limit,
-                                    SpicaImageResult *out);
+SpicaImageStatus spica_image_decode(const uint8_t *source, size_t length, int max_width,
+                                    int max_height, size_t thumbnail_limit, SpicaImageResult *out);
 void spica_image_release(SpicaImageResult *result);
 
 #endif

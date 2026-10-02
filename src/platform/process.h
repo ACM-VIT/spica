@@ -2,11 +2,14 @@
 #define SPICA_PROCESS_H
 #include <stddef.h>
 #include <stdint.h>
-typedef struct { int input, output, error, exit_fd, pid; } SpicaProcess;
+typedef struct {
+    int input, output, error, exit_fd, pid;
+} SpicaProcess;
 int spica_wake_create(int fds[2]);
 void spica_wake(int fd);
 void spica_close(int fd);
-int spica_process_spawn(SpicaProcess *p, const char *node, const char *entry, const char *cwd, const char *resume, int trust);
+int spica_process_spawn(SpicaProcess *p, const char *node, const char *entry, const char *cwd,
+                        const char *resume, int trust);
 /* A verifier that fails while still alive remains owned in p for explicit shutdown. */
 int spica_process_version(SpicaProcess *p, const char *node, const char *entry);
 /* bits: wake=1 stdout=2 stderr=4 writable=8 exited=16 */

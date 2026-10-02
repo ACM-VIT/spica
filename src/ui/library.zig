@@ -553,8 +553,12 @@ pub const Panel = struct {
                             return null;
                         };
                     },
-                    c.SDLK_Z => { _ = if (shift) self.editor.redo() else self.editor.undo(); },
-                    c.SDLK_Y => { _ = self.editor.redo(); },
+                    c.SDLK_Z => {
+                        _ = if (shift) self.editor.redo() else self.editor.undo();
+                    },
+                    c.SDLK_Y => {
+                        _ = self.editor.redo();
+                    },
                     else => {},
                 };
                 if (key == c.SDLK_BACKSPACE) {

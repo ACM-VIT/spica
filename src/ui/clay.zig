@@ -51,8 +51,10 @@ pub const Layout = struct {
         c.Clay__CloseElement();
         _ = c.Clay_EndLayout();
         return .{
-            .sidebar = bounds("sidebar"), .header = bounds("header"),
-            .conversation = bounds("conversation"), .composer = bounds("composer"),
+            .sidebar = bounds("sidebar"),
+            .header = bounds("header"),
+            .conversation = bounds("conversation"),
+            .composer = bounds("composer"),
         };
     }
 

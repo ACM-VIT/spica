@@ -50,8 +50,7 @@ pub fn seed(db: *store.Store, allocator: std.mem.Allocator, io: std.Io) !void {
     try db.putSession(.{ .session_file = session_file, .session_id = "resource", .project_id = "fixture", .display_name = "Resource acceptance scene" });
     for (0..message_count) |ordinal| {
         var buffer: [2048]u8 = undefined;
-        const source = if (ordinal == message_count - 1) response else try std.fmt.bufPrint(&buffer,
-            "### Message {d}\n\nA saved conversation should not become a resident object tree. This entry is read from the chunk store only when selected. **Stable identities** keep repeated text distinct.\n\n```python\nfor entry in visible:\n    draw(entry)\n```\n\n| Item | State |\n|---|---|\n| History | persisted |\n\n{d}\n", .{ ordinal + 1, ordinal });
+        const source = if (ordinal == message_count - 1) response else try std.fmt.bufPrint(&buffer, "### Message {d}\n\nA saved conversation should not become a resident object tree. This entry is read from the chunk store only when selected. **Stable identities** keep repeated text distinct.\n\n```python\nfor entry in visible:\n    draw(entry)\n```\n\n| Item | State |\n|---|---|\n| History | persisted |\n\n{d}\n", .{ ordinal + 1, ordinal });
         const id = contentId(ordinal);
         try db.beginContent(id, "utf-8", "text/markdown");
         try db.append(id, 0, source, true);

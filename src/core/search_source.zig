@@ -13,15 +13,15 @@ pub fn init(db: *sql.Db) !void {
     errdefer db.exec("ROLLBACK") catch {};
     try db.exec(
         "CREATE TABLE IF NOT EXISTS search_sources(session_file TEXT PRIMARY KEY,generation INTEGER NOT NULL DEFAULT 0,size INTEGER NOT NULL DEFAULT 0,mtime TEXT NOT NULL DEFAULT '',identity TEXT NOT NULL DEFAULT '',leaf TEXT NOT NULL DEFAULT '',available INTEGER NOT NULL DEFAULT 1,incomplete INTEGER NOT NULL DEFAULT 0);" ++
-        "CREATE TABLE IF NOT EXISTS search_segments(rowid INTEGER PRIMARY KEY,session_file TEXT NOT NULL,generation INTEGER NOT NULL,entry_id TEXT NOT NULL,field INTEGER NOT NULL,text TEXT NOT NULL);" ++
-        "CREATE INDEX IF NOT EXISTS search_segments_source ON search_segments(session_file,generation,rowid);" ++
-        "CREATE TABLE IF NOT EXISTS search_graph(session_file TEXT NOT NULL,generation INTEGER NOT NULL,record INTEGER NOT NULL,entry_id TEXT NOT NULL,parent_id TEXT NOT NULL,eligible INTEGER NOT NULL,PRIMARY KEY(session_file,generation,entry_id));" ++
-        "CREATE TABLE IF NOT EXISTS search_stage(rowid INTEGER PRIMARY KEY,session_file TEXT NOT NULL,generation INTEGER NOT NULL,record INTEGER NOT NULL,block INTEGER NOT NULL,part INTEGER NOT NULL,text TEXT NOT NULL);" ++
-        "CREATE INDEX IF NOT EXISTS search_stage_source ON search_stage(session_file,generation,rowid);" ++
-        "CREATE INDEX IF NOT EXISTS search_stage_record ON search_stage(session_file,generation,record,block);" ++
-        "CREATE TABLE IF NOT EXISTS search_blocks(session_file TEXT NOT NULL,generation INTEGER NOT NULL,record INTEGER NOT NULL,block INTEGER NOT NULL,eligible INTEGER NOT NULL,PRIMARY KEY(session_file,generation,record,block));" ++
-        "CREATE TABLE IF NOT EXISTS search_branch(session_file TEXT NOT NULL,generation INTEGER NOT NULL,entry_id TEXT NOT NULL,record INTEGER NOT NULL,PRIMARY KEY(session_file,generation,entry_id));" ++
-        "CREATE INDEX IF NOT EXISTS search_branch_record ON search_branch(session_file,generation,record);",
+            "CREATE TABLE IF NOT EXISTS search_segments(rowid INTEGER PRIMARY KEY,session_file TEXT NOT NULL,generation INTEGER NOT NULL,entry_id TEXT NOT NULL,field INTEGER NOT NULL,text TEXT NOT NULL);" ++
+            "CREATE INDEX IF NOT EXISTS search_segments_source ON search_segments(session_file,generation,rowid);" ++
+            "CREATE TABLE IF NOT EXISTS search_graph(session_file TEXT NOT NULL,generation INTEGER NOT NULL,record INTEGER NOT NULL,entry_id TEXT NOT NULL,parent_id TEXT NOT NULL,eligible INTEGER NOT NULL,PRIMARY KEY(session_file,generation,entry_id));" ++
+            "CREATE TABLE IF NOT EXISTS search_stage(rowid INTEGER PRIMARY KEY,session_file TEXT NOT NULL,generation INTEGER NOT NULL,record INTEGER NOT NULL,block INTEGER NOT NULL,part INTEGER NOT NULL,text TEXT NOT NULL);" ++
+            "CREATE INDEX IF NOT EXISTS search_stage_source ON search_stage(session_file,generation,rowid);" ++
+            "CREATE INDEX IF NOT EXISTS search_stage_record ON search_stage(session_file,generation,record,block);" ++
+            "CREATE TABLE IF NOT EXISTS search_blocks(session_file TEXT NOT NULL,generation INTEGER NOT NULL,record INTEGER NOT NULL,block INTEGER NOT NULL,eligible INTEGER NOT NULL,PRIMARY KEY(session_file,generation,record,block));" ++
+            "CREATE TABLE IF NOT EXISTS search_branch(session_file TEXT NOT NULL,generation INTEGER NOT NULL,entry_id TEXT NOT NULL,record INTEGER NOT NULL,PRIMARY KEY(session_file,generation,entry_id));" ++
+            "CREATE INDEX IF NOT EXISTS search_branch_record ON search_branch(session_file,generation,record);",
     );
     db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(text,tokenize='unicode61 remove_diacritics 2')") catch return error.Fts5Unavailable;
     try db.exec("COMMIT");
@@ -259,7 +259,9 @@ const Record = struct {
                     .errorMessage => self.has_error = true,
                     else => {},
                 },
-                .block => if (frame.key == .type) { self.block_type.overflow = true; },
+                .block => if (frame.key == .type) {
+                    self.block_type.overflow = true;
+                },
                 else => {},
             };
             frame.wants_key = true;
@@ -517,7 +519,8 @@ pub const Indexer = struct {
             return false;
         };
         if (stat.inode != self.stat.inode or stat.size != self.stat.size or
-            stat.mtime.toNanoseconds() != self.stat.mtime.toNanoseconds()) {
+            stat.mtime.toNanoseconds() != self.stat.mtime.toNanoseconds())
+        {
             self.warn(error.SourceChanged);
             try self.sourceState(true);
             return false;
@@ -756,8 +759,7 @@ test "canonical search traverses every entry kind and classifies out of order co
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "source.jsonl", .data =
-        "{\"type\":\"session\",\"id\":\"header\"}\n" ++
+    try tmp.dir.writeFile(io, .{ .sub_path = "source.jsonl", .data = "{\"type\":\"session\",\"id\":\"header\"}\n" ++
         "{\"id\":\"root\",\"parentId\":null,\"message\":{\"content\":[{\"text\":\"visibleprompt\",\"type\":\"text\"},{\"text\":\"hiddenreasoning\",\"type\":\"thinking\"},{\"text\":\"hiddenimage\",\"type\":\"image\"},{\"text\":\"hiddentool\",\"type\":\"toolCall\"}],\"role\":\"user\"},\"type\":\"message\"}\n" ++
         "{\"id\":\"discarded\",\"parentId\":\"root\",\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"abandonedbranch\"}}\n" ++
         "{\"id\":\"bridge\",\"parentId\":\"root\",\"type\":\"model_change\"}\n" ++
@@ -872,8 +874,7 @@ test "malformed fragments never reach search and broken graphs retain the publis
     try std.testing.expectEqual(error.MissingParent, indexer.warning.?);
     try std.testing.expectEqual(published, try testScalar(&db, "SELECT generation FROM search_sources"));
     try std.testing.expectEqual(@as(i64, 0), try testMatches(&db, "missingparentword"));
-    try tmp.dir.writeFile(io, .{ .sub_path = "source.jsonl", .data =
-        "{\"id\":\"a\",\"parentId\":\"b\",\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"cycleword\"}}\n" ++
+    try tmp.dir.writeFile(io, .{ .sub_path = "source.jsonl", .data = "{\"id\":\"a\",\"parentId\":\"b\",\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"cycleword\"}}\n" ++
         "{\"id\":\"b\",\"parentId\":\"a\",\"type\":\"model_change\"}\n" });
     try testRun(&indexer, path);
     try std.testing.expectEqual(error.ParentCycle, indexer.warning.?);
@@ -890,8 +891,7 @@ test "fingerprinted and runtime leaves select canonical branches without stale r
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "source.jsonl", .data =
-        "{\"id\":\"selected\",\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"selectedword\"}}\n" ++
+    try tmp.dir.writeFile(io, .{ .sub_path = "source.jsonl", .data = "{\"id\":\"selected\",\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"selectedword\"}}\n" ++
         "{\"id\":\"last\",\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"lastword\"}}\n" });
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
@@ -930,8 +930,7 @@ test "fingerprinted and runtime leaves select canonical branches without stale r
     try std.testing.expectEqual(@as(i64, 1), try testMatches(&db, "selectedword"));
     try std.testing.expectEqual(@as(i64, 0), try testMatches(&db, "lastword"));
     // An external rewrite may invalidate an un-fingerprinted runtime selection.
-    try tmp.dir.writeFile(io, .{ .sub_path = "source.jsonl", .data =
-        "{\"id\":\"replacement\",\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"replacementword\"}}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "source.jsonl", .data = "{\"id\":\"replacement\",\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"replacementword\"}}\n" });
     try testRun(&indexer, path);
     try std.testing.expectEqual(@as(?anyerror, null), indexer.warning);
     try std.testing.expectEqual(@as(i64, 1), try testMatches(&db, "replacementword"));
@@ -980,19 +979,23 @@ test "staged generations are invisible and moving sources retain the previous in
 
 test "assistant tool preambles errors and aborted turns are not final answers" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{}); defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "source.jsonl", .data =
-        "{\"id\":\"u\",\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"visibleprompt\"}}\n" ++
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "source.jsonl", .data = "{\"id\":\"u\",\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"visibleprompt\"}}\n" ++
         "{\"id\":\"p\",\"parentId\":\"u\",\"type\":\"message\",\"message\":{\"content\":[{\"text\":\"hiddenpreamble\",\"type\":\"text\"},{\"type\":\"toolCall\",\"id\":\"call\",\"name\":\"read\",\"arguments\":{}}],\"stopReason\":\"toolUse\",\"role\":\"assistant\"}}\n" ++
         "{\"id\":\"t\",\"parentId\":\"p\",\"type\":\"message\",\"message\":{\"role\":\"toolResult\",\"content\":\"hiddentoolresult\"}}\n" ++
         "{\"id\":\"e\",\"parentId\":\"t\",\"type\":\"message\",\"message\":{\"content\":\"hiddenerror\",\"role\":\"assistant\",\"stopReason\":\"error\"}}\n" ++
         "{\"id\":\"a\",\"parentId\":\"e\",\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"aborted\",\"content\":\"hiddenabort\"}}\n" ++
         "{\"id\":\"legacy\",\"parentId\":\"a\",\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"text\":\"hiddenlegacytool\",\"type\":\"text\"},{\"type\":\"toolCall\",\"id\":\"call2\"}]}}\n" ++
         "{\"id\":\"f\",\"parentId\":\"legacy\",\"type\":\"message\",\"message\":{\"content\":[{\"text\":\"visiblefinalanswer\",\"type\":\"text\"},{\"type\":\"thinking\",\"thinking\":\"hiddenreasoning\"}],\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n" });
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator); defer allocator.free(root);
-    const path = try std.fs.path.join(allocator, &.{ root, "source.jsonl" }); defer allocator.free(path);
-    var db = try testDatabase(); defer db.deinit();
-    var indexer = try Indexer.init(io, &db); defer indexer.deinit();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "source.jsonl" });
+    defer allocator.free(path);
+    var db = try testDatabase();
+    defer db.deinit();
+    var indexer = try Indexer.init(io, &db);
+    defer indexer.deinit();
     try testRun(&indexer, path);
     try std.testing.expectEqual(@as(i64, 1), try testMatches(&db, "visibleprompt"));
     try std.testing.expectEqual(@as(i64, 1), try testMatches(&db, "visiblefinalanswer"));
@@ -1003,16 +1006,22 @@ test "assistant tool preambles errors and aborted turns are not final answers" {
 
 test "runtime branch changes during staging cannot publish obsolete selection" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{}); defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "source.jsonl", .data =
-        "{\"id\":\"first\",\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"firstbranchword\"}}\n" ++
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "source.jsonl", .data = "{\"id\":\"first\",\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"firstbranchword\"}}\n" ++
         "{\"id\":\"last\",\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"lastbranchword\"}}\n" });
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator); defer allocator.free(root);
-    const path = try std.fs.path.join(allocator, &.{ root, "source.jsonl" }); defer allocator.free(path);
-    var db = try testDatabase(); defer db.deinit();
-    const selected = try db.prepare("INSERT INTO sessions VALUES(?1,'first','',0,0)"); defer _ = c.sqlite3_finalize(selected);
-    try sql.bindText(selected, 1, path); try sql.done(selected);
-    var indexer = try Indexer.init(io, &db); defer indexer.deinit();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "source.jsonl" });
+    defer allocator.free(path);
+    var db = try testDatabase();
+    defer db.deinit();
+    const selected = try db.prepare("INSERT INTO sessions VALUES(?1,'first','',0,0)");
+    defer _ = c.sqlite3_finalize(selected);
+    try sql.bindText(selected, 1, path);
+    try sql.done(selected);
+    var indexer = try Indexer.init(io, &db);
+    defer indexer.deinit();
     try testRun(&indexer, path);
     const generation = try testScalar(&db, "SELECT generation FROM search_sources");
     try db.exec("UPDATE sessions SET leaf_id='last'");

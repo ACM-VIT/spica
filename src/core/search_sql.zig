@@ -1,5 +1,7 @@
 const std = @import("std");
-pub const c = @cImport({ @cInclude("sqlite3.h"); });
+pub const c = @cImport({
+    @cInclude("sqlite3.h");
+});
 const allocator = std.heap.page_allocator;
 pub const Db = struct {
     handle: *c.sqlite3,
@@ -17,7 +19,9 @@ pub const Db = struct {
         try self.exec("PRAGMA foreign_keys=ON; PRAGMA temp_store=FILE; PRAGMA mmap_size=0; PRAGMA cache_size=-256");
         return self;
     }
-    pub fn deinit(self: *Db) void { _ = c.sqlite3_close(self.handle); }
+    pub fn deinit(self: *Db) void {
+        _ = c.sqlite3_close(self.handle);
+    }
     pub fn exec(self: *Db, query: [*:0]const u8) !void {
         if (c.sqlite3_exec(self.handle, query, null, null, null) != c.SQLITE_OK) return error.SqliteFailure;
     }

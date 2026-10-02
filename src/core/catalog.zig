@@ -26,13 +26,23 @@ pub const SearchPage = struct {
 pub const SearchResult = union(enum) {
     ready: SearchPage,
     failure: struct { generation: u64, err: anyerror },
-    pub fn deinit(self: *SearchResult) void { if (self.* == .ready) self.ready.deinit(); }
+    pub fn deinit(self: *SearchResult) void {
+        if (self.* == .ready) self.ready.deinit();
+    }
 };
 pub const MutationResult = struct { id: u64, err: ?anyerror = null, archived: ?bool = null };
 const SearchRequest = struct { scope: Scope, query: [256]u8 = undefined, length: usize, offset: usize, generation: u64 };
 const MutationRequest = struct {
-    kind: Mutation, path: []u8, cwd: []u8, title: []u8, id: u64,
-    fn deinit(self: *MutationRequest) void { allocator.free(self.path); allocator.free(self.cwd); allocator.free(self.title); }
+    kind: Mutation,
+    path: []u8,
+    cwd: []u8,
+    title: []u8,
+    id: u64,
+    fn deinit(self: *MutationRequest) void {
+        allocator.free(self.path);
+        allocator.free(self.cwd);
+        allocator.free(self.title);
+    }
 };
 const MutationSlot = struct { request: ?MutationRequest = null, result: ?MutationResult = null, executing: bool = false };
 threadlocal var scheduled_worker: ?*Worker = null;
@@ -156,16 +166,22 @@ pub const Worker = struct {
         c.SDL_SignalCondition(self.condition);
     }
     pub fn takeSearch(self: *Worker) ?SearchResult {
-        c.SDL_LockMutex(self.mutex); defer c.SDL_UnlockMutex(self.mutex);
-        const result = self.search_result; self.search_result = null; return result;
+        c.SDL_LockMutex(self.mutex);
+        defer c.SDL_UnlockMutex(self.mutex);
+        const result = self.search_result;
+        self.search_result = null;
+        return result;
     }
     pub fn mutate(self: *Worker, kind: Mutation, path: []const u8, cwd: []const u8, title: []const u8, id: u64) !void {
         if (id == 0) return error.InvalidMutationId;
         var request: MutationRequest = .{ .kind = kind, .path = try allocator.dupe(u8, path), .cwd = undefined, .title = undefined, .id = id };
         errdefer allocator.free(request.path);
-        request.cwd = try allocator.dupe(u8, cwd); errdefer allocator.free(request.cwd);
-        request.title = try allocator.dupe(u8, title); errdefer allocator.free(request.title);
-        c.SDL_LockMutex(self.mutex); defer c.SDL_UnlockMutex(self.mutex);
+        request.cwd = try allocator.dupe(u8, cwd);
+        errdefer allocator.free(request.cwd);
+        request.title = try allocator.dupe(u8, title);
+        errdefer allocator.free(request.title);
+        c.SDL_LockMutex(self.mutex);
+        defer c.SDL_UnlockMutex(self.mutex);
         if (self.closing) return error.WorkerClosed;
         for (&self.slots) |*slot| if (slot.request == null and slot.result == null and !slot.executing) {
             slot.request = request;
@@ -175,34 +191,54 @@ pub const Worker = struct {
         return error.MutationQueueFull;
     }
     pub fn takeMutation(self: *Worker) ?MutationResult {
-        c.SDL_LockMutex(self.mutex); defer c.SDL_UnlockMutex(self.mutex);
-        for (&self.slots) |*slot| if (slot.result) |result| { slot.result = null; return result; };
+        c.SDL_LockMutex(self.mutex);
+        defer c.SDL_UnlockMutex(self.mutex);
+        for (&self.slots) |*slot| if (slot.result) |result| {
+            slot.result = null;
+            return result;
+        };
         return null;
     }
     pub fn take(self: *Worker) ?Result {
-        c.SDL_LockMutex(self.mutex); defer c.SDL_UnlockMutex(self.mutex);
-        const result = self.result; self.result = null; return result;
+        c.SDL_LockMutex(self.mutex);
+        defer c.SDL_UnlockMutex(self.mutex);
+        const result = self.result;
+        self.result = null;
+        return result;
     }
     pub fn destroy(self: *Worker) void {
-        c.SDL_LockMutex(self.mutex); self.closing = true; c.SDL_BroadcastCondition(self.condition); c.SDL_UnlockMutex(self.mutex);
+        c.SDL_LockMutex(self.mutex);
+        self.closing = true;
+        c.SDL_BroadcastCondition(self.condition);
+        c.SDL_UnlockMutex(self.mutex);
         if (self.thread) |thread| thread.join();
         if (self.result) |*result| result.deinit();
         if (self.search_result) |*result| result.deinit();
         for (&self.slots) |*slot| if (slot.request) |*request| request.deinit();
-        self.environment.deinit(); allocator.free(self.legacy_dir); allocator.free(self.database_path);
-        c.SDL_DestroyCondition(self.condition); c.SDL_DestroyMutex(self.mutex); allocator.destroy(self);
+        self.environment.deinit();
+        allocator.free(self.legacy_dir);
+        allocator.free(self.database_path);
+        c.SDL_DestroyCondition(self.condition);
+        c.SDL_DestroyMutex(self.mutex);
+        allocator.destroy(self);
     }
     fn wake(self: *Worker) void {
-        var event = std.mem.zeroes(c.SDL_Event); event.type = self.wake_event; _ = c.SDL_PushEvent(&event);
+        var event = std.mem.zeroes(c.SDL_Event);
+        event.type = self.wake_event;
+        _ = c.SDL_PushEvent(&event);
     }
     fn serviceMutations(self: *Worker) void {
         for (&self.slots) |*slot| {
             c.SDL_LockMutex(self.mutex);
             const request = slot.request;
-            if (request != null) { slot.request = null; slot.executing = true; }
+            if (request != null) {
+                slot.request = null;
+                slot.executing = true;
+            }
             c.SDL_UnlockMutex(self.mutex);
             if (request) |value| {
-                var owned = value; defer owned.deinit();
+                var owned = value;
+                defer owned.deinit();
                 var result: MutationResult = .{ .id = value.id };
                 if (self.mutation_store) |db| {
                     const action = switch (value.kind) {
@@ -210,16 +246,23 @@ pub const Worker = struct {
                         .archive => db.setArchived(value.path, true),
                         .restore => db.setArchived(value.path, false),
                     };
-                    action catch |err| { result.err = err; };
-                    if (result.err == null) result.archived = db.workspaceState(value.path) catch |err| blk: { result.err = err; break :blk null; };
+                    action catch |err| {
+                        result.err = err;
+                    };
+                    if (result.err == null) result.archived = db.workspaceState(value.path) catch |err| blk: {
+                        result.err = err;
+                        break :blk null;
+                    };
                 } else result.err = error.SqliteFailure;
                 c.SDL_LockMutex(self.mutex);
-                slot.executing = false; slot.result = result;
+                slot.executing = false;
+                slot.result = result;
                 if (result.err == null and !self.closing) {
                     self.catalog_pending = true;
                     self.index_pending = true;
                 }
-                c.SDL_UnlockMutex(self.mutex); self.wake();
+                c.SDL_UnlockMutex(self.mutex);
+                self.wake();
             }
         }
     }
@@ -243,31 +286,42 @@ pub const Worker = struct {
         self.wake();
     }
     fn publishSearch(self: *Worker, result: SearchResult) void {
-        c.SDL_LockMutex(self.mutex); defer c.SDL_UnlockMutex(self.mutex);
+        c.SDL_LockMutex(self.mutex);
+        defer c.SDL_UnlockMutex(self.mutex);
         if (self.search_result) |*old| old.deinit();
-        self.search_result = result; self.wake();
+        self.search_result = result;
+        self.wake();
     }
     fn serviceSearch(self: *Worker) void {
         c.SDL_LockMutex(self.mutex);
-        const request = self.search_request; self.search_request = null;
-        const closing = self.closing; c.SDL_UnlockMutex(self.mutex);
+        const request = self.search_request;
+        self.search_request = null;
+        const closing = self.closing;
+        c.SDL_UnlockMutex(self.mutex);
         if (closing) return;
         const engine = self.engine orelse {
             if (request) |value| self.publishSearch(.{ .failure = .{ .generation = value.generation, .err = self.search_error } });
             return;
         };
         if (request) |value| engine.begin(value.scope, value.query[0..value.length], value.offset, value.generation) catch |err| {
-            engine.complete = true; engine.dirty = true;
-            self.publishSearch(.{ .failure = .{ .generation = value.generation, .err = err } }); return;
+            engine.complete = true;
+            engine.dirty = true;
+            self.publishSearch(.{ .failure = .{ .generation = value.generation, .err = err } });
+            return;
         };
         const was_searching = !engine.complete;
         if (was_searching) _ = engine.step() catch |err| {
-            engine.complete = true; engine.dirty = true; self.publishSearch(.{ .failure = .{ .generation = engine.generation, .err = err } }); return;
+            engine.complete = true;
+            engine.dirty = true;
+            self.publishSearch(.{ .failure = .{ .generation = engine.generation, .err = err } });
+            return;
         };
         if ((request != null or was_searching) and engine.generation != 0) {
             const page = engine.page(self.io) catch |err| {
-                engine.complete = true; engine.dirty = true;
-                self.publishSearch(.{ .failure = .{ .generation = engine.generation, .err = err } }); return;
+                engine.complete = true;
+                engine.dirty = true;
+                self.publishSearch(.{ .failure = .{ .generation = engine.generation, .err = err } });
+                return;
             };
             self.publishSearch(.{ .ready = page });
         }
@@ -285,8 +339,10 @@ pub const Worker = struct {
                 return;
             }
             if (engine.generation != 0) engine.begin(engine.scope, query[0..engine.raw_len], engine.offset, engine.generation) catch |err| {
-                engine.complete = true; engine.dirty = true;
-                self.publishSearch(.{ .failure = .{ .generation = engine.generation, .err = err } }); return;
+                engine.complete = true;
+                engine.dirty = true;
+                self.publishSearch(.{ .failure = .{ .generation = engine.generation, .err = err } });
+                return;
             };
             if (engine.generation != 0) {
                 const page = engine.page(self.io) catch return;
@@ -301,15 +357,34 @@ pub const Worker = struct {
         self.mutation_store = if (mutation_store) |*db| db else null;
         const engine = allocator.create(search_engine.Engine) catch null;
         if (engine) |value| {
-            if (search_engine.Engine.init(self.database_path)) |initialized| { value.* = initialized; value.indexing = true; self.engine = value; } else |err| { self.search_error = err; allocator.destroy(value); }
+            if (search_engine.Engine.init(self.database_path)) |initialized| {
+                value.* = initialized;
+                value.indexing = true;
+                self.engine = value;
+            } else |err| {
+                self.search_error = err;
+                allocator.destroy(value);
+            }
         }
-        defer if (self.engine) |value| { value.deinit(); allocator.destroy(value); };
-        var indexer: ?source_index.Indexer = if (self.engine) |value| source_index.Indexer.init(self.io, &value.db) catch |err| blk: { value.indexing = false; value.warning = err; break :blk null; } else null;
+        defer if (self.engine) |value| {
+            value.deinit();
+            allocator.destroy(value);
+        };
+        var indexer: ?source_index.Indexer = if (self.engine) |value| source_index.Indexer.init(self.io, &value.db) catch |err| blk: {
+            value.indexing = false;
+            value.warning = err;
+            break :blk null;
+        } else null;
         defer if (indexer) |*value| value.deinit();
-        var metadata_cursor: []u8 = &.{}; defer allocator.free(metadata_cursor);
-        var source_cursor: []u8 = &.{}; defer allocator.free(source_cursor);
-        var syncing = false; var scanning = false; var source_active = false;
-        scheduled_worker = self; defer scheduled_worker = null;
+        var metadata_cursor: []u8 = &.{};
+        defer allocator.free(metadata_cursor);
+        var source_cursor: []u8 = &.{};
+        defer allocator.free(source_cursor);
+        var syncing = false;
+        var scanning = false;
+        var source_active = false;
+        scheduled_worker = self;
+        defer scheduled_worker = null;
         while (true) {
             self.serviceMutations();
             self.publishCatalog(null);
@@ -329,7 +404,10 @@ pub const Worker = struct {
             self.pending = false;
             self.index_pending = false;
             c.SDL_UnlockMutex(self.mutex);
-            if (closing) { self.serviceMutations(); return; }
+            if (closing) {
+                self.serviceMutations();
+                return;
+            }
             if (refresh_pending) {
                 var warning: ?anyerror = null;
                 if (discover(self.io, &self.environment, self.legacy_dir, self.database_path)) |found| {
@@ -347,9 +425,11 @@ pub const Worker = struct {
                 index_pending = true;
             }
             if (index_pending) {
-                allocator.free(metadata_cursor); metadata_cursor = &.{};
+                allocator.free(metadata_cursor);
+                metadata_cursor = &.{};
                 syncing = self.engine != null;
-                allocator.free(source_cursor); source_cursor = &.{};
+                allocator.free(source_cursor);
+                source_cursor = &.{};
                 scanning = indexer != null;
                 if (self.engine) |value| {
                     value.indexing = scanning;
@@ -359,8 +439,19 @@ pub const Worker = struct {
             }
             if (syncing) {
                 const value = self.engine.?;
-                const next = value.syncMetadata(metadata_cursor) catch |err| { value.warning = err; syncing = false; self.rerun(); continue; };
-                if (next) |cursor| { allocator.free(metadata_cursor); metadata_cursor = cursor; } else { syncing = false; self.rerun(); }
+                const next = value.syncMetadata(metadata_cursor) catch |err| {
+                    value.warning = err;
+                    syncing = false;
+                    self.rerun();
+                    continue;
+                };
+                if (next) |cursor| {
+                    allocator.free(metadata_cursor);
+                    metadata_cursor = cursor;
+                } else {
+                    syncing = false;
+                    self.rerun();
+                }
             } else if (scanning) {
                 const value = self.engine.?;
                 if (source_active) {
@@ -370,7 +461,8 @@ pub const Worker = struct {
                         indexer = source_index.Indexer.init(self.io, &value.db) catch null;
                         source_active = false;
                         if (indexer == null) scanning = false;
-                        self.rerun(); continue;
+                        self.rerun();
+                        continue;
                     };
                     if (finished) {
                         source_active = false;
@@ -378,31 +470,65 @@ pub const Worker = struct {
                         self.rerun();
                     }
                 } else {
-                    const stmt = value.db.prepare("SELECT session_file FROM workspace_chats WHERE session_file>?1 ORDER BY session_file LIMIT 1") catch |err| { scanning = false; value.indexing = false; value.warning = err; self.rerun(); continue; };
+                    const stmt = value.db.prepare("SELECT session_file FROM workspace_chats WHERE session_file>?1 ORDER BY session_file LIMIT 1") catch |err| {
+                        scanning = false;
+                        value.indexing = false;
+                        value.warning = err;
+                        self.rerun();
+                        continue;
+                    };
                     defer _ = sql.c.sqlite3_finalize(stmt);
-                    sql.bindText(stmt, 1, source_cursor) catch |err| { scanning = false; value.indexing = false; value.warning = err; self.rerun(); continue; };
+                    sql.bindText(stmt, 1, source_cursor) catch |err| {
+                        scanning = false;
+                        value.indexing = false;
+                        value.warning = err;
+                        self.rerun();
+                        continue;
+                    };
                     if (search_engine.row(stmt) catch false) {
-                        const path = allocator.dupe(u8, sql.column(stmt, 0)) catch |err| { scanning = false; value.indexing = false; value.warning = err; self.rerun(); continue; };
-                        allocator.free(source_cursor); source_cursor = path;
-                        source_active = indexer.?.start(path) catch |err| blk: { value.warning = err; break :blk false; };
+                        const path = allocator.dupe(u8, sql.column(stmt, 0)) catch |err| {
+                            scanning = false;
+                            value.indexing = false;
+                            value.warning = err;
+                            self.rerun();
+                            continue;
+                        };
+                        allocator.free(source_cursor);
+                        source_cursor = path;
+                        source_active = indexer.?.start(path) catch |err| blk: {
+                            value.warning = err;
+                            break :blk false;
+                        };
                         if (indexer.?.warning) |err| value.warning = err;
-                    } else { scanning = false; value.indexing = false; self.rerun(); }
+                    } else {
+                        scanning = false;
+                        value.indexing = false;
+                        self.rerun();
+                    }
                 }
-                if (!scanning) { value.indexing = false; self.rerun(); }
+                if (!scanning) {
+                    value.indexing = false;
+                    self.rerun();
+                }
             }
         }
     }
-    fn hasQueuedMutations(self: *Worker) bool { for (self.slots) |slot| if (slot.request != null) return true; return false; }
+    fn hasQueuedMutations(self: *Worker) bool {
+        for (self.slots) |slot| if (slot.request != null) return true;
+        return false;
+    }
     fn activeCatalog(self: *Worker) !Catalog {
         const store = self.mutation_store orelse return error.SqliteFailure;
         var db: sql.Db = .{ .handle = @ptrCast(store.db) };
-        const stmt = try db.prepare(
-            "SELECT w.session_file,COALESCE(i.cwd,s.project_id),COALESCE(i.title,NULLIF(s.display_name,''),'Untitled session'),COALESCE(i.modified,s.file_mtime,0) " ++
+        const stmt = try db.prepare("SELECT w.session_file,COALESCE(i.cwd,s.project_id),COALESCE(i.title,NULLIF(s.display_name,''),'Untitled session'),COALESCE(i.modified,s.file_mtime,0) " ++
             "FROM workspace_chats w LEFT JOIN session_index i ON i.session_file=w.session_file LEFT JOIN sessions s ON s.session_file=w.session_file " ++
             "WHERE w.archived=0 ORDER BY 4 DESC,w.session_file");
         defer _ = sql.c.sqlite3_finalize(stmt);
         var threads: std.ArrayList(Thread) = .empty;
-        errdefer { for (threads.items) |*thread| thread.deinit(); threads.deinit(allocator); }
+        errdefer {
+            for (threads.items) |*thread| thread.deinit();
+            threads.deinit(allocator);
+        }
         while (try search_engine.row(stmt)) {
             var thread = try indexedThread(.{
                 .session_file = sql.column(stmt, 0),
@@ -411,11 +537,18 @@ pub const Worker = struct {
                 .modified = sql.c.sqlite3_column_int64(stmt, 3),
             });
             const file = std.Io.Dir.cwd().openFile(self.io, thread.path, .{}) catch null;
-            thread.available = file != null; if (file) |f| f.close(self.io);
-            threads.append(allocator, thread) catch |err| { thread.deinit(); return err; };
+            thread.available = file != null;
+            if (file) |f| f.close(self.io);
+            threads.append(allocator, thread) catch |err| {
+                thread.deinit();
+                return err;
+            };
         }
         const owned = try threads.toOwnedSlice(allocator);
-        errdefer { for (owned) |*thread| thread.deinit(); allocator.free(owned); }
+        errdefer {
+            for (owned) |*thread| thread.deinit();
+            allocator.free(owned);
+        }
         return groupThreads(owned, null);
     }
 };
@@ -499,12 +632,16 @@ fn discover(io: std.Io, environment: *const std.process.Environ.Map, legacy_dir:
             page[count] = .{ .session_file = thread.path, .cwd = thread.cwd, .title = thread.title, .modified = thread.modified };
             count += 1;
             if (count == page.len) {
-                db.putSessionIndexPage(page[0..count]) catch |err| { warning = err; };
+                db.putSessionIndexPage(page[0..count]) catch |err| {
+                    warning = err;
+                };
                 count = 0;
                 try checkpoint();
             }
         }
-        if (count != 0) db.putSessionIndexPage(page[0..count]) catch |err| { warning = err; };
+        if (count != 0) db.putSessionIndexPage(page[0..count]) catch |err| {
+            warning = err;
+        };
     }
     std.mem.sort(Thread, threads.items, {}, struct {
         fn less(_: void, a: Thread, b: Thread) bool {
@@ -950,7 +1087,10 @@ pub fn validateSource(io: std.Io, path: []const u8, cwd: []const u8) !void {
         const end = std.mem.indexOfScalar(u8, buffer[0..n], '\n');
         try record.feed(buffer[0..(end orelse n)]);
         offset += n;
-        if (end != null) { finished = true; break; }
+        if (end != null) {
+            finished = true;
+            break;
+        }
     }
     if (!finished and offset == 131072) return error.InvalidSessionHeader;
     try record.finish();
@@ -1002,15 +1142,13 @@ test "catalog discovers all cwd folders and legacy sessions, orders by file rece
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try environment.put("HOME", root);
-    try testWrite(tmp.dir, ".pi/agent/sessions/--first--/a.jsonl",
-        "{\"type\":\"session\",\"cwd\":\"/projects/first\"}\n" ++
+    try testWrite(tmp.dir, ".pi/agent/sessions/--first--/a.jsonl", "{\"type\":\"session\",\"cwd\":\"/projects/first\"}\n" ++
         "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"data\":\"unused\"},{\"text\":\"First \\\\ request\",\"type\":\"text\"}]}}\n" ++
         "{\"type\":\"session_info\",\"name\":\"Old name\"}\n" ++
         "not JSON\n" ++
         "{\"type\":\"session_info\",\"name\":\"  Latest name  \"}\n" ++
         "{\"type\":\"session_info\",\"name\":\"Interrupted", 1000);
-    try testWrite(tmp.dir, ".pi/agent/sessions/--second--/b.jsonl",
-        "{\"cwd\":\"/elsewhere/second\",\"type\":\"session\"}\r\n" ++
+    try testWrite(tmp.dir, ".pi/agent/sessions/--second--/b.jsonl", "{\"cwd\":\"/elsewhere/second\",\"type\":\"session\"}\r\n" ++
         "{\"type\":\"message\",\"message\":{\"content\":\"Second prompt\",\"role\":\"user\"}}\n" ++
         "{\"type\":\"session_info\",\"name\":\"Discarded name\"}\n" ++
         "{\"type\":\"session_info\",\"name\":\"\"}\n", 3000);
@@ -1133,11 +1271,9 @@ test "catalog restart retains indexed and imported sessions outside current disc
     defer a.free(indexed_path);
     const imported_path = try std.fs.path.join(a, &.{ root, "external", "b.jsonl" });
     defer a.free(imported_path);
-    try testWrite(tmp.dir, ".pi/agent/sessions/a.jsonl",
-        "{\"type\":\"session\",\"cwd\":\"/first-project\"}\n" ++
+    try testWrite(tmp.dir, ".pi/agent/sessions/a.jsonl", "{\"type\":\"session\",\"cwd\":\"/first-project\"}\n" ++
         "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"Original first prompt\"}}\n", 1000);
-    try testWrite(tmp.dir, "external/b.jsonl",
-        "{\"type\":\"session\",\"cwd\":\"/second-project\"}\n" ++
+    try testWrite(tmp.dir, "external/b.jsonl", "{\"type\":\"session\",\"cwd\":\"/second-project\"}\n" ++
         "{\"type\":\"session_info\",\"name\":\"Original external chat\"}\n", 2000);
     {
         var db = try storage.Store.init(a, db_path);
@@ -1185,13 +1321,20 @@ test "catalog restart retains indexed and imported sessions outside current disc
 
 test "mutation capacity includes unconsumed completions and failures acknowledge once" {
     if (!c.spica_image_install_sdl_allocator()) return error.SDLAllocatorInstallation;
-    var tmp = std.testing.tmpDir(.{}); defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator); defer allocator.free(root);
-    const path = try std.fs.path.join(allocator, &.{root, "mutations.sqlite"}); defer allocator.free(path);
-    var db = try storage.Store.init(allocator, path); defer db.deinit();
-    const mutex = c.SDL_CreateMutex() orelse return error.MutexCreation; defer c.SDL_DestroyMutex(mutex);
-    const condition = c.SDL_CreateCondition() orelse return error.ConditionCreation; defer c.SDL_DestroyCondition(condition);
-    var environment = std.process.Environ.Map.init(allocator); defer environment.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "mutations.sqlite" });
+    defer allocator.free(path);
+    var db = try storage.Store.init(allocator, path);
+    defer db.deinit();
+    const mutex = c.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer c.SDL_DestroyMutex(mutex);
+    const condition = c.SDL_CreateCondition() orelse return error.ConditionCreation;
+    defer c.SDL_DestroyCondition(condition);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
     var worker: Worker = .{ .mutex = mutex, .condition = condition, .io = std.testing.io, .environment = environment, .legacy_dir = &.{}, .database_path = &.{}, .wake_event = c.SDL_EVENT_USER, .mutation_store = &db, .pending = false };
     for (1..17) |id| try worker.mutate(.enroll, "/project/session.jsonl", "/project", "Shared chat", @intCast(id));
     try std.testing.expectError(error.MutationQueueFull, worker.mutate(.archive, "/project/session.jsonl", "/project", "", 17));
@@ -1202,7 +1345,8 @@ test "mutation capacity includes unconsumed completions and failures acknowledge
     try std.testing.expectEqual(@as(?anyerror, null), first.err);
     try worker.mutate(.archive, "/project/session.jsonl", "/project", "", 17);
     worker.serviceMutations();
-    var seen: [18]bool = @splat(false); seen[1] = true;
+    var seen: [18]bool = @splat(false);
+    seen[1] = true;
     while (worker.takeMutation()) |result| {
         try std.testing.expect(!seen[@intCast(result.id)]);
         seen[@intCast(result.id)] = true;
@@ -1223,9 +1367,12 @@ test "mutation capacity includes unconsumed completions and failures acknowledge
 
 test "worker shutdown drains every accepted durable membership mutation" {
     if (!c.spica_image_install_sdl_allocator()) return error.SDLAllocatorInstallation;
-    var tmp = std.testing.tmpDir(.{}); defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator); defer allocator.free(root);
-    const path = try std.fs.path.join(allocator, &.{root, "shutdown.sqlite"}); defer allocator.free(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "shutdown.sqlite" });
+    defer allocator.free(path);
     const worker = try allocator.create(Worker);
     worker.* = .{
         .mutex = c.SDL_CreateMutex() orelse return error.MutexCreation,
@@ -1242,7 +1389,8 @@ test "worker shutdown drains every accepted durable membership mutation" {
     try worker.mutate(.enroll, "/project/accepted.jsonl", "/project", "Still archived", 3);
     worker.thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, Worker.run, .{worker});
     worker.destroy();
-    var reopened = try storage.Store.init(allocator, path); defer reopened.deinit();
+    var reopened = try storage.Store.init(allocator, path);
+    defer reopened.deinit();
     try std.testing.expectEqual(@as(?bool, true), try reopened.workspaceState("/project/accepted.jsonl"));
 }
 
@@ -1275,11 +1423,16 @@ fn testWaitCatalog(worker: *Worker, count: usize) !Catalog {
 test "worker publishes accepted unpersisted chats in their project and archive restore does not need discovery" {
     if (!c.spica_image_install_sdl_allocator()) return error.SDLAllocatorInstallation;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{}); defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator); defer allocator.free(root);
-    const database = try std.fs.path.join(allocator, &.{root, "workspace.sqlite"}); defer allocator.free(database);
-    const source = try std.fs.path.join(allocator, &.{root, "allocated", "not-written.jsonl"}); defer allocator.free(source);
-    const project = try std.fs.path.join(allocator, &.{root, "project-b"}); defer allocator.free(project);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const database = try std.fs.path.join(allocator, &.{ root, "workspace.sqlite" });
+    defer allocator.free(database);
+    const source = try std.fs.path.join(allocator, &.{ root, "allocated", "not-written.jsonl" });
+    defer allocator.free(source);
+    const project = try std.fs.path.join(allocator, &.{ root, "project-b" });
+    defer allocator.free(project);
     try tmp.dir.createDirPath(io, "project-b");
     const worker = try allocator.create(Worker);
     worker.* = .{
@@ -1303,7 +1456,8 @@ test "worker publishes accepted unpersisted chats in their project and archive r
     try std.testing.expectEqual(@as(?anyerror, null), enrollment.err);
     try std.testing.expectEqual(@as(?bool, false), enrollment.archived);
     {
-        var active = try testWaitCatalog(worker, 1); defer active.deinit();
+        var active = try testWaitCatalog(worker, 1);
+        defer active.deinit();
         try std.testing.expectEqualStrings(source, active.threads[0].path);
         try std.testing.expectEqualStrings(project, active.threads[0].cwd);
         try std.testing.expectEqualStrings("Accepted first prompt", active.threads[0].title);
@@ -1316,46 +1470,66 @@ test "worker publishes accepted unpersisted chats in their project and archive r
     const archived = try testWaitMutation(worker, 2);
     try std.testing.expectEqual(@as(?anyerror, null), archived.err);
     try std.testing.expectEqual(@as(?bool, true), archived.archived);
-    var hidden = try testWaitCatalog(worker, 0); hidden.deinit();
+    var hidden = try testWaitCatalog(worker, 0);
+    hidden.deinit();
     try worker.mutate(.enroll, source, project, "Still archived", 3);
     const reenrolled = try testWaitMutation(worker, 3);
     try std.testing.expectEqual(@as(?bool, true), reenrolled.archived);
-    var still_hidden = try testWaitCatalog(worker, 0); still_hidden.deinit();
+    var still_hidden = try testWaitCatalog(worker, 0);
+    still_hidden.deinit();
     try worker.mutate(.restore, source, project, "", 4);
     const restored = try testWaitMutation(worker, 4);
     try std.testing.expectEqual(@as(?anyerror, null), restored.err);
     try std.testing.expectEqual(@as(?bool, false), restored.archived);
     {
-        var active = try testWaitCatalog(worker, 1); defer active.deinit();
+        var active = try testWaitCatalog(worker, 1);
+        defer active.deinit();
         try std.testing.expectEqualStrings(source, active.threads[0].path);
         try std.testing.expectEqualStrings(project, active.threads[0].cwd);
         try std.testing.expectEqualStrings("Still archived", active.threads[0].title);
         try std.testing.expect(!active.threads[0].available);
     }
-    var reopened = try storage.Store.init(allocator, database); defer reopened.deinit();
+    var reopened = try storage.Store.init(allocator, database);
+    defer reopened.deinit();
     try std.testing.expectEqual(@as(?bool, false), try reopened.workspaceState(source));
 }
 
 test "discovery checkpoint publishes committed membership without requesting another history scan" {
     if (!c.spica_image_install_sdl_allocator()) return error.SDLAllocatorInstallation;
-    var tmp = std.testing.tmpDir(.{}); defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator); defer allocator.free(root);
-    const database = try std.fs.path.join(allocator, &.{root, "checkpoint.sqlite"}); defer allocator.free(database);
-    var db = try storage.Store.init(allocator, database); defer db.deinit();
-    const mutex = c.SDL_CreateMutex() orelse return error.MutexCreation; defer c.SDL_DestroyMutex(mutex);
-    const condition = c.SDL_CreateCondition() orelse return error.ConditionCreation; defer c.SDL_DestroyCondition(condition);
-    var environment = std.process.Environ.Map.init(allocator); defer environment.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const database = try std.fs.path.join(allocator, &.{ root, "checkpoint.sqlite" });
+    defer allocator.free(database);
+    var db = try storage.Store.init(allocator, database);
+    defer db.deinit();
+    const mutex = c.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer c.SDL_DestroyMutex(mutex);
+    const condition = c.SDL_CreateCondition() orelse return error.ConditionCreation;
+    defer c.SDL_DestroyCondition(condition);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
     var worker: Worker = .{
-        .mutex = mutex, .condition = condition, .io = std.testing.io,
-        .environment = environment, .legacy_dir = &.{}, .database_path = &.{},
-        .wake_event = c.SDL_EVENT_USER, .mutation_store = &db, .pending = false, .catalog_pending = false,
+        .mutex = mutex,
+        .condition = condition,
+        .io = std.testing.io,
+        .environment = environment,
+        .legacy_dir = &.{},
+        .database_path = &.{},
+        .wake_event = c.SDL_EVENT_USER,
+        .mutation_store = &db,
+        .pending = false,
+        .catalog_pending = false,
     };
     defer if (worker.result) |*result| result.deinit();
-    scheduled_worker = &worker; defer scheduled_worker = null;
+    scheduled_worker = &worker;
+    defer scheduled_worker = null;
     try worker.mutate(.enroll, "/missing/new-chat.jsonl", "/project-c", "New in C", 1);
     try checkpoint();
     try std.testing.expectEqual(@as(?anyerror, null), worker.takeMutation().?.err);
-    var active = try testWaitCatalog(&worker, 1); defer active.deinit();
+    var active = try testWaitCatalog(&worker, 1);
+    defer active.deinit();
     try std.testing.expectEqualStrings("/project-c", active.folders[0].cwd);
     try std.testing.expectEqualStrings("New in C", active.threads[0].title);
     try std.testing.expect(!active.threads[0].available);
@@ -1363,38 +1537,57 @@ test "discovery checkpoint publishes committed membership without requesting ano
     try worker.mutate(.archive, "/missing/new-chat.jsonl", "", "", 2);
     try checkpoint();
     try std.testing.expectEqual(@as(?bool, true), worker.takeMutation().?.archived);
-    var hidden = try testWaitCatalog(&worker, 0); hidden.deinit();
+    var hidden = try testWaitCatalog(&worker, 0);
+    hidden.deinit();
     try std.testing.expect(!worker.pending);
 }
 
 test "discovery cannot replace a newly accepted offline chat with its older cached metadata" {
     if (!c.spica_image_install_sdl_allocator()) return error.SDLAllocatorInstallation;
-    var tmp = std.testing.tmpDir(.{}); defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator); defer allocator.free(root);
-    const database = try std.fs.path.join(allocator, &.{root, "offline.sqlite"}); defer allocator.free(database);
-    const source = try std.fs.path.join(allocator, &.{root, "not-written.jsonl"}); defer allocator.free(source);
-    var db = try storage.Store.init(allocator, database); defer db.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const database = try std.fs.path.join(allocator, &.{ root, "offline.sqlite" });
+    defer allocator.free(database);
+    const source = try std.fs.path.join(allocator, &.{ root, "not-written.jsonl" });
+    defer allocator.free(source);
+    var db = try storage.Store.init(allocator, database);
+    defer db.deinit();
     try db.putSessionIndex(.{ .session_file = source, .cwd = "/old-project", .title = "Before acceptance", .modified = 0 });
-    const mutex = c.SDL_CreateMutex() orelse return error.MutexCreation; defer c.SDL_DestroyMutex(mutex);
-    const condition = c.SDL_CreateCondition() orelse return error.ConditionCreation; defer c.SDL_DestroyCondition(condition);
-    var environment = std.process.Environ.Map.init(allocator); defer environment.deinit();
+    const mutex = c.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer c.SDL_DestroyMutex(mutex);
+    const condition = c.SDL_CreateCondition() orelse return error.ConditionCreation;
+    defer c.SDL_DestroyCondition(condition);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
     var worker: Worker = .{
-        .mutex = mutex, .condition = condition, .io = std.testing.io,
-        .environment = environment, .legacy_dir = &.{}, .database_path = &.{},
-        .wake_event = c.SDL_EVENT_USER, .mutation_store = &db, .pending = false, .catalog_pending = false,
+        .mutex = mutex,
+        .condition = condition,
+        .io = std.testing.io,
+        .environment = environment,
+        .legacy_dir = &.{},
+        .database_path = &.{},
+        .wake_event = c.SDL_EVENT_USER,
+        .mutation_store = &db,
+        .pending = false,
+        .catalog_pending = false,
     };
     defer if (worker.result) |*result| result.deinit();
-    scheduled_worker = &worker; defer scheduled_worker = null;
+    scheduled_worker = &worker;
+    defer scheduled_worker = null;
     try worker.mutate(.enroll, source, "/correct-project", "Accepted title", 1);
     // loadIndexed reads its metadata page before servicing the queued mutation.
     // Discovery must not write that older offline page back over the commit.
     var discovered = try discover(std.testing.io, &environment, root, database);
     defer discovered.deinit();
     try std.testing.expectEqual(@as(?anyerror, null), worker.takeMutation().?.err);
-    var published = try testWaitCatalog(&worker, 1); defer published.deinit();
+    var published = try testWaitCatalog(&worker, 1);
+    defer published.deinit();
     try std.testing.expectEqualStrings("/correct-project", published.threads[0].cwd);
     try std.testing.expectEqualStrings("Accepted title", published.threads[0].title);
-    var after_discovery = try worker.activeCatalog(); defer after_discovery.deinit();
+    var after_discovery = try worker.activeCatalog();
+    defer after_discovery.deinit();
     try std.testing.expectEqualStrings(source, after_discovery.threads[0].path);
     try std.testing.expectEqualStrings("/correct-project", after_discovery.threads[0].cwd);
     try std.testing.expectEqualStrings("Accepted title", after_discovery.threads[0].title);

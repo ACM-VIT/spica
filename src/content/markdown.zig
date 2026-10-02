@@ -15,7 +15,17 @@ const max_depth: usize = 64;
 
 pub const State = enum(u8) { rich, display_budget };
 pub const BlockKind = enum(u8) {
-    paragraph, heading, quote, list, item, code, html, rule, table, table_row, table_cell,
+    paragraph,
+    heading,
+    quote,
+    list,
+    item,
+    code,
+    html,
+    rule,
+    table,
+    table_row,
+    table_cell,
 };
 pub const RunKind = enum(u8) { text, code, html, image, line_break };
 pub const TargetPolicy = enum(u8) { none, open_link, confirm_local_file, blocked };
@@ -219,7 +229,10 @@ const Walker = struct {
                 const aligns = c.cmark_gfm_extensions_get_table_alignments(table);
                 const count = c.cmark_gfm_extensions_get_table_columns(table);
                 if (aligns != null and column < count) alignment = switch (aligns[column]) {
-                    'l' => .left, 'c' => .center, 'r' => .right, else => .default,
+                    'l' => .left,
+                    'c' => .center,
+                    'r' => .right,
+                    else => .default,
                 };
             }
             const number: i32 = if (ordered)
@@ -237,8 +250,12 @@ const Walker = struct {
             if (self.doc.blocks.items.len >= max_blocks) return error.DisplayBudget;
             const index: u32 = @intCast(self.doc.blocks.items.len);
             var block: Block = .{
-                .kind = kind, .parent = parent, .text_start = @intCast(self.doc.text.items.len),
-                .text_end = 0, .first_run = @intCast(self.doc.runs.items.len), .end_run = 0,
+                .kind = kind,
+                .parent = parent,
+                .text_start = @intCast(self.doc.text.items.len),
+                .text_end = 0,
+                .first_run = @intCast(self.doc.runs.items.len),
+                .end_run = 0,
             };
             if (kind == .heading) block.heading_level = @intCast(c.cmark_node_get_heading_level(node));
             if (kind == .list) {
@@ -303,9 +320,14 @@ const Walker = struct {
         const start: u32 = @intCast(self.doc.text.items.len);
         try self.doc.text.appendSlice(self.doc.allocator, bytes);
         try self.doc.runs.append(self.doc.allocator, .{
-            .kind = kind, .start = start, .end = @intCast(self.doc.text.items.len),
-            .emphasis = style.emphasis, .strong = style.strong, .strike = style.strike,
-            .target = style.target, .policy = style.policy,
+            .kind = kind,
+            .start = start,
+            .end = @intCast(self.doc.text.items.len),
+            .emphasis = style.emphasis,
+            .strong = style.strong,
+            .strike = style.strike,
+            .target = style.target,
+            .policy = style.policy,
         });
     }
 

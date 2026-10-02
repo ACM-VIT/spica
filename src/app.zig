@@ -284,7 +284,10 @@ pub const App = struct {
         }
         for (saved.projects) |path| {
             var duplicate = false;
-            for (projects.items) |existing| if (std.mem.eql(u8, existing, path)) { duplicate = true; break; };
+            for (projects.items) |existing| if (std.mem.eql(u8, existing, path)) {
+                duplicate = true;
+                break;
+            };
             if (!duplicate and projects.items.len < 64) {
                 const owned = try allocator.dupeZ(u8, path);
                 errdefer allocator.free(owned);
@@ -742,10 +745,14 @@ pub const App = struct {
     fn shutdownOwned(self: *App) !void {
         var failure: ?anyerror = null;
         if (self.runtime) |runtime| if (!runtime.isFinished()) {
-            runtime.shutdown() catch |err| { failure = err; };
+            runtime.shutdown() catch |err| {
+                failure = err;
+            };
         };
         for (self.parked_chats.items) |*chat| if (chat.runtime) |runtime| if (!runtime.isFinished()) {
-            runtime.shutdown() catch |err| { failure = err; };
+            runtime.shutdown() catch |err| {
+                failure = err;
+            };
             chat.retiring = true;
         };
         if (failure) |err| return err;
@@ -762,11 +769,15 @@ pub const App = struct {
     fn forceOwned(self: *App) !void {
         var failure: ?anyerror = null;
         if (self.runtime) |runtime| if (!runtime.isFinished() and (self.closing or self.runtimeStatus() == .needs_force_stop)) {
-            runtime.forceTerminate() catch |err| { failure = err; };
+            runtime.forceTerminate() catch |err| {
+                failure = err;
+            };
         };
         for (self.parked_chats.items) |chat| if (chat.runtime) |runtime| if (!runtime.isFinished()) {
             if (self.closing or (chat.snapshot != null and chat.snapshot.?.status == .needs_force_stop)) {
-                runtime.forceTerminate() catch |err| { failure = err; };
+                runtime.forceTerminate() catch |err| {
+                    failure = err;
+                };
             }
         };
         if (failure) |err| return err;
@@ -1699,10 +1710,14 @@ pub const App = struct {
         if (self.catalog) |catalog| for (catalog.folders) |folder| {
             rows += if (self.folderCollapsed(folder.cwd)) 1 else folder.row_count;
         };
-        for (self.projects.items) |path| if (!self.indexedFolder(path)) { rows += 1; };
+        for (self.projects.items) |path| if (!self.indexedFolder(path)) {
+            rows += 1;
+        };
         if (!self.indexedFolder(self.project_path) and !self.savedFolder(self.project_path)) rows += 1;
         if (self.transientCurrent() and !self.folderCollapsed(self.project_path)) rows += 1;
-        for (self.parked_chats.items) |*chat| if (self.transientParked(chat)) { rows += 1; };
+        for (self.parked_chats.items) |*chat| if (self.transientParked(chat)) {
+            rows += 1;
+        };
         return rows;
     }
 
@@ -1890,8 +1905,7 @@ pub const App = struct {
             try self.fitLabel(clippedLabel(displayed_project), content_x + 16, empty_y + 38, content_width - 32, 13, colors.muted);
             const description = if (self.chat_view == .opening)
                 (if (self.runtimeStatus() == .failed) "Unable to open chat." else "Opening chat...")
-            else if (self.chat_view == .existing) "This saved chat has no messages."
-            else "Describe what you want to build or change.";
+            else if (self.chat_view == .existing) "This saved chat has no messages." else "Describe what you want to build or change.";
             try self.fitLabel(description, content_x + 16, empty_y + 64, content_width - 32, 13, colors.muted);
         }
         if (!self.follow_bottom and self.transcript.height > viewport_height) try self.flatButton(.latest, "Jump to latest", .{ .x = content_x + content_width - 128, .y = conversation.y + conversation.height - 33, .w = 128, .h = 28 });
@@ -2139,8 +2153,7 @@ pub const App = struct {
             }
         }
         if (self.library.open and !self.closing and !self.force_dialog) switch (event.type) {
-            c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_TEXT_INPUT, c.SDL_EVENT_TEXT_EDITING,
-            c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_BUTTON_UP, c.SDL_EVENT_MOUSE_MOTION, c.SDL_EVENT_MOUSE_WHEEL, c.SDL_EVENT_WINDOW_FOCUS_LOST => {
+            c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_TEXT_INPUT, c.SDL_EVENT_TEXT_EDITING, c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_BUTTON_UP, c.SDL_EVENT_MOUSE_MOTION, c.SDL_EVENT_MOUSE_WHEEL, c.SDL_EVENT_WINDOW_FOCUS_LOST => {
                 if (try self.library.handle(self, event)) |intent| self.libraryIntent(intent) catch |err| {
                     self.library.fail(err);
                     self.report("Chat library action", err);

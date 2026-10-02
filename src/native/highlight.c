@@ -19,7 +19,11 @@
 #define GRAMMAR_SUFFIX ".so"
 #endif
 
-typedef struct { uint32_t byte; uint16_t token; int16_t delta; } Event;
+typedef struct {
+    uint32_t byte;
+    uint16_t token;
+    int16_t delta;
+} Event;
 struct SpicaHighlight {
     SpicaParseArena arena;
     SDL_SharedObject *grammar;
@@ -65,7 +69,8 @@ static const char python_query[] =
     "\"def\" \"del\" \"elif\" \"else\" \"except\" \"finally\" \"for\" \"from\" "
     "\"global\" \"if\" \"import\" \"lambda\" \"nonlocal\" \"pass\" \"raise\" "
     "\"return\" \"try\" \"while\" \"with\" \"yield\" \"match\" \"case\"] @keyword\n"
-    "[\"+\" \"-\" \"*\" \"/\" \"=\" \"==\" \"!=\" \"and\" \"or\" \"not\" \"in\" \"is\"] @operator\n";
+    "[\"+\" \"-\" \"*\" \"/\" \"=\" \"==\" \"!=\" \"and\" \"or\" \"not\" \"in\" \"is\"] "
+    "@operator\n";
 static const char javascript_query[] =
     "(comment) @comment\n[(string) (template_string) (regex)] @string\n"
     "(number) @number\n[(true) (false) (null) (undefined)] @constant\n"
@@ -81,12 +86,15 @@ static const char javascript_query[] =
     "\"extends\" \"finally\" \"for\" \"from\" \"function\" \"if\" \"import\" "
     "\"in\" \"instanceof\" \"let\" \"new\" \"return\" \"static\" \"switch\" "
     "\"throw\" \"try\" \"typeof\" \"var\" \"void\" \"while\" \"with\" \"yield\"] @keyword\n"
-    "[\"=\" \"+\" \"-\" \"*\" \"/\" \"==\" \"===\" \"!=\" \"!==\" \"=>\" \"&&\" \"||\"] @operator\n";
+    "[\"=\" \"+\" \"-\" \"*\" \"/\" \"==\" \"===\" \"!=\" \"!==\" \"=>\" \"&&\" \"||\"] "
+    "@operator\n";
 static const char json_query[] =
     "(pair key: (string) @property)\n(string) @string\n(number) @number\n"
     "[(true) (false) (null)] @constant\n(comment) @comment\n";
 
-typedef struct { const char *name, *symbol, *query; } Grammar;
+typedef struct {
+    const char *name, *symbol, *query;
+} Grammar;
 static const Grammar grammars[] = {
     {"zig", "tree_sitter_zig", zig_query},
     {"json", "tree_sitter_json", json_query},
@@ -94,19 +102,25 @@ static const Grammar grammars[] = {
     {"python", "tree_sitter_python", python_query},
 };
 static bool name_equal(const char *left, const char *right) {
-    if (!left) return false;
+    if (!left)
+        return false;
     while (*left && *right) {
         unsigned char c = (unsigned char)*left++;
-        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
-        if (c != (unsigned char)*right++) return false;
+        if (c >= 'A' && c <= 'Z')
+            c += 'a' - 'A';
+        if (c != (unsigned char)*right++)
+            return false;
     }
     return !*left && !*right;
 }
 static const Grammar *grammar_for(const char *language) {
-    if (name_equal(language, "js")) return &grammars[2];
-    if (name_equal(language, "py")) return &grammars[3];
+    if (name_equal(language, "js"))
+        return &grammars[2];
+    if (name_equal(language, "py"))
+        return &grammars[3];
     for (size_t i = 0; i < sizeof(grammars) / sizeof(*grammars); ++i)
-        if (name_equal(language, grammars[i].name)) return &grammars[i];
+        if (name_equal(language, grammars[i].name))
+            return &grammars[i];
     return NULL;
 }
 static void *arena_malloc(size_t size) { return spica_parse_calloc(1, size); }
@@ -116,71 +130,88 @@ static bool string_equal(const TSQuery *query, uint32_t id, const char *text) {
     return value && length == strlen(text) && !memcmp(value, text, length);
 }
 /* Fail closed even if a future query accidentally introduces another predicate. */
-static bool predicates_match(const TSQuery *query, const TSQueryMatch *match,
-                             const char *source, size_t length) {
+static bool predicates_match(const TSQuery *query, const TSQueryMatch *match, const char *source,
+                             size_t length) {
     uint32_t count;
-    const TSQueryPredicateStep *steps = ts_query_predicates_for_pattern(
-        query, match->pattern_index, &count);
+    const TSQueryPredicateStep *steps =
+        ts_query_predicates_for_pattern(query, match->pattern_index, &count);
     for (uint32_t i = 0; i < count;) {
         uint32_t end = i;
-        while (end < count && steps[end].type != TSQueryPredicateStepTypeDone) ++end;
-        if (end == count || end - i < 3 ||
-            steps[i].type != TSQueryPredicateStepTypeString ||
-            steps[i + 1].type != TSQueryPredicateStepTypeCapture) return false;
+        while (end < count && steps[end].type != TSQueryPredicateStepTypeDone)
+            ++end;
+        if (end == count || end - i < 3 || steps[i].type != TSQueryPredicateStepTypeString ||
+            steps[i + 1].type != TSQueryPredicateStepTypeCapture)
+            return false;
         bool eq = string_equal(query, steps[i].value_id, "eq?");
         bool any = string_equal(query, steps[i].value_id, "any-of?");
-        if ((!eq && !any) || (eq && end - i != 3)) return false;
+        if ((!eq && !any) || (eq && end - i != 3))
+            return false;
         for (uint32_t k = i + 2; k < end; ++k)
-            if (steps[k].type != TSQueryPredicateStepTypeString) return false;
+            if (steps[k].type != TSQueryPredicateStepTypeString)
+                return false;
         bool found_capture = false;
         for (uint16_t j = 0; j < match->capture_count; ++j) {
-            if (match->captures[j].index != steps[i + 1].value_id) continue;
+            if (match->captures[j].index != steps[i + 1].value_id)
+                continue;
             found_capture = true;
             TSNode node = match->captures[j].node;
             uint32_t start = ts_node_start_byte(node), stop = ts_node_end_byte(node);
-            if (start > stop || stop > length) return false;
+            if (start > stop || stop > length)
+                return false;
             bool matched = false;
             for (uint32_t k = i + 2; k < end; ++k) {
                 uint32_t size;
                 const char *text = ts_query_string_value_for_id(query, steps[k].value_id, &size);
-                if (text && stop - start == size && !memcmp(source + start, text, size)) matched = true;
+                if (text && stop - start == size && !memcmp(source + start, text, size))
+                    matched = true;
             }
-            if (!matched) return false;
+            if (!matched)
+                return false;
         }
-        if (!found_capture) return false;
+        if (!found_capture)
+            return false;
         i = end + 1;
     }
     return true;
 }
 static unsigned token_class(const TSQuery *query, uint32_t capture) {
-    static const char *names[] = {"", "operator", "constant", "number", "keyword",
-        "type", "string", "property", "function", "comment"};
+    static const char *names[] = {"",     "operator", "constant", "number",   "keyword",
+                                  "type", "string",   "property", "function", "comment"};
     uint32_t length;
     const char *name = ts_query_capture_name_for_id(query, capture, &length);
     for (unsigned i = 1; i < sizeof(names) / sizeof(*names); ++i)
-        if (length == strlen(names[i]) && !memcmp(name, names[i], length)) return i;
+        if (length == strlen(names[i]) && !memcmp(name, names[i], length))
+            return i;
     return SPICA_TOKEN_NONE;
 }
 static uint32_t token_color(unsigned token) {
-    static const uint32_t colors[] = {0, 0xc0caf5ff, 0xff9e64ff, 0xff9e64ff,
-        0xbb9af7ff, 0x2ac3deff, 0x9ece6aff, 0x73dacaff, 0x7aa2f7ff, 0x7f8c9aff};
+    static const uint32_t colors[] = {0,          0xc0caf5ff, 0xff9e64ff, 0xff9e64ff, 0xbb9af7ff,
+                                      0x2ac3deff, 0x9ece6aff, 0x73dacaff, 0x7aa2f7ff, 0x7f8c9aff};
     return colors[token];
 }
 /* In-place heapsort avoids libc sort implementations' untracked scratch. */
 static void sift(Event *events, size_t root, size_t count) {
     for (;;) {
         size_t child = root * 2 + 1;
-        if (child >= count) return;
-        if (child + 1 < count && events[child].byte < events[child + 1].byte) ++child;
-        if (events[root].byte >= events[child].byte) return;
-        Event saved = events[root]; events[root] = events[child]; events[child] = saved;
+        if (child >= count)
+            return;
+        if (child + 1 < count && events[child].byte < events[child + 1].byte)
+            ++child;
+        if (events[root].byte >= events[child].byte)
+            return;
+        Event saved = events[root];
+        events[root] = events[child];
+        events[child] = saved;
         root = child;
     }
 }
 static void sort_events(Event *events, size_t count) {
-    for (size_t i = count / 2; i; --i) sift(events, i - 1, count);
+    for (size_t i = count / 2; i; --i)
+        sift(events, i - 1, count);
     for (size_t i = count; i > 1; --i) {
-        Event saved = events[0]; events[0] = events[i - 1]; events[i - 1] = saved;
+        Event saved = events[0];
+        events[0] = events[i - 1];
+        events[i - 1] = saved;
         sift(events, 0, i - 1);
     }
 }
@@ -196,51 +227,69 @@ static void finish_spans(SpicaHighlight *job, Event *events, size_t count) {
             if (job->count && job->spans[job->count - 1].byte_end == previous &&
                 job->spans[job->count - 1].token_class == selected)
                 job->spans[job->count - 1].byte_end = position;
-            else job->spans[job->count++] = (SpicaHighlightSpan){
-                previous, position, token_color(selected), selected};
+            else
+                job->spans[job->count++] =
+                    (SpicaHighlightSpan){previous, position, token_color(selected), selected};
         }
         do {
             active[events[i].token] += events[i].delta;
             ++i;
         } while (i < count && events[i].byte == position);
         selected = SPICA_TOKEN_COMMENT;
-        while (selected && !active[selected]) --selected;
+        while (selected && !active[selected])
+            --selected;
         previous = position;
     }
 }
 static void unload_grammar(SpicaHighlight *job) {
-    if (job->grammar) SDL_UnloadObject(job->grammar);
+    if (job->grammar)
+        SDL_UnloadObject(job->grammar);
     job->grammar = NULL;
 }
 
-SpicaHighlightResult spica_highlight_parse(const char *source, size_t length,
-    const char *language, const char *grammar_directory, size_t arena_limit,
-    SpicaHighlight **out) {
-    if (out) *out = NULL;
-    if (!out || (!source && length) || length > MAX_SOURCE || !grammar_directory ||
-        !arena_limit || arena_limit > MAX_ARENA) return SPICA_HIGHLIGHT_INVALID_SOURCE;
+SpicaHighlightResult spica_highlight_parse(const char *source, size_t length, const char *language,
+                                           const char *grammar_directory, size_t arena_limit,
+                                           SpicaHighlight **out) {
+    if (out)
+        *out = NULL;
+    if (!out || (!source && length) || length > MAX_SOURCE || !grammar_directory || !arena_limit ||
+        arena_limit > MAX_ARENA)
+        return SPICA_HIGHLIGHT_INVALID_SOURCE;
     const Grammar *grammar = grammar_for(language);
-    if (!grammar) return SPICA_HIGHLIGHT_UNSUPPORTED;
-    if (length >= arena_limit) return SPICA_HIGHLIGHT_BUDGET_EXCEEDED;
+    if (!grammar)
+        return SPICA_HIGHLIGHT_UNSUPPORTED;
+    if (length >= arena_limit)
+        return SPICA_HIGHLIGHT_BUDGET_EXCEEDED;
     char path[4096];
     int written = snprintf(path, sizeof(path), "%s/libspica-tree-sitter-%s" GRAMMAR_SUFFIX,
                            grammar_directory, grammar->name);
-    if (written < 0 || (size_t)written >= sizeof(path)) return SPICA_HIGHLIGHT_GRAMMAR_ERROR;
+    if (written < 0 || (size_t)written >= sizeof(path))
+        return SPICA_HIGHLIGHT_GRAMMAR_ERROR;
     SpicaHighlight *job = calloc(1, sizeof(*job));
-    if (!job) return SPICA_HIGHLIGHT_OUT_OF_MEMORY;
+    if (!job)
+        return SPICA_HIGHLIGHT_OUT_OF_MEMORY;
     job->source_length = length;
     /* Grammar DSOs have static parser tables and no allocating constructors.
      * Python scanner allocation uses TREE_SITTER_REUSE_ALLOCATOR and the same
      * libtree-sitter ts_current_* pointers installed below. */
     job->grammar = SDL_LoadObject(path);
-    if (!job->grammar) { free(job); return SPICA_HIGHLIGHT_GRAMMAR_ERROR; }
+    if (!job->grammar) {
+        free(job);
+        return SPICA_HIGHLIGHT_GRAMMAR_ERROR;
+    }
     /* Grammar exports use the native C ABI, not SDL's own SDLCALL ABI. */
     const TSLanguage *(*language_fn)(void) =
         (const TSLanguage *(*)(void))SDL_LoadFunction(job->grammar, grammar->symbol);
-    if (!language_fn) { unload_grammar(job); free(job); return SPICA_HIGHLIGHT_GRAMMAR_ERROR; }
+    if (!language_fn) {
+        unload_grammar(job);
+        free(job);
+        return SPICA_HIGHLIGHT_GRAMMAR_ERROR;
+    }
     jmp_buf failure;
     if (!spica_parse_arena_init(&job->arena, arena_limit - length, &failure)) {
-        unload_grammar(job); free(job); return SPICA_HIGHLIGHT_OUT_OF_MEMORY;
+        unload_grammar(job);
+        free(job);
+        return SPICA_HIGHLIGHT_OUT_OF_MEMORY;
     }
     if (setjmp(failure)) {
         /* No destructors touch potentially interrupted Tree-sitter state. All
@@ -252,18 +301,26 @@ SpicaHighlightResult spica_highlight_parse(const char *source, size_t length,
     ts_set_allocator(arena_malloc, spica_parse_calloc, spica_parse_realloc, spica_parse_free);
     TSParser *parser = ts_parser_new();
     if (!ts_parser_set_language(parser, language_fn())) {
-        spica_highlight_release(job); return SPICA_HIGHLIGHT_GRAMMAR_ERROR;
+        spica_highlight_release(job);
+        return SPICA_HIGHLIGHT_GRAMMAR_ERROR;
     }
     TSTree *tree = ts_parser_parse_string(parser, NULL, source ? source : "", (uint32_t)length);
-    if (!tree) { spica_highlight_release(job); return SPICA_HIGHLIGHT_INVALID_SOURCE; }
+    if (!tree) {
+        spica_highlight_release(job);
+        return SPICA_HIGHLIGHT_INVALID_SOURCE;
+    }
     uint32_t error_offset;
     TSQueryError error;
-    TSQuery *query = ts_query_new(language_fn(), grammar->query,
-        (uint32_t)strlen(grammar->query), &error_offset, &error);
-    if (!query) { spica_highlight_release(job); return SPICA_HIGHLIGHT_GRAMMAR_ERROR; }
+    TSQuery *query = ts_query_new(language_fn(), grammar->query, (uint32_t)strlen(grammar->query),
+                                  &error_offset, &error);
+    if (!query) {
+        spica_highlight_release(job);
+        return SPICA_HIGHLIGHT_GRAMMAR_ERROR;
+    }
     uint32_t capture_count = ts_query_capture_count(query);
     unsigned *classes = spica_parse_calloc(capture_count, sizeof(*classes));
-    for (uint32_t i = 0; i < capture_count; ++i) classes[i] = token_class(query, i);
+    for (uint32_t i = 0; i < capture_count; ++i)
+        classes[i] = token_class(query, i);
     TSQueryCursor *cursor = ts_query_cursor_new();
     ts_query_cursor_set_match_limit(cursor, 256);
     ts_query_cursor_exec(cursor, query, ts_tree_root_node(tree));
@@ -271,22 +328,27 @@ SpicaHighlightResult spica_highlight_parse(const char *source, size_t length,
     size_t event_count = 0;
     TSQueryMatch match;
     while (ts_query_cursor_next_match(cursor, &match)) {
-        if (!predicates_match(query, &match, source, length)) continue;
+        if (!predicates_match(query, &match, source, length))
+            continue;
         for (uint16_t i = 0; i < match.capture_count; ++i) {
             unsigned token = classes[match.captures[i].index];
-            if (!token) continue;
+            if (!token)
+                continue;
             uint32_t start = ts_node_start_byte(match.captures[i].node);
             uint32_t end = ts_node_end_byte(match.captures[i].node);
-            if (start >= end || end > length) continue;
+            if (start >= end || end > length)
+                continue;
             if (event_count == MAX_EVENTS) {
-                spica_highlight_release(job); return SPICA_HIGHLIGHT_BUDGET_EXCEEDED;
+                spica_highlight_release(job);
+                return SPICA_HIGHLIGHT_BUDGET_EXCEEDED;
             }
             events[event_count++] = (Event){start, (uint16_t)token, 1};
             events[event_count++] = (Event){end, (uint16_t)token, -1};
         }
     }
     if (ts_query_cursor_did_exceed_match_limit(cursor)) {
-        spica_highlight_release(job); return SPICA_HIGHLIGHT_BUDGET_EXCEEDED;
+        spica_highlight_release(job);
+        return SPICA_HIGHLIGHT_BUDGET_EXCEEDED;
     }
     finish_spans(job, events, event_count);
     ts_query_cursor_delete(cursor);
@@ -306,7 +368,8 @@ size_t spica_highlight_arena_used(const SpicaHighlight *job) {
     return job ? job->source_length + job->arena.used : 0;
 }
 void spica_highlight_release(SpicaHighlight *job) {
-    if (!job) return;
+    if (!job)
+        return;
     spica_parse_arena_release(&job->arena);
     unload_grammar(job);
     free(job);

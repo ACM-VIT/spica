@@ -1,5 +1,7 @@
 const std = @import("std");
-const c = @cImport({ @cInclude("text.h"); });
+const c = @cImport({
+    @cInclude("text.h");
+});
 
 const Fixture = struct {
     surface: *c.SDL_Surface,
@@ -114,7 +116,6 @@ fn expectSamePixels(a: *c.SDL_Surface, b: *c.SDL_Surface) !void {
         try std.testing.expectEqualSlices(u8, lhs[start_a .. start_a + bytes], rhs[start_b .. start_b + bytes]);
     }
 }
-
 
 test "DPR transitions rebuild raster pixels without changing wrapping or logical carets" {
     const f = try Fixture.init();
