@@ -78,6 +78,7 @@ const ParkedChat = struct {
     scroll: f32,
     retiring: bool = false,
     folder_selected: bool = true,
+    created_here: bool = false,
     closed: bool = false,
 
     fn session(self: *const ParkedChat) []const u8 {
@@ -148,6 +149,7 @@ pub const App = struct {
     runtime_snapshot: ?pi.Snapshot = null,
     parked_chats: std.ArrayList(ParkedChat) = .empty,
     chat_id: u64 = 1,
+    created_here: bool = true,
     next_chat_id: u64 = 2,
     model_restore: ?ModelRestore = null,
     runtime_retiring: bool = false,
@@ -345,6 +347,7 @@ pub const App = struct {
             .draft_writer = draft_writer,
             .transcript = TranscriptView.init(allocator),
             .chat_view = if (options.resume_file != null) .opening else .new_thread,
+            .created_here = options.resume_file == null,
             .library = library,
             .enrollment_intent = options.resume_file != null,
             .catalog_worker = catalog_worker,
@@ -556,6 +559,7 @@ pub const App = struct {
         transferred = true;
         self.chat_id = self.next_chat_id;
         self.next_chat_id += 1;
+        self.created_here = true;
         self.folder_selected = false;
         self.focused_editor = true;
         _ = c.SDL_StartTextInput(self.window);
@@ -786,6 +790,7 @@ pub const App = struct {
             .scroll = self.scroll,
             .retiring = self.runtime_retiring,
             .folder_selected = self.folder_selected,
+            .created_here = self.created_here,
         });
         self.runtime = null;
         self.runtime_snapshot = null;
@@ -826,6 +831,7 @@ pub const App = struct {
         defer self.allocator.free(chat.draft);
         self.chat_id = chat.id;
         self.folder_selected = chat.folder_selected;
+        self.created_here = chat.created_here;
         self.focused_editor = true;
         _ = c.SDL_StartTextInput(self.window);
         self.runtime = chat.runtime;
@@ -877,6 +883,7 @@ pub const App = struct {
         try self.parkCurrent();
         self.pending_thread = null;
         self.folder_selected = true;
+        self.created_here = target.path == null;
         self.focused_editor = true;
         _ = c.SDL_StartTextInput(self.window);
         self.chat_id = self.next_chat_id;
@@ -1962,7 +1969,7 @@ pub const App = struct {
     }
 
     fn transientCurrent(self: *const App) bool {
-        return !self.current_archived and !self.currentIndexed() and
+        return !self.current_archived and (self.created_here or !self.currentIndexed()) and
             (self.chat_view == .new_thread or self.enrollment_intent or self.current_member);
     }
 
@@ -2049,9 +2056,9 @@ pub const App = struct {
             for (catalog.rows[folder.first_row + 1 ..][0 .. folder.row_count - 1]) |item| {
                 const thread = catalog.threads[item.thread];
                 const active = std.mem.eql(u8, thread.path, self.currentSession());
-                if (active and self.current_archived) continue;
+                if (active and (self.current_archived or self.created_here)) continue;
                 var closed = false;
-                for (self.parked_chats.items) |*chat| if (std.mem.eql(u8, chat.session(), thread.path) and (chat.closed or chat.archived)) {
+                for (self.parked_chats.items) |*chat| if (std.mem.eql(u8, chat.session(), thread.path) and (chat.closed or chat.archived or chat.created_here)) {
                     closed = true;
                     break;
                 };
@@ -2065,20 +2072,18 @@ pub const App = struct {
         while (true) {
             var next: ?u64 = null;
             var path: []const u8 = self.project_path;
-            if (self.transientCurrent() and self.currentGrouped() and !self.indexedFolder(self.project_path) and
-                self.chat_id > prior and self.firstLiveFolderId(self.project_path) == self.chat_id)
-            {
+            if (self.transientCurrent() and self.currentGrouped() and self.chat_id > prior) {
                 next = self.chat_id;
             }
             for (self.parked_chats.items) |*chat| {
-                if (!self.transientParked(chat) or !parkedGrouped(chat) or self.indexedFolder(chat.cwd) or
-                    chat.id <= prior or self.firstLiveFolderId(chat.cwd) != chat.id) continue;
+                if (!self.transientParked(chat) or !parkedGrouped(chat) or chat.id <= prior) continue;
                 if (next == null or chat.id < next.?) {
                     next = chat.id;
                     path = chat.cwd;
                 }
             }
             prior = next orelse break;
+            if (self.indexedFolder(path) or self.firstLiveFolderId(path) != prior) continue;
             plan.append(.{ .folder = .{ .path = path, .create = .{ .new_folder_thread = path }, .toggle = .{ .toggle_live_folder = path } } }, false);
             if (!self.folderCollapsed(path)) self.appendLiveFolder(&plan, path);
         }
@@ -2114,6 +2119,7 @@ pub const App = struct {
 
     fn transientParked(self: *const App, chat: *const ParkedChat) bool {
         if (chat.archived or chat.closed) return false;
+        if (chat.created_here) return true;
         if (self.catalog) |catalog| for (catalog.threads) |thread| {
             if (std.mem.eql(u8, thread.path, chat.session())) return false;
         };
@@ -3010,6 +3016,7 @@ test "plain tabs stay ungrouped until folder choice or acceptance" {
     var app: App = undefined;
     app.allocator = allocator;
     app.chat_id = 1;
+    app.created_here = false;
     app.folder_selected = false;
     app.project_path = @constCast("/b");
     app.projects = .empty;
@@ -3137,6 +3144,7 @@ test "both tab layouts use bounded folder rows without duplicating parked sessio
     app.accepted_enrollment = false;
     app.enrollment_intent = false;
     app.chat_id = 1;
+    app.created_here = false;
     app.folder_selected = false;
     app.project_path = @constCast("/a");
     app.options = .{ .resume_file = "/a/one.jsonl" };
@@ -3160,6 +3168,7 @@ test "both tab layouts use bounded folder rows without duplicating parked sessio
         chat.path = null;
         chat.snapshot = null;
         chat.member = false;
+        chat.created_here = false;
         chat.folder_selected = false;
         chat.accepted_enrollment = false;
         chat.closed = false;
@@ -3252,6 +3261,7 @@ test "changing draft folders keeps each tab once and ignores picker recency" {
     app.accepted_enrollment = false;
     app.enrollment_intent = false;
     app.chat_id = 5;
+    app.created_here = true;
     app.folder_selected = false;
     app.project_path = @constCast("/tmp");
     app.options = .{};
@@ -3263,6 +3273,7 @@ test "changing draft folders keeps each tab once and ignores picker recency" {
         chat.path = null;
         chat.snapshot = null;
         chat.member = false;
+        chat.created_here = false;
         chat.folder_selected = true;
         chat.accepted_enrollment = false;
         chat.closed = false;
@@ -3310,4 +3321,26 @@ test "changing draft folders keeps each tab once and ignores picker recency" {
     app.collapsed_folders = .{ .items = &collapsed, .capacity = collapsed.len };
     try std.testing.expect(app.navigation(0, 96).selected == null);
     try std.testing.expectEqual(@as(usize, 2), app.navigation(0, 96).total);
+
+    // Catalog publication must not move a locally created tab ahead of older
+    // drafts, even when their first prompts were accepted in the opposite order.
+    app.collapsed_folders = .empty;
+    app.created_here = true;
+    app.current_member = true;
+    app.options.resume_file = "/b/four.jsonl";
+    parked[1].created_here = true;
+    parked[1].member = true;
+    parked[1].path = @constCast("/b/three.jsonl");
+    var threads = [_]SessionCatalog.Thread{
+        .{ .path = @constCast("/b/four.jsonl"), .cwd = @constCast("/b"), .title = @constCast("Four"), .modified = 1 },
+        .{ .path = @constCast("/b/three.jsonl"), .cwd = @constCast("/b"), .title = @constCast("Three"), .modified = 2 },
+    };
+    var folders = [_]SessionCatalog.Folder{.{ .cwd = "/b", .first_row = 0, .row_count = 3 }};
+    var rows = [_]SessionCatalog.SidebarRow{ .{ .folder = 0 }, .{ .thread = 0 }, .{ .thread = 1 } };
+    app.catalog = .{ .threads = &threads, .folders = &folders, .rows = &rows };
+    const enrolled = app.navigation(0, 96);
+    try std.testing.expectEqual(@as(usize, 4), enrolled.total);
+    try std.testing.expectEqual(@as(?usize, 2), enrolled.selected);
+    try std.testing.expectEqual(@as(usize, 1), enrolled.rows[1].parked);
+    try std.testing.expect(enrolled.rows[2] == .current);
 }
