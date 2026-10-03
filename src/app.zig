@@ -193,6 +193,7 @@ pub const App = struct {
     sidebar_first: usize = 0,
     tab_scroll: TabScroll = .{},
     hit_clip: ?c.SDL_FRect = null,
+    pointer: ?c.SDL_FPoint = null,
     sidebar_reveal_current: bool = false,
     pending_thread: ?ThreadTarget = null,
     resume_path: ?[:0]u8 = null,
@@ -1624,6 +1625,16 @@ pub const App = struct {
         return x >= bounds.x and x < bounds.x + bounds.w and y >= bounds.y and y < bounds.y + bounds.h;
     }
 
+    fn folderUnderPointer(self: *const App, point: ?c.SDL_FPoint) ?Action {
+        if (self.appearance.horizontal_tabs or !self.sidebar_visible or self.settings_open or self.library.open) return null;
+        const pos = point orelse return null;
+        for (self.buttons[0..self.button_count]) |button_value| switch (button_value.action) {
+            .toggle_folder, .toggle_project_folder, .toggle_current_folder => if (contains(button_value.bounds, pos.x, pos.y)) return button_value.action,
+            else => {},
+        };
+        return null;
+    }
+
     fn drawOverlays(self: *App) !void {
         const colors = self.palette();
         if (self.model_menu) {
@@ -2049,9 +2060,9 @@ pub const App = struct {
                     return;
                 }
                 try widgets.icon(self.renderer, .folder, .{ .x = bounds.x + 8, .y = bounds.y + 10, .w = 14, .h = 14 }, colors.muted);
-                try self.hit(folder.toggle, .{ .x = bounds.x, .y = bounds.y, .w = bounds.w - 32, .h = bounds.h });
+                try self.hit(folder.toggle, bounds);
                 try self.fitLabel(text, bounds.x + 30, bounds.y + 9, bounds.w - 62, 12, colors.muted);
-                try self.iconButton(folder.create, .plus, .{ .x = bounds.x + bounds.w - 30, .y = bounds.y + 2, .w = 28, .h = 28 }, colors.muted);
+                if (self.pointer) |pos| if (contains(bounds, pos.x, pos.y)) try self.iconButton(folder.create, .plus, .{ .x = bounds.x + bounds.w - 30, .y = bounds.y + 2, .w = 28, .h = 28 }, colors.muted);
                 try self.rectangle(bounds.x, bounds.y + bounds.h - 1, bounds.w, 1, 0, colors.border);
             },
             else => {
@@ -2256,6 +2267,14 @@ pub const App = struct {
         if (!c.SDL_SetRenderLogicalPresentation(self.renderer, 0, 0, c.SDL_LOGICAL_PRESENTATION_DISABLED) or
             !c.SDL_SetRenderScale(self.renderer, scale_x, scale_y)) return error.RenderScale;
         if (!c.spica_text_set_render_scale(self.text, scale_x, scale_y)) return error.TextRenderScale;
+        self.pointer = null;
+        if (c.SDL_GetMouseFocus() == self.window) {
+            var mouse_x: f32 = 0;
+            var mouse_y: f32 = 0;
+            _ = c.SDL_GetMouseState(&mouse_x, &mouse_y);
+            var point: c.SDL_FPoint = undefined;
+            if (c.SDL_RenderCoordinatesFromWindow(self.renderer, mouse_x, mouse_y, &point.x, &point.y)) self.pointer = point;
+        }
         width = @intFromFloat(@as(f32, @floatFromInt(width)) / scale);
         height = @intFromFloat(@as(f32, @floatFromInt(height)) / scale);
         self.layout.resize(@floatFromInt(width), @floatFromInt(height));
@@ -2578,6 +2597,10 @@ pub const App = struct {
         switch (event.type) {
             c.SDL_EVENT_QUIT, c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => try self.requestClose(),
             c.SDL_EVENT_WINDOW_EXPOSED => self.dirty = true,
+            c.SDL_EVENT_WINDOW_MOUSE_LEAVE => {
+                if (self.folderUnderPointer(self.pointer) != null) self.dirty = true;
+                self.pointer = null;
+            },
             c.SDL_EVENT_WINDOW_RESIZED, c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED => {
                 self.button_count = 0;
                 self.library.invalidateTargets();
@@ -2650,9 +2673,14 @@ pub const App = struct {
                 self.dirty = true;
             },
             c.SDL_EVENT_MOUSE_BUTTON_UP => self.dragging = false,
-            c.SDL_EVENT_MOUSE_MOTION => if (self.dragging and !self.settings_open) {
-                if (self.editor_layout) |layout| self.editor.setCaret(self.editor_start + c.spica_text_layout_hit_test(layout, event.motion.x - self.editor_bounds.x - 12, event.motion.y - self.editor_bounds.y - 10 + self.editor_scroll), true);
-                self.dirty = true;
+            c.SDL_EVENT_MOUSE_MOTION => {
+                const before = self.folderUnderPointer(self.pointer);
+                self.pointer = .{ .x = event.motion.x, .y = event.motion.y };
+                if (!std.meta.eql(before, self.folderUnderPointer(self.pointer))) self.dirty = true;
+                if (self.dragging and !self.settings_open) {
+                    if (self.editor_layout) |layout| self.editor.setCaret(self.editor_start + c.spica_text_layout_hit_test(layout, event.motion.x - self.editor_bounds.x - 12, event.motion.y - self.editor_bounds.y - 10 + self.editor_scroll), true);
+                    self.dirty = true;
+                }
             },
             c.SDL_EVENT_KEY_DOWN => {
                 const command = (event.key.mod & (c.SDL_KMOD_CTRL | c.SDL_KMOD_GUI)) != 0;
