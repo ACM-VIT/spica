@@ -17,6 +17,7 @@ const SessionCatalog = @import("core/catalog.zig");
 const Settings = @import("ui/settings.zig");
 const Library = @import("ui/library.zig");
 const TabScroll = @import("ui/tabs.zig").Scroll;
+const Motion = @import("ui/motion.zig");
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
 const Action = union(enum) { start, new_thread, folder_picker, pick_folder, choose_project: usize, choose_current, folder_previous, folder_next, close_current, close_parked: usize, tab_previous, tab_next, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
@@ -194,6 +195,10 @@ pub const App = struct {
     tab_scroll: TabScroll = .{},
     hit_clip: ?c.SDL_FRect = null,
     pointer: ?c.SDL_FPoint = null,
+    sidebar_motion: Motion.Tween = .{},
+    tab_motion: Motion.Tween = .{},
+    entering_chat_id: u64 = 0,
+    motion_was_active: bool = false,
     sidebar_reveal_current: bool = false,
     pending_thread: ?ThreadTarget = null,
     resume_path: ?[:0]u8 = null,
@@ -570,7 +575,19 @@ pub const App = struct {
         try self.editor.setText("");
         self.resetChatViewport();
         self.sidebar_reveal_current = true;
+        self.animateNewTab();
         try self.beginRuntime();
+    }
+
+    fn animateNewTab(self: *App) void {
+        self.entering_chat_id = self.chat_id;
+        self.tab_motion.snap(0);
+        self.tab_motion.retarget(1, c.SDL_GetTicks(), self.appearance.animations);
+    }
+
+    fn motionActive(self: *const App, now: u64) bool {
+        return self.appearance.animations and
+            ((!self.appearance.horizontal_tabs and self.sidebar_motion.active(now)) or self.tab_motion.active(now));
     }
 
     fn chooseFolder(self: *App, path: []const u8) !void {
@@ -867,6 +884,7 @@ pub const App = struct {
         self.follow_bottom = true;
         self.resetChatViewport();
         self.revealCurrentFolder();
+        if (target.path == null) self.animateNewTab();
         try self.beginRuntime();
     }
 
@@ -1522,7 +1540,12 @@ pub const App = struct {
                         self.tab_scroll.offset = 0;
                         self.sidebar_reveal_current = true;
                         self.sidebar_visible = true;
+                        self.sidebar_motion.snap(1);
                         self.button_count = 0;
+                    }
+                    if (!self.appearance.animations) {
+                        self.sidebar_motion.snap(if (self.sidebar_visible) 1 else 0);
+                        self.tab_motion.snap(1);
                     }
                     self.light = self.appearance.light;
                     self.theme.metrics = Settings.metrics(self.base_metrics, self.appearance);
@@ -1531,7 +1554,10 @@ pub const App = struct {
                     self.draft_due = c.SDL_GetTicks() + 250;
                 }
             },
-            .sidebar => self.sidebar_visible = !self.sidebar_visible,
+            .sidebar => {
+                self.sidebar_visible = !self.sidebar_visible;
+                self.sidebar_motion.retarget(if (self.sidebar_visible) 1 else 0, c.SDL_GetTicks(), self.appearance.animations);
+            },
             .open_thread => |index| try self.openThread(index),
             .send => try self.submit(),
             .stop => if (self.runtime) |runtime| {
@@ -2047,7 +2073,17 @@ pub const App = struct {
         return true;
     }
 
-    fn drawNavRow(self: *App, item: NavRow, bounds: c.SDL_FRect) !void {
+    fn drawNavRow(self: *App, item: NavRow, row_bounds: c.SDL_FRect) !void {
+        var bounds = row_bounds;
+        const entering = switch (item) {
+            .current => self.chat_id == self.entering_chat_id,
+            .parked => |index| self.parked_chats.items[index].id == self.entering_chat_id,
+            else => false,
+        };
+        if (entering) {
+            const remaining = 1 - self.tab_motion.value(c.SDL_GetTicks());
+            if (self.appearance.horizontal_tabs) bounds.x += remaining * 12 else bounds.y += remaining * 6;
+        }
         const colors = self.palette();
         switch (item) {
             .folder => |folder| {
@@ -2115,24 +2151,32 @@ pub const App = struct {
         return self.navigation(self.sidebar_first, visible);
     }
 
-    fn drawSidebar(self: *App, height: f32) !void {
+    fn drawSidebar(self: *App, height: f32, width: f32) !void {
         const colors = self.palette();
-        const width = self.shell.sidebar.width;
-        try self.rectangle(0, 0, width, height, 0, colors.panel);
-        try self.rectangle(width - 1, 0, 1, height, 0, colors.border);
-        try self.iconButton(.sidebar, .sidebar, .{ .x = 12, .y = 9, .w = 30, .h = 30 }, colors.muted);
-        try self.label("Spica", 50, 17, 15, colors.text);
-        try self.iconButton(.new_thread, .plus, .{ .x = width - 42, .y = 9, .w = 30, .h = 30 }, colors.muted);
+        const visible_width = self.shell.sidebar.width;
+        const x = visible_width - width;
+        const clip = c.SDL_Rect{ .x = 0, .y = 0, .w = @intFromFloat(@ceil(visible_width)), .h = @intFromFloat(height) };
+        _ = c.SDL_SetRenderClipRect(self.renderer, &clip);
+        self.hit_clip = .{ .x = 0, .y = 0, .w = visible_width, .h = height };
+        defer {
+            _ = c.SDL_SetRenderClipRect(self.renderer, null);
+            self.hit_clip = null;
+        }
+        try self.rectangle(0, 0, visible_width, height, 0, colors.panel);
+        try self.rectangle(visible_width - 1, 0, 1, height, 0, colors.border);
+        try self.iconButton(.sidebar, .sidebar, .{ .x = x + 12, .y = 9, .w = 30, .h = 30 }, colors.muted);
+        try self.label("Spica", x + 50, 17, 15, colors.text);
+        try self.iconButton(.new_thread, .plus, .{ .x = x + width - 42, .y = 9, .w = 30, .h = 30 }, colors.muted);
         const visible: usize = @intFromFloat(std.math.clamp(@floor((height - 160) / 36), 1, 96));
         const plan = self.visibleNavigation(visible);
         for (plan.rows[0..plan.len], 0..) |item, index| {
             const indent: f32 = if (item == .folder) 12 else 20;
-            try self.drawNavRow(item, .{ .x = indent, .y = 58 + @as(f32, @floatFromInt(index)) * 36, .w = width - indent - 12, .h = 34 });
+            try self.drawNavRow(item, .{ .x = x + indent, .y = 58 + @as(f32, @floatFromInt(index)) * 36, .w = width - indent - 12, .h = 34 });
         }
-        try self.rectangle(12, height - 100, width - 24, 1, 0, colors.border);
-        try self.flatButton(.{ .open_library = .workspace }, "Search", .{ .x = 12, .y = height - 96, .w = width - 24, .h = 28 });
-        try self.flatButton(.{ .open_library = .archives }, "History", .{ .x = 12, .y = height - 66, .w = width - 24, .h = 28 });
-        try self.flatButton(.settings, "Settings", .{ .x = 12, .y = height - 36, .w = width - 24, .h = 28 });
+        try self.rectangle(x + 12, height - 100, width - 24, 1, 0, colors.border);
+        try self.flatButton(.{ .open_library = .workspace }, "Search", .{ .x = x + 12, .y = height - 96, .w = width - 24, .h = 28 });
+        try self.flatButton(.{ .open_library = .archives }, "History", .{ .x = x + 12, .y = height - 66, .w = width - 24, .h = 28 });
+        try self.flatButton(.settings, "Settings", .{ .x = x + 12, .y = height - 36, .w = width - 24, .h = 28 });
     }
 
     fn horizontalItemWidth(self: *App, item: NavRow) !f32 {
@@ -2279,16 +2323,18 @@ pub const App = struct {
         height = @intFromFloat(@as(f32, @floatFromInt(height)) / scale);
         self.layout.resize(@floatFromInt(width), @floatFromInt(height));
         const colors = self.palette();
-        self.shell = self.layout.shell(if (self.sidebar_visible and !self.appearance.horizontal_tabs) @min(268, @as(f32, @floatFromInt(width)) * 0.34) else 0, self.theme.metrics.header_height + (if (self.appearance.horizontal_tabs) @as(f32, 40) else 0), @min(202, @as(f32, @floatFromInt(height)) * 0.4));
+        const sidebar_width = @min(268, @as(f32, @floatFromInt(width)) * 0.34);
+        const visible_sidebar = if (!self.appearance.horizontal_tabs) sidebar_width * self.sidebar_motion.value(c.SDL_GetTicks()) else 0;
+        self.shell = self.layout.shell(visible_sidebar, self.theme.metrics.header_height + (if (self.appearance.horizontal_tabs) @as(f32, 40) else 0), @min(202, @as(f32, @floatFromInt(height)) * 0.4));
         const header = self.shell.header;
         const conversation = self.shell.conversation;
         const displayed_project = if (self.pending_thread) |target| target.cwd else self.project_path;
         const project = clippedLabel(std.fs.path.basename(displayed_project));
         if (!c.SDL_SetRenderDrawColor(self.renderer, colors.canvas.r, colors.canvas.g, colors.canvas.b, 255) or
             !c.SDL_RenderClear(self.renderer)) return error.ClearFrame;
-        if (self.appearance.horizontal_tabs) try self.drawHorizontalTabs(@floatFromInt(width)) else if (self.sidebar_visible) try self.drawSidebar(@floatFromInt(height)) else if (!self.appearance.horizontal_tabs) try self.iconButton(.sidebar, .sidebar, .{ .x = header.x + 12, .y = 7, .w = 30, .h = 30 }, colors.muted);
+        if (self.appearance.horizontal_tabs) try self.drawHorizontalTabs(@floatFromInt(width)) else if (visible_sidebar > 0) try self.drawSidebar(@floatFromInt(height), sidebar_width) else try self.iconButton(.sidebar, .sidebar, .{ .x = header.x + 12, .y = 7, .w = 30, .h = 30 }, colors.muted);
         const header_y: f32 = if (self.appearance.horizontal_tabs) 40 else 0;
-        const crumb_x = header.x + (if (self.sidebar_visible or self.appearance.horizontal_tabs) @as(f32, 22) else 52);
+        const crumb_x = header.x + (if (visible_sidebar > 0 or self.appearance.horizontal_tabs) @as(f32, 22) else 52);
         if (self.current_member) {
             try widgets.icon(self.renderer, .folder, .{ .x = crumb_x, .y = header_y + 15, .w = 14, .h = 14 }, colors.muted);
             try self.fitLabel(if (std.mem.eql(u8, displayed_project, self.temporary_project)) "tmp" else clippedLabel(displayed_project), crumb_x + 24, header_y + 15, @max(0, header.width - 220), 12, colors.muted);
@@ -2503,6 +2549,9 @@ pub const App = struct {
                 self.saveDraft() catch |err| self.report("Saving draft", err);
                 self.draft_due = null;
             };
+            const motion_active = self.motionActive(now);
+            if (motion_active or self.motion_was_active) self.dirty = true;
+            self.motion_was_active = motion_active;
             if (self.dirty and !self.minimized) try self.paint();
             self.pumpContent() catch |err| self.report("Loading viewport", err);
             var timeout: c_int = -1;
@@ -2511,6 +2560,7 @@ pub const App = struct {
                 const remaining: c_int = @intCast(@min(2147483647, due -| c.SDL_GetTicks()));
                 timeout = if (timeout == -1) remaining else @min(timeout, remaining);
             }
+            if (motion_active) timeout = if (timeout == -1) 16 else @min(timeout, 16);
             var event: c.SDL_Event = undefined;
             if (c.SDL_WaitEventTimeout(&event, timeout)) {
                 self.handle(&event) catch |err| self.report("Input", err);
