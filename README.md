@@ -10,11 +10,13 @@
 
 ## Features
 
-- Project folders, chat import, archives, and fuzzy full-message search.
+- Folder-grouped vertical or horizontal tabs, chat import, History, and fuzzy full-message search.
 - Switch chats while prompts run in the background.
 - Markdown, code highlighting, images, and Unicode editing.
 
-Import continues the original Pi session; archiving does not delete it.
+The + opens a plain chat at the right end. Its composer has a folder control with recently opened folders first and a Browse option. Sending without choosing a folder groups the chat under `tmp`. Switch tab layouts in Settings. Horizontal tabs scroll with a trackpad, mouse wheel, or arrows only when they exceed the window width. Closing a saved tab keeps it in History; reopening continues the original Pi session.
+
+Ctrl/Cmd+T (or Ctrl/Cmd+N) opens a tab; Ctrl/Cmd+W closes it. Stop a running prompt before closing its tab.
 
 <img width="1813" height="1187" alt="image" src="https://github.com/user-attachments/assets/6892b4eb-ef3a-43cf-a70c-c642789d5347" />
 
