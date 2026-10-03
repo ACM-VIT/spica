@@ -7,6 +7,7 @@ test {
     _ = @import("core/search_source.zig");
     _ = @import("ui/library.zig");
     _ = @import("ui/theme.zig");
+    _ = @import("ui/motion.zig");
     _ = @import("ui/transcript.zig");
     _ = @import("text/edit.zig");
     _ = @import("text/composer.zig");
