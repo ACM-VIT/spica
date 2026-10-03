@@ -14,7 +14,7 @@
 - Switch chats while prompts run in the background.
 - Markdown, code highlighting, images, and Unicode editing.
 
-The + opens a plain chat at the right end. Its composer has a folder control with recently opened folders first and a Browse option. Sending without choosing a folder groups the chat under `tmp`. Switch tab layouts in Settings. Horizontal tabs scroll with a trackpad, mouse wheel, or arrows only when they exceed the window width. Closing a saved tab keeps it in History; reopening continues the original Pi session.
+The + opens a plain chat at the right end. Its composer has a folder control with recently opened folders first and a Browse option. Choosing a folder moves the draft into that group; the + on a folder creates a draft inside it. Changing a draft's folder keeps its text, selection, and undo history. Sending without choosing a folder groups the chat under `tmp`. Switch tab layouts in Settings. Horizontal tabs scroll with a trackpad, mouse wheel, or arrows only when they exceed the window width. Closing a tab selects its visible neighbor. Closing a saved tab keeps it in History; reopening continues the original Pi session.
 
 Ctrl/Cmd+T (or Ctrl/Cmd+N) opens a tab; Ctrl/Cmd+W closes it. Stop a running prompt before closing its tab.
 
