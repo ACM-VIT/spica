@@ -289,7 +289,7 @@ pub const App = struct {
         const catalog_worker = try SessionCatalog.Worker.create(io, environ, legacy_sessions, paths.database, wake_event);
         errdefer catalog_worker.destroy();
         const saved = restored.value();
-        const appearance = Settings.Values{ .font_size = saved.font_size, .ui_scale = saved.ui_scale, .chat_width = saved.chat_width, .light = options.light or saved.light, .horizontal_tabs = saved.horizontal_tabs };
+        const appearance = Settings.Values{ .font_size = saved.font_size, .ui_scale = saved.ui_scale, .chat_width = saved.chat_width, .light = options.light or saved.light, .horizontal_tabs = saved.horizontal_tabs, .animations = saved.animations };
         var projects: std.ArrayList([:0]u8) = .empty;
         errdefer {
             for (projects.items) |path| allocator.free(path);
@@ -1819,7 +1819,7 @@ pub const App = struct {
         const bytes = self.editor.textBytes();
         var projects: [64][]const u8 = undefined;
         for (self.projects.items, 0..) |path, index| projects[index] = path;
-        try self.draft_writer.submit(.{ .draft = bytes, .light = self.light, .font_size = self.appearance.font_size, .ui_scale = self.appearance.ui_scale, .chat_width = self.appearance.chat_width, .horizontal_tabs = self.appearance.horizontal_tabs, .projects = projects[0..self.projects.items.len] });
+        try self.draft_writer.submit(.{ .draft = bytes, .light = self.light, .font_size = self.appearance.font_size, .ui_scale = self.appearance.ui_scale, .chat_width = self.appearance.chat_width, .horizontal_tabs = self.appearance.horizontal_tabs, .animations = self.appearance.animations, .projects = projects[0..self.projects.items.len] });
         self.draft_due = null;
     }
 

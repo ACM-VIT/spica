@@ -6,6 +6,7 @@ pub const State = struct {
     draft: []const u8 = "",
     light: bool = false,
     horizontal_tabs: bool = false,
+    animations: bool = true,
     font_size: u8 = 15,
     ui_scale: u16 = 100,
     chat_width: u16 = 768,
@@ -16,6 +17,7 @@ const RawState = struct {
     draft: []const u8 = "",
     light: bool = false,
     horizontal_tabs: bool = false,
+    animations: bool = true,
     font_size: std.json.Value = .null,
     ui_scale: std.json.Value = .null,
     chat_width: std.json.Value = .null,
@@ -42,6 +44,7 @@ pub const Restored = struct {
             .draft = raw.draft,
             .light = raw.light,
             .horizontal_tabs = raw.horizontal_tabs,
+            .animations = raw.animations,
             .font_size = restoredNumber(u8, raw.font_size, 15, 12, 24),
             .ui_scale = restoredNumber(u16, raw.ui_scale, 100, 75, 175),
             .chat_width = restoredNumber(u16, raw.chat_width, 768, 560, 1120),
@@ -174,4 +177,17 @@ test "tab layout restores old workspace files and round trips horizontal prefere
     defer old.deinit();
     try std.testing.expect(!old.value().horizontal_tabs);
     try std.testing.expectEqualStrings("old draft", old.value().draft);
+}
+
+test "animation preference persists and older workspace files enable motion" {
+    for ([_]bool{ false, true }) |enabled| {
+        const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, State{ .animations = enabled }, .{});
+        defer std.testing.allocator.free(bytes);
+        var restored = Restored{ .parsed = try std.json.parseFromSlice(RawState, allocator, bytes, .{}) };
+        defer restored.deinit();
+        try std.testing.expectEqual(enabled, restored.value().animations);
+    }
+    var old = Restored{ .parsed = try std.json.parseFromSlice(RawState, allocator, "{\"draft\":\"kept\"}", .{}) };
+    defer old.deinit();
+    try std.testing.expect(old.value().animations);
 }

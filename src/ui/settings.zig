@@ -7,6 +7,7 @@ pub const Action = enum {
     light,
     tabs_vertical,
     tabs_horizontal,
+    animations,
     font_smaller,
     font_larger,
     scale_smaller,
@@ -23,6 +24,7 @@ pub const Values = struct {
     chat_width: u16 = 768,
     light: bool = false,
     horizontal_tabs: bool = false,
+    animations: bool = true,
 };
 
 pub fn apply(values: *Values, action: Action) void {
@@ -32,6 +34,7 @@ pub fn apply(values: *Values, action: Action) void {
         .light => values.light = true,
         .tabs_vertical => values.horizontal_tabs = false,
         .tabs_horizontal => values.horizontal_tabs = true,
+        .animations => values.animations = !values.animations,
         .font_smaller => values.font_size = std.math.clamp(values.font_size -| 1, 12, 24),
         .font_larger => values.font_size = std.math.clamp(values.font_size +| 1, 12, 24),
         .scale_smaller => values.ui_scale = std.math.clamp(values.ui_scale -| 5, 75, 175),
@@ -60,15 +63,16 @@ pub fn draw(app: anytype) !void {
     const canvas_width = app.shell.sidebar.width + app.shell.conversation.width;
     const canvas_height = app.shell.header.height + app.shell.conversation.height + app.shell.composer.height;
     const width = @min(@as(f32, 500), @max(@as(f32, 0), canvas_width - 32));
-    const height = @min(@as(f32, 410), @max(@as(f32, 0), canvas_height - 32));
+    const height = @min(@as(f32, 460), @max(@as(f32, 0), canvas_height - 32));
     const x = (canvas_width - width) / 2;
     const y = (canvas_height - height) / 2;
     const left = x + 20;
     const right = x + width - 20;
-    const row_step = (height - 120) / 5;
+    const row_step = (height - 120) / 6;
     const theme_y = y + 70;
     const tabs_y = theme_y + row_step;
-    const font_y = tabs_y + row_step;
+    const animation_y = tabs_y + row_step;
+    const font_y = animation_y + row_step;
     const scale_y = font_y + row_step;
     const width_y = scale_y + row_step;
     const footer_y = width_y + row_step;
@@ -85,6 +89,9 @@ pub fn draw(app: anytype) !void {
     try app.label("Tabs", left, tabs_y + 8, 13, colors.text);
     try app.button(.{ .appearance = .tabs_vertical }, if (app.appearance.horizontal_tabs) "Vertical" else "Vertical (on)", .{ .x = right - 214, .y = tabs_y, .w = 102, .h = 34 });
     try app.button(.{ .appearance = .tabs_horizontal }, if (app.appearance.horizontal_tabs) "Horizontal(buggy) (on)" else "Horizontal(buggy)", .{ .x = right - 106, .y = tabs_y, .w = 106, .h = 34 });
+
+    try app.label("Animations", left, animation_y + 8, 13, colors.text);
+    try app.button(.{ .appearance = .animations }, if (app.appearance.animations) "On" else "Off", .{ .x = right - 86, .y = animation_y, .w = 86, .h = 34 });
 
     var buffer: [32]u8 = undefined;
     const font = try std.fmt.bufPrint(&buffer, "{d} px", .{app.appearance.font_size});
