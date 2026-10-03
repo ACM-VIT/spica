@@ -153,6 +153,12 @@ pub const Store = struct {
         if (database_path.len == 0 or database_path.len > max_key or std.mem.indexOfScalar(u8, database_path, 0) != null) return error.InvalidPath;
         const path = try allocator.dupeZ(u8, database_path);
         defer allocator.free(path);
+        // Workers may open a brand-new database together. Serialize WAL setup
+        // as well as migrations; SQLite's lock upgrade can otherwise fail before
+        // busy_timeout applies, leaving the catalog unavailable until restart.
+        const initialization_mutex = c.sqlite3_mutex_alloc(c.SQLITE_MUTEX_STATIC_APP1);
+        c.sqlite3_mutex_enter(initialization_mutex);
+        defer c.sqlite3_mutex_leave(initialization_mutex);
         var handle: ?*c.sqlite3 = null;
         const rc = c.sqlite3_open_v2(path.ptr, &handle, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_NOMUTEX, null);
         if (rc != c.SQLITE_OK) {
