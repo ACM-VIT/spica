@@ -312,24 +312,37 @@ def main():
     # Homebrew's brotli was linked from /opt/homebrew. macOS therefore builds the locked libpng and
     # pins both choices; the stamp rebuilds installs made without them.
     if system == 'macos':
+        sdk = Path(subprocess.check_output(
+            ['xcrun', '--sdk', os.environ.get('SDKROOT') or 'macosx', '--show-sdk-path'],
+            text=True).strip())
+        # Use the OS zlib's SDK headers and link stub, never an ambient package-manager install.
+        zlib_options = [f'-DCMAKE_OSX_SYSROOT={sdk}',
+                        f'-DCMAKE_OSX_ARCHITECTURES={"arm64" if machine == "aarch64" else machine}',
+                        f'-DZLIB_INCLUDE_DIR={sdk / "usr/include"}',
+                        f'-DZLIB_LIBRARY={sdk / "usr/lib/libz.tbd"}',
+                        f'-DZLIB_LIBRARY_RELEASE={sdk / "usr/lib/libz.tbd"}',
+                        f'-DZLIB_LIBRARY_DEBUG={sdk / "usr/lib/libz.tbd"}']
         png_library = prefix / 'lib' / 'libpng16.dylib'
-        if not png_library.exists():
+        png_stamp = prefix / '.libpng-config'
+        png_config = fingerprint + '\n' + ' '.join(zlib_options)
+        if not build_is_current(png_library, png_stamp, png_config):
             log('building libpng')
-            build = CACHE / 'build' / 'libpng'
+            build = CACHE / 'build' / (system + '-' + machine) / 'libpng'
+            shutil.rmtree(build, ignore_errors=True)
             subprocess.run(['cmake', '-S', str(codecs['libpng']), '-B', str(build),
                             '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
                             '-DPNG_SHARED=ON', '-DPNG_STATIC=OFF', '-DPNG_FRAMEWORK=OFF',
-                            '-DPNG_TESTS=OFF', '-DPNG_TOOLS=OFF'], check=True)
+                            '-DPNG_TESTS=OFF', '-DPNG_TOOLS=OFF', *zlib_options], check=True)
             subprocess.run(['cmake', '--build', str(build), '--parallel', '4'], check=True)
             subprocess.run(['cmake', '--install', str(build)], check=True)
             if not png_library.exists():
                 raise RuntimeError(f'libpng install did not produce {png_library}')
+            png_stamp.write_text(png_config)
         freetype_options += ['-DFT_REQUIRE_PNG=ON', '-DFT_DISABLE_BROTLI=ON',
-                             f'-DCMAKE_PREFIX_PATH={prefix}']
+                             f'-DCMAKE_PREFIX_PATH={prefix}', *zlib_options]
     freetype_stamp = prefix / '.freetype-config'
-    freetype_config = ' '.join(freetype_options)
-    if not freetype_library.exists() or (system == 'macos' and not build_is_current(
-            freetype_library, freetype_stamp, freetype_config)):
+    freetype_config = fingerprint + '\n' + ' '.join(freetype_options)
+    if not build_is_current(freetype_library, freetype_stamp, freetype_config):
         log('building FreeType')
         build = CACHE / 'build' / 'freetype'
         shutil.rmtree(build, ignore_errors=True)  # a cached configure keeps old library lookups
@@ -340,12 +353,11 @@ def main():
         subprocess.run(['cmake', '--install', str(build)], check=True)
         if not freetype_library.exists():
             raise RuntimeError(f'FreeType install did not produce {freetype_library}')
-        if system == 'macos':
-            freetype_stamp.write_text(freetype_config)
+        freetype_stamp.write_text(freetype_config)
     harfbuzz_library = prefix / 'lib' / ('libharfbuzz' + suffix)
     if not harfbuzz_library.exists():
         log('building HarfBuzz')
-        build = CACHE / 'build' / 'harfbuzz'
+        build = CACHE / 'build' / (system + '-' + machine) / 'harfbuzz'
         subprocess.run([sys.executable, str(meson / 'meson.py'), 'setup', str(build), str(harfbuzz),
                         '--prefix', str(prefix), '--buildtype=release',
                         '-Ddefault_library=shared', '-Dfreetype=enabled',
@@ -372,7 +384,7 @@ def main():
     fribidi_library = prefix / 'lib' / ('libfribidi' + suffix)
     if not fribidi_library.exists():
         log('building FriBidi')
-        build = CACHE / 'build' / 'fribidi'
+        build = CACHE / 'build' / (system + '-' + machine) / 'fribidi'
         subprocess.run([sys.executable, str(meson / 'meson.py'), 'setup', str(build), str(fribidi),
                         '--prefix', str(prefix), '--buildtype=release',
                         '-Ddefault_library=shared', '-Ddocs=false', '-Dbin=false',

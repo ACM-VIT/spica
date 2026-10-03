@@ -376,8 +376,15 @@ static bool face_style(const Face *f, unsigned style) {
            (!(style & SPICA_TEXT_BOLD) || (f->face->style_flags & FT_STYLE_FLAG_BOLD) ||
             f->variable_bold);
 }
+static unsigned available_style(const Face *f, unsigned style) {
+    /* Color emoji fonts commonly have only a regular face. Keep their color artwork when a
+     * surrounding Markdown span requests an unavailable style, without synthesizing glyphs. */
+    if (FT_HAS_COLOR(f->face) && !face_style(f, style))
+        style &= ~(SPICA_TEXT_BOLD | SPICA_TEXT_ITALIC);
+    return style;
+}
 static bool select_style(Face *f, unsigned style) {
-    style &= SPICA_TEXT_BOLD | SPICA_TEXT_ITALIC;
+    style = available_style(f, style) & (SPICA_TEXT_BOLD | SPICA_TEXT_ITALIC);
     if (!face_style(f, style))
         return error("requested font style is unavailable");
     if (f->active_style == style)
@@ -427,7 +434,7 @@ static bool ignorable(uint32_t c) {
            c == 0x200e || c == 0x200f || c == 0xad;
 }
 static bool covers(Face *f, const FriBidiChar *chars, unsigned count, unsigned style) {
-    if (!face_style(f, style))
+    if (!face_style(f, available_style(f, style)))
         return false;
     for (unsigned i = 0; i < count; ++i) {
         if (chars[i] == 0xfe0f && i && !FT_HAS_COLOR(f->face) &&
@@ -529,7 +536,7 @@ static int system_face(SpicaText *t, const FriBidiChar *chars, unsigned count, u
 static long collection_index(SpicaText *t, const char *path, const char *name) {
     FT_Face face;
     if (FT_New_Face(t->library, path, -1, &face))
-        return 0;
+        return -1;
     long count = face->num_faces;
     FT_Done_Face(face);
     for (long i = 0; i < count; ++i) {
@@ -541,7 +548,7 @@ static long collection_index(SpicaText *t, const char *path, const char *name) {
         if (match)
             return i;
     }
-    return 0;
+    return -1;
 }
 static int open_system_font(SpicaText *t, CTFontRef font, const FriBidiChar *chars, unsigned count,
                             unsigned style) {
@@ -560,8 +567,11 @@ static int open_system_font(SpicaText *t, CTFontRef font, const FriBidiChar *cha
     int face = -1;
     if (url && postscript &&
         CFURLGetFileSystemRepresentation(url, true, (UInt8 *)path, sizeof(path)) &&
-        CFStringGetCString(postscript, name, sizeof(name), kCFStringEncodingUTF8))
-        face = open_face(t, path, collection_index(t, path, name), false);
+        CFStringGetCString(postscript, name, sizeof(name), kCFStringEncodingUTF8)) {
+        long index = collection_index(t, path, name);
+        if (index >= 0)
+            face = open_face(t, path, index, false);
+    }
     if (postscript)
         CFRelease(postscript);
     if (url)
@@ -1048,8 +1058,10 @@ SpicaTextLayout *spica_text_layout_create_spans(SpicaText *t, const char *utf8, 
             faces |= (uint16_t)(1u << f);
             ++t->faces[f].pins;
         }
-        for (unsigned c = i; c < end; ++c)
+        for (unsigned c = i; c < end; ++c) {
             t->char_faces[c] = (uint16_t)f;
+            t->styles[c] = (uint16_t)available_style(&t->faces[f], t->styles[c]);
+        }
         i = end;
     }
     unsigned glyph_count = 0, caret_count = 0, line_count = 0, p = 0;

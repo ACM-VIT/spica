@@ -59,7 +59,8 @@ SpicaTextLayout *spica_text_layout_create_styled(SpicaText *engine, const char *
                                                  unsigned style);
 /* Spans must be sorted, disjoint, and on grapheme boundaries. Unspanned bytes
  * use the base face; MONOSPACE selects the registered mono face. No fake styles:
- * bold uses a real bold face or variable wght; italic requires a real italic. */
+ * bold uses a real bold face or variable wght; italic requires a real italic.
+ * Color emoji retain their regular artwork when that style is unavailable. */
 SpicaTextLayout *spica_text_layout_create_spans(SpicaText *engine, const char *utf8, size_t length,
                                                 float width, unsigned pixel_size, bool monospace,
                                                 const SpicaTextSpan *spans, size_t span_count);

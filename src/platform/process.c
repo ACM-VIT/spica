@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #ifdef __linux__
 #include <sys/syscall.h>
 #include <dirent.h>
@@ -382,28 +383,49 @@ static int force_owned(pid_t pid, int depth) {
     }
     if (kill(pid, SIGSTOP) < 0)
         return errno == ESRCH ? 0 : -1;
+    pid_t local[256], *children = local;
+    int capacity = (int)(sizeof local / sizeof local[0]);
+    int result = -1;
     struct proc_bsdinfo info;
     info.pbi_status = 0;
     for (int i = 0; i < 100; i++) {
-        if (bsd_info(pid, &info) < 0)
-            return errno == ESRCH ? 0 : -1;
+        if (bsd_info(pid, &info) < 0) {
+            if (errno == ESRCH)
+                result = 0;
+            goto done;
+        }
         if (info.pbi_status == SSTOP || info.pbi_status == SZOMB)
             break;
         usleep(1000);
     }
     if (info.pbi_status != SSTOP && info.pbi_status != SZOMB) {
         errno = EBUSY;
-        return -1;
+        goto done;
     }
-    /* ponytail: fixed 256-child bound per process; a full buffer fails rather than leaving children
-     * behind. Grow it if Pi ever runs that many direct children. */
-    pid_t children[256];
-    int count = proc_listchildpids(pid, children, sizeof children);
-    if (count < 0)
-        return -1;
-    if (count >= (int)(sizeof children / sizeof children[0])) {
-        errno = E2BIG;
-        return -1;
+    /* The stopped parent cannot fork or reap. Grow only on overflow, retaining the common small
+     * list on the stack. A full list may be truncated, so never kill from that snapshot. */
+    int count;
+    for (;;) {
+        errno = 0;
+        count = proc_listchildpids(pid, children, capacity * (int)sizeof(*children));
+        if (count < 0 || (!count && errno))
+            goto done;
+        if (count < capacity)
+            break;
+        if (capacity > INT_MAX / (int)sizeof(*children) / 2) {
+            errno = E2BIG;
+            goto done;
+        }
+        int next = capacity * 2;
+        pid_t *grown = malloc((size_t)next * sizeof(*children));
+        if (!grown) {
+            errno = ENOMEM;
+            goto done;
+        }
+        if (children != local)
+            free(children);
+        children = grown;
+        capacity = next;
     }
     for (int i = 0; i < count; i++) {
         struct proc_bsdinfo child;
@@ -411,13 +433,23 @@ static int force_owned(pid_t pid, int depth) {
         if (bsd_info(children[i], &child) < 0) {
             if (errno == ESRCH)
                 continue;
-            return -1;
+            goto done;
         }
         if ((pid_t)child.pbi_ppid == pid && force_owned(children[i], depth + 1) < 0)
-            return -1;
+            goto done;
     }
-    /* Never release the parent while enumeration or an owned descendant failed. */
-    return kill(pid, SIGKILL) < 0 && errno != ESRCH ? -1 : 0;
+    result = kill(pid, SIGKILL) < 0 && errno != ESRCH ? -1 : 0;
+done: {
+    int saved = errno;
+    if (children != local)
+        free(children);
+    /* Failed enumeration/recursion must not strand the owned tree in SIGSTOP. Descendants resume
+     * on their own failure before this unwinds; killed descendants remain pinned until reaped. */
+    if (result < 0)
+        kill(pid, SIGCONT);
+    errno = saved;
+    return result;
+}
 }
 #endif
 int spica_process_force(SpicaProcess *p) {

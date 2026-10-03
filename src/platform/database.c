@@ -30,6 +30,25 @@ static int validate(sqlite3 *database) {
     return rc == SQLITE_OK ? final : rc;
 }
 
+static int open_validated(const char *path, sqlite3 **database) {
+    int rc = sqlite3_open_v2(path, database, SQLITE_OPEN_READONLY, NULL);
+    if (rc == SQLITE_OK)
+        rc = validate(*database);
+#ifdef __APPLE__
+    /* macOS SQLite may need write access to recreate missing WAL sidecars. Try reads first:
+     * a legacy database can be read-only, and existing sidecars or DELETE mode need no writes. */
+    if ((rc & 0xff) == SQLITE_CANTOPEN || (rc & 0xff) == SQLITE_READONLY) {
+        if (*database)
+            sqlite3_close(*database);
+        *database = NULL;
+        rc = sqlite3_open_v2(path, database, SQLITE_OPEN_READWRITE, NULL);
+        if (rc == SQLITE_OK)
+            rc = validate(*database);
+    }
+#endif
+    return rc;
+}
+
 static int discard_staging(const char *temporary) {
     char sidecar[8192];
     const char *suffixes[] = {"", "-wal", "-shm", "-journal"};
@@ -73,18 +92,7 @@ static int cutover(const char *destination, const char *legacy, const char *temp
     FILE *probe = fopen(destination, "rb");
     if (probe) {
         fclose(probe);
-#ifdef __APPLE__
-        /* Read-write on macOS, though validation only reads: the app keeps this database in WAL
-         * mode, and a read-only connection must create the -wal/-shm files when they are missing
-         * (deleted, or the database was copied without them). macOS's SQLite refuses that
-         * (SQLITE_CANTOPEN), which failed startup with DatabaseMigrationFailed. This is Spica's own
-         * file and the store opens it read-write right after. */
-        rc = sqlite3_open_v2(destination, &target, SQLITE_OPEN_READWRITE, NULL);
-#else
-        rc = sqlite3_open_v2(destination, &target, SQLITE_OPEN_READONLY, NULL);
-#endif
-        if (rc == SQLITE_OK)
-            rc = validate(target);
+        rc = open_validated(destination, &target);
         if (target && sqlite3_close(target) != SQLITE_OK && rc == SQLITE_OK)
             rc = SQLITE_BUSY;
         return rc;
@@ -99,19 +107,7 @@ static int cutover(const char *destination, const char *legacy, const char *temp
     rc = discard_staging(temporary);
     if (rc != SQLITE_OK)
         return rc;
-#ifdef __APPLE__
-    /* Read-write on macOS for the same reason as the destination above: a legacy database left in
-     * WAL mode without its -wal/-shm files cannot be opened read-only by macOS's SQLite
-     * (SQLITE_CANTOPEN), which would fail the migration. Only validate() and the backup read it, so
-     * its data is not changed. SQLite creates -wal/-shm beside it and leaves them after close; the
-     * -wal stays empty and -shm is only an index. */
-    rc = sqlite3_open_v2(legacy, &source, SQLITE_OPEN_READWRITE, NULL);
-#else
-    rc = sqlite3_open_v2(legacy, &source, SQLITE_OPEN_READONLY, NULL);
-#endif
-    if (rc != SQLITE_OK)
-        goto done;
-    rc = validate(source);
+    rc = open_validated(legacy, &source);
     if (rc != SQLITE_OK)
         goto done;
     rc = sqlite3_open_v2(temporary, &target, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);

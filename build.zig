@@ -32,7 +32,11 @@ pub fn build(b: *std.Build) void {
     nativeDependencies(b, test_module, prefix);
     test_module.addCSourceFile(.{ .file = b.path("src/native/parse_arena_test.c"), .flags = &.{ "-std=c11", "-O2" } });
     const tests = b.addTest(.{ .root_module = test_module });
-    b.step("test", "Run protocol, storage, Unicode, Markdown, image, and highlighting regressions").dependOn(&b.addRunArtifact(tests).step);
+    const test_step = b.step("test", "Run protocol, storage, Unicode, Markdown, image, and highlighting regressions");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    const bootstrap_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "build", "-p", "*_test.py" });
+    bootstrap_tests.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    test_step.dependOn(&bootstrap_tests.step);
 }
 
 fn nativeDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const u8) void {
