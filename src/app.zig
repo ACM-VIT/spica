@@ -2082,7 +2082,11 @@ pub const App = struct {
         };
         if (entering) {
             const remaining = 1 - self.tab_motion.value(c.SDL_GetTicks());
-            if (self.appearance.horizontal_tabs) bounds.x += remaining * 12 else bounds.y += remaining * 6;
+            if (self.appearance.horizontal_tabs) {
+                const shift = remaining * 12;
+                bounds.x += shift;
+                bounds.w -= shift; // Keep the right edge clear of the trailing plus.
+            } else bounds.y += remaining * 6;
         }
         const colors = self.palette();
         switch (item) {
