@@ -11,6 +11,11 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "asset_directory", b.path("assets").getPath(b));
     options.addOption([]const u8, "font_directory", b.path(".deps/install/fonts").getPath(b));
 
+    // macOS 27 SDK: Zig 0.16 cannot build its bundled libc++ ("use of undeclared identifier
+    // 'INFINITY'"). The SDK's math.h leaves INFINITY to float.h when clang modules are on, and
+    // Zig's float.h does not provide it under -std=c++23. Point Zig at the 26.x SDK instead:
+    //   zig libc > macos-26.libc, replace the MacOSX27.0.sdk paths with
+    //   /Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk, then set env var ZIG_LIBC to that file.
     const module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
     module.addOptions("build_options", options);
     if (target.result.os.tag == .linux) module.addRPathSpecial(b.fmt("$ORIGIN/../../{s}/lib", .{prefix}));
@@ -47,7 +52,13 @@ fn nativeDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const 
     module.addLibraryPath(b.path(b.fmt("{s}/lib", .{prefix})));
     module.addRPath(b.path(b.fmt("{s}/lib", .{prefix})));
     inline for (.{ "SDL3_image", "SDL3", "freetype", "harfbuzz", "unibreak", "fribidi", "cmark-gfm-extensions", "cmark-gfm", "tree-sitter", "sqlite3" }) |name| {
-        module.linkSystemLibrary(name, .{});
+        // Link only the locked builds in .deps. With pkg-config on (Zig's default), any library that
+        // also has a system install with a .pc file (Homebrew, apt, etc.) resolves to that copy
+        // instead, and its directory can land ahead of .deps in the rpath. System copies are other
+        // versions and lack the allocator hooks bootstrap.py configures, which crashes the
+        // allocation-failure tests. Libraries not built into .deps (sqlite3) still resolve from the
+        // standard system library directories.
+        module.linkSystemLibrary(name, .{ .use_pkg_config = .no });
     }
     module.addIncludePath(b.path(".deps/src/cmark-gfm-0.29.0.gfm.13/src"));
     module.addIncludePath(b.path(".deps/build/cmark-gfm/src"));

@@ -17,11 +17,17 @@ CACHE = ROOT / '.deps'
 SOURCES = json.loads((ROOT / 'deps.lock.json').read_text())['sources']
 
 
+def log(message):
+    # Zig shows no progress for this step, so report each slow phase.
+    print('[deps] ' + message, file=sys.stderr, flush=True)
+
+
 def acquire(name):
     spec = SOURCES[name]
     archive = CACHE / 'archives' / (name.lower() + '-' + spec['version'] + '.tar.gz')
     archive.parent.mkdir(parents=True, exist_ok=True)
     if not archive.exists():
+        log(f'downloading {name} {spec["version"]}')
         with urllib.request.urlopen(spec['url'], timeout=90) as response, archive.open('wb') as output:
             while chunk := response.read(65536):
                 output.write(chunk)
@@ -31,6 +37,7 @@ def acquire(name):
         raise RuntimeError(f'{name}: locked SHA-256 mismatch: {actual}')
     target = CACHE / 'src' / (name.lower() + '-' + spec['version'])
     if not target.exists():
+        log(f'extracting {name}')
         target.mkdir(parents=True)
         with tarfile.open(archive) as tar:
             for member in tar.getmembers():
@@ -49,6 +56,7 @@ def acquire_font(name, member, filename):
     destination = CACHE / 'install' / 'fonts' / filename
     archive.parent.mkdir(parents=True, exist_ok=True)
     if not archive.exists():
+        log(f'downloading {name} {spec["version"]}')
         with urllib.request.urlopen(spec['url'], timeout=90) as response, archive.open('wb') as output:
             while chunk := response.read(65536):
                 output.write(chunk)
@@ -180,6 +188,7 @@ def build_highlighting(prefix, fingerprint):
     runtime = libraries / ('libtree-sitter' + suffix)
     runtime_stamp = prefix / '.tree-sitter-allocator-config'
     if not build_is_current(runtime, runtime_stamp, fingerprint):
+        log('building tree-sitter')
         identity = ['-Wl,-install_name,@rpath/' + runtime.name] if system == 'Darwin' else ['-Wl,-soname,' + runtime.name]
         subprocess.run(['cc', '-std=c11', '-D_DEFAULT_SOURCE', '-O2', '-fPIC', shared,
                         '-I' + str(core / 'lib' / 'include'),
@@ -192,6 +201,7 @@ def build_highlighting(prefix, fingerprint):
         stamp = prefix / ('.tree-sitter-' + name + '-allocator-config')
         if build_is_current(library, stamp, fingerprint):
             continue
+        log(f'building tree-sitter-{name}')
         sources = [str(source / 'src' / 'parser.c')]
         scanner = source / 'src' / 'scanner.c'
         if scanner.exists():
@@ -233,6 +243,7 @@ def main():
     library = prefix / 'lib' / ('libSDL3.dylib' if system == 'macos' else 'libSDL3.so')
     sdl_stamp = prefix / '.sdl-allocator-config'
     if not build_is_current(library, sdl_stamp, fingerprint):
+        log('building SDL')
         build = CACHE / 'build' / 'sdl'
         subprocess.run(['cmake', '-S', str(sdl), '-B', str(build), '-DCMAKE_BUILD_TYPE=Release',
                         f'-DCMAKE_INSTALL_PREFIX={prefix}', '-DSDL_SHARED=ON', '-DSDL_STATIC=OFF',
@@ -248,6 +259,7 @@ def main():
     image_library = prefix / 'lib' / ('libSDL3_image.dylib' if system == 'macos' else 'libSDL3_image.so')
     image_stamp = prefix / '.image-allocator-config'
     if not build_is_current(image_library, image_stamp, fingerprint):
+        log('building SDL_image')
         build = CACHE / 'build' / 'sdl-image'
         subprocess.run(['cmake', '-S', str(image), '-B', str(build),
                         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
@@ -272,6 +284,7 @@ def main():
         image_stamp.write_text(fingerprint)
     cmark_library = prefix / 'lib' / 'libcmark-gfm.a'
     if not cmark_library.exists():
+        log('building cmark-gfm')
         build = CACHE / 'build' / 'cmark-gfm'
         subprocess.run(['cmake', '-S', str(markdown), '-B', str(build),
                         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
@@ -281,17 +294,20 @@ def main():
         subprocess.run(['cmake', '--install', str(build)], check=True)
         if not cmark_library.exists():
             raise RuntimeError(f'cmark install did not produce {cmark_library}')
+    suffix = '.dylib' if system == 'macos' else '.so'
     tools = CACHE / 'tools'
     tools.mkdir(exist_ok=True)
     ninja_binary = tools / 'ninja'
     if not ninja_binary.exists():
+        log('building ninja')
         subprocess.run([sys.executable, 'configure.py', '--bootstrap'], cwd=ninja, check=True)
         shutil.copy2(ninja / 'ninja', ninja_binary)
     child_env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ.get('PATH', ''))
     pkg_config = str(prefix / 'lib' / 'pkgconfig')
     child_env['PKG_CONFIG_PATH'] = pkg_config + os.pathsep + child_env.get('PKG_CONFIG_PATH', '')
-    freetype_library = prefix / 'lib' / 'libfreetype.so'
+    freetype_library = prefix / 'lib' / ('libfreetype' + suffix)
     if not freetype_library.exists():
+        log('building FreeType')
         build = CACHE / 'build' / 'freetype'
         subprocess.run(['cmake', '-S', str(freetype), '-B', str(build),
                         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
@@ -300,8 +316,9 @@ def main():
         subprocess.run(['cmake', '--install', str(build)], check=True)
         if not freetype_library.exists():
             raise RuntimeError(f'FreeType install did not produce {freetype_library}')
-    harfbuzz_library = prefix / 'lib' / 'libharfbuzz.so'
+    harfbuzz_library = prefix / 'lib' / ('libharfbuzz' + suffix)
     if not harfbuzz_library.exists():
+        log('building HarfBuzz')
         build = CACHE / 'build' / 'harfbuzz'
         subprocess.run([sys.executable, str(meson / 'meson.py'), 'setup', str(build), str(harfbuzz),
                         '--prefix', str(prefix), '--buildtype=release',
@@ -317,6 +334,7 @@ def main():
             raise RuntimeError(f'HarfBuzz install did not produce {harfbuzz_library}')
     unibreak_library = prefix / 'lib' / 'libunibreak.a'
     if not unibreak_library.exists():
+        log('building libunibreak')
         subprocess.run(['autoreconf', '-fi'], cwd=unibreak, check=True)
         build = CACHE / 'build' / 'libunibreak'
         build.mkdir(parents=True, exist_ok=True)
@@ -325,8 +343,9 @@ def main():
         subprocess.run(['make', 'install'], cwd=build, check=True)
         if not unibreak_library.exists():
             raise RuntimeError(f'libunibreak install did not produce {unibreak_library}')
-    fribidi_library = prefix / 'lib' / 'libfribidi.so'
+    fribidi_library = prefix / 'lib' / ('libfribidi' + suffix)
     if not fribidi_library.exists():
+        log('building FriBidi')
         build = CACHE / 'build' / 'fribidi'
         subprocess.run([sys.executable, str(meson / 'meson.py'), 'setup', str(build), str(fribidi),
                         '--prefix', str(prefix), '--buildtype=release',
@@ -336,6 +355,7 @@ def main():
         subprocess.run([str(ninja_binary), '-C', str(build), 'install'], env=child_env, check=True)
         if not fribidi_library.exists():
             raise RuntimeError(f'FriBidi install did not produce {fribidi_library}')
+    log('native dependencies ready')
 
 
 if __name__ == '__main__':

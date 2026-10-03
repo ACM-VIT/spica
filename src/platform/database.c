@@ -43,6 +43,28 @@ static int discard_staging(const char *temporary) {
     return SQLITE_OK;
 }
 
+/* Bind helpers for Zig callers (store.zig, search_sql.zig). They live in C, not Zig, because
+ * Zig cannot pass SQLITE_TRANSIENT on aarch64.
+ *
+ * SQLITE_TRANSIENT tells SQLite to copy the bytes before the bind call returns, so the caller's
+ * slice only has to live for the duration of the call. SQLite defines it as
+ * ((sqlite3_destructor_type)-1): an all-ones sentinel in a function-pointer slot that SQLite
+ * compares against but never calls.
+ *
+ * @cImport does not bring that macro over, so the Zig code used to rebuild it with
+ * @ptrFromInt(maxInt(usize)). Zig checks that an address converted to a function pointer meets
+ * the target's code alignment. x86_64 needs 1 byte, so the all-ones address compiled there;
+ * aarch64 needs 4, so Zig rejects it ("requires aligned address") and the build fails on Apple
+ * Silicon and ARM Linux. C performs no such check, so these wrappers use SQLite's own macro and
+ * pass exactly the value SQLite expects, with the same code on every architecture. */
+int spica_database_bind_text(sqlite3_stmt *statement, int index, const char *text, int length) {
+    return sqlite3_bind_text(statement, index, text, length, SQLITE_TRANSIENT);
+}
+
+int spica_database_bind_blob(sqlite3_stmt *statement, int index, const void *data, int length) {
+    return sqlite3_bind_blob(statement, index, data, length, SQLITE_TRANSIENT);
+}
+
 /* Called under the application instance lock. Legacy files are never modified. */
 int spica_database_cutover(const char *destination, const char *legacy, const char *temporary,
                            const char *directory) {
