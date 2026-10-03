@@ -51,8 +51,9 @@ pub const help =
     \\Software is the lower-residency default. Neither backend has passed the 32 MiB gate.
     \\Pi starts automatically. Project resources are disabled unless --trust-project is given.
     \\The real-process application runs on Linux and macOS, pinned to Pi 1.0.0.
-    \\Executable defaults match a system Node and npm installation.
-    \\Use --node and --pi-entry for another installation. --resume is explicit, not replay.
+    \\Executable defaults match a Linux system Node and npm installation.
+    \\Elsewhere (macOS, nvm, fnm, pnpm) pass --node and --pi-entry; the README shows how.
+    \\--resume is explicit, not replay.
     \\Checkout demo libraries, fonts and themes resolve independently of the launch directory.
     \\Keep the checkout's .deps and assets directories; rebuild after moving the checkout.
     \\Project resources may run code: --trust-project opts in; --no-project-resources opts out.

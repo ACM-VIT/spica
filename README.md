@@ -36,7 +36,16 @@ zig build
 
 Configure provider credentials through Pi. Dependencies are pinned in [`deps.lock.json`](./deps.lock.json); keep `.deps/` and `assets/` with the checkout and rebuild after moving it.
 
-Spica defaults to `/usr/bin/node` and `/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`. Use `--node` and `--pi-entry` if your installation differs.
+Spica defaults to `/usr/bin/node` and `/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`. Use `--node` and `--pi-entry` if your installation differs, as it does on macOS or with nvm, fnm, or pnpm:
+
+```sh
+# npm (including nvm and fnm)
+./zig-out/bin/spica --node "$(which node)" \
+  --pi-entry "$(npm root -g)/@earendil-works/pi-coding-agent/dist/bundle/cli.js"
+# pnpm
+./zig-out/bin/spica --node "$(which node)" \
+  --pi-entry "$(pnpm ls -g --parseable @earendil-works/pi-coding-agent | tail -1)/dist/bundle/cli.js"
+```
 
 ## Development
 
