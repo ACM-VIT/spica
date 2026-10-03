@@ -522,7 +522,7 @@ pub const Worker = struct {
         var db: sql.Db = .{ .handle = @ptrCast(store.db) };
         const stmt = try db.prepare("SELECT w.session_file,COALESCE(i.cwd,s.project_id),COALESCE(i.title,NULLIF(s.display_name,''),'Untitled session'),COALESCE(i.modified,s.file_mtime,0) " ++
             "FROM workspace_chats w LEFT JOIN session_index i ON i.session_file=w.session_file LEFT JOIN sessions s ON s.session_file=w.session_file " ++
-            "WHERE w.archived=0 ORDER BY 4 DESC,w.session_file");
+            "WHERE w.archived=0 ORDER BY w.rowid");
         defer _ = sql.c.sqlite3_finalize(stmt);
         var threads: std.ArrayList(Thread) = .empty;
         errdefer {
@@ -549,7 +549,7 @@ pub const Worker = struct {
             for (owned) |*thread| thread.deinit();
             allocator.free(owned);
         }
-        return groupThreads(owned, null);
+        return groupThreads(owned, null, .opened);
     }
 };
 
@@ -654,7 +654,7 @@ fn discover(io: std.Io, environment: *const std.process.Environ.Map, legacy_dir:
         for (owned) |*thread| thread.deinit();
         allocator.free(owned);
     }
-    return try groupThreads(owned, warning);
+    return try groupThreads(owned, warning, .folder_name);
 }
 
 fn loadIndexed(io: std.Io, db: *storage.Store, threads: *std.ArrayList(Thread), seen: *std.StringHashMap(void), warning: *?anyerror) !void {
@@ -698,16 +698,34 @@ fn indexedThread(entry: storage.SessionIndexEntry) !Thread {
     };
 }
 
-fn groupThreads(threads: []Thread, warning: ?anyerror) !Catalog {
+fn groupThreads(threads: []Thread, warning: ?anyerror, order: enum { folder_name, opened }) !Catalog {
     const indices = try allocator.alloc(usize, threads.len);
     defer allocator.free(indices);
     for (indices, 0..) |*index, i| index.* = i;
-    std.mem.sort(usize, indices, threads, struct {
-        fn less(items: []Thread, a: usize, b: usize) bool {
-            const order = std.mem.order(u8, items[a].cwd, items[b].cwd);
-            return if (order == .eq) a < b else order == .lt;
+    if (order == .opened) {
+        // Workspace groups follow first enrollment, independent of file activity.
+        const folder_order = try allocator.alloc(usize, threads.len);
+        defer allocator.free(folder_order);
+        var first_seen = std.StringHashMap(usize).init(allocator);
+        defer first_seen.deinit();
+        for (threads, 0..) |thread, index| {
+            const entry = try first_seen.getOrPut(thread.cwd);
+            if (!entry.found_existing) entry.value_ptr.* = index;
+            folder_order[index] = entry.value_ptr.*;
         }
-    }.less);
+        std.mem.sort(usize, indices, folder_order, struct {
+            fn less(folders: []usize, a: usize, b: usize) bool {
+                return if (folders[a] == folders[b]) a < b else folders[a] < folders[b];
+            }
+        }.less);
+    } else {
+        std.mem.sort(usize, indices, threads, struct {
+            fn less(items: []Thread, a: usize, b: usize) bool {
+                const compared = std.mem.order(u8, items[a].cwd, items[b].cwd);
+                return if (compared == .eq) a < b else compared == .lt;
+            }
+        }.less);
+    }
     var folders: std.ArrayList(Folder) = .empty;
     defer folders.deinit(allocator);
     var rows: std.ArrayList(SidebarRow) = .empty;
@@ -1418,6 +1436,41 @@ fn testWaitCatalog(worker: *Worker, count: usize) !Catalog {
         c.SDL_Delay(1);
     }
     return error.CatalogPublicationTimeout;
+}
+
+test "workspace tabs and groups retain enrollment order after activity and restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(path);
+    const database = try std.fs.path.join(allocator, &.{ path, "tab-order.sqlite" });
+    defer allocator.free(database);
+    const entries = [_]storage.SessionIndexEntry{
+        .{ .session_file = "/tabs/z/first.jsonl", .cwd = "/z", .title = "First", .modified = 100 },
+        .{ .session_file = "/tabs/a/second.jsonl", .cwd = "/a", .title = "Second", .modified = 200 },
+        .{ .session_file = "/tabs/z/third.jsonl", .cwd = "/z", .title = "Third", .modified = 300 },
+    };
+    {
+        var db = try storage.Store.init(allocator, database);
+        defer db.deinit();
+        for (entries) |entry| try db.enroll(entry);
+        var updated = entries[0];
+        updated.modified = 900;
+        updated.title = "First with new activity";
+        try db.putSessionIndex(updated);
+    }
+    var reopened = try storage.Store.init(allocator, database);
+    defer reopened.deinit();
+    var worker: Worker = undefined;
+    worker.io = std.testing.io;
+    worker.mutation_store = &reopened;
+    var catalog = try worker.activeCatalog();
+    defer catalog.deinit();
+    try std.testing.expectEqualStrings("/z", catalog.folders[0].cwd);
+    try std.testing.expectEqualStrings("/a", catalog.folders[1].cwd);
+    try std.testing.expectEqualStrings(entries[0].session_file, catalog.threads[catalog.rows[1].thread].path);
+    try std.testing.expectEqualStrings(entries[2].session_file, catalog.threads[catalog.rows[2].thread].path);
+    try std.testing.expectEqualStrings(entries[1].session_file, catalog.threads[catalog.rows[4].thread].path);
 }
 
 test "worker publishes accepted unpersisted chats in their project and archive restore does not need discovery" {
