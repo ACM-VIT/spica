@@ -34,7 +34,9 @@ zig build
 ./zig-out/bin/spica --project /path/to/project
 ```
 
-Use **Settings → Connect a provider**, or **Connect a provider** in the model picker, to choose a provider and its sign-in method. For browser sign-in, use **Open browser**; paste a code or redirect URL only if needed. API keys and authorization codes are masked; Escape cancels authentication. Credentials stay in Pi's normal credential store, shared with the Pi CLI. Models refresh after connection without replacing the current chat. Connecting requires an idle Pi runtime.
+Use **Settings → Connect a provider**, or **Connect a provider** in the model picker, to choose a provider and its sign-in method. For browser sign-in, use **Open browser**; paste a code or redirect URL only if needed. API keys and authorization codes are masked, with an 8192-byte UTF-8 input limit. Credentials stay in Pi's normal credential store, shared with the Pi CLI. Models refresh after connection without replacing the current chat. Stop any active chat run before connecting.
+
+Authentication runs in a dedicated Pi SDK helper without loading extensions. Provider dialogs accept prompts only from this helper, never from chat extensions. Extension-defined authentication handlers are not loaded by the helper. Pi extensions remain trusted code with access to credential files; this isolates the UI channel, not the operating-system account.
 
 Spica defaults to `/usr/bin/node` and `/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`. Use `--node` and `--pi-entry` if your installation differs.
 

@@ -134,6 +134,8 @@ pub const App = struct {
     draft_writer: *Draft.Writer,
     runtime: ?*pi.Runtime = null,
     runtime_snapshot: ?pi.Snapshot = null,
+    auth_runtime: ?*pi.Runtime = null,
+    auth_snapshot: ?pi.Snapshot = null,
     parked_chats: std.ArrayList(ParkedChat) = .empty,
     chat_id: u64 = 1,
     next_chat_id: u64 = 2,
@@ -328,7 +330,9 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         if (self.runtime) |runtime| runtime.destroy() catch |err| std.log.err("Runtime shutdown invariant: {s}", .{@errorName(err)});
-        self.providers.wipe();
+        if (self.auth_runtime) |runtime| runtime.destroy() catch |err| std.log.err("Authentication shutdown invariant: {s}", .{@errorName(err)});
+        if (self.auth_snapshot) |*snapshot| snapshot.deinit();
+        self.providers.deinit(self.allocator);
         if (self.runtime_snapshot) |*snapshot| snapshot.deinit();
         for (self.parked_chats.items) |*chat| chat.deinit(self.allocator);
         self.parked_chats.deinit(self.allocator);
@@ -741,12 +745,16 @@ pub const App = struct {
 
     fn ownedRuntimesFinished(self: *const App) bool {
         if (self.runtime) |runtime| if (!runtime.isFinished()) return false;
+        if (self.auth_runtime) |runtime| if (!runtime.isFinished()) return false;
         for (self.parked_chats.items) |chat| if (chat.runtime) |runtime| if (!runtime.isFinished()) return false;
         return true;
     }
 
     fn shutdownOwned(self: *App) !void {
         var failure: ?anyerror = null;
+        if (self.auth_runtime) |runtime| if (!runtime.isFinished()) runtime.shutdown() catch |err| {
+            failure = err;
+        };
         if (self.runtime) |runtime| if (!runtime.isFinished()) {
             runtime.shutdown() catch |err| {
                 failure = err;
@@ -763,6 +771,9 @@ pub const App = struct {
 
     fn needsForceStop(self: *const App) bool {
         if (self.runtime) |runtime| if (!runtime.isFinished() and self.runtimeStatus() == .needs_force_stop) return true;
+        if (self.auth_runtime) |runtime| if (!runtime.isFinished()) {
+            if (self.auth_snapshot) |snapshot| if (snapshot.status == .needs_force_stop) return true;
+        };
         for (self.parked_chats.items) |chat| if (chat.runtime) |runtime| if (!runtime.isFinished()) {
             if (chat.snapshot) |snapshot| if (snapshot.status == .needs_force_stop) return true;
         };
@@ -771,6 +782,13 @@ pub const App = struct {
 
     fn forceOwned(self: *App) !void {
         var failure: ?anyerror = null;
+        if (self.auth_runtime) |runtime| if (!runtime.isFinished() and
+            (self.closing or (self.auth_snapshot != null and self.auth_snapshot.?.status == .needs_force_stop)))
+        {
+            runtime.forceTerminate() catch |err| {
+                failure = err;
+            };
+        };
         if (self.runtime) |runtime| if (!runtime.isFinished() and (self.closing or self.runtimeStatus() == .needs_force_stop)) {
             runtime.forceTerminate() catch |err| {
                 failure = err;
@@ -797,7 +815,7 @@ pub const App = struct {
         if (!self.closing) {
             if (self.providers.open) {
                 self.providers.wipe();
-                if (self.runtime) |runtime| runtime.cancelProvider() catch {};
+                if (self.auth_runtime) |runtime| runtime.cancelProvider(self.providers.attempt) catch {};
                 self.providers.close();
             }
             try self.saveDraft();
@@ -828,16 +846,6 @@ pub const App = struct {
             if (self.runtime_snapshot) |*old| old.deinit();
             self.runtime_snapshot = incoming;
             const snapshot = &self.runtime_snapshot.?;
-            self.providers.observe(self, snapshot.provider_ui);
-            if (self.providers.open and self.providers.failure == null and
-                (snapshot.status == .failed or snapshot.status == .stopped or snapshot.status == .exited) and
-                snapshot.provider_ui.kind != .done and snapshot.provider_ui.kind != .failed)
-            {
-                self.providers.active = false;
-                self.providers.fail("Pi exited. Restart Pi to sign in.");
-                _ = c.SDL_ClearComposition(self.window);
-                _ = c.SDL_StopTextInput(self.window);
-            }
             if (snapshot.status == .ready) if (self.model_restore) |settings| {
                 self.model_restore = null;
                 var owned = settings;
@@ -1260,8 +1268,38 @@ pub const App = struct {
         }
     }
 
+    fn consumeAuth(self: *App) void {
+        const runtime = self.auth_runtime orelse return;
+        if (runtime.takeSnapshot()) |incoming| {
+            const new_connection = incoming.provider_ui.kind == .done and
+                incoming.provider_ui.attempt == self.providers.attempt and
+                (self.auth_snapshot == null or self.auth_snapshot.?.provider_ui.kind != .done or
+                    self.auth_snapshot.?.provider_ui.attempt != incoming.provider_ui.attempt);
+            if (self.auth_snapshot) |*old| old.deinit();
+            self.auth_snapshot = incoming;
+            if (incoming.provider_ui.attempt == self.providers.attempt and self.providers.attempt != 0)
+                self.providers.observe(self, incoming.provider_ui);
+            if (self.providers.open and self.providers.active and
+                (incoming.status == .failed or incoming.status == .exited or incoming.status == .needs_force_stop))
+            {
+                self.providers.active = false;
+                self.providers.fail("Sign-in stopped. Retry.");
+                _ = c.SDL_ClearComposition(self.window);
+                _ = c.SDL_StopTextInput(self.window);
+            }
+            if (new_connection) {
+                if (self.runtimeStatus() == .ready) {
+                    if (self.runtime) |chat| chat.refreshModels() catch |err| self.report("Refreshing models", err);
+                } else self.beginRuntime() catch |err| self.report("Starting pi", err);
+            }
+            self.dirty = true;
+        }
+    }
+
     fn providerUi(self: *const App) pi.ProviderUi {
-        return if (self.runtime_snapshot) |snapshot| snapshot.provider_ui else .{ .kind = .closed };
+        if (self.auth_snapshot) |snapshot| if (snapshot.provider_ui.attempt == self.providers.attempt)
+            return snapshot.provider_ui;
+        return .{ .kind = .waiting };
     }
 
     fn connectProvider(self: *App) void {
@@ -1287,16 +1325,39 @@ pub const App = struct {
             self.providers.fail("Stop the current run to sign in.");
             return;
         }
-        if (self.runtimeStatus() != .ready) {
-            self.providers.fail("Pi isn't ready. Start Pi, then retry.");
+        if (self.runtimeStatus() == .starting or self.runtimeStatus() == .stopping or self.runtimeStatus() == .needs_force_stop) {
+            self.providers.fail("Wait for Pi to finish starting or stopping.");
             return;
         }
-        const runtime = self.runtime orelse {
-            self.providers.fail("Start Pi to sign in.");
-            return;
+        if (self.auth_runtime) |runtime| if (runtime.isFinished()) {
+            runtime.destroy() catch {
+                self.providers.fail("Couldn't restart sign-in.");
+                return;
+            };
+            self.auth_runtime = null;
+            if (self.auth_snapshot) |*snapshot| snapshot.deinit();
+            self.auth_snapshot = null;
         };
-        runtime.connectProvider() catch {
-            self.providers.fail("Couldn't start sign-in. Retry when Pi is ready.");
+        if (self.auth_runtime == null) {
+            self.auth_runtime = pi.Runtime.create(self.allocator, self.io, .{
+                .database_path = self.paths.database,
+                .project_path = self.project_path,
+                .node_path = self.options.node_path,
+                .pi_entrypoint = self.options.pi_entrypoint,
+                .wake_event = self.wake_event,
+                .auth_only = true,
+            }) catch {
+                self.providers.fail("Couldn't start sign-in.");
+                return;
+            };
+            self.auth_runtime.?.start() catch {
+                self.auth_runtime.?.shutdown() catch {};
+                self.providers.fail("Couldn't start sign-in.");
+                return;
+            };
+        }
+        self.providers.attempt = self.auth_runtime.?.connectProvider() catch {
+            self.providers.fail("Couldn't start sign-in. Retry.");
             return;
         };
         self.providers.active = true;
@@ -1315,7 +1376,7 @@ pub const App = struct {
             .cancel => {
                 self.providers.wipe();
                 _ = c.SDL_ClearComposition(self.window);
-                if (self.providers.active) if (self.runtime) |runtime| runtime.cancelProvider() catch {
+                if (self.providers.active) if (self.auth_runtime) |runtime| runtime.cancelProvider(self.providers.attempt) catch {
                     self.providers.input_error = "Could not cancel provider connection. Try Cancel again.";
                     self.dirty = true;
                     return;
@@ -1349,11 +1410,11 @@ pub const App = struct {
                     else => return,
                 };
                 defer self.providers.wipe();
-                const runtime = self.runtime orelse {
+                const runtime = self.auth_runtime orelse {
                     self.providers.fail("Pi exited during provider connection.");
                     return;
                 };
-                runtime.respondProvider(ui.id, value) catch {
+                runtime.respondProvider(self.providers.attempt, ui.id, value) catch {
                     self.providers.fail("Couldn't send the response. Retry sign-in.");
                     return;
                 };
@@ -1570,6 +1631,7 @@ pub const App = struct {
 
     fn consume(self: *App) void {
         self.consumeRuntime();
+        self.consumeAuth();
         self.consumeParked();
         while (self.catalog_worker.takeMutation()) |result| {
             if (self.pending_mutation) |value| {

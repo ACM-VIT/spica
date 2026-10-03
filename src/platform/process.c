@@ -113,27 +113,12 @@ int spica_process_spawn(SpicaProcess *p, const char *node, const char *entry, co
         argv[n++] = (char *)resume;
     }
     argv[n] = 0;
-    size_t count = 0;
-    while (environ[count])
-        ++count;
-    char **env = calloc(count + 2, sizeof *env);
-    char *pi_entry = malloc(strlen(entry) + sizeof "SPICA_PI_ENTRY=");
-    if (!env || !pi_entry) {
-        free(env);
-        free(pi_entry);
-        errno = ENOMEM;
-        return -1;
-    }
-    sprintf(pi_entry, "SPICA_PI_ENTRY=%s", entry);
-    size_t used = 0;
-    for (size_t i = 0; i < count; ++i)
-        if (strncmp(environ[i], "SPICA_PI_ENTRY=", sizeof "SPICA_PI_ENTRY=" - 1))
-            env[used++] = environ[i];
-    env[used] = pi_entry;
-    int result = spawn(p, node, argv, cwd, env);
-    free(pi_entry);
-    free(env);
-    return result;
+    return spawn(p, node, argv, cwd, environ);
+}
+int spica_process_auth(SpicaProcess *p, const char *node, const char *entry, const char *cwd,
+                       const char *helper) {
+    char *argv[] = {(char *)node, (char *)helper, (char *)entry, NULL};
+    return spawn(p, node, argv, cwd, environ);
 }
 long spica_process_read(int fd, void *b, size_t n) {
     ssize_t r;
@@ -460,6 +445,15 @@ int spica_process_spawn(SpicaProcess *p, const char *n, const char *e, const cha
     (void)r;
     (void)t;
     (void)x;
+    return -1;
+}
+int spica_process_auth(SpicaProcess *p, const char *n, const char *e, const char *c,
+                       const char *h) {
+    (void)p;
+    (void)n;
+    (void)e;
+    (void)c;
+    (void)h;
     return -1;
 }
 int spica_process_version(SpicaProcess *p, const char *n, const char *e) {
