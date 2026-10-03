@@ -1,23 +1,64 @@
 #define _GNU_SOURCE
 #include "process.h"
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
 #include <fcntl.h>
 #include <spawn.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
-#include <sys/syscall.h>
 #include <time.h>
 #include <pthread.h>
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef __linux__
+#include <sys/syscall.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#else
+#include <sys/event.h>
+#include <sys/proc.h>
+#include <libproc.h>
+#endif
 extern char **environ;
+#ifdef __linux__
 static int pipes(int p[2]) { return pipe2(p, O_CLOEXEC); }
+static int exit_watch(pid_t pid) { return (int)syscall(SYS_pidfd_open, pid, 0); }
+#else
+/* No pipe2: CLOEXEC is set after the fact, and POSIX_SPAWN_CLOEXEC_DEFAULT in spawn() keeps a pipe
+ * created on another thread in that gap out of the child. */
+static int pipes(int p[2]) {
+    if (pipe(p))
+        return -1;
+    fcntl(p[0], F_SETFD, FD_CLOEXEC);
+    fcntl(p[1], F_SETFD, FD_CLOEXEC);
+    return 0;
+}
+/* No pidfd: a kqueue watching the child's exit stands in for it. Like a pidfd it is pollable and
+ * stays readable once the child exits. Attaching to a child that already exited fails with ESRCH;
+ * it is still unreaped and ours, so a user event is triggered to make the kqueue readable now. */
+static int exit_watch(pid_t pid) {
+    int kq = kqueue();
+    if (kq < 0)
+        return -1;
+    struct kevent change;
+    EV_SET(&change, pid, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, 0);
+    int rc = kevent(kq, &change, 1, 0, 0, 0);
+    if (rc < 0 && errno == ESRCH) {
+        EV_SET(&change, 0, EVFILT_USER, EV_ADD, NOTE_TRIGGER, 0, 0);
+        rc = kevent(kq, &change, 1, 0, 0, 0);
+    }
+    if (rc < 0) {
+        int saved = errno;
+        close(kq);
+        errno = saved;
+        return -1;
+    }
+    return kq;
+}
+#endif
 static void nonblock(int fd) {
     int n = fcntl(fd, F_GETFL);
     if (n >= 0)
@@ -51,7 +92,11 @@ static int spawn(SpicaProcess *p, const char *node, char *const argv[], const ch
     posix_spawn_file_actions_adddup2(&acts, err[1], 2);
     posix_spawn_file_actions_addchdir_np(&acts, cwd);
     /* A new session exclusively owns this tree; never signal the GUI's group. */
-    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGDEF);
+    short flags = POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGDEF;
+#ifdef __APPLE__
+    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT; /* Only the three dup2'd descriptors reach the child. */
+#endif
+    posix_spawnattr_setflags(&attr, flags);
     sigset_t defs;
     sigemptyset(&defs);
     sigaddset(&defs, SIGPIPE);
@@ -67,7 +112,7 @@ static int spawn(SpicaProcess *p, const char *node, char *const argv[], const ch
     close(in[0]);
     close(out[1]);
     close(err[1]);
-    *p = (SpicaProcess){in[1], out[0], err[0], (int)syscall(SYS_pidfd_open, pid, 0), pid};
+    *p = (SpicaProcess){in[1], out[0], err[0], exit_watch(pid), pid};
     int spawn_error = errno;
     nonblock(p->input);
     nonblock(p->output);
@@ -162,6 +207,7 @@ int spica_process_reap(SpicaProcess *p, int *status) {
     }
     return r < 0 ? -1 : 0;
 }
+#ifdef __linux__
 static int disappeared(void) { return errno == ENOENT || errno == ESRCH; }
 static int pidfd_exited(int fd) {
     struct pollfd item = {fd, POLLIN, 0};
@@ -317,6 +363,63 @@ fail: {
     return -1;
 }
 }
+#else
+static int bsd_info(pid_t pid, struct proc_bsdinfo *info) {
+    errno = 0;
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, info, sizeof *info) == (int)sizeof *info)
+        return 0;
+    if (!errno)
+        errno = EIO;
+    return -1;
+}
+/* No pidfds, so ownership rests on reaping: a PID cannot be reused until its parent reaps it. The
+ * caller guarantees pid is unreaped (Spica never reaps before force, and a stopped parent cannot
+ * reap), so ESRCH for it means it already exited. Stopping pid pins its children the same way. */
+static int force_owned(pid_t pid, int depth) {
+    if (depth > 128) {
+        errno = ELOOP;
+        return -1;
+    }
+    if (kill(pid, SIGSTOP) < 0)
+        return errno == ESRCH ? 0 : -1;
+    struct proc_bsdinfo info;
+    info.pbi_status = 0;
+    for (int i = 0; i < 100; i++) {
+        if (bsd_info(pid, &info) < 0)
+            return errno == ESRCH ? 0 : -1;
+        if (info.pbi_status == SSTOP || info.pbi_status == SZOMB)
+            break;
+        usleep(1000);
+    }
+    if (info.pbi_status != SSTOP && info.pbi_status != SZOMB) {
+        errno = EBUSY;
+        return -1;
+    }
+    /* ponytail: fixed 256-child bound per process; a full buffer fails rather than leaving children
+     * behind. Grow it if Pi ever runs that many direct children. */
+    pid_t children[256];
+    int count = proc_listchildpids(pid, children, sizeof children);
+    if (count < 0)
+        return -1;
+    if (count >= (int)(sizeof children / sizeof children[0])) {
+        errno = E2BIG;
+        return -1;
+    }
+    for (int i = 0; i < count; i++) {
+        struct proc_bsdinfo child;
+        /* Prove parentage before signaling. ESRCH: it exited and stays unreaped by the stopped pid. */
+        if (bsd_info(children[i], &child) < 0) {
+            if (errno == ESRCH)
+                continue;
+            return -1;
+        }
+        if ((pid_t)child.pbi_ppid == pid && force_owned(children[i], depth + 1) < 0)
+            return -1;
+    }
+    /* Never release the parent while enumeration or an owned descendant failed. */
+    return kill(pid, SIGKILL) < 0 && errno != ESRCH ? -1 : 0;
+}
+#endif
 int spica_process_force(SpicaProcess *p) {
     if (p->pid <= 0)
         return 0;
@@ -328,11 +431,15 @@ int spica_process_force(SpicaProcess *p) {
             return 0;
         if (reaped < 0)
             return -1; /* Never pin a possibly reused PID after ownership was lost. */
-        p->exit_fd = (int)syscall(SYS_pidfd_open, p->pid, 0);
+        p->exit_fd = exit_watch(p->pid);
         if (p->exit_fd < 0)
             return -1;
     }
+#ifdef __linux__
     return force_owned(p->pid, p->exit_fd, 0);
+#else
+    return force_owned(p->pid, 0);
+#endif
 }
 void spica_process_dispose(SpicaProcess *p) {
     spica_close(p->input);
@@ -412,12 +519,16 @@ int spica_process_version(SpicaProcess *p, const char *node, const char *entry) 
 }
 uint64_t spica_runtime_id(void) {
     uint64_t id = 0;
+#ifdef __APPLE__
+    arc4random_buf(&id, sizeof id);
+#else
     ssize_t n;
     do {
         n = syscall(SYS_getrandom, &id, sizeof id, 0);
     } while (n < 0 && errno == EINTR);
     if (n != (ssize_t)sizeof id)
         return 0;
+#endif
     id &= INT64_MAX;
     return id ? id : 1;
 }

@@ -174,7 +174,7 @@ pub const Runtime = struct {
     entries_again: bool = false,
 
     pub fn create(a: std.mem.Allocator, io: std.Io, options: Options) !*Runtime {
-        if (builtin.os.tag != .linux) return error.UnsupportedRuntimeTarget;
+        if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedRuntimeTarget;
         const self = try a.create(Runtime);
         errdefer a.destroy(self);
         const mutex = native.SDL_CreateMutex() orelse return error.MutexCreation;

@@ -65,9 +65,8 @@ int spica_database_bind_blob(sqlite3_stmt *statement, int index, const void *dat
     return sqlite3_bind_blob(statement, index, data, length, SQLITE_TRANSIENT);
 }
 
-/* Called under the application instance lock. Legacy files are never modified. */
-int spica_database_cutover(const char *destination, const char *legacy, const char *temporary,
-                           const char *directory) {
+static int cutover(const char *destination, const char *legacy, const char *temporary,
+                   const char *directory) {
     sqlite3 *source = NULL, *target = NULL;
     sqlite3_backup *backup = NULL;
     int rc = SQLITE_OK;
@@ -181,4 +180,29 @@ done:
         return SQLITE_IOERR_FSYNC;
 #endif
     return SQLITE_OK;
+}
+
+/* The store's worker connections (runtime, catalog) open this database concurrently, and each runs
+ * PRAGMA journal_mode=WAL. Switching a database into WAL needs the only connection, and SQLite
+ * returns SQLITE_BUSY for that at once, without waiting on busy_timeout. A new or migrated
+ * (DELETE-mode) database therefore lost that race on first launch ("Pi: SqliteFailure"). WAL is
+ * persistent in the file, so switch it here while nothing else has it open; the workers' pragma is
+ * then a no-op. A missing destination is created empty, and the store adds the schema. */
+static int switch_to_wal(const char *destination) {
+    sqlite3 *database = NULL;
+    int rc = sqlite3_open_v2(destination, &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                             NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_exec(database, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+    if (database && sqlite3_close(database) != SQLITE_OK && rc == SQLITE_OK)
+        rc = SQLITE_BUSY;
+    return rc;
+}
+
+/* Called under the application instance lock, before any worker opens the database. Legacy files
+ * are never modified. */
+int spica_database_cutover(const char *destination, const char *legacy, const char *temporary,
+                           const char *directory) {
+    int rc = cutover(destination, legacy, temporary, directory);
+    return rc == SQLITE_OK ? switch_to_wal(destination) : rc;
 }
