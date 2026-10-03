@@ -76,9 +76,10 @@ int spica_database_cutover(const char *destination, const char *legacy, const ch
         fclose(probe);
 #ifdef __APPLE__
         /* Read-write on macOS, though validation only reads: the app keeps this database in WAL
-         * mode, and a read-only connection must create the -wal/-shm files when a clean close has
-         * removed them. macOS's SQLite refuses that (SQLITE_CANTOPEN), so every launch after the
-         * first failed. This is Spica's own file and the store opens it read-write right after. */
+         * mode, and a read-only connection must create the -wal/-shm files when they are missing
+         * (deleted, or the database was copied without them). macOS's SQLite refuses that
+         * (SQLITE_CANTOPEN), which failed startup with DatabaseMigrationFailed. This is Spica's own
+         * file and the store opens it read-write right after. */
         rc = sqlite3_open_v2(destination, &target, SQLITE_OPEN_READWRITE, NULL);
 #else
         rc = sqlite3_open_v2(destination, &target, SQLITE_OPEN_READONLY, NULL);
@@ -103,7 +104,8 @@ int spica_database_cutover(const char *destination, const char *legacy, const ch
     /* Read-write on macOS for the same reason as the destination above: a legacy database left in
      * WAL mode without its -wal/-shm files cannot be opened read-only by macOS's SQLite
      * (SQLITE_CANTOPEN), which would fail the migration. Only validate() and the backup read it, so
-     * its data is not changed; SQLite may create -wal/-shm beside it and removes them on close. */
+     * its data is not changed. SQLite creates -wal/-shm beside it and leaves them after close; the
+     * -wal stays empty and -shm is only an index. */
     rc = sqlite3_open_v2(legacy, &source, SQLITE_OPEN_READWRITE, NULL);
 #else
     rc = sqlite3_open_v2(legacy, &source, SQLITE_OPEN_READONLY, NULL);

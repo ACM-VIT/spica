@@ -236,7 +236,13 @@ pub const App = struct {
             return error.SDLInitialization;
         }
         errdefer c.SDL_Quit();
-        if (options.renderer == .software) _ = c.SDL_SetHint(c.SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
+        // The software renderer draws into the window's framebuffer surface. Linux and Windows
+        // provide one natively, and the hint keeps SDL from routing it through a GPU renderer.
+        // Cocoa has no native window framebuffer, so SDL emulates one with a GPU renderer; with
+        // the hint set to "0" that emulation is off and SDL_CreateRenderer fails ("Window
+        // framebuffer support not available"). macOS therefore skips the hint: the CPU still
+        // draws every frame, and Metal (built into macOS, nothing to install) only presents it.
+        if (options.renderer == .software and builtin.os.tag != .macos) _ = c.SDL_SetHint(c.SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
         const window = c.SDL_CreateWindow("Spica", 1280, 800, c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY) orelse return error.WindowCreation;
         errdefer c.SDL_DestroyWindow(window);
         _ = c.SDL_SetWindowMinimumSize(window, 800, 560);
