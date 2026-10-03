@@ -1614,7 +1614,7 @@ pub const App = struct {
         self.buttons[self.button_count] = .{ .action = action, .bounds = bounds };
         self.button_count += 1;
         try self.rectangle(bounds.x, bounds.y, bounds.w, bounds.h, 6, self.palette().raised);
-        try self.label(clippedLabel(text), bounds.x + 10, bounds.y + 8, 13, self.palette().text);
+        try self.fitLabel(clippedLabel(text), bounds.x + 10, bounds.y + 8, @max(0, bounds.w - 20), 13, self.palette().text);
     }
 
     fn hit(self: *App, action: Action, bounds: c.SDL_FRect) !void {
