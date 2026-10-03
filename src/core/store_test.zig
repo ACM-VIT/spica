@@ -124,3 +124,34 @@ test "entry and live metadata pages preserve stable IDs and compound cursors" {
     defer cleared.deinit();
     try std.testing.expectEqual(@as(usize, 0), cleared.rows.len);
 }
+
+const ConcurrentOpen = struct {
+    path: []const u8,
+    failure: ?anyerror = null,
+    fn run(self: *ConcurrentOpen) void {
+        var store = cache.Store.init(std.heap.page_allocator, self.path) catch |err| {
+            self.failure = err;
+            return;
+        };
+        store.deinit();
+    }
+};
+
+test "fresh history database initializes safely across all app workers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/history.sqlite", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    var opens: [8]ConcurrentOpen = undefined;
+    var threads: [8]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |thread| thread.join();
+    for (&opens, &threads) |*context, *thread| {
+        context.* = .{ .path = path };
+        thread.* = try std.Thread.spawn(.{}, ConcurrentOpen.run, .{context});
+        started += 1;
+    }
+    for (threads) |thread| thread.join();
+    started = 0;
+    for (opens) |context| try std.testing.expect(context.failure == null);
+}

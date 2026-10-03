@@ -62,17 +62,17 @@ pub const help =
     \\The first accepted prompt enrolls a new chat; empty drafts never accumulate workspace members.
     \\New and newly enrolled chats reveal their folder and selected row without expanding other folders.
     \\Ctrl/Cmd+K searches titles, folders and full user/final-assistant text with RapidFuzz fuzzy matching.
-    \\Search includes archived chats; Archives uses the same search restricted to archived members.
-    \\Archive changes membership only, never source files. Opening an archived chat does not restore it.
-    \\Archived conversations retain their draft and require Restore before sending.
+    \\Search includes closed chats; History shows conversations whose tabs have been closed.
+    \\Closing a saved tab keeps its source files and moves it to History. Reopen continues that session.
+    \\Stop running prompts before closing their tabs. Ctrl/Cmd+W closes the selected tab.
     \\Click a chat to reopen it; folder headers only expand/collapse their chat list.
-    \\Add folder saves a folder chosen in the native browser; it does not create a chat.
-    \\A folder's + creates a thread there; New thread / Ctrl+N uses the current folder.
+    \\Click the folder control inside the composer to pick a recent folder or browse. Recent folders are saved newest first.
+    \\Ctrl/Cmd+T or Ctrl/Cmd+N opens a plain chat. Sending without a folder uses the app-owned tmp workspace.
     \\Reopening keeps the selected chat title visible while its history loads.
     \\Long messages and table cells render in bounded visible segments without truncating retained text.
     \\SQLite membership and content live in app/history.sqlite; legacy cache databases migrate via backup.
     \\Source files remain original resume sources; unavailable chats retain metadata and cached search.
-    \\Search waits for a complete ranking before allowing Open, Archive/Restore, or paging.
+    \\Search waits for a complete ranking before allowing Open, Close tab/Reopen, or paging.
     \\New sessions use pi's normal configured storage, shared with the pi CLI.
     \\Switch chats or create a new thread while prompts run; background chats keep their own Pi process.
     \\Returning to a running chat reconnects its existing process and restores its draft.
@@ -95,9 +95,10 @@ pub const help =
     \\If pi will not exit, Force requires an explicit choice (also Ctrl+Shift+Esc).
     \\Wheel and PageUp/PageDown scroll the full conversation, including previous prompts.
     \\Scrolling upward stops auto-follow; Jump to latest or clicking the current thread resumes it.
-    \\The sidebar has its own wheel scroll. Ctrl+B hides/shows it; Ctrl/Cmd+R refreshes theme/library.
-    \\Settings / Ctrl+, opens appearance: text 12–24px, UI scale 75–175%, reading width 560–1120px.
-    \\Dark/light themes, appearance values, and added folders persist across restarts.
+    \\Vertical and horizontal tabs share folder groups and their own wheel scroll. Ctrl+B hides/shows it; Ctrl/Cmd+R refreshes theme/library.
+    \\Settings / Ctrl+, switches tab layouts and opens appearance: text 12–24px, UI scale 75–175%, reading width 560–1120px.
+    \\Settings > Animations toggles short tab entrances and sidebar sliding; Off applies immediately.
+    \\Dark/light themes, tab layout, animations, appearance values, and recent folders persist across restarts.
     \\UI scale changes layout and hit targets; text rasterizes at native output DPI.
     \\Ctrl+Plus/Minus or Ctrl+wheel zooms; Ctrl+0 resets UI scale to 100%.
     \\Ctrl+L also switches dark/light. Settings has Reset and Done; Escape closes it.

@@ -45,7 +45,7 @@ pub fn panel(renderer: *c.SDL_Renderer, rect: c.SDL_FRect, radius_value: f32, co
     if (!c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_BLEND) or !c.SDL_RenderGeometry(renderer, null, &vertices, vertices.len, &indices, indices.len)) return error.RoundedRectangleDraw;
 }
 
-pub const Icon = enum { sidebar, plus, folder, layers, archive, arrow_up, stop, chevron_down, theme };
+pub const Icon = enum { search, settings, sidebar, plus, folder, layers, archive, arrow_up, stop, chevron_down, theme };
 
 fn line(renderer: *c.SDL_Renderer, x1: f32, y1: f32, x2: f32, y2: f32) !void {
     if (!c.SDL_RenderLine(renderer, x1, y1, x2, y2)) return error.IconDraw;
@@ -57,6 +57,21 @@ pub fn icon(renderer: *c.SDL_Renderer, kind: Icon, bounds: c.SDL_FRect, color: C
     const y = bounds.y;
     const s = bounds.w / 16;
     switch (kind) {
+        .search => {
+            var points: [17]c.SDL_FPoint = undefined;
+            for (&points, 0..) |*point, index| {
+                const angle = @as(f32, @floatFromInt(index)) * std.math.tau / 16;
+                point.* = .{ .x = x + (7 + @cos(angle) * 4.5) * s, .y = y + (7 + @sin(angle) * 4.5) * s };
+            }
+            if (!c.SDL_RenderLines(renderer, &points, points.len)) return error.IconDraw;
+            try line(renderer, x + 10 * s, y + 10 * s, x + 14 * s, y + 14 * s);
+        },
+        .settings => {
+            for ([_]f32{ 4, 8, 12 }, [_]f32{ 6, 10, 5 }) |row, knob| {
+                try line(renderer, x + 2 * s, y + row * s, x + 14 * s, y + row * s);
+                try panel(renderer, .{ .x = x + knob * s, .y = y + (row - 2) * s, .w = 2 * s, .h = 4 * s }, 0, color);
+            }
+        },
         .sidebar => {
             const border = c.SDL_FRect{ .x = x + 2 * s, .y = y + 2 * s, .w = 12 * s, .h = 12 * s };
             if (!c.SDL_RenderRect(renderer, &border)) return error.IconDraw;
