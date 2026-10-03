@@ -629,21 +629,22 @@ pub const App = struct {
 
     fn leaveClosedCurrent(self: *App) !void {
         const closed_id = self.chat_id;
-        var neighbor: ?usize = null;
-        var index = self.parked_chats.items.len;
-        while (index != 0) {
-            index -= 1;
-            if (!self.parked_chats.items[index].closed and !self.parked_chats.items[index].archived) {
-                neighbor = index;
-                break;
-            }
-        }
-        if (neighbor) |choice| try self.activateParked(choice) else try self.newTab();
+        // An archive acknowledgement already marked this chat archived. Include
+        // it long enough to find its visible neighbor before transferring it.
+        const archived = self.current_archived;
+        self.current_archived = false;
+        const neighbor = self.adjacentTab();
+        self.current_archived = archived;
+        if (neighbor) |choice| switch (choice) {
+            .parked => |index| try self.activateParked(index),
+            .thread => |index| try self.openThread(index),
+            else => unreachable,
+        } else try self.newTab();
         for (self.parked_chats.items) |*chat| if (chat.id == closed_id) {
             chat.closed = true;
             break;
         };
-        self.sidebar_reveal_current = true;
+        self.revealCurrentFolder();
     }
 
     fn closeCurrentTab(self: *App) !void {
@@ -2073,6 +2074,23 @@ pub const App = struct {
         return self.navigation(0, 0).total;
     }
 
+    fn adjacentTab(self: *const App) ?NavRow {
+        const selected = self.currentSidebarRow() orelse return null;
+        var previous: ?NavRow = null;
+        var first: usize = 0;
+        while (true) {
+            const plan = self.navigation(first, 96);
+            for (plan.rows[0..plan.len], first..) |item, row| {
+                if (item == .folder or row == selected) continue;
+                if (row > selected) return item;
+                previous = item;
+            }
+            first += plan.len;
+            if (first >= plan.total) break;
+        }
+        return previous;
+    }
+
     fn transientParked(self: *const App, chat: *const ParkedChat) bool {
         if (chat.archived or chat.closed) return false;
         if (self.catalog) |catalog| for (catalog.threads) |thread| {
@@ -3238,6 +3256,7 @@ test "changing draft folders keeps each tab once and ignores picker recency" {
     try std.testing.expectEqualStrings("/b", before.rows[3].folder.path);
     try std.testing.expectEqual(@as(usize, 1), before.rows[4].parked);
     try std.testing.expect(before.rows[5] == .current);
+    try std.testing.expectEqual(@as(usize, 1), app.adjacentTab().?.parked);
     // Recently choosing /b does not reorder /a or drop it when absent from MRU.
     var projects = [_][:0]u8{@constCast("/b")};
     app.projects = .{ .items = &projects, .capacity = projects.len };
@@ -3260,6 +3279,7 @@ test "changing draft folders keeps each tab once and ignores picker recency" {
     try std.testing.expectEqual(@as(?usize, 4), switched.selected);
     try std.testing.expect(switched.rows[4] == .current);
     try std.testing.expectEqual(@as(usize, 2), switched.rows[5].parked);
+    try std.testing.expectEqual(@as(usize, 2), app.adjacentTab().?.parked);
     // Last draft leaving a folder removes its header; closed runtimes stay hidden.
     parked[0].closed = true;
     const closed = app.navigation(0, 96);
