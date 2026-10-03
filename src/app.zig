@@ -16,9 +16,10 @@ const build_options = @import("build_options");
 const SessionCatalog = @import("core/catalog.zig");
 const Settings = @import("ui/settings.zig");
 const Library = @import("ui/library.zig");
+const TabScroll = @import("ui/tabs.zig").Scroll;
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
-const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
+const Action = union(enum) { start, new_thread, folder_picker, pick_folder, choose_project: usize, choose_current, folder_previous, folder_next, close_current, close_parked: usize, tab_previous, tab_next, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
 const ThreadTarget = struct { path: ?[:0]u8, cwd: [:0]u8, archived: bool = false };
 const SubmittedPrompt = struct { token: u64, draft_revision: u64 };
 const ChatView = enum { new_thread, opening, existing };
@@ -67,6 +68,8 @@ const ParkedChat = struct {
     error_len: usize,
     scroll: f32,
     retiring: bool = false,
+    folder_selected: bool = true,
+    closed: bool = false,
 
     fn session(self: *const ParkedChat) []const u8 {
         if (self.snapshot) |snapshot| if (snapshot.session_file.len != 0) return snapshot.session_file;
@@ -92,6 +95,7 @@ const PendingMutation = struct {
     open_after: bool,
     automatic: bool,
     owner_id: ?u64 = null,
+    close_tab: bool = false,
 
     fn deinit(self: *PendingMutation, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -161,6 +165,11 @@ pub const App = struct {
     catalog_error: ?anyerror = null,
     collapsed_folders: std.ArrayList([]u8) = .empty,
     folder_pending: bool = false,
+    folder_chat_id: ?u64 = null,
+    folder_selected: bool = true,
+    folder_first: usize = 0,
+    folder_picker_open: bool = false,
+    folder_picker_bounds: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     behavior: pi.Behavior = .prompt,
     draft_revision: u64 = 0,
     submitted_prompt: ?SubmittedPrompt = null,
@@ -182,6 +191,8 @@ pub const App = struct {
     accepted_enrollment: bool = false,
     enrollment_failed: bool = false,
     sidebar_first: usize = 0,
+    tab_scroll: TabScroll = .{},
+    hit_clip: ?c.SDL_FRect = null,
     sidebar_reveal_current: bool = false,
     pending_thread: ?ThreadTarget = null,
     resume_path: ?[:0]u8 = null,
@@ -191,6 +202,7 @@ pub const App = struct {
     last_content_metadata: bool = false,
     paths: Paths,
     project_path: [:0]u8,
+    temporary_project: [:0]u8,
     options: Options,
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -218,6 +230,11 @@ pub const App = struct {
         errdefer paths.deinit();
         const project_path = if (options.fixture) try allocator.dupeZ(u8, options.project) else try std.Io.Dir.cwd().realPathFileAlloc(io, options.project, allocator);
         errdefer allocator.free(project_path);
+        const temporary_path = try std.fs.path.join(allocator, &.{ paths.data, "tmp" });
+        defer allocator.free(temporary_path);
+        try std.Io.Dir.cwd().createDirPath(io, temporary_path);
+        const temporary_project = try std.Io.Dir.cwd().realPathFileAlloc(io, temporary_path, allocator);
+        errdefer allocator.free(temporary_project);
         const theme_bytes = try std.Io.Dir.cwd().readFileAlloc(io, build_options.asset_directory ++ "/theme.json", allocator, .limited(16384));
         defer allocator.free(theme_bytes);
         const theme = try theme_module.parse(allocator, theme_bytes);
@@ -271,16 +288,11 @@ pub const App = struct {
         const catalog_worker = try SessionCatalog.Worker.create(io, environ, legacy_sessions, paths.database, wake_event);
         errdefer catalog_worker.destroy();
         const saved = restored.value();
-        const appearance = Settings.Values{ .font_size = saved.font_size, .ui_scale = saved.ui_scale, .chat_width = saved.chat_width, .light = options.light or saved.light };
+        const appearance = Settings.Values{ .font_size = saved.font_size, .ui_scale = saved.ui_scale, .chat_width = saved.chat_width, .light = options.light or saved.light, .horizontal_tabs = saved.horizontal_tabs };
         var projects: std.ArrayList([:0]u8) = .empty;
         errdefer {
             for (projects.items) |path| allocator.free(path);
             projects.deinit(allocator);
-        }
-        {
-            const initial_project = try allocator.dupeZ(u8, project_path);
-            errdefer allocator.free(initial_project);
-            try projects.append(allocator, initial_project);
         }
         for (saved.projects) |path| {
             var duplicate = false;
@@ -293,6 +305,16 @@ pub const App = struct {
                 errdefer allocator.free(owned);
                 try projects.append(allocator, owned);
             }
+        }
+        var initial_saved = false;
+        for (projects.items) |path| if (std.mem.eql(u8, path, project_path)) {
+            initial_saved = true;
+            break;
+        };
+        if (!initial_saved and projects.items.len < 64) {
+            const initial_project = try allocator.dupeZ(u8, project_path);
+            errdefer allocator.free(initial_project);
+            try projects.append(allocator, initial_project);
         }
         return .{
             .window = window,
@@ -318,6 +340,7 @@ pub const App = struct {
             .allocator = allocator,
             .wake_event = wake_event,
             .project_path = project_path,
+            .temporary_project = temporary_project,
             .light = options.light or restored.value().light,
             .follow_bottom = true,
             .quit_due = if (options.quit_after_ms) |ms| c.SDL_GetTicks() + ms else null,
@@ -357,6 +380,7 @@ pub const App = struct {
         c.SDL_Quit();
         self.paths.deinit();
         self.allocator.free(self.project_path);
+        self.allocator.free(self.temporary_project);
         for (self.projects.items) |path| self.allocator.free(path);
         self.projects.deinit(self.allocator);
         for (self.collapsed_folders.items) |path| self.allocator.free(path);
@@ -406,10 +430,22 @@ pub const App = struct {
         if (width <= 0) return;
         const truncated = try self.labelWidth(bytes, size) > width;
         const suffix_width = if (truncated) try self.labelWidth("…", size) else 0;
-        const clip = c.SDL_Rect{ .x = @intFromFloat(x), .y = @intFromFloat(top), .w = @intFromFloat(@max(0, width - suffix_width)), .h = @intCast(size + 8) };
+        var clip = c.SDL_Rect{ .x = @intFromFloat(x), .y = @intFromFloat(top), .w = @intFromFloat(@max(0, width - suffix_width)), .h = @intCast(size + 8) };
+        const clipped_before = c.SDL_RenderClipEnabled(self.renderer);
+        var previous: c.SDL_Rect = undefined;
+        if (clipped_before) {
+            _ = c.SDL_GetRenderClipRect(self.renderer, &previous);
+            const right = @min(clip.x + clip.w, previous.x + previous.w);
+            const bottom = @min(clip.y + clip.h, previous.y + previous.h);
+            clip.x = @max(clip.x, previous.x);
+            clip.y = @max(clip.y, previous.y);
+            clip.w = @max(0, right - clip.x);
+            clip.h = @max(0, bottom - clip.y);
+        }
         _ = c.SDL_SetRenderClipRect(self.renderer, &clip);
+        defer _ = c.SDL_SetRenderClipRect(self.renderer, if (clipped_before) &previous else null);
         try self.label(bytes, x, top, size, color);
-        _ = c.SDL_SetRenderClipRect(self.renderer, null);
+        _ = c.SDL_SetRenderClipRect(self.renderer, if (clipped_before) &previous else null);
         if (truncated) try self.label("…", x + width - suffix_width, top, size, color);
     }
 
@@ -417,7 +453,7 @@ pub const App = struct {
         if (self.options.fixture) return "Resource scene";
         if (self.chat_view == .opening) return if (self.thread_title_len != 0) self.thread_title[0..self.thread_title_len] else "Opening chat...";
         if (self.runtime_snapshot) |snapshot| if (snapshot.session_name.len != 0) return clippedLabel(snapshot.session_name);
-        return if (self.thread_title_len != 0) self.thread_title[0..self.thread_title_len] else "New thread";
+        return if (self.thread_title_len != 0) self.thread_title[0..self.thread_title_len] else "New tab";
     }
 
     fn report(self: *App, operation: []const u8, err: anyerror) void {
@@ -475,12 +511,144 @@ pub const App = struct {
     }
 
     fn addProject(self: *App, path: []const u8) !void {
-        for (self.projects.items) |existing| if (std.mem.eql(u8, existing, path)) return;
-        if (self.projects.items.len == 64) return error.ProjectLimitReached;
+        try self.rememberFolder(path);
+        self.draft_due = c.SDL_GetTicks() + 250;
+    }
+
+    fn rememberFolder(self: *App, path: []const u8) !void {
+        if (std.mem.eql(u8, path, self.temporary_project)) return;
+        for (self.projects.items, 0..) |existing, index| if (std.mem.eql(u8, existing, path)) {
+            std.mem.copyBackwards([:0]u8, self.projects.items[1 .. index + 1], self.projects.items[0..index]);
+            self.projects.items[0] = existing;
+            return;
+        };
         const owned = try self.allocator.dupeZ(u8, path);
         errdefer self.allocator.free(owned);
-        try self.projects.append(self.allocator, owned);
-        self.draft_due = c.SDL_GetTicks() + 250;
+        if (self.projects.items.len == 64) {
+            self.allocator.free(self.projects.pop().?);
+            self.projects.insertAssumeCapacity(0, owned);
+        } else try self.projects.insert(self.allocator, 0, owned);
+    }
+
+    fn newTab(self: *App) !void {
+        if (self.pending_thread != null or self.closing) return error.ThreadSwitchPending;
+        if (self.pending_mutation) |mutation| if (!mutation.automatic) return error.WorkspaceMutationPending;
+        const cwd = try self.allocator.dupeZ(u8, self.temporary_project);
+        var transferred = false;
+        errdefer if (!transferred) self.allocator.free(cwd);
+        try self.saveDraft();
+        try self.parkCurrent();
+        self.project_path = cwd;
+        transferred = true;
+        self.chat_id = self.next_chat_id;
+        self.next_chat_id += 1;
+        self.folder_selected = false;
+        self.focused_editor = true;
+        _ = c.SDL_StartTextInput(self.window);
+        self.folder_picker_open = false;
+        self.folder_first = 0;
+        self.options.resume_file = null;
+        self.options.trust_project = false;
+        self.current_archived = false;
+        self.current_member = false;
+        self.enrollment_intent = false;
+        self.enrollment_failed = false;
+        self.accepted_enrollment = false;
+        self.submitted_prompt = null;
+        self.accepted_clear_revision = null;
+        self.draft_revision = 0;
+        self.thread_title_len = 0;
+        self.chat_view = .new_thread;
+        self.run_started = null;
+        self.run_elapsed = null;
+        self.run_base_revision = 0;
+        self.behavior = .prompt;
+        self.error_len = 0;
+        self.scroll = 0;
+        self.follow_bottom = true;
+        try self.editor.setText("");
+        self.resetChatViewport();
+        self.sidebar_reveal_current = true;
+        try self.beginRuntime();
+    }
+
+    fn chooseFolder(self: *App, path: []const u8) !void {
+        if (self.current_member or self.submitted_prompt != null or self.enrollment_intent or self.run_started != null) return;
+        const id = self.chat_id;
+        const draft = try self.allocator.dupe(u8, self.editor.textBytes());
+        defer self.allocator.free(draft);
+        const caret = self.editor.caret;
+        const anchor = self.editor.anchor;
+        var restore: ?ModelRestore = null;
+        defer if (restore) |*settings| settings.deinit(self.allocator);
+        if (self.runtime_snapshot) |snapshot| {
+            const provider = try self.allocator.dupe(u8, snapshot.provider);
+            errdefer self.allocator.free(provider);
+            const model = try self.allocator.dupe(u8, snapshot.model);
+            errdefer self.allocator.free(model);
+            const thinking = try self.allocator.dupe(u8, snapshot.thinking_level);
+            restore = .{ .provider = provider, .model = model, .thinking = thinking };
+        }
+        try self.newThreadIn(path);
+        self.model_restore = restore;
+        restore = null;
+        // A folder choice replaces this empty tab's runtime, not the tab itself.
+        const replacement_id = self.chat_id;
+        self.chat_id = id;
+        for (self.parked_chats.items) |*chat| if (chat.id == id) {
+            chat.id = replacement_id;
+            chat.closed = true;
+            break;
+        };
+        try self.editor.setText(draft);
+        self.editor.setCaret(anchor, false);
+        self.editor.setCaret(caret, true);
+        self.edited();
+        self.folder_picker_open = false;
+        self.focused_editor = true;
+        _ = c.SDL_StartTextInput(self.window);
+    }
+
+    fn leaveClosedCurrent(self: *App) !void {
+        const closed_id = self.chat_id;
+        var neighbor: ?usize = null;
+        var index = self.parked_chats.items.len;
+        while (index != 0) {
+            index -= 1;
+            if (!self.parked_chats.items[index].closed and !self.parked_chats.items[index].archived) {
+                neighbor = index;
+                break;
+            }
+        }
+        if (neighbor) |choice| try self.activateParked(choice) else try self.newTab();
+        for (self.parked_chats.items) |*chat| if (chat.id == closed_id) {
+            chat.closed = true;
+            break;
+        };
+        self.sidebar_reveal_current = true;
+    }
+
+    fn closeCurrentTab(self: *App) !void {
+        if (self.closing or self.pending_mutation != null or self.pending_thread != null) return error.WorkspaceMutationPending;
+        if (self.current_member and !self.current_archived) {
+            try self.queueMutation(.archive, self.currentSession(), self.project_path, self.title(), false, false);
+            self.pending_mutation.?.close_tab = true;
+        } else {
+            if (self.submitted_prompt != null or self.enrollment_intent or self.runtimeStatus() == .streaming or self.bashRunning()) return error.StopRunBeforeClosingTab;
+            try self.leaveClosedCurrent();
+        }
+    }
+
+    fn closeParkedTab(self: *App, index: usize) !void {
+        if (index >= self.parked_chats.items.len) return;
+        const chat = &self.parked_chats.items[index];
+        if (chat.member and !chat.archived) {
+            try self.queueMutation(.archive, chat.session(), chat.cwd, chat.title[0..chat.title_len], false, false);
+            self.pending_mutation.?.close_tab = true;
+        } else {
+            if (chat.submitted != null or chat.enrollment_intent or chat.run_started != null) return error.StopRunBeforeClosingTab;
+            chat.closed = true;
+        }
     }
 
     fn newThreadIn(self: *App, path: []const u8) !void {
@@ -491,7 +659,7 @@ pub const App = struct {
         errdefer if (!transferred) self.allocator.free(cwd);
         var dir = try std.Io.Dir.cwd().openDir(self.io, cwd, .{});
         dir.close(self.io);
-        if (self.projects.items.len < 64) try self.addProject(cwd);
+        try self.addProject(cwd);
         try self.saveDraft();
         self.pending_thread = .{ .path = null, .cwd = cwd };
         transferred = true;
@@ -508,6 +676,7 @@ pub const App = struct {
     fn openSource(self: *App, source: []const u8, project: []const u8, title_text: []const u8, archived: bool, available: bool) !void {
         if (self.pending_thread != null or self.closing) return error.ThreadSwitchPending;
         if (self.pending_mutation) |mutation| if (!mutation.automatic) return error.WorkspaceMutationPending;
+        try self.addProject(project);
         if (std.mem.eql(u8, self.currentSession(), source)) {
             self.current_archived = archived;
             self.current_member = true;
@@ -576,6 +745,7 @@ pub const App = struct {
             .error_len = self.error_len,
             .scroll = self.scroll,
             .retiring = self.runtime_retiring,
+            .folder_selected = self.folder_selected,
         });
         self.runtime = null;
         self.runtime_snapshot = null;
@@ -603,6 +773,7 @@ pub const App = struct {
         self.preferred_caret_x = null;
         self.editor_changed = true;
         self.button_count = 0;
+        self.folder_picker_open = false;
         self.draft_due = c.SDL_GetTicks() + 250;
         self.dirty = true;
     }
@@ -614,6 +785,9 @@ pub const App = struct {
         const chat = self.parked_chats.orderedRemove(index);
         defer self.allocator.free(chat.draft);
         self.chat_id = chat.id;
+        self.folder_selected = chat.folder_selected;
+        self.focused_editor = true;
+        _ = c.SDL_StartTextInput(self.window);
         self.runtime = chat.runtime;
         self.runtime_snapshot = chat.snapshot;
         self.project_path = chat.cwd;
@@ -662,6 +836,9 @@ pub const App = struct {
         const trust = self.options.trust_project != null and self.options.trust_project.? and std.mem.eql(u8, self.project_path, target.cwd);
         try self.parkCurrent();
         self.pending_thread = null;
+        self.folder_selected = true;
+        self.focused_editor = true;
+        _ = c.SDL_StartTextInput(self.window);
         self.chat_id = self.next_chat_id;
         self.next_chat_id += 1;
         self.project_path = target.cwd;
@@ -1084,6 +1261,12 @@ pub const App = struct {
                         self.allocator.free(snapshot.thinking_levels);
                         snapshot.thinking_levels = &.{};
                     }
+                } else if (chat.closed and !chat.retiring) {
+                    runtime.shutdown() catch |err| {
+                        parkedFailure(chat, "Closing tab runtime", err);
+                        continue;
+                    };
+                    chat.retiring = true;
                 } else if (!self.closing and !chat.retiring and chat.submitted == null and chat.run_started == null and !chat.enrollment_intent and chat.model_restore == null) {
                     if (chat.snapshot) |snapshot| if (snapshot.status == .ready and !snapshot.bash_running and snapshot.queued_count == 0) {
                         idle_count += 1;
@@ -1097,11 +1280,17 @@ pub const App = struct {
                     };
                 }
             } else self.enrollParked(chat);
+            if (chat.closed and chat.runtime == null and !chat.enrollment_intent) {
+                var removed = self.parked_chats.orderedRemove(index);
+                removed.deinit(self.allocator);
+                self.button_count = 0;
+                self.dirty = true;
+            }
         }
     }
 
     fn submit(self: *App) !void {
-        if (self.current_archived) return error.RestoreArchivedChatBeforeSending;
+        if (self.current_archived) return error.ReopenHistoryChatBeforeSending;
         if (self.enrollment_intent) return error.WorkspaceEnrollmentPending;
         if (self.pending_mutation) |mutation| if (!mutation.automatic or mutation.owner_id == self.chat_id) return error.WorkspaceEnrollmentPending;
         if (self.preedit.items.len != 0 or self.closing) return;
@@ -1152,6 +1341,7 @@ pub const App = struct {
     }
 
     fn showLibrary(self: *App, scope: SessionCatalog.Scope) !void {
+        self.folder_picker_open = false;
         if (self.closing or self.force_dialog) return;
         if (!self.library.open) self.prior_editor_focus = self.focused_editor;
         self.settings_open = false;
@@ -1182,11 +1372,11 @@ pub const App = struct {
         if (self.pending_mutation != null) return error.WorkspaceMutationPending;
         if (self.closing and !automatic) return error.ApplicationClosing;
         if (kind == .archive and std.mem.eql(u8, path, self.currentSession()) and
-            (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null or self.pending_thread != null)) return error.StopCurrentRunBeforeArchiving;
+            (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null or self.pending_thread != null)) return error.StopRunBeforeClosingTab;
         if (kind == .archive) for (self.parked_chats.items) |chat| {
             if (!std.mem.eql(u8, path, chat.session())) continue;
-            if (chat.submitted != null) return error.StopCurrentRunBeforeArchiving;
-            if (chat.snapshot) |snapshot| if (snapshot.status == .streaming or snapshot.bash_running) return error.StopCurrentRunBeforeArchiving;
+            if (chat.submitted != null) return error.StopRunBeforeClosingTab;
+            if (chat.snapshot) |snapshot| if (snapshot.status == .streaming or snapshot.bash_running) return error.StopRunBeforeClosingTab;
         };
         if (open_after) {
             if (self.pending_thread != null) return error.ThreadSwitchPending;
@@ -1231,13 +1421,18 @@ pub const App = struct {
                 if (self.library.scope == .import_pi) {
                     try self.queueMutation(.enroll, thread.path, thread.cwd, thread.title, true, false);
                 } else {
-                    try self.openSource(thread.path, thread.cwd, thread.title, thread.archived, thread.available);
-                    self.closeLibrary();
+                    if (thread.archived) {
+                        try self.queueMutation(.restore, thread.path, thread.cwd, thread.title, true, false);
+                    } else {
+                        try self.openSource(thread.path, thread.cwd, thread.title, false, thread.available);
+                        self.closeLibrary();
+                    }
                 }
             },
             .archive, .restore => {
                 const thread = self.library.selectedThread() orelse return;
-                try self.queueMutation(if (intent == .archive) .archive else .restore, thread.path, thread.cwd, thread.title, false, false);
+                try self.queueMutation(if (intent == .archive) .archive else .restore, thread.path, thread.cwd, thread.title, intent == .restore, false);
+                if (intent == .archive) self.pending_mutation.?.close_tab = true;
             },
         }
     }
@@ -1245,7 +1440,31 @@ pub const App = struct {
     fn act(self: *App, action: Action) !void {
         switch (action) {
             .start => try self.beginRuntime(),
-            .new_thread => try self.newThreadIn(self.project_path),
+            .new_thread => try self.newTab(),
+            .folder_picker => {
+                if (self.current_member or self.submitted_prompt != null or self.enrollment_intent) return;
+                self.folder_picker_open = !self.folder_picker_open;
+                self.model_menu = false;
+                self.thinking_menu = false;
+                self.focused_editor = !self.folder_picker_open;
+                self.folder_first = 0;
+                if (self.folder_picker_open) _ = c.SDL_StopTextInput(self.window) else _ = c.SDL_StartTextInput(self.window);
+            },
+            .pick_folder => if (!self.folder_pending) {
+                self.folder_pending = true;
+                self.folder_chat_id = self.chat_id;
+                c.SDL_ShowOpenFolderDialog(folderChosen, @ptrFromInt(self.wake_event), self.window, self.project_path.ptr, false);
+            },
+            .choose_project => |index| {
+                if (index < self.projects.items.len) try self.chooseFolder(self.projects.items[index]);
+            },
+            .choose_current => try self.chooseFolder(self.project_path),
+            .folder_previous => self.folder_first -|= 1,
+            .folder_next => self.folder_first = @min(self.projects.items.len -| 1, self.folder_first + 1),
+            .close_current => try self.closeCurrentTab(),
+            .close_parked => |index| try self.closeParkedTab(index),
+            .tab_previous => _ = self.tab_scroll.move(-180),
+            .tab_next => _ = self.tab_scroll.move(180),
             .open_parked => |index| {
                 if (self.closing or self.pending_thread != null) return error.ThreadSwitchPending;
                 if (self.pending_mutation) |mutation| if (!mutation.automatic) return error.WorkspaceMutationPending;
@@ -1273,14 +1492,17 @@ pub const App = struct {
                 if (self.catalog) |catalog| if (index < catalog.threads.len) {
                     const thread = catalog.threads[index];
                     try self.queueMutation(.archive, thread.path, thread.cwd, thread.title, false, false);
+                    self.pending_mutation.?.close_tab = true;
                 };
             },
             .restore_current => try self.queueMutation(.restore, self.currentSession(), self.project_path, self.title(), false, false),
             .add_project => if (!self.folder_pending) {
                 self.folder_pending = true;
+                self.folder_chat_id = null;
                 c.SDL_ShowOpenFolderDialog(folderChosen, @ptrFromInt(self.wake_event), self.window, self.project_path.ptr, false);
             },
             .settings => {
+                self.folder_picker_open = false;
                 self.settings_open = !self.settings_open;
                 self.model_menu = false;
                 self.thinking_menu = false;
@@ -1294,6 +1516,13 @@ pub const App = struct {
                     _ = c.SDL_StartTextInput(self.window);
                 } else {
                     Settings.apply(&self.appearance, choice);
+                    if (choice == .tabs_vertical or choice == .tabs_horizontal or choice == .reset) {
+                        self.sidebar_first = 0;
+                        self.tab_scroll.offset = 0;
+                        self.sidebar_reveal_current = true;
+                        self.sidebar_visible = true;
+                        self.button_count = 0;
+                    }
                     self.light = self.appearance.light;
                     self.theme.metrics = Settings.metrics(self.base_metrics, self.appearance);
                     self.transcript.invalidateLayouts();
@@ -1362,8 +1591,18 @@ pub const App = struct {
     }
 
     fn hit(self: *App, action: Action, bounds: c.SDL_FRect) !void {
+        var visible = bounds;
+        if (self.hit_clip) |clip| {
+            const right = @min(bounds.x + bounds.w, clip.x + clip.w);
+            const bottom = @min(bounds.y + bounds.h, clip.y + clip.h);
+            visible.x = @max(bounds.x, clip.x);
+            visible.y = @max(bounds.y, clip.y);
+            visible.w = @max(0, right - visible.x);
+            visible.h = @max(0, bottom - visible.y);
+            if (visible.w == 0 or visible.h == 0) return;
+        }
         if (self.button_count == self.buttons.len) return error.ButtonBudget;
-        self.buttons[self.button_count] = .{ .action = action, .bounds = bounds };
+        self.buttons[self.button_count] = .{ .action = action, .bounds = visible };
         self.button_count += 1;
     }
 
@@ -1473,6 +1712,7 @@ pub const App = struct {
                         if (std.mem.eql(u8, target.path, chat.session())) {
                             chat.member = true;
                             chat.archived = result.archived orelse (target.kind == .archive);
+                            if (target.close_tab) chat.closed = true;
                             if (target.kind == .enroll and chat.view == .new_thread) chat.view = .existing;
                         }
                     }
@@ -1481,6 +1721,9 @@ pub const App = struct {
                         if (target.kind == .enroll or target.kind == .restore) self.revealCurrentFolder();
                         self.current_archived = result.archived orelse (target.kind == .archive);
                         if (target.kind == .enroll and self.chat_view == .new_thread) self.chat_view = .existing;
+                    }
+                    if (target.close_tab and std.mem.eql(u8, target.path, self.currentSession())) {
+                        self.leaveClosedCurrent() catch |err| self.report("Closing saved tab", err);
                     }
                     self.catalog_worker.refresh();
                     if (target.open_after) {
@@ -1505,6 +1748,7 @@ pub const App = struct {
             .ready => |catalog| {
                 self.button_count = 0;
                 self.library.invalidateTargets();
+                if (self.catalog == null or (self.catalog.?.threads.len == 0 and catalog.threads.len > 0)) self.sidebar_reveal_current = true;
                 if (self.catalog) |*old| old.deinit();
                 self.catalog = catalog;
                 self.catalog_error = catalog.warning;
@@ -1564,7 +1808,7 @@ pub const App = struct {
         const bytes = self.editor.textBytes();
         var projects: [64][]const u8 = undefined;
         for (self.projects.items, 0..) |path, index| projects[index] = path;
-        try self.draft_writer.submit(.{ .draft = bytes, .light = self.light, .font_size = self.appearance.font_size, .ui_scale = self.appearance.ui_scale, .chat_width = self.appearance.chat_width, .projects = projects[0..self.projects.items.len] });
+        try self.draft_writer.submit(.{ .draft = bytes, .light = self.light, .font_size = self.appearance.font_size, .ui_scale = self.appearance.ui_scale, .chat_width = self.appearance.chat_width, .horizontal_tabs = self.appearance.horizontal_tabs, .projects = projects[0..self.projects.items.len] });
         self.draft_due = null;
     }
 
@@ -1681,80 +1925,183 @@ pub const App = struct {
         self.sidebar_reveal_current = true;
     }
 
-    fn currentSidebarRow(self: *const App) ?usize {
-        var row: usize = 0;
-        const transient = self.transientCurrent();
-        if (!self.indexedFolder(self.project_path) and self.savedFolder(self.project_path)) {
-            row += 1;
-            if (transient and !self.folderCollapsed(self.project_path)) return row;
-        }
-        if (!self.indexedFolder(self.project_path) and !self.savedFolder(self.project_path)) {
-            row += 1;
-            if (transient and !self.folderCollapsed(self.project_path)) return row;
-        }
-        if (self.catalog) |catalog| for (catalog.folders) |folder| {
-            row += 1;
-            if (self.folderCollapsed(folder.cwd)) continue;
-            if (transient and std.mem.eql(u8, folder.cwd, self.project_path)) return row;
-            const count = folder.row_count - 1;
-            for (catalog.rows[folder.first_row + 1 ..][0..count], 0..) |item, offset| {
-                if (std.mem.eql(u8, catalog.threads[item.thread].path, self.currentSession())) return row + offset;
+    const NavRow = union(enum) {
+        folder: struct { path: []const u8, create: Action, toggle: Action },
+        thread: usize,
+        current,
+        parked: usize,
+    };
+    const NavPlan = struct {
+        rows: [96]NavRow = undefined,
+        len: usize = 0,
+        total: usize = 0,
+        selected: ?usize = null,
+        first: usize,
+        limit: usize,
+
+        fn append(self: *NavPlan, item: NavRow, selected: bool) void {
+            if (selected) self.selected = self.total;
+            if (self.total >= self.first and self.len < @min(self.limit, self.rows.len)) {
+                self.rows[self.len] = item;
+                self.len += 1;
             }
-            row += count;
+            self.total += 1;
+        }
+    };
+
+    fn currentGrouped(self: *const App) bool {
+        return self.current_member or self.accepted_enrollment;
+    }
+
+    fn parkedGrouped(chat: *const ParkedChat) bool {
+        return chat.member or chat.accepted_enrollment;
+    }
+
+    fn liveFolder(self: *const App, path: []const u8) bool {
+        if (self.transientCurrent() and self.currentGrouped() and std.mem.eql(u8, path, self.project_path)) return true;
+        for (self.parked_chats.items) |*chat| if (self.transientParked(chat) and parkedGrouped(chat) and std.mem.eql(u8, path, chat.cwd)) return true;
+        return false;
+    }
+
+    fn appendLiveFolder(self: *const App, plan: *NavPlan, path: []const u8) void {
+        self.appendTransientTabs(plan, path);
+    }
+
+    fn appendTransientTabs(self: *const App, plan: *NavPlan, folder: ?[]const u8) void {
+        // Runtime ownership changes on activation; creation IDs keep tab positions stable.
+        var prior: u64 = 0;
+        while (true) {
+            var next: ?u64 = null;
+            var item: NavRow = .current;
+            const current_matches = if (folder) |path| self.currentGrouped() and std.mem.eql(u8, path, self.project_path) else !self.currentGrouped();
+            if (self.transientCurrent() and current_matches and self.chat_id > prior) next = self.chat_id;
+            for (self.parked_chats.items, 0..) |*chat, index| {
+                const matches = if (folder) |path| parkedGrouped(chat) and std.mem.eql(u8, path, chat.cwd) else !parkedGrouped(chat);
+                if (chat.id <= prior or !self.transientParked(chat) or !matches) continue;
+                if (next == null or chat.id < next.?) {
+                    next = chat.id;
+                    item = .{ .parked = index };
+                }
+            }
+            prior = next orelse break;
+            plan.append(item, item == .current);
+        }
+    }
+
+    fn navigation(self: *const App, first: usize, limit: usize) NavPlan {
+        var plan = NavPlan{ .first = first, .limit = limit };
+        if (self.catalog) |catalog| for (catalog.folders, 0..) |folder, folder_index| {
+            plan.append(.{ .folder = .{ .path = folder.cwd, .create = .{ .new_catalog_thread = folder_index }, .toggle = .{ .toggle_folder = folder_index } } }, false);
+            if (self.folderCollapsed(folder.cwd)) continue;
+            for (catalog.rows[folder.first_row + 1 ..][0 .. folder.row_count - 1]) |item| {
+                const thread = catalog.threads[item.thread];
+                const active = std.mem.eql(u8, thread.path, self.currentSession());
+                if (active and self.current_archived) continue;
+                var closed = false;
+                for (self.parked_chats.items) |*chat| if (std.mem.eql(u8, chat.session(), thread.path) and (chat.closed or chat.archived)) {
+                    closed = true;
+                    break;
+                };
+                if (!closed) plan.append(.{ .thread = item.thread }, active);
+            }
+            self.appendLiveFolder(&plan, folder.cwd);
         };
-        return null;
+        for (self.projects.items, 0..) |path, index| {
+            if (self.indexedFolder(path) or !self.liveFolder(path)) continue;
+            plan.append(.{ .folder = .{ .path = path, .create = .{ .new_project_thread = index }, .toggle = .{ .toggle_project_folder = index } } }, false);
+            if (!self.folderCollapsed(path)) self.appendLiveFolder(&plan, path);
+        }
+        if (!self.indexedFolder(self.project_path) and !self.savedFolder(self.project_path) and self.liveFolder(self.project_path)) {
+            plan.append(.{ .folder = .{ .path = self.project_path, .create = .new_thread, .toggle = .toggle_current_folder } }, false);
+            if (!self.folderCollapsed(self.project_path)) self.appendLiveFolder(&plan, self.project_path);
+        }
+        // The global plus adds a plain tab at the right end, outside folder groups.
+        self.appendTransientTabs(&plan, null);
+        return plan;
+    }
+
+    fn currentSidebarRow(self: *const App) ?usize {
+        return self.navigation(0, 0).selected;
     }
 
     fn sidebarRows(self: *const App) usize {
-        var rows: usize = 0;
-        if (self.catalog) |catalog| for (catalog.folders) |folder| {
-            rows += if (self.folderCollapsed(folder.cwd)) 1 else folder.row_count;
-        };
-        for (self.projects.items) |path| if (!self.indexedFolder(path)) {
-            rows += 1;
-        };
-        if (!self.indexedFolder(self.project_path) and !self.savedFolder(self.project_path)) rows += 1;
-        if (self.transientCurrent() and !self.folderCollapsed(self.project_path)) rows += 1;
-        for (self.parked_chats.items) |*chat| if (self.transientParked(chat)) {
-            rows += 1;
-        };
-        return rows;
+        return self.navigation(0, 0).total;
     }
 
     fn transientParked(self: *const App, chat: *const ParkedChat) bool {
-        if (chat.archived) return false;
+        if (chat.archived or chat.closed) return false;
         if (self.catalog) |catalog| for (catalog.threads) |thread| {
             if (std.mem.eql(u8, thread.path, chat.session())) return false;
         };
         return true;
     }
 
-    fn sidebarRowY(self: *const App, row: usize, height: f32) ?f32 {
-        if (row < self.sidebar_first) return null;
-        const y = 158 + @as(f32, @floatFromInt(row - self.sidebar_first)) * 38;
-        return if (y + 36 <= height - 104) y else null;
+    fn drawNavRow(self: *App, item: NavRow, bounds: c.SDL_FRect) !void {
+        const colors = self.palette();
+        switch (item) {
+            .folder => |folder| {
+                const name = std.fs.path.basename(folder.path);
+                const text = clippedLabel(if (name.len == 0) folder.path else name);
+                if (self.appearance.horizontal_tabs) {
+                    try self.rectangle(bounds.x, bounds.y + 7, bounds.w, 26, 4, colors.accent);
+                    try self.hit(folder.toggle, bounds);
+                    try self.fitLabel(text, bounds.x + 10, bounds.y + 13, bounds.w - 20, 12, colors.canvas);
+                    return;
+                }
+                try widgets.icon(self.renderer, .folder, .{ .x = bounds.x + 8, .y = bounds.y + 10, .w = 14, .h = 14 }, colors.muted);
+                try self.hit(folder.toggle, .{ .x = bounds.x, .y = bounds.y, .w = bounds.w - 32, .h = bounds.h });
+                try self.fitLabel(text, bounds.x + 30, bounds.y + 9, bounds.w - 62, 12, colors.muted);
+                try self.iconButton(folder.create, .plus, .{ .x = bounds.x + bounds.w - 30, .y = bounds.y + 2, .w = 28, .h = 28 }, colors.muted);
+                try self.rectangle(bounds.x, bounds.y + bounds.h - 1, bounds.w, 1, 0, colors.border);
+            },
+            else => {
+                var title_text: []const u8 = self.title();
+                var activate: Action = .latest;
+                var close: Action = .close_current;
+                var active = item == .current;
+                var working = active and (self.runtimeStatus() == .streaming or self.bashRunning());
+                switch (item) {
+                    .thread => |index| {
+                        const thread = self.catalog.?.threads[index];
+                        title_text = thread.title;
+                        active = std.mem.eql(u8, thread.path, self.currentSession());
+                        activate = .{ .open_thread = index };
+                        close = .{ .archive_thread = index };
+                        for (self.parked_chats.items) |chat| if (std.mem.eql(u8, chat.session(), thread.path)) {
+                            if (chat.snapshot) |snapshot| working = snapshot.status == .streaming or snapshot.bash_running;
+                        };
+                        if (active) working = self.runtimeStatus() == .streaming or self.bashRunning();
+                    },
+                    .parked => |index| {
+                        const chat = &self.parked_chats.items[index];
+                        title_text = if (chat.snapshot) |snapshot| if (snapshot.session_name.len != 0) snapshot.session_name else if (chat.title_len != 0) chat.title[0..chat.title_len] else "New tab" else if (chat.title_len != 0) chat.title[0..chat.title_len] else "New tab";
+                        activate = .{ .open_parked = index };
+                        close = .{ .close_parked = index };
+                        if (chat.snapshot) |snapshot| working = snapshot.status == .streaming or snapshot.bash_running;
+                    },
+                    else => {},
+                }
+                if (active) {
+                    try self.rectangle(bounds.x, bounds.y, bounds.w, bounds.h, if (self.appearance.horizontal_tabs) 0 else 4, colors.raised);
+                    if (self.appearance.horizontal_tabs) try self.rectangle(bounds.x + 6, bounds.y + bounds.h - 2, bounds.w - 12, 2, 0, colors.accent) else try self.rectangle(bounds.x, bounds.y + 6, 2, bounds.h - 12, 0, colors.accent);
+                }
+                try self.hit(activate, .{ .x = bounds.x, .y = bounds.y, .w = bounds.w - 30, .h = bounds.h });
+                if (working) try self.rectangle(bounds.x + 7, bounds.y + 14, 5, 5, 3, colors.accent);
+                try self.fitLabel(clippedLabel(title_text), bounds.x + 16, bounds.y + 9, bounds.w - 50, 13, if (active) colors.accent else colors.text);
+                try self.flatButton(close, "×", .{ .x = bounds.x + bounds.w - 28, .y = bounds.y + 2, .w = 26, .h = 28 });
+            },
+        }
     }
 
-    fn drawFolderRow(self: *App, path: []const u8, action: Action, browse: ?Action, row: usize, height: f32) !void {
-        const y = self.sidebarRowY(row, height) orelse return;
-        const colors = self.palette();
-        const width = self.shell.sidebar.width;
-        const active = std.mem.eql(u8, path, self.project_path);
-        try widgets.icon(self.renderer, .folder, .{ .x = 20, .y = y + 10, .w = 14, .h = 14 }, if (active) colors.accent else colors.muted);
-        // Browsing only expands/collapses; the separate plus creates a thread.
-        if (browse) |choice| try self.hit(choice, .{ .x = 10, .y = y, .w = width - 52, .h = 34 });
-        const name = std.fs.path.basename(path);
-        try self.fitLabel(clippedLabel(if (name.len == 0) path else name), 42, y + 9, width - 86, 13, colors.text);
-        try self.iconButton(action, .plus, .{ .x = width - 42, .y = y + 2, .w = 30, .h = 30 }, colors.muted);
-    }
-
-    fn drawCurrentRow(self: *App, row: usize, height: f32) !void {
-        const y = self.sidebarRowY(row, height) orelse return;
-        const width = self.shell.sidebar.width;
-        const colors = self.palette();
-        try self.rectangle(28, y, width - 40, 34, 6, colors.raised);
-        try self.hit(.latest, .{ .x = 28, .y = y, .w = width - 40, .h = 34 });
-        try self.fitLabel(clippedLabel(self.title()), 40, y + 9, width - 64, 13, colors.accent);
+    fn visibleNavigation(self: *App, visible: usize) NavPlan {
+        const plan = self.navigation(0, 0);
+        self.sidebar_first = @min(self.sidebar_first, plan.total -| visible);
+        if (self.sidebar_reveal_current) if (plan.selected) |selected| {
+            if (selected < self.sidebar_first) self.sidebar_first = selected;
+            if (selected >= self.sidebar_first + visible) self.sidebar_first = selected + 1 -| visible;
+            self.sidebar_reveal_current = false;
+        };
+        return self.navigation(self.sidebar_first, visible);
     }
 
     fn drawSidebar(self: *App, height: f32) !void {
@@ -1764,80 +2111,135 @@ pub const App = struct {
         try self.rectangle(width - 1, 0, 1, height, 0, colors.border);
         try self.iconButton(.sidebar, .sidebar, .{ .x = 12, .y = 9, .w = 30, .h = 30 }, colors.muted);
         try self.label("Spica", 50, 17, 15, colors.text);
-        try self.button(.new_thread, "New thread", .{ .x = 12, .y = 46, .w = width - 24, .h = 30 });
-        try self.flatButton(.{ .open_library = .workspace }, if (builtin.os.tag == .macos) "Search chats    Cmd+K" else "Search chats    Ctrl+K", .{ .x = 12, .y = 80, .w = width - 24, .h = 30 });
-        try self.label("Projects", 20, 128, 12, colors.muted);
-        try self.flatButton(.add_project, "+ Add folder", .{ .x = width - 108, .y = 120, .w = 100, .h = 30 });
-        const visible: usize = @intFromFloat(@max(1, @floor((height - 262) / 38)));
-        self.sidebar_first = @min(self.sidebar_first, self.sidebarRows() -| visible);
-        if (self.sidebar_reveal_current) if (self.currentSidebarRow()) |selected_row| {
-            if (selected_row < self.sidebar_first) self.sidebar_first = selected_row;
-            if (selected_row >= self.sidebar_first + visible) self.sidebar_first = selected_row + 1 -| visible;
-            self.sidebar_reveal_current = false;
-        };
-        const current_missing = self.transientCurrent();
-        var row: usize = 0;
-        for (self.projects.items, 0..) |path, project_index| {
-            if (self.indexedFolder(path) or !std.mem.eql(u8, path, self.project_path)) continue;
-            try self.drawFolderRow(path, .{ .new_project_thread = project_index }, .{ .toggle_project_folder = project_index }, row, height);
-            row += 1;
-            if (current_missing and !self.folderCollapsed(path) and std.mem.eql(u8, path, self.project_path)) {
-                try self.drawCurrentRow(row, height);
-                row += 1;
-            }
-        }
-        if (!self.indexedFolder(self.project_path) and !self.savedFolder(self.project_path)) {
-            try self.drawFolderRow(self.project_path, .new_thread, .toggle_current_folder, row, height);
-            row += 1;
-            if (current_missing and !self.folderCollapsed(self.project_path)) {
-                try self.drawCurrentRow(row, height);
-                row += 1;
-            }
-        }
-        if (self.catalog) |catalog| for (catalog.folders, 0..) |folder, folder_index| {
-            try self.drawFolderRow(folder.cwd, .{ .new_catalog_thread = folder_index }, .{ .toggle_folder = folder_index }, row, height);
-            row += 1;
-            if (self.folderCollapsed(folder.cwd)) continue;
-            if (current_missing and std.mem.eql(u8, folder.cwd, self.project_path)) {
-                try self.drawCurrentRow(row, height);
-                row += 1;
-            }
-            const count = folder.row_count - 1;
-            // Decode/draw/hit-test only the visible slice, not every session.
-            const first = @min(count, self.sidebar_first -| row);
-            const end = @min(count, (self.sidebar_first + visible) -| row);
-            for (catalog.rows[folder.first_row + 1 + first .. folder.first_row + 1 + end], first..) |item, offset| {
-                const index = item.thread;
-                const thread = catalog.threads[index];
-                const y = self.sidebarRowY(row + offset, height) orelse continue;
-                const active = std.mem.eql(u8, self.currentSession(), thread.path);
-                if (active) try self.rectangle(28, y, width - 40, 34, 6, colors.raised);
-                try self.hit(.{ .open_thread = index }, .{ .x = 28, .y = y, .w = width - 76, .h = 34 });
-                try self.fitLabel(clippedLabel(thread.title), 40, y + 9, width - 100, 13, if (active) colors.accent else if (thread.available) colors.text else colors.muted);
-                try self.iconButton(.{ .archive_thread = index }, .archive, .{ .x = width - 42, .y = y + 2, .w = 30, .h = 30 }, colors.muted);
-            }
-            row += count;
-        };
-        for (self.projects.items, 0..) |path, project_index| {
-            if (self.indexedFolder(path) or std.mem.eql(u8, path, self.project_path)) continue;
-            try self.drawFolderRow(path, .{ .new_project_thread = project_index }, .{ .toggle_project_folder = project_index }, row, height);
-            row += 1;
-        }
-        for (self.parked_chats.items, 0..) |*chat, index| {
-            if (!self.transientParked(chat)) continue;
-            const parked_row = row;
-            row += 1;
-            const y = self.sidebarRowY(parked_row, height) orelse continue;
-            const text = if (chat.snapshot) |snapshot|
-                (if (snapshot.session_name.len != 0) snapshot.session_name else if (chat.title_len != 0) chat.title[0..chat.title_len] else "New thread")
-            else if (chat.title_len != 0) chat.title[0..chat.title_len] else "New thread";
-            try self.hit(.{ .open_parked = index }, .{ .x = 28, .y = y, .w = width - 40, .h = 34 });
-            try self.fitLabel(clippedLabel(text), 40, y + 9, width - 68, 13, colors.text);
+        try self.iconButton(.new_thread, .plus, .{ .x = width - 42, .y = 9, .w = 30, .h = 30 }, colors.muted);
+        const visible: usize = @intFromFloat(std.math.clamp(@floor((height - 160) / 36), 1, 96));
+        const plan = self.visibleNavigation(visible);
+        for (plan.rows[0..plan.len], 0..) |item, index| {
+            const indent: f32 = if (item == .folder) 12 else 20;
+            try self.drawNavRow(item, .{ .x = indent, .y = 58 + @as(f32, @floatFromInt(index)) * 36, .w = width - indent - 12, .h = 34 });
         }
         try self.rectangle(12, height - 100, width - 24, 1, 0, colors.border);
-        try self.flatButton(.{ .open_library = .import_pi }, "Import Pi chat", .{ .x = 12, .y = height - 96, .w = width - 24, .h = 28 });
-        try self.flatButton(.{ .open_library = .archives }, "Archives", .{ .x = 12, .y = height - 66, .w = width - 24, .h = 28 });
+        try self.flatButton(.{ .open_library = .workspace }, "Search", .{ .x = 12, .y = height - 96, .w = width - 24, .h = 28 });
+        try self.flatButton(.{ .open_library = .archives }, "History", .{ .x = 12, .y = height - 66, .w = width - 24, .h = 28 });
         try self.flatButton(.settings, "Settings", .{ .x = 12, .y = height - 36, .w = width - 24, .h = 28 });
+    }
+
+    fn horizontalItemWidth(self: *App, item: NavRow) !f32 {
+        return switch (item) {
+            .folder => |folder| blk: {
+                const name = std.fs.path.basename(folder.path);
+                break :blk std.math.clamp(try self.labelWidth(clippedLabel(if (name.len == 0) folder.path else name), 12) + 20, 44, 128);
+            },
+            else => 180,
+        };
+    }
+
+    fn navGrouped(self: *const App, item: NavRow) bool {
+        return switch (item) {
+            .folder, .thread => true,
+            .current => self.currentGrouped(),
+            .parked => |index| parkedGrouped(&self.parked_chats.items[index]),
+        };
+    }
+
+    fn horizontalGap(self: *const App, item: NavRow, previous: ?NavRow) f32 {
+        const before = previous orelse return 0;
+        return if (item == .folder or (!self.navGrouped(item) and self.navGrouped(before))) 10 else 0;
+    }
+
+    const TabMetrics = struct {
+        width: f32 = 0,
+        selected: ?struct { start: f32, end: f32 } = null,
+    };
+
+    fn horizontalMetrics(self: *App) !TabMetrics {
+        var result: TabMetrics = .{};
+        var first: usize = 0;
+        var previous: ?NavRow = null;
+        // Fixed-size pages retain no offscreen title layouts or per-tab geometry.
+        while (true) {
+            const plan = self.navigation(first, 96);
+            if (plan.len == 0) break;
+            for (plan.rows[0..plan.len], 0..) |item, index| {
+                result.width += self.horizontalGap(item, previous);
+                const end = result.width + try self.horizontalItemWidth(item);
+                if (plan.selected == first + index) result.selected = .{ .start = result.width, .end = end };
+                result.width = end;
+                previous = item;
+            }
+            first += plan.len;
+            if (first >= plan.total) break;
+        }
+        return result;
+    }
+
+    fn drawHorizontalTabs(self: *App, width: f32) !void {
+        const colors = self.palette();
+        const y: f32 = 0;
+        try self.rectangle(0, y, width, 40, 0, colors.panel);
+        const metrics = try self.horizontalMetrics();
+        self.tab_scroll.configure(metrics.width, width);
+        if (self.sidebar_reveal_current) if (metrics.selected) |selected| self.tab_scroll.reveal(selected.start, selected.end);
+        self.sidebar_reveal_current = false;
+        const left = self.tab_scroll.left();
+        const clip = c.SDL_Rect{ .x = @intFromFloat(left), .y = 0, .w = @intFromFloat(self.tab_scroll.viewport_width), .h = 40 };
+        _ = c.SDL_SetRenderClipRect(self.renderer, &clip);
+        self.hit_clip = .{ .x = left, .y = 0, .w = self.tab_scroll.viewport_width, .h = 40 };
+        defer {
+            _ = c.SDL_SetRenderClipRect(self.renderer, null);
+            self.hit_clip = null;
+        }
+        var first: usize = 0;
+        var cursor: f32 = 0;
+        var previous: ?NavRow = null;
+        draw_rows: while (true) {
+            const plan = self.navigation(first, 96);
+            if (plan.len == 0) break;
+            for (plan.rows[0..plan.len]) |item| {
+                cursor += self.horizontalGap(item, previous);
+                const item_width = try self.horizontalItemWidth(item);
+                if (cursor >= self.tab_scroll.offset + self.tab_scroll.viewport_width) break :draw_rows;
+                if (cursor + item_width > self.tab_scroll.offset) {
+                    const x = left + cursor - self.tab_scroll.offset;
+                    try self.drawNavRow(item, .{ .x = x, .y = y, .w = item_width, .h = 40 });
+                    if (self.navGrouped(item)) try self.rectangle(x, y + 38, item_width, 2, 0, colors.accent);
+                }
+                cursor += item_width;
+                previous = item;
+            }
+            first += plan.len;
+            if (first >= plan.total) break;
+        }
+        _ = c.SDL_SetRenderClipRect(self.renderer, null);
+        self.hit_clip = null;
+        const plus_x = if (self.tab_scroll.overflowing) width - 64 else metrics.width + 4;
+        try self.iconButton(.new_thread, .plus, .{ .x = plus_x, .y = y + 5, .w = 30, .h = 30 }, colors.muted);
+        if (self.tab_scroll.overflowing) {
+            if (self.tab_scroll.offset > 0) try self.flatButton(.tab_previous, "‹", .{ .x = 2, .y = y + 4, .w = 26, .h = 32 }) else try self.label("‹", 10, y + 11, 13, colors.border);
+            if (self.tab_scroll.offset < self.tab_scroll.limit()) try self.flatButton(.tab_next, "›", .{ .x = width - 30, .y = y + 4, .w = 28, .h = 32 }) else try self.label("›", width - 22, y + 11, 13, colors.border);
+        }
+    }
+
+    fn drawFolderChooser(self: *App, x: f32, top: f32, width: f32, height: f32) !void {
+        const colors = self.palette();
+        const panel_width = width - 24;
+        const left = x + 12;
+        try self.label("Folders", left, top + 3, 13, colors.muted);
+        try self.button(.pick_folder, "Browse…", .{ .x = left + panel_width - 94, .y = top - 4, .w = 94, .h = 28 });
+        var visible: usize = @intFromFloat(@max(0, @floor((height - 40) / 36)));
+        if (self.projects.items.len > visible) visible = @intFromFloat(@max(0, @floor((height - 68) / 36)));
+        self.folder_first = @min(self.folder_first, self.projects.items.len -| visible);
+        const end = @min(self.projects.items.len, self.folder_first + visible);
+        for (self.projects.items[self.folder_first..end], self.folder_first..) |path, index| {
+            const row_y = top + 34 + @as(f32, @floatFromInt(index - self.folder_first)) * 36;
+            try self.rectangle(left, row_y, panel_width, 34, 5, colors.raised);
+            try self.hit(.{ .choose_project = index }, .{ .x = left, .y = row_y, .w = panel_width, .h = 34 });
+            try widgets.icon(self.renderer, .folder, .{ .x = left + 10, .y = row_y + 10, .w = 14, .h = 14 }, colors.muted);
+            try self.fitLabel(clippedLabel(path), left + 34, row_y + 9, panel_width - 46, 13, colors.text);
+        }
+        const footer_y = top + 34 + @as(f32, @floatFromInt(end - self.folder_first)) * 36;
+        if (self.folder_first > 0) try self.flatButton(.folder_previous, "‹", .{ .x = left, .y = footer_y, .w = 30, .h = 28 });
+        if (end < self.projects.items.len and visible > 0) try self.flatButton(.folder_next, "›", .{ .x = left + panel_width - 30, .y = footer_y, .w = 30, .h = 28 });
     }
 
     fn paint(self: *App) !void {
@@ -1858,33 +2260,27 @@ pub const App = struct {
         height = @intFromFloat(@as(f32, @floatFromInt(height)) / scale);
         self.layout.resize(@floatFromInt(width), @floatFromInt(height));
         const colors = self.palette();
-        self.shell = self.layout.shell(if (self.sidebar_visible) @min(268, @as(f32, @floatFromInt(width)) * 0.34) else 0, self.theme.metrics.header_height, @min(202, @as(f32, @floatFromInt(height)) * 0.4));
+        self.shell = self.layout.shell(if (self.sidebar_visible and !self.appearance.horizontal_tabs) @min(268, @as(f32, @floatFromInt(width)) * 0.34) else 0, self.theme.metrics.header_height + (if (self.appearance.horizontal_tabs) @as(f32, 40) else 0), @min(202, @as(f32, @floatFromInt(height)) * 0.4));
         const header = self.shell.header;
         const conversation = self.shell.conversation;
         const displayed_project = if (self.pending_thread) |target| target.cwd else self.project_path;
         const project = clippedLabel(std.fs.path.basename(displayed_project));
         if (!c.SDL_SetRenderDrawColor(self.renderer, colors.canvas.r, colors.canvas.g, colors.canvas.b, 255) or
             !c.SDL_RenderClear(self.renderer)) return error.ClearFrame;
-        if (self.sidebar_visible) try self.drawSidebar(@floatFromInt(height)) else try self.iconButton(.sidebar, .sidebar, .{ .x = header.x + 12, .y = 7, .w = 30, .h = 30 }, colors.muted);
-        const crumb_x = header.x + (if (self.sidebar_visible) @as(f32, 22) else 52);
-        try widgets.icon(self.renderer, .folder, .{ .x = crumb_x, .y = 15, .w = 14, .h = 14 }, colors.accent);
-        const project_width = @min(try self.labelWidth(project, 13), header.width * 0.32);
-        try self.fitLabel(project, crumb_x + 24, 15, project_width, 13, colors.text);
-        const title_x = crumb_x + 40 + project_width;
-        try self.label("/", title_x, 15, 13, colors.muted);
-        try self.fitLabel(clippedLabel(self.title()), title_x + 20, 15, @max(0, header.x + header.width - 158 - title_x), 13, colors.muted);
-        const state: []const u8 = if (self.options.fixture) "Resource scene" else if (self.current_archived) "Archived" else switch (self.runtimeStatus()) {
-            .starting => "Starting pi",
-            .ready => if (self.bashRunning()) "Running Bash" else "Ready",
-            .streaming => "Working",
-            .stopping => "Stopping",
-            .needs_force_stop => "Needs Force",
-            .failed => "Pi failed",
-            .exited => "Pi exited",
-            .stopped => "Stopped",
-        };
-        try self.label(state, header.x + header.width - 138, 16, 11, if (self.runtimeStatus() == .failed) colors.error_color else if (self.runtimeStatus() == .streaming) colors.accent else colors.muted);
-        if (!self.options.fixture and self.pending_thread == null and (self.runtime == null or self.runtime.?.isFinished())) try self.button(.start, "Retry", .{ .x = header.x + header.width - 86, .y = 8, .w = 68, .h = 28 });
+        if (self.appearance.horizontal_tabs) try self.drawHorizontalTabs(@floatFromInt(width)) else if (self.sidebar_visible) try self.drawSidebar(@floatFromInt(height)) else if (!self.appearance.horizontal_tabs) try self.iconButton(.sidebar, .sidebar, .{ .x = header.x + 12, .y = 7, .w = 30, .h = 30 }, colors.muted);
+        const header_y: f32 = if (self.appearance.horizontal_tabs) 40 else 0;
+        const crumb_x = header.x + (if (self.sidebar_visible or self.appearance.horizontal_tabs) @as(f32, 22) else 52);
+        if (self.current_member) {
+            try widgets.icon(self.renderer, .folder, .{ .x = crumb_x, .y = header_y + 15, .w = 14, .h = 14 }, colors.muted);
+            try self.fitLabel(if (std.mem.eql(u8, displayed_project, self.temporary_project)) "tmp" else clippedLabel(displayed_project), crumb_x + 24, header_y + 15, @max(0, header.width - 220), 12, colors.muted);
+        }
+        if (self.appearance.horizontal_tabs) {
+            try self.iconButton(.{ .open_library = .workspace }, .search, .{ .x = header.x + header.width - 150, .y = header_y + 7, .w = 30, .h = 30 }, colors.muted);
+            try self.flatButton(.{ .open_library = .archives }, "History", .{ .x = header.x + header.width - 112, .y = header_y + 7, .w = 64, .h = 30 });
+            try self.iconButton(.settings, .settings, .{ .x = header.x + header.width - 38, .y = header_y + 7, .w = 30, .h = 30 }, colors.muted);
+        }
+        if (self.runtimeStatus() == .streaming or self.bashRunning()) try self.label("Working", header.x + header.width - (if (self.appearance.horizontal_tabs) @as(f32, 220) else 90), header_y + 16, 11, colors.accent);
+        if (!self.options.fixture and self.pending_thread == null and (self.runtime == null or self.runtime.?.isFinished())) try self.button(.start, "Retry", .{ .x = header.x + header.width - (if (self.appearance.horizontal_tabs) @as(f32, 224) else 86), .y = header_y + 8, .w = 68, .h = 28 });
 
         const content_width = @max(160, @min(self.theme.metrics.chat_max_width, conversation.width - 40));
         const content_x = conversation.x + (conversation.width - content_width) / 2;
@@ -1897,17 +2293,7 @@ pub const App = struct {
             for (self.transcript.disclosures[0..self.transcript.disclosure_count]) |disclosure| try self.hit(.{ .disclosure = disclosure.toggle }, disclosure.bounds);
         }
         _ = c.SDL_SetRenderClipRect(self.renderer, null);
-        if (!self.options.fixture and (self.chat_view == .opening or
-            (self.transcript.items.items.len == 0 and !self.content_pending and !self.conversation_dirty and self.runtimeStatus() == .ready)))
-        {
-            const empty_y = body_top + @min(96, viewport_height * 0.2);
-            try self.label(if (self.chat_view == .opening) self.title() else if (self.chat_view == .existing) "No messages in this chat" else "New thread", content_x + 16, empty_y, @intFromFloat(self.theme.metrics.body_px + 5), colors.text);
-            try self.fitLabel(clippedLabel(displayed_project), content_x + 16, empty_y + 38, content_width - 32, 13, colors.muted);
-            const description = if (self.chat_view == .opening)
-                (if (self.runtimeStatus() == .failed) "Unable to open chat." else "Opening chat...")
-            else if (self.chat_view == .existing) "This saved chat has no messages." else "Describe what you want to build or change.";
-            try self.fitLabel(description, content_x + 16, empty_y + 64, content_width - 32, 13, colors.muted);
-        }
+        if (self.chat_view == .opening) try self.label("Opening…", content_x + 16, body_top + 20, 13, colors.muted);
         if (!self.follow_bottom and self.transcript.height > viewport_height) try self.flatButton(.latest, "Jump to latest", .{ .x = content_x + content_width - 128, .y = conversation.y + conversation.height - 33, .w = 128, .h = 28 });
         self.composer_bounds = .{ .x = content_x, .y = self.shell.composer.y + 8, .w = content_width, .h = @min(144, self.shell.composer.height - 44) };
         const composer = self.composer_bounds;
@@ -1929,33 +2315,37 @@ pub const App = struct {
                 break;
             };
         }
-        const model_width = @min(@min(220, composer.w * 0.43), try self.labelWidth(clippedLabel(model_name), 13) + 34);
-        self.model_bounds = .{ .x = composer.x + 8, .y = controls_y, .w = model_width, .h = 30 };
+        const folder_width = @min(140, composer.w * 0.24);
+        const folder_bounds = c.SDL_FRect{ .x = composer.x + 8, .y = controls_y, .w = folder_width, .h = 30 };
+        const can_choose = !self.current_member and self.submitted_prompt == null and !self.enrollment_intent;
+        if (can_choose) try self.hit(.folder_picker, folder_bounds);
+        try widgets.icon(self.renderer, .folder, .{ .x = folder_bounds.x + 4, .y = controls_y + 9, .w = 12, .h = 12 }, colors.muted);
+        try self.fitLabel(if (self.folder_selected) project else "tmp", folder_bounds.x + 22, controls_y + 8, folder_width - 24, 12, colors.muted);
+        const model_width = @min(@min(220, composer.w * 0.38), try self.labelWidth(clippedLabel(model_name), 13) + 34);
+        self.model_bounds = .{ .x = composer.x + folder_width + 12, .y = controls_y, .w = model_width, .h = 30 };
         try self.flatButton(.models, model_name, self.model_bounds);
         try widgets.icon(self.renderer, .chevron_down, .{ .x = self.model_bounds.x + model_width - 19, .y = controls_y + 9, .w = 12, .h = 12 }, colors.muted);
         const thinking = if (self.runtime_snapshot) |snapshot| snapshot.thinking_level else "";
         self.thinking_bounds = .{ .x = self.model_bounds.x + model_width + 4, .y = controls_y, .w = 80, .h = 30 };
-        if (thinking.len != 0) {
+        const show_thinking = thinking.len != 0 and self.thinking_bounds.x + 80 < composer.x + composer.w - 44;
+        if (show_thinking) {
             try self.flatButton(.thinking, thinking, self.thinking_bounds);
             try widgets.icon(self.renderer, .chevron_down, .{ .x = self.thinking_bounds.x + 59, .y = controls_y + 9, .w = 12, .h = 12 }, colors.muted);
         }
         if (!self.options.fixture) {
-            const mode_x = self.thinking_bounds.x + (if (thinking.len == 0) @as(f32, 0) else 84);
+            const mode_x = self.thinking_bounds.x + (if (!show_thinking) @as(f32, 0) else 84);
             if (self.runtimeStatus() == .streaming and mode_x + 100 < composer.x + composer.w - 48) {
                 try self.flatButton(.behavior, if (self.behavior == .steer) "Steer" else "Follow-up", .{ .x = mode_x, .y = controls_y, .w = 96, .h = 30 });
             }
             const send_bounds = c.SDL_FRect{ .x = composer.x + composer.w - 44, .y = controls_y, .w = 32, .h = 32 };
             const working = self.runtimeStatus() == .streaming or self.bashRunning();
             if (self.current_archived) {
-                try self.button(.restore_current, "Restore", .{ .x = composer.x + composer.w - 86, .y = controls_y, .w = 78, .h = 32 });
+                try self.button(.restore_current, "Reopen", .{ .x = composer.x + composer.w - 86, .y = controls_y, .w = 78, .h = 32 });
             } else {
                 try self.rectangle(send_bounds.x, send_bounds.y, send_bounds.w, send_bounds.h, 16, if (self.runtime == null) colors.raised else colors.accent);
                 try self.iconButton(if (working) .stop else .send, if (working) .stop else .arrow_up, send_bounds, if (self.runtime == null) colors.muted else colors.text);
             }
         }
-        try widgets.icon(self.renderer, .folder, .{ .x = composer.x + 2, .y = composer.y + composer.h + 13, .w = 12, .h = 12 }, colors.muted);
-        try self.label("Local checkout", composer.x + 22, composer.y + composer.h + 13, 11, colors.muted);
-        try self.fitLabel(project, composer.x + 130, composer.y + composer.h + 13, @max(0, composer.w - 130), 11, colors.muted);
         if (self.error_len != 0) {
             try self.fitLabel(clippedLabel(self.error_text[0..self.error_len]), composer.x, composer.y - 25, composer.w, 12, colors.error_color);
         } else if (self.runtime_snapshot) |snapshot| {
@@ -1966,6 +2356,16 @@ pub const App = struct {
                 const progress = std.fmt.bufPrint(&buffer, "{s}{s}{d} queued", .{ if (self.bashRunning()) "Running Bash" else "Working", " · ", snapshot.queued_count }) catch unreachable;
                 try self.fitLabel(progress, composer.x, composer.y - 25, composer.w - 140, 12, colors.accent);
             }
+        }
+        if (self.folder_picker_open) {
+            const rows = @min(6, self.projects.items.len);
+            const desired_height = 64 + @as(f32, @floatFromInt(rows)) * 36 + (if (self.projects.items.len > rows) @as(f32, 28) else 0);
+            const picker_height = @min(desired_height, @max(90, conversation.height - 16));
+            self.folder_picker_bounds = .{ .x = composer.x + 8, .y = composer.y - picker_height - 8, .w = @min(420, composer.w - 16), .h = picker_height };
+            const bounds = self.folder_picker_bounds;
+            try self.rectangle(bounds.x, bounds.y, bounds.w, bounds.h, 8, colors.border);
+            try self.rectangle(bounds.x + 1, bounds.y + 1, bounds.w - 2, bounds.h - 2, 7, colors.panel);
+            try self.drawFolderChooser(bounds.x, bounds.y + 16, bounds.w, bounds.h - 24);
         }
         try self.drawOverlays();
         if (self.settings_open) {
@@ -2030,7 +2430,7 @@ pub const App = struct {
                 if (!c.SDL_SetRenderDrawBlendMode(self.renderer, c.SDL_BLENDMODE_BLEND) or !c.SDL_SetRenderDrawColor(self.renderer, colors.accent.r, colors.accent.g, colors.accent.b, 60) or !c.SDL_RenderFillRects(self.renderer, &rects, @intCast(count))) return error.SelectionDraw;
             }
             if (!c.spica_text_layout_draw(self.text, layout, bounds.x + 12, bounds.y + 10 - self.editor_scroll, rgba(colors.text))) return error.EditorDraw;
-            if (self.editor.len == 0) try self.label("Ask for changes or send a follow-up", bounds.x + 12, bounds.y + 10, @intFromFloat(self.theme.metrics.body_px), colors.muted);
+            if (self.editor.len == 0) try self.label("Message…", bounds.x + 12, bounds.y + 10, @intFromFloat(self.theme.metrics.body_px), colors.muted);
         }
         if (self.preedit.items.len != 0) try self.label(clippedLabel(self.preedit.items), bounds.x + 12, bounds.y + 66, 15, colors.accent);
         if (self.focused_editor and has_caret) try self.rectangle(bounds.x + 12 + caret.x, bounds.y + 10 + caret.y - self.editor_scroll, 2, caret.h, 0, colors.text);
@@ -2115,16 +2515,29 @@ pub const App = struct {
         if (event.type == self.wake_event) {
             if (event.user.code == 2) {
                 self.folder_pending = false;
+                self.folder_chat_id = null;
                 return error.FolderPickerUnavailable;
             }
             if (event.user.code == 1) {
                 self.folder_pending = false;
+                const owner = self.folder_chat_id;
+                self.folder_chat_id = null;
                 if (event.user.data1) |path| {
                     defer c.SDL_free(path);
                     const chosen = std.mem.span(@as([*:0]const u8, @ptrCast(path)));
                     const canonical = try std.Io.Dir.cwd().realPathFileAlloc(self.io, chosen, self.allocator);
                     defer self.allocator.free(canonical);
-                    try self.addProject(canonical);
+                    if (owner) |id| {
+                        if (id == self.chat_id) {
+                            try self.chooseFolder(canonical);
+                        } else {
+                            for (self.parked_chats.items, 0..) |chat, index| if (chat.id == id and !chat.closed) {
+                                try self.activateParked(index);
+                                try self.chooseFolder(canonical);
+                                break;
+                            };
+                        }
+                    } else try self.addProject(canonical);
                 }
                 self.dirty = true;
             }
@@ -2168,6 +2581,7 @@ pub const App = struct {
             c.SDL_EVENT_WINDOW_RESIZED, c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED => {
                 self.button_count = 0;
                 self.library.invalidateTargets();
+                self.sidebar_reveal_current = true;
                 self.dirty = true;
             },
             c.SDL_EVENT_WINDOW_MINIMIZED => self.minimized = true,
@@ -2187,7 +2601,12 @@ pub const App = struct {
                     const last = if (self.runtime_snapshot) |snapshot| snapshot.models.len -| 1 else 0;
                     self.model_first = if (event.wheel.y > 0) self.model_first -| 1 else @min(last, self.model_first + 1);
                 } else if (!self.closing) {
-                    if (self.sidebar_visible and event.wheel.mouse_x < self.shell.sidebar.width) {
+                    if (self.folder_picker_open) {
+                        self.folder_first = if (event.wheel.y > 0) self.folder_first -| 1 else @min(self.projects.items.len -| 1, self.folder_first + 1);
+                    } else if (self.appearance.horizontal_tabs and event.wheel.mouse_y < 40) {
+                        if (self.tab_scroll.wheel(event.wheel.x, event.wheel.y, event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED)) self.dirty = true;
+                        return;
+                    } else if (self.sidebar_visible and !self.appearance.horizontal_tabs and event.wheel.mouse_x < self.shell.sidebar.width) {
                         const last = self.sidebarRows() -| 1;
                         self.sidebar_first = if (event.wheel.y > 0) self.sidebar_first -| 1 else @min(last, self.sidebar_first + 1);
                     } else {
@@ -2199,6 +2618,10 @@ pub const App = struct {
                 self.dirty = true;
             },
             c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
+                if (self.folder_picker_open and !contains(self.folder_picker_bounds, event.button.x, event.button.y)) {
+                    try self.act(.folder_picker);
+                    return;
+                }
                 var button_index = self.button_count;
                 while (button_index != 0) {
                     button_index -= 1;
@@ -2209,7 +2632,7 @@ pub const App = struct {
                         return;
                     }
                 }
-                if (self.closing or self.force_dialog or self.settings_open) return;
+                if (self.closing or self.force_dialog or self.settings_open or self.folder_picker_open) return;
                 if (self.model_menu or self.thinking_menu) {
                     self.model_menu = false;
                     self.thinking_menu = false;
@@ -2267,7 +2690,15 @@ pub const App = struct {
                     if (event.key.key == c.SDLK_ESCAPE) try self.act(.{ .appearance = .close });
                     return;
                 }
-                if (command and event.key.key == c.SDLK_N) {
+                if (self.folder_picker_open) {
+                    if (event.key.key == c.SDLK_ESCAPE) try self.act(.folder_picker);
+                    return;
+                }
+                if (command and event.key.key == c.SDLK_W and !event.key.repeat) {
+                    try self.act(.close_current);
+                    return;
+                }
+                if (command and (event.key.key == c.SDLK_N or event.key.key == c.SDLK_T) and !event.key.repeat) {
                     try self.act(.new_thread);
                     return;
                 }
@@ -2445,10 +2876,11 @@ pub const App = struct {
     }
 };
 
-test "new chat reveal expands only its project and archived current never makes a transient row" {
+test "draft tabs stay ungrouped until acceptance and closed chats leave navigation" {
     const allocator = std.testing.allocator;
     var app: App = undefined;
     app.allocator = allocator;
+    app.chat_id = 1;
     app.project_path = @constCast("/b");
     app.projects = .empty;
     app.collapsed_folders = .empty;
@@ -2463,10 +2895,15 @@ test "new chat reveal expands only its project and archived current never makes 
     app.current_archived = false;
     app.current_member = false;
     app.enrollment_intent = false;
+    app.accepted_enrollment = false;
     app.chat_view = .new_thread;
     app.runtime_snapshot = null;
     app.pending_thread = null;
     app.options = .{};
+    try std.testing.expectEqual(@as(?usize, 0), app.currentSidebarRow());
+    try std.testing.expectEqual(@as(usize, 1), app.sidebarRows());
+    app.accepted_enrollment = true;
+    app.enrollment_intent = true;
     try std.testing.expect(app.currentSidebarRow() == null);
     app.revealCurrentFolder();
     try std.testing.expect(app.folderCollapsed("/a"));
@@ -2478,7 +2915,7 @@ test "new chat reveal expands only its project and archived current never makes 
     app.chat_view = .existing;
     try std.testing.expect(!app.transientCurrent());
     try std.testing.expect(app.currentSidebarRow() == null);
-    try std.testing.expectEqual(@as(usize, 1), app.sidebarRows());
+    try std.testing.expectEqual(@as(usize, 0), app.sidebarRows());
 }
 
 test "background prompt acknowledgements clear only the submitted chat revision" {
@@ -2550,4 +2987,116 @@ test "background prompt acknowledgements clear only the submitted chat revision"
         try std.testing.expectEqualStrings(if (edited_after_send) text else "recovered background input", chat.draft);
         try std.testing.expectEqualStrings("active chat draft", app.editor.textBytes());
     }
+}
+
+test "both tab layouts use bounded folder rows without duplicating parked sessions" {
+    var app: App = undefined;
+    app.projects = .empty;
+    app.collapsed_folders = .empty;
+    app.parked_chats = .empty;
+    app.pending_thread = null;
+    app.runtime_snapshot = null;
+    app.current_archived = false;
+    app.accepted_enrollment = false;
+    app.enrollment_intent = false;
+    app.chat_id = 1;
+    app.project_path = @constCast("/a");
+    app.options = .{ .resume_file = "/a/one.jsonl" };
+    app.chat_view = .existing;
+    app.current_member = true;
+    var threads = [_]SessionCatalog.Thread{
+        .{ .path = @constCast("/a/one.jsonl"), .cwd = @constCast("/a"), .title = @constCast("One"), .modified = 3 },
+        .{ .path = @constCast("/a/two.jsonl"), .cwd = @constCast("/a"), .title = @constCast("Two"), .modified = 2 },
+        .{ .path = @constCast("/b/three.jsonl"), .cwd = @constCast("/b"), .title = @constCast("Three"), .modified = 1 },
+    };
+    var folders = [_]SessionCatalog.Folder{
+        .{ .cwd = "/a", .first_row = 0, .row_count = 3 },
+        .{ .cwd = "/b", .first_row = 3, .row_count = 2 },
+    };
+    var rows = [_]SessionCatalog.SidebarRow{ .{ .folder = 0 }, .{ .thread = 0 }, .{ .thread = 1 }, .{ .folder = 1 }, .{ .thread = 2 } };
+    app.catalog = .{ .threads = &threads, .folders = &folders, .rows = &rows };
+    var parked: [4]ParkedChat = undefined;
+    for (&parked, 0..) |*chat, index| {
+        chat.id = index + 2;
+        chat.cwd = @constCast("/b");
+        chat.path = null;
+        chat.snapshot = null;
+        chat.member = false;
+        chat.accepted_enrollment = false;
+        chat.closed = false;
+        chat.archived = false;
+    }
+    parked[0].path = @constCast("/a/two.jsonl");
+    parked[0].member = true;
+    parked[1].accepted_enrollment = true;
+    parked[3].closed = true;
+    app.parked_chats = .{ .items = &parked, .capacity = parked.len };
+    const all = app.navigation(0, 128);
+    try std.testing.expectEqual(@as(usize, 7), all.total);
+    try std.testing.expectEqual(@as(?usize, 1), all.selected);
+    try std.testing.expectEqualStrings("/a", all.rows[0].folder.path);
+    try std.testing.expectEqualStrings("/b", all.rows[3].folder.path);
+    try std.testing.expectEqual(@as(usize, 1), all.rows[5].parked); // Accepted in its own folder.
+    try std.testing.expectEqual(@as(usize, 2), all.rows[6].parked); // Draft at the right end.
+    const page = app.navigation(3, 2);
+    try std.testing.expectEqual(@as(usize, 2), page.len);
+    try std.testing.expectEqual(all.total, page.total);
+    try std.testing.expectEqualStrings("/b", page.rows[0].folder.path);
+    const continuation = app.navigation(5, 1);
+    try std.testing.expectEqual(@as(usize, 1), continuation.rows[0].parked);
+    var collapsed = [_][]u8{@constCast("/b")};
+    app.collapsed_folders = .{ .items = &collapsed, .capacity = collapsed.len };
+    try std.testing.expectEqual(@as(usize, 5), app.sidebarRows());
+    app.current_archived = true;
+    try std.testing.expect(app.currentSidebarRow() == null);
+    try std.testing.expectEqual(@as(usize, 4), app.sidebarRows());
+
+    // Opening another plain tab appends it after all groups and older drafts.
+    app.collapsed_folders = .empty;
+    app.current_archived = false;
+    app.current_member = false;
+    app.chat_view = .new_thread;
+    app.options.resume_file = null;
+    app.chat_id = 6;
+    const new_tab = app.navigation(0, 96);
+    try std.testing.expectEqual(@as(?usize, 7), new_tab.selected);
+    try std.testing.expectEqual(@as(usize, 2), new_tab.rows[6].parked);
+    try std.testing.expect(new_tab.rows[7] == .current);
+    try std.testing.expect(!app.navGrouped(new_tab.rows[7]));
+    // Activating the older blank changes ownership, without changing positions.
+    app.chat_id = 4;
+    parked[2].id = 6;
+    const switched = app.navigation(0, 96);
+    try std.testing.expectEqual(@as(?usize, 6), switched.selected);
+    try std.testing.expect(switched.rows[6] == .current);
+    try std.testing.expectEqual(@as(usize, 2), switched.rows[7].parked);
+}
+
+test "folder picker keeps most recently opened folders first and excludes tmp" {
+    const allocator = std.testing.allocator;
+    var app: App = undefined;
+    app.allocator = allocator;
+    app.projects = .empty;
+    app.temporary_project = @constCast("/spica/tmp");
+    defer {
+        for (app.projects.items) |path| allocator.free(path);
+        app.projects.deinit(allocator);
+    }
+    try app.rememberFolder("/first");
+    try app.rememberFolder("/second");
+    try app.rememberFolder("/third");
+    try app.rememberFolder("/first");
+    try app.rememberFolder("/spica/tmp");
+    try std.testing.expectEqual(@as(usize, 3), app.projects.items.len);
+    try std.testing.expectEqualStrings("/first", app.projects.items[0]);
+    try std.testing.expectEqualStrings("/third", app.projects.items[1]);
+    try std.testing.expectEqualStrings("/second", app.projects.items[2]);
+    var buffer: [32]u8 = undefined;
+    for (0..64) |index| {
+        const path = try std.fmt.bufPrint(&buffer, "/folder/{d}", .{index});
+        try app.rememberFolder(path);
+    }
+    try std.testing.expectEqual(@as(usize, 64), app.projects.items.len);
+    try std.testing.expectEqualStrings("/folder/63", app.projects.items[0]);
+    try std.testing.expectEqualStrings("/folder/0", app.projects.items[63]);
 }

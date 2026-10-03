@@ -5,6 +5,8 @@ pub const Action = enum {
     close,
     dark,
     light,
+    tabs_vertical,
+    tabs_horizontal,
     font_smaller,
     font_larger,
     scale_smaller,
@@ -20,6 +22,7 @@ pub const Values = struct {
     ui_scale: u16 = 100,
     chat_width: u16 = 768,
     light: bool = false,
+    horizontal_tabs: bool = false,
 };
 
 pub fn apply(values: *Values, action: Action) void {
@@ -27,6 +30,8 @@ pub fn apply(values: *Values, action: Action) void {
         .close => {},
         .dark => values.light = false,
         .light => values.light = true,
+        .tabs_vertical => values.horizontal_tabs = false,
+        .tabs_horizontal => values.horizontal_tabs = true,
         .font_smaller => values.font_size = std.math.clamp(values.font_size -| 1, 12, 24),
         .font_larger => values.font_size = std.math.clamp(values.font_size +| 1, 12, 24),
         .scale_smaller => values.ui_scale = std.math.clamp(values.ui_scale -| 5, 75, 175),
@@ -55,14 +60,15 @@ pub fn draw(app: anytype) !void {
     const canvas_width = app.shell.sidebar.width + app.shell.conversation.width;
     const canvas_height = app.shell.header.height + app.shell.conversation.height + app.shell.composer.height;
     const width = @min(@as(f32, 500), @max(@as(f32, 0), canvas_width - 32));
-    const height = @min(@as(f32, 360), @max(@as(f32, 0), canvas_height - 32));
+    const height = @min(@as(f32, 410), @max(@as(f32, 0), canvas_height - 32));
     const x = (canvas_width - width) / 2;
     const y = (canvas_height - height) / 2;
     const left = x + 20;
     const right = x + width - 20;
-    const row_step = (height - 146) / 4;
-    const theme_y = y + 96;
-    const font_y = theme_y + row_step;
+    const row_step = (height - 120) / 5;
+    const theme_y = y + 70;
+    const tabs_y = theme_y + row_step;
+    const font_y = tabs_y + row_step;
     const scale_y = font_y + row_step;
     const width_y = scale_y + row_step;
     const footer_y = width_y + row_step;
@@ -71,12 +77,14 @@ pub fn draw(app: anytype) !void {
     try app.rectangle(x, y, width, height, 10, colors.border);
     try app.rectangle(x + 1, y + 1, width - 2, height - 2, 9, colors.panel);
     try app.label("Appearance", left, y + 18, 19, colors.text);
-    try app.label("UI scale changes interface size.", left, y + 48, 13, colors.muted);
-    try app.label("Hardware DPI remains automatic.", left, y + 66, 13, colors.muted);
 
     try app.label("Theme", left, theme_y + 8, 13, colors.text);
     try app.button(.{ .appearance = .dark }, if (app.appearance.light) "Dark" else "Dark (on)", .{ .x = right - 182, .y = theme_y, .w = 86, .h = 34 });
     try app.button(.{ .appearance = .light }, if (app.appearance.light) "Light (on)" else "Light", .{ .x = right - 86, .y = theme_y, .w = 86, .h = 34 });
+
+    try app.label("Tabs", left, tabs_y + 8, 13, colors.text);
+    try app.button(.{ .appearance = .tabs_vertical }, if (app.appearance.horizontal_tabs) "Vertical" else "Vertical (on)", .{ .x = right - 214, .y = tabs_y, .w = 102, .h = 34 });
+    try app.button(.{ .appearance = .tabs_horizontal }, if (app.appearance.horizontal_tabs) "Horizontal(buggy) (on)" else "Horizontal(buggy)", .{ .x = right - 106, .y = tabs_y, .w = 106, .h = 34 });
 
     var buffer: [32]u8 = undefined;
     const font = try std.fmt.bufPrint(&buffer, "{d} px", .{app.appearance.font_size});

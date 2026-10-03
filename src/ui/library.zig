@@ -272,7 +272,7 @@ pub const Panel = struct {
         try self.button(app, .close, "Close", .{ .x = x + w - 74, .y = y + 7, .w = 62, .h = 28 });
         const tab_w = (inner - 12) / 3;
         const scopes = [_]catalog.Scope{ .workspace, .archives, .import_pi };
-        const names = [_][]const u8{ "Search", "Archives", "Import Pi" };
+        const names = [_][]const u8{ "Search", "History", "Import Pi" };
         for (scopes, names, 0..) |scope, name, index| {
             const bounds = c.SDL_FRect{ .x = left + @as(f32, @floatFromInt(index)) * (tab_w + 6), .y = y + 41, .w = tab_w, .h = 28 };
             try self.button(app, .{ .scope = scope }, name, bounds);
@@ -306,13 +306,13 @@ pub const Panel = struct {
                 const top = self.results_bounds.y + @as(f32, @floatFromInt(index - self.first)) * row_height;
                 const bounds = c.SDL_FRect{ .x = left, .y = top, .w = inner, .h = row_height - 4 };
                 if (index == self.selected) try app.rectangle(bounds.x, bounds.y, bounds.w, bounds.h, 5, colors.raised);
-                const badge: []const u8 = if (thread.archived and !thread.available) "Archived/offline" else if (thread.archived) "Archived" else if (!thread.available) "Unavailable" else "";
+                const badge: []const u8 = if (!thread.available) "Unavailable" else if (thread.archived and self.scope != .archives) "In History" else "";
                 const badge_w: f32 = if (badge.len != 0) 104 else 0;
                 try clippedLabel(app, thread.title, left + 8, top + 5, inner - 16 - badge_w, 14, colors.text);
                 if (badge.len != 0) try app.label(badge, left + inner - 100, top + 6, 11, colors.muted);
                 try clippedLabel(app, if (thread.cwd.len != 0) thread.cwd else thread.path, left + 8, top + 24, inner - 16, 11, colors.muted);
-                const excerpt = if (thread.snippet.len != 0) thread.snippet else if (!thread.available) "Source unavailable; cached result" else thread.path;
-                try clippedLabel(app, excerpt, left + 8, top + 42, inner - 16, 11, colors.muted);
+                const excerpt = if (thread.snippet.len != 0) thread.snippet else if (!thread.available) "Source unavailable" else "";
+                if (excerpt.len != 0) try clippedLabel(app, excerpt, left + 8, top + 42, inner - 16, 11, colors.muted);
                 if (!self.waiting and !self.busy and page.generation == self.generation and page.scope == self.scope and page.offset == self.offset and bounds.y + bounds.h <= self.results_bounds.y + self.results_bounds.h) self.addTarget(.{ .select = index }, bounds);
             }
         }
@@ -323,8 +323,8 @@ pub const Panel = struct {
         if (!self.waiting) if (self.page) |page| if (page.generation == self.generation and page.scope == self.scope and page.offset == self.offset and page.more and !page.searching) try self.button(app, .next, "Next", .{ .x = left + 58, .y = footer_y, .w = paging_width, .h = 28 });
         if (self.selectedThread()) |thread| {
             const open_w: f32 = if (self.scope == .import_pi) 118 else 62;
-            if (self.scope != .import_pi) try self.button(app, if (thread.archived) .restore else .archive, if (thread.archived) "Restore" else "Archive", .{ .x = left + inner - open_w - 84, .y = footer_y, .w = 78, .h = 28 });
-            try self.button(app, .activate, if (self.scope == .import_pi) "Import and open" else "Open", .{ .x = left + inner - open_w, .y = footer_y, .w = open_w, .h = 28 });
+            if (self.scope != .import_pi and !thread.archived) try self.button(app, .archive, "Close tab", .{ .x = left + inner - open_w - 84, .y = footer_y, .w = 78, .h = 28 });
+            try self.button(app, .activate, if (self.scope == .import_pi) "Import and open" else if (thread.archived) "Reopen" else "Open", .{ .x = left + inner - open_w, .y = footer_y, .w = open_w, .h = 28 });
         }
     }
 
