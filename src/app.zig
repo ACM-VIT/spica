@@ -20,7 +20,7 @@ const TabScroll = @import("ui/tabs.zig").Scroll;
 const Motion = @import("ui/motion.zig");
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
-const Action = union(enum) { start, new_thread, folder_picker, pick_folder, choose_project: usize, choose_current, folder_previous, folder_next, close_current, close_parked: usize, tab_previous, tab_next, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
+const Action = union(enum) { start, new_thread, folder_picker, pick_folder, choose_project: usize, choose_current, folder_previous, folder_next, close_current, close_parked: usize, tab_previous, tab_next, new_folder_thread: []const u8, new_catalog_thread: usize, toggle_folder: usize, toggle_live_folder: []const u8, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
 const ThreadTarget = struct { path: ?[:0]u8, cwd: [:0]u8, archived: bool = false };
 const SubmittedPrompt = struct { token: u64, draft_revision: u64 };
 const ChatView = enum { new_thread, opening, existing };
@@ -1492,19 +1492,14 @@ pub const App = struct {
                 try self.activateParked(index);
                 self.revealCurrentFolder();
             },
-            .new_project_thread => |index| {
-                if (index < self.projects.items.len) try self.newThreadIn(self.projects.items[index]);
-            },
+            .new_folder_thread => |path| try self.newThreadIn(path),
             .new_catalog_thread => |index| {
                 if (self.catalog) |catalog| if (index < catalog.folders.len) try self.newThreadIn(catalog.folders[index].cwd);
             },
             .toggle_folder => |index| {
                 if (self.catalog) |catalog| if (index < catalog.folders.len) try self.toggleFolder(catalog.folders[index].cwd);
             },
-            .toggle_project_folder => |index| {
-                if (index < self.projects.items.len) try self.toggleFolder(self.projects.items[index]);
-            },
-            .toggle_current_folder => try self.toggleFolder(self.project_path),
+            .toggle_live_folder => |path| try self.toggleFolder(path),
             .open_library => |scope| try self.showLibrary(scope),
             .library => |choice| if (self.library.act(choice)) |intent| try self.libraryIntent(intent),
             .archive_thread => |index| {
@@ -1655,7 +1650,7 @@ pub const App = struct {
         if (self.appearance.horizontal_tabs or !self.sidebar_visible or self.settings_open or self.library.open) return null;
         const pos = point orelse return null;
         for (self.buttons[0..self.button_count]) |button_value| switch (button_value.action) {
-            .toggle_folder, .toggle_project_folder, .toggle_current_folder => if (contains(button_value.bounds, pos.x, pos.y)) return button_value.action,
+            .toggle_folder, .toggle_live_folder => if (contains(button_value.bounds, pos.x, pos.y)) return button_value.action,
             else => {},
         };
         return null;
@@ -1939,11 +1934,6 @@ pub const App = struct {
         return false;
     }
 
-    fn savedFolder(self: *const App, path: []const u8) bool {
-        for (self.projects.items) |project| if (std.mem.eql(u8, project, path)) return true;
-        return false;
-    }
-
     fn folderCollapsed(self: *const App, path: []const u8) bool {
         for (self.collapsed_folders.items) |folder| if (std.mem.eql(u8, folder, path)) return true;
         return false;
@@ -1987,17 +1977,21 @@ pub const App = struct {
     };
 
     fn currentGrouped(self: *const App) bool {
-        return self.current_member or self.accepted_enrollment;
+        return self.folder_selected or self.current_member or self.accepted_enrollment;
     }
 
     fn parkedGrouped(chat: *const ParkedChat) bool {
-        return chat.member or chat.accepted_enrollment;
+        return chat.folder_selected or chat.member or chat.accepted_enrollment;
     }
 
-    fn liveFolder(self: *const App, path: []const u8) bool {
-        if (self.transientCurrent() and self.currentGrouped() and std.mem.eql(u8, path, self.project_path)) return true;
-        for (self.parked_chats.items) |*chat| if (self.transientParked(chat) and parkedGrouped(chat) and std.mem.eql(u8, path, chat.cwd)) return true;
-        return false;
+    fn firstLiveFolderId(self: *const App, path: []const u8) ?u64 {
+        var first: ?u64 = null;
+        if (self.transientCurrent() and self.currentGrouped() and std.mem.eql(u8, path, self.project_path)) first = self.chat_id;
+        for (self.parked_chats.items) |*chat| {
+            if (!self.transientParked(chat) or !parkedGrouped(chat) or !std.mem.eql(u8, path, chat.cwd)) continue;
+            if (first == null or chat.id < first.?) first = chat.id;
+        }
+        return first;
     }
 
     fn appendLiveFolder(self: *const App, plan: *NavPlan, path: []const u8) void {
@@ -2043,14 +2037,28 @@ pub const App = struct {
             }
             self.appendLiveFolder(&plan, folder.cwd);
         };
-        for (self.projects.items, 0..) |path, index| {
-            if (self.indexedFolder(path) or !self.liveFolder(path)) continue;
-            plan.append(.{ .folder = .{ .path = path, .create = .{ .new_project_thread = index }, .toggle = .{ .toggle_project_folder = index } } }, false);
+        // Picker recency is independent of tab order. Enumerate live folders
+        // by their oldest visible draft, including folders evicted from the MRU.
+        var prior: u64 = 0;
+        while (true) {
+            var next: ?u64 = null;
+            var path: []const u8 = self.project_path;
+            if (self.transientCurrent() and self.currentGrouped() and !self.indexedFolder(self.project_path) and
+                self.chat_id > prior and self.firstLiveFolderId(self.project_path) == self.chat_id)
+            {
+                next = self.chat_id;
+            }
+            for (self.parked_chats.items) |*chat| {
+                if (!self.transientParked(chat) or !parkedGrouped(chat) or self.indexedFolder(chat.cwd) or
+                    chat.id <= prior or self.firstLiveFolderId(chat.cwd) != chat.id) continue;
+                if (next == null or chat.id < next.?) {
+                    next = chat.id;
+                    path = chat.cwd;
+                }
+            }
+            prior = next orelse break;
+            plan.append(.{ .folder = .{ .path = path, .create = .{ .new_folder_thread = path }, .toggle = .{ .toggle_live_folder = path } } }, false);
             if (!self.folderCollapsed(path)) self.appendLiveFolder(&plan, path);
-        }
-        if (!self.indexedFolder(self.project_path) and !self.savedFolder(self.project_path) and self.liveFolder(self.project_path)) {
-            plan.append(.{ .folder = .{ .path = self.project_path, .create = .new_thread, .toggle = .toggle_current_folder } }, false);
-            if (!self.folderCollapsed(self.project_path)) self.appendLiveFolder(&plan, self.project_path);
         }
         // The global plus adds a plain tab at the right end, outside folder groups.
         self.appendTransientTabs(&plan, null);
@@ -2958,11 +2966,12 @@ pub const App = struct {
     }
 };
 
-test "draft tabs stay ungrouped until acceptance and closed chats leave navigation" {
+test "plain tabs stay ungrouped until folder choice or acceptance" {
     const allocator = std.testing.allocator;
     var app: App = undefined;
     app.allocator = allocator;
     app.chat_id = 1;
+    app.folder_selected = false;
     app.project_path = @constCast("/b");
     app.projects = .empty;
     app.collapsed_folders = .empty;
@@ -2984,6 +2993,13 @@ test "draft tabs stay ungrouped until acceptance and closed chats leave navigati
     app.options = .{};
     try std.testing.expectEqual(@as(?usize, 0), app.currentSidebarRow());
     try std.testing.expectEqual(@as(usize, 1), app.sidebarRows());
+    app.folder_selected = true;
+    try std.testing.expect(app.currentSidebarRow() == null); // Chosen folder is collapsed.
+    app.revealCurrentFolder();
+    try std.testing.expectEqual(@as(?usize, 1), app.currentSidebarRow());
+    try std.testing.expectEqual(@as(usize, 2), app.sidebarRows());
+    app.folder_selected = false;
+    try app.collapsed_folders.append(allocator, try allocator.dupe(u8, "/b"));
     app.accepted_enrollment = true;
     app.enrollment_intent = true;
     try std.testing.expect(app.currentSidebarRow() == null);
@@ -3082,6 +3098,7 @@ test "both tab layouts use bounded folder rows without duplicating parked sessio
     app.accepted_enrollment = false;
     app.enrollment_intent = false;
     app.chat_id = 1;
+    app.folder_selected = false;
     app.project_path = @constCast("/a");
     app.options = .{ .resume_file = "/a/one.jsonl" };
     app.chat_view = .existing;
@@ -3104,6 +3121,7 @@ test "both tab layouts use bounded folder rows without duplicating parked sessio
         chat.path = null;
         chat.snapshot = null;
         chat.member = false;
+        chat.folder_selected = false;
         chat.accepted_enrollment = false;
         chat.closed = false;
         chat.archived = false;
@@ -3181,4 +3199,74 @@ test "folder picker keeps most recently opened folders first and excludes tmp" {
     try std.testing.expectEqual(@as(usize, 64), app.projects.items.len);
     try std.testing.expectEqualStrings("/folder/63", app.projects.items[0]);
     try std.testing.expectEqualStrings("/folder/0", app.projects.items[63]);
+}
+
+test "changing draft folders keeps each tab once and ignores picker recency" {
+    var app: App = undefined;
+    app.projects = .empty;
+    app.collapsed_folders = .empty;
+    app.catalog = null;
+    app.pending_thread = null;
+    app.runtime_snapshot = null;
+    app.current_archived = false;
+    app.current_member = false;
+    app.accepted_enrollment = false;
+    app.enrollment_intent = false;
+    app.chat_id = 5;
+    app.folder_selected = false;
+    app.project_path = @constCast("/tmp");
+    app.options = .{};
+    app.chat_view = .new_thread;
+    var parked: [3]ParkedChat = undefined;
+    for (&parked, 0..) |*chat, index| {
+        chat.id = index + 2;
+        chat.cwd = @constCast(if (index == 1) "/b" else "/a");
+        chat.path = null;
+        chat.snapshot = null;
+        chat.member = false;
+        chat.folder_selected = true;
+        chat.accepted_enrollment = false;
+        chat.closed = false;
+        chat.archived = false;
+    }
+    app.parked_chats = .{ .items = &parked, .capacity = parked.len };
+    const before = app.navigation(0, 96);
+    try std.testing.expectEqual(@as(usize, 6), before.total);
+    try std.testing.expectEqualStrings("/a", before.rows[0].folder.path);
+    try std.testing.expectEqual(@as(usize, 0), before.rows[1].parked);
+    try std.testing.expectEqual(@as(usize, 2), before.rows[2].parked);
+    try std.testing.expectEqualStrings("/b", before.rows[3].folder.path);
+    try std.testing.expectEqual(@as(usize, 1), before.rows[4].parked);
+    try std.testing.expect(before.rows[5] == .current);
+    // Recently choosing /b does not reorder /a or drop it when absent from MRU.
+    var projects = [_][:0]u8{@constCast("/b")};
+    app.projects = .{ .items = &projects, .capacity = projects.len };
+    const recent = app.navigation(0, 96);
+    try std.testing.expectEqual(before.total, recent.total);
+    try std.testing.expectEqualDeep(before.rows[0..before.len], recent.rows[0..recent.len]);
+    // Move an existing draft, then switch runtime ownership to that draft.
+    parked[2].cwd = @constCast("/b");
+    const moved = app.navigation(0, 96);
+    try std.testing.expectEqual(@as(usize, 6), moved.total);
+    try std.testing.expectEqualStrings("/b", moved.rows[2].folder.path);
+    try std.testing.expectEqual(@as(usize, 2), moved.rows[4].parked);
+    app.chat_id = 4;
+    app.project_path = @constCast("/b");
+    app.folder_selected = true;
+    parked[2].id = 5;
+    parked[2].cwd = @constCast("/tmp");
+    parked[2].folder_selected = false;
+    const switched = app.navigation(0, 96);
+    try std.testing.expectEqual(@as(?usize, 4), switched.selected);
+    try std.testing.expect(switched.rows[4] == .current);
+    try std.testing.expectEqual(@as(usize, 2), switched.rows[5].parked);
+    // Last draft leaving a folder removes its header; closed runtimes stay hidden.
+    parked[0].closed = true;
+    const closed = app.navigation(0, 96);
+    try std.testing.expectEqual(@as(usize, 4), closed.total);
+    try std.testing.expectEqualStrings("/b", closed.rows[0].folder.path);
+    var collapsed = [_][]u8{@constCast("/b")};
+    app.collapsed_folders = .{ .items = &collapsed, .capacity = collapsed.len };
+    try std.testing.expect(app.navigation(0, 96).selected == null);
+    try std.testing.expectEqual(@as(usize, 2), app.navigation(0, 96).total);
 }
