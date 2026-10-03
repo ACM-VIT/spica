@@ -60,6 +60,11 @@ fn nativeDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const 
         // standard system library directories.
         module.linkSystemLibrary(name, .{ .use_pkg_config = .no });
     }
+    // text.c finds fallback fonts through CoreText on macOS (fontconfig, loaded at runtime, on Linux).
+    if (module.resolved_target.?.result.os.tag == .macos) {
+        module.linkFramework("CoreText", .{});
+        module.linkFramework("CoreFoundation", .{});
+    }
     module.addIncludePath(b.path(".deps/src/cmark-gfm-0.29.0.gfm.13/src"));
     module.addIncludePath(b.path(".deps/build/cmark-gfm/src"));
 }

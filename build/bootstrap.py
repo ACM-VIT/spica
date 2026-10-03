@@ -306,16 +306,42 @@ def main():
     pkg_config = str(prefix / 'lib' / 'pkgconfig')
     child_env['PKG_CONFIG_PATH'] = pkg_config + os.pathsep + child_env.get('PKG_CONFIG_PATH', '')
     freetype_library = prefix / 'lib' / ('libfreetype' + suffix)
-    if not freetype_library.exists():
+    freetype_options = ['-DFT_DISABLE_HARFBUZZ=ON']
+    # FreeType enables the optional libraries it happens to find. macOS has no system libpng, so
+    # Apple Color Emoji (PNG glyphs) could not render and the app closed on the first emoji, while
+    # Homebrew's brotli was linked from /opt/homebrew. macOS therefore builds the locked libpng and
+    # pins both choices; the stamp rebuilds installs made without them.
+    if system == 'macos':
+        png_library = prefix / 'lib' / 'libpng16.dylib'
+        if not png_library.exists():
+            log('building libpng')
+            build = CACHE / 'build' / 'libpng'
+            subprocess.run(['cmake', '-S', str(codecs['libpng']), '-B', str(build),
+                            '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
+                            '-DPNG_SHARED=ON', '-DPNG_STATIC=OFF', '-DPNG_FRAMEWORK=OFF',
+                            '-DPNG_TESTS=OFF', '-DPNG_TOOLS=OFF'], check=True)
+            subprocess.run(['cmake', '--build', str(build), '--parallel', '4'], check=True)
+            subprocess.run(['cmake', '--install', str(build)], check=True)
+            if not png_library.exists():
+                raise RuntimeError(f'libpng install did not produce {png_library}')
+        freetype_options += ['-DFT_REQUIRE_PNG=ON', '-DFT_DISABLE_BROTLI=ON',
+                             f'-DCMAKE_PREFIX_PATH={prefix}']
+    freetype_stamp = prefix / '.freetype-config'
+    freetype_config = ' '.join(freetype_options)
+    if not freetype_library.exists() or (system == 'macos' and not build_is_current(
+            freetype_library, freetype_stamp, freetype_config)):
         log('building FreeType')
         build = CACHE / 'build' / 'freetype'
+        shutil.rmtree(build, ignore_errors=True)  # a cached configure keeps old library lookups
         subprocess.run(['cmake', '-S', str(freetype), '-B', str(build),
                         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
-                        '-DBUILD_SHARED_LIBS=ON', '-DFT_DISABLE_HARFBUZZ=ON'], check=True)
+                        '-DBUILD_SHARED_LIBS=ON', *freetype_options], check=True)
         subprocess.run(['cmake', '--build', str(build), '--parallel', '4'], check=True)
         subprocess.run(['cmake', '--install', str(build)], check=True)
         if not freetype_library.exists():
             raise RuntimeError(f'FreeType install did not produce {freetype_library}')
+        if system == 'macos':
+            freetype_stamp.write_text(freetype_config)
     harfbuzz_library = prefix / 'lib' / ('libharfbuzz' + suffix)
     if not harfbuzz_library.exists():
         log('building HarfBuzz')
