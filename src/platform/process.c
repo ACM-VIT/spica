@@ -38,7 +38,8 @@ void spica_close(int fd) {
     if (fd >= 0)
         close(fd);
 }
-static int spawn(SpicaProcess *p, const char *node, char *const argv[], const char *cwd) {
+static int spawn(SpicaProcess *p, const char *node, char *const argv[], const char *cwd,
+                 char *const env[]) {
     int in[2] = {-1, -1}, out[2] = {-1, -1}, err[2] = {-1, -1};
     if (pipes(in) || pipes(out) || pipes(err))
         goto fail;
@@ -57,7 +58,7 @@ static int spawn(SpicaProcess *p, const char *node, char *const argv[], const ch
     sigaddset(&defs, SIGPIPE);
     posix_spawnattr_setsigdefault(&attr, &defs);
     pid_t pid = 0;
-    int rc = posix_spawn(&pid, node, &acts, &attr, argv, environ);
+    int rc = posix_spawn(&pid, node, &acts, &attr, argv, env);
     posix_spawn_file_actions_destroy(&acts);
     posix_spawnattr_destroy(&attr);
     if (rc) {
@@ -97,20 +98,27 @@ fail:
     return -1;
 }
 int spica_process_spawn(SpicaProcess *p, const char *node, const char *entry, const char *cwd,
-                        const char *resume, int trust) {
-    char *argv[8];
+                        const char *resume, int trust, const char *extension) {
+    char *argv[10];
     int n = 0;
     argv[n++] = (char *)node;
     argv[n++] = (char *)entry;
     argv[n++] = "--mode";
     argv[n++] = "rpc";
     argv[n++] = trust ? "--approve" : "--no-approve";
+    argv[n++] = "--extension";
+    argv[n++] = (char *)extension;
     if (resume) {
         argv[n++] = "--session";
         argv[n++] = (char *)resume;
     }
     argv[n] = 0;
-    return spawn(p, node, argv, cwd);
+    return spawn(p, node, argv, cwd, environ);
+}
+int spica_process_auth(SpicaProcess *p, const char *node, const char *entry, const char *cwd,
+                       const char *helper) {
+    char *argv[] = {(char *)node, (char *)helper, (char *)entry, NULL};
+    return spawn(p, node, argv, cwd, environ);
 }
 long spica_process_read(int fd, void *b, size_t n) {
     ssize_t r;
@@ -349,7 +357,7 @@ static long long ms(void) {
 uint64_t spica_monotonic_ms(void) { return (uint64_t)ms(); }
 int spica_process_version(SpicaProcess *p, const char *node, const char *entry) {
     char *argv[] = {(char *)node, (char *)entry, "--version", 0};
-    if (spawn(p, node, argv, "/"))
+    if (spawn(p, node, argv, "/", environ))
         return -1;
     spica_close(p->input);
     p->input = -1;
@@ -429,13 +437,23 @@ int spica_wake_create(int f[2]) {
 void spica_wake(int f) { (void)f; }
 void spica_close(int f) { (void)f; }
 int spica_process_spawn(SpicaProcess *p, const char *n, const char *e, const char *c, const char *r,
-                        int t) {
+                        int t, const char *x) {
     (void)p;
     (void)n;
     (void)e;
     (void)c;
     (void)r;
     (void)t;
+    (void)x;
+    return -1;
+}
+int spica_process_auth(SpicaProcess *p, const char *n, const char *e, const char *c,
+                       const char *h) {
+    (void)p;
+    (void)n;
+    (void)e;
+    (void)c;
+    (void)h;
     return -1;
 }
 int spica_process_version(SpicaProcess *p, const char *n, const char *e) {

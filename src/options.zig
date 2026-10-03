@@ -83,6 +83,9 @@ pub const help =
     \\Enter sends; Shift+Enter inserts a newline; Ctrl+Enter also sends.
     \\While running, input is a follow-up; click that control to choose steering instead.
     \\The composer only sends prompts, never direct shell commands. Ctrl+M opens configured models.
+    \\Connect a provider in Settings or the model picker runs Pi-managed sign-in while the chat is idle.
+    \\Choose browser sign-in or API-key/setup prompts; Escape cancels. Credentials stay in Pi's store.
+    \\Connection refreshes configured models without replacing the current chat.
     \\Thinking choices come from pi; each assistant's Reasoning disclosure keeps its answer visible.
     \\Prompts use bubbles; answers stay plain. Timestamps are source times in UTC, not estimated durations.
     \\File reads, changes and commands collapse into activity summaries; failed calls remain visible.
@@ -96,7 +99,7 @@ pub const help =
     \\Wheel and PageUp/PageDown scroll the full conversation, including previous prompts.
     \\Scrolling upward stops auto-follow; Jump to latest or clicking the current thread resumes it.
     \\The sidebar has its own wheel scroll. Ctrl+B hides/shows it; Ctrl/Cmd+R refreshes theme/library.
-    \\Settings / Ctrl+, opens appearance: text 12–24px, UI scale 75–175%, reading width 560–1120px.
+    \\Settings / Ctrl+, opens provider connection and appearance: text 12–24px, UI scale 75–175%, reading width 560–1120px.
     \\Dark/light themes, appearance values, and added folders persist across restarts.
     \\UI scale changes layout and hit targets; text rasterizes at native output DPI.
     \\Ctrl+Plus/Minus or Ctrl+wheel zooms; Ctrl+0 resets UI scale to 100%.

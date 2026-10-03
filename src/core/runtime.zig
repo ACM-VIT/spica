@@ -9,10 +9,59 @@ const protocol = @import("protocol.zig");
 const session = @import("session.zig");
 const Value = std.json.Value;
 const record_limit = 1024 * 1024;
+pub const provider_input_limit = 8192;
+
+fn wipeBytes(bytes: []u8) void {
+    for (bytes) |*byte| {
+        const pointer: *volatile u8 = byte;
+        pointer.* = 0;
+    }
+}
 
 pub const Behavior = enum { prompt, steer, follow_up };
 pub const Status = enum { stopped, starting, ready, streaming, stopping, needs_force_stop, exited, failed };
 pub const Model = struct { provider: []const u8, id: []const u8, name: []const u8 };
+pub const ProviderUi = struct {
+    kind: enum { closed, select, input, waiting, done, failed },
+    attempt: u64 = 0,
+    id: []const u8 = "",
+    title: []const u8 = "",
+    message: []const u8 = "",
+    placeholder: []const u8 = "",
+    url: []const u8 = "",
+    options: []const []const u8 = &.{},
+    secret: bool = false,
+
+    fn deinit(self: *ProviderUi, allocator: std.mem.Allocator) void {
+        inline for (.{ "id", "title", "message", "placeholder", "url" }) |field| allocator.free(@field(self, field));
+        for (self.options) |option| allocator.free(option);
+        allocator.free(self.options);
+    }
+
+    fn clone(self: ProviderUi, allocator: std.mem.Allocator) !ProviderUi {
+        var result = self;
+        var allocated: [5][]u8 = undefined;
+        var count: usize = 0;
+        errdefer for (allocated[0..count]) |bytes| allocator.free(bytes);
+        inline for (.{ "id", "title", "message", "placeholder", "url" }) |field| {
+            const bytes = try allocator.dupe(u8, @field(self, field));
+            allocated[count] = bytes;
+            count += 1;
+            @field(result, field) = bytes;
+        }
+        result.options = try allocator.alloc([]const u8, self.options.len);
+        var option_count: usize = 0;
+        errdefer {
+            for (result.options[0..option_count]) |option| allocator.free(option);
+            allocator.free(result.options);
+        }
+        for (self.options, @constCast(result.options)) |option, *dest| {
+            dest.* = try allocator.dupe(u8, option);
+            option_count += 1;
+        }
+        return result;
+    }
+};
 pub const Options = struct {
     database_path: []const u8,
     project_path: []const u8,
@@ -21,6 +70,7 @@ pub const Options = struct {
     trust_project: bool = false,
     resume_file: ?[]const u8 = null,
     wake_event: u32,
+    auth_only: bool = false,
 };
 pub const Snapshot = struct {
     allocator: std.mem.Allocator,
@@ -55,7 +105,9 @@ pub const Snapshot = struct {
     role: []const u8 = "assistant",
     kind: []const u8 = "message",
     content_status: []const u8 = "",
+    provider_ui: ProviderUi = .{ .kind = .closed },
     pub fn deinit(self: *Snapshot) void {
+        self.provider_ui.deinit(self.allocator);
         inline for (.{ "model", "provider", "session_file", "session_id", "session_name", "thinking_level", "error_message", "attention", "pending_draft", "rejected_command_id", "accepted_command_id", "role", "kind", "content_status" }) |field| self.allocator.free(@field(self, field));
         for (self.models) |m| {
             self.allocator.free(m.provider);
@@ -109,6 +161,7 @@ fn copySnapshot(a: std.mem.Allocator, original: Snapshot) !Snapshot {
         dest.* = try a.dupe(u8, level);
         level_count += 1;
     }
+    result.provider_ui = try original.provider_ui.clone(a);
     return result;
 }
 const QueuedBytes = struct { data: []u8, command_id: ?u64 = null, bash: bool = false, stop: bool = false };
@@ -156,6 +209,9 @@ pub const Runtime = struct {
     store: ?storage.Store = null,
     sink: Sink = undefined,
     next_id: u64 = 1,
+    auth_next_attempt: u64 = 1,
+    auth_attempt: u64 = 0, // Protected by mutex; invalidated when cancellation is queued.
+    auth_record: std.ArrayList(u8) = .empty,
     content_counter: u64 = 1,
     outgoing: std.ArrayList(u8) = .empty,
     write_offset: usize = 0,
@@ -226,6 +282,47 @@ pub const Runtime = struct {
     pub fn setThinkingLevel(self: *Runtime, level: []const u8) !void {
         _ = try self.command(.{ .type = "set_thinking_level", .level = level }, null);
     }
+    pub fn refreshModels(self: *Runtime) !void {
+        if (self.options.auth_only) return error.InvalidRuntimeMode;
+        try self.enqueue(.{ .bytes = .{ .data = try self.allocator.dupe(u8, "{\"id\":\"spica-refresh-models\",\"type\":\"prompt\",\"message\":\"/spica-refresh-models\"}\n") } });
+    }
+    pub fn connectProvider(self: *Runtime) !u64 {
+        if (!self.options.auth_only) return error.InvalidRuntimeMode;
+        native.SDL_LockMutex(self.mutex);
+        const attempt = self.auth_next_attempt;
+        self.auth_next_attempt += 1;
+        self.auth_attempt = attempt;
+        native.SDL_UnlockMutex(self.mutex);
+        try self.providerCommand(.{ .type = "connect", .attempt = attempt });
+        return attempt;
+    }
+    pub fn cancelProvider(self: *Runtime, attempt: u64) !void {
+        if (!self.options.auth_only) return error.InvalidRuntimeMode;
+        try self.providerCommand(.{ .type = "cancel", .attempt = attempt });
+        native.SDL_LockMutex(self.mutex);
+        if (self.auth_attempt == attempt) self.auth_attempt = 0;
+        native.SDL_UnlockMutex(self.mutex);
+    }
+    pub fn respondProvider(self: *Runtime, attempt: u64, id: []const u8, value: []const u8) !void {
+        if (!self.options.auth_only) return error.InvalidRuntimeMode;
+        if (id.len == 0 or id.len > 128 or value.len > provider_input_limit) return error.InvalidProviderResponse;
+        native.SDL_LockMutex(self.mutex);
+        const current = self.auth_attempt;
+        native.SDL_UnlockMutex(self.mutex);
+        if (attempt == 0 or attempt != current) return error.StaleProviderResponse;
+        try self.providerCommand(.{ .type = "respond", .attempt = attempt, .id = id, .value = value });
+    }
+    fn providerCommand(self: *Runtime, value: anytype) !void {
+        const bytes = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
+        defer {
+            wipeBytes(bytes);
+            self.allocator.free(bytes);
+        }
+        const line = try self.allocator.alloc(u8, bytes.len + 1);
+        @memcpy(line[0..bytes.len], bytes);
+        line[bytes.len] = '\n';
+        try self.enqueue(.{ .bytes = .{ .data = line } });
+    }
     pub fn stop(self: *Runtime) !void {
         // One queue item preserves ordering even with simultaneous UI producers.
         try self.enqueue(.{ .bytes = .{ .data = try self.allocator.dupe(u8, "{\"type\":\"clear_queue\"}\n{\"type\":\"abort\"}\n{\"type\":\"abort_bash\"}\n"), .stop = true } });
@@ -252,7 +349,7 @@ pub const Runtime = struct {
     pub fn destroy(self: *Runtime) !void {
         if (!self.isFinished()) return error.RuntimeStillRunning;
         self.thread.?.join();
-        for (self.inputs.items) |input| if (input == .bytes) self.allocator.free(input.bytes.data);
+        for (self.inputs.items) |input| if (input == .bytes) self.freeInput(input.bytes.data);
         self.inputs.deinit(self.allocator);
         if (self.snapshot) |*snap| snap.deinit();
         self.state.deinit();
@@ -260,7 +357,9 @@ pub const Runtime = struct {
         self.allocator.free(self.last_entry_id);
         self.allocator.free(self.leaf_id);
         self.allocator.free(self.last_prompt);
+        wipeBytes(self.outgoing.items);
         self.outgoing.deinit(self.allocator);
+        self.auth_record.deinit(self.allocator);
         self.blocks.deinit(self.allocator);
         for (self.tools.items) |tool| self.allocator.free(tool.id);
         self.tools.deinit(self.allocator);
@@ -276,7 +375,7 @@ pub const Runtime = struct {
         a.destroy(self);
     }
     fn enqueue(self: *Runtime, input: Input) !void {
-        errdefer if (input == .bytes) self.allocator.free(input.bytes.data);
+        errdefer if (input == .bytes) self.freeInput(input.bytes.data);
         native.SDL_LockMutex(self.mutex);
         defer native.SDL_UnlockMutex(self.mutex);
         if (self.worker_done or (!self.accepting and input != .force)) return error.RuntimeClosed;
@@ -311,6 +410,10 @@ pub const Runtime = struct {
         self.inputs.appendAssumeCapacity(.{ .bytes = .{ .data = line, .command_id = token, .bash = std.mem.eql(u8, value.type, "bash") } });
         p.spica_wake(self.wake[1]);
         return token;
+    }
+    fn freeInput(self: *Runtime, bytes: []u8) void {
+        wipeBytes(bytes);
+        self.allocator.free(bytes);
     }
     pub fn replace(self: *Runtime, target: *[]const u8, bytes: []const u8) !void {
         const bounded = if (target == &self.state.error_message or target == &self.state.attention) bytes[0..@min(bytes.len, 4096)] else bytes;
@@ -349,7 +452,7 @@ pub const Runtime = struct {
             native.SDL_UnlockMutex(self.mutex);
             for (unsent.items) |input| if (input == .bytes) {
                 if (input.bytes.command_id) |token| self.rejectUnsent(token) catch {};
-                self.allocator.free(input.bytes.data);
+                self.freeInput(input.bytes.data);
             };
             unsent.deinit(self.allocator);
             self.rejectOutstanding() catch {};
@@ -359,11 +462,11 @@ pub const Runtime = struct {
             notification.type = self.options.wake_event;
             _ = native.SDL_PushEvent(&notification);
         }
-        self.store = storage.Store.init(self.allocator, self.options.database_path) catch |err| {
+        if (!self.options.auth_only) self.store = storage.Store.init(self.allocator, self.options.database_path) catch |err| {
             self.fail(err);
             return;
         };
-        defer self.store.?.deinit();
+        defer if (self.store) |*store| store.deinit();
         self.sink = .{ .runtime = self };
         defer self.sink.deinit();
         var framer = protocol.Framer(Sink).init(self.allocator, &self.sink);
@@ -388,7 +491,7 @@ pub const Runtime = struct {
                     polling.exit_fd = -1;
                     if (!reported_reap_failure) {
                         reported_reap_failure = true;
-                        self.replace(&self.state.error_message, "Child reap failed; process ownership retained for explicit retry") catch {};
+                        self.replace(&self.state.error_message, "Couldn't finish Pi shutdown") catch {};
                         self.publish() catch {};
                     }
                 }
@@ -430,7 +533,10 @@ pub const Runtime = struct {
             if (bits & 8 != 0) {
                 const n = p.spica_process_write(self.process.input, self.outgoing.items.ptr + self.write_offset, self.outgoing.items.len - self.write_offset);
                 if (n == -1) return error.ProcessInputClosed;
-                if (n > 0) self.write_offset += @intCast(n);
+                if (n > 0) {
+                    wipeBytes(self.outgoing.items[self.write_offset..][0..@intCast(n)]);
+                    self.write_offset += @intCast(n);
+                }
                 if (self.write_offset == self.outgoing.items.len) {
                     self.outgoing.clearRetainingCapacity();
                     self.write_offset = 0;
@@ -446,7 +552,7 @@ pub const Runtime = struct {
                 var status: c_int = 0;
                 if (p.spica_process_reap(&self.process, &status) != 1) return error.ProcessWait;
                 self.state.status = .exited;
-                if (!self.closing) try self.replace(&self.state.error_message, "Pi exited unexpectedly; pending draft is recoverable");
+                if (!self.closing) try self.replace(&self.state.error_message, "Pi exited unexpectedly; draft retained");
                 try self.publish();
                 return;
             }
@@ -467,7 +573,7 @@ pub const Runtime = struct {
         self.inputs = .empty;
         native.SDL_UnlockMutex(self.mutex);
         defer {
-            for (inputs.items) |input| if (input == .bytes) self.allocator.free(input.bytes.data);
+            for (inputs.items) |input| if (input == .bytes) self.freeInput(input.bytes.data);
             inputs.deinit(self.allocator);
         }
         for (inputs.items) |input| switch (input) {
@@ -476,12 +582,12 @@ pub const Runtime = struct {
             },
             .bytes => |queued| {
                 if (self.process.pid == 0 or self.process.input < 0) {
-                    try self.replace(&self.state.error_message, "Pi is not accepting commands; unsent draft retained");
+                    try self.replace(&self.state.error_message, "Pi unavailable; draft retained");
                     if (queued.command_id) |token| try self.rejectUnsent(token);
                     try self.publish();
                 } else {
-                    if (self.outgoing.items.len + queued.data.len > 2 * 1024 * 1024) return error.OutgoingQueueFull;
-                    try self.outgoing.appendSlice(self.allocator, queued.data);
+                    try self.ensureOutgoing(queued.data.len);
+                    self.outgoing.appendSliceAssumeCapacity(queued.data);
                     if (queued.stop) self.stop_requested = true;
                     if (queued.bash) {
                         self.state.bash_running = true;
@@ -493,6 +599,7 @@ pub const Runtime = struct {
             },
             .shutdown => {
                 self.closing = true;
+                // EOF cancels the dedicated helper without involving chat extensions.
                 self.shutdown_deadline = p.spica_monotonic_ms() + 5000;
                 self.state.status = .stopping;
                 try self.publish();
@@ -500,7 +607,7 @@ pub const Runtime = struct {
             .force => {
                 if (p.spica_process_force(&self.process) != 0) {
                     self.state.status = .needs_force_stop;
-                    try self.replace(&self.state.error_message, "Force termination failed; owned process retained. Retry Force explicitly.");
+                    try self.replace(&self.state.error_message, "Couldn't stop Pi. Try Force again.");
                     try self.publish();
                 }
             },
@@ -517,9 +624,15 @@ pub const Runtime = struct {
         const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.options.project_path, self.allocator);
         defer self.allocator.free(cwd);
         self.options.project_path = try self.options_arena.allocator().dupeZ(u8, cwd);
+        if (self.options.auth_only) {
+            if (p.spica_process_auth(&self.process, node, entry, cwd, @import("build_options").asset_directory ++ "/provider-auth.mjs") != 0) return error.ProviderLaunchFailed;
+            self.state.status = .ready;
+            try self.publish();
+            return;
+        }
         const resume_path = if (self.options.resume_file) |file| try std.Io.Dir.cwd().realPathFileAlloc(self.io, file, self.allocator) else null;
         defer if (resume_path) |file| self.allocator.free(file);
-        if (p.spica_process_spawn(&self.process, node, entry, cwd, if (resume_path) |r| r.ptr else null, @intFromBool(self.options.trust_project)) != 0) return error.PiLaunchFailed;
+        if (p.spica_process_spawn(&self.process, node, entry, cwd, if (resume_path) |r| r.ptr else null, @intFromBool(self.options.trust_project), @import("build_options").asset_directory ++ "/provider-extension.mjs") != 0) return error.PiLaunchFailed;
         try self.requestState();
         try self.queue(.{ .type = "get_available_models" });
         try self.queue(.{ .type = "get_available_thinking_levels" });
@@ -527,11 +640,25 @@ pub const Runtime = struct {
     fn requestState(self: *Runtime) !void {
         try self.queue(.{ .type = "get_state", .id = self.state.generation });
     }
+    fn ensureOutgoing(self: *Runtime, extra: usize) !void {
+        const needed = self.outgoing.items.len + extra;
+        if (needed > 2 * 1024 * 1024) return error.OutgoingQueueFull;
+        if (needed <= self.outgoing.capacity) return;
+        const capacity = @min(2 * 1024 * 1024, @max(needed, self.outgoing.capacity + self.outgoing.capacity / 2 + 256));
+        const bytes = try self.allocator.alloc(u8, capacity);
+        @memcpy(bytes[0..self.outgoing.items.len], self.outgoing.items);
+        const old = self.outgoing.items.ptr[0..self.outgoing.capacity];
+        wipeBytes(old);
+        self.allocator.free(old);
+        self.outgoing.items = bytes[0..self.outgoing.items.len];
+        self.outgoing.capacity = capacity;
+    }
     fn queue(self: *Runtime, value: anytype) !void {
         const bytes = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
         defer self.allocator.free(bytes);
-        try self.outgoing.appendSlice(self.allocator, bytes);
-        try self.outgoing.append(self.allocator, '\n');
+        try self.ensureOutgoing(bytes.len + 1);
+        self.outgoing.appendSliceAssumeCapacity(bytes);
+        self.outgoing.appendAssumeCapacity('\n');
     }
     fn readStdout(self: *Runtime, framer: *protocol.Framer(Sink)) !void {
         var b: [65536]u8 = undefined;
@@ -544,8 +671,50 @@ pub const Runtime = struct {
                 self.process.output = -1;
                 break;
             }
-            try framer.ingest(b[0..@intCast(n)]);
+            if (self.options.auth_only) try self.readAuthRecords(b[0..@intCast(n)]) else try framer.ingest(b[0..@intCast(n)]);
         }
+    }
+    fn readAuthRecords(self: *Runtime, bytes: []const u8) !void {
+        var offset: usize = 0;
+        for (bytes, 0..) |byte, index| if (byte == '\n') {
+            if (self.auth_record.items.len + index - offset > record_limit) return error.ProviderRecordTooLarge;
+            try self.auth_record.appendSlice(self.allocator, bytes[offset..index]);
+            const parsed = try std.json.parseFromSlice(Value, self.allocator, self.auth_record.items, .{});
+            defer parsed.deinit();
+            try self.authEvent(parsed.value);
+            self.auth_record.clearRetainingCapacity();
+            offset = index + 1;
+        };
+        if (self.auth_record.items.len + bytes.len - offset > record_limit) return error.ProviderRecordTooLarge;
+        try self.auth_record.appendSlice(self.allocator, bytes[offset..]);
+    }
+    fn authEvent(self: *Runtime, value: Value) !void {
+        if (!self.options.auth_only or !std.mem.eql(u8, string(value, "type"), "provider_ui")) return;
+        const attempt = integer(value, "attempt");
+        native.SDL_LockMutex(self.mutex);
+        const current = self.auth_attempt;
+        native.SDL_UnlockMutex(self.mutex);
+        if (attempt <= 0 or @as(u64, @intCast(attempt)) != current) return;
+        const kind = std.meta.stringToEnum(@FieldType(ProviderUi, "kind"), string(value, "kind")) orelse return error.InvalidProviderRecord;
+        const choices = child(value, "options");
+        var options: std.ArrayList([]const u8) = .empty;
+        defer options.deinit(self.allocator);
+        if (choices == .array) for (choices.array.items) |choice| {
+            if (choice != .string) return error.InvalidProviderRecord;
+            try options.append(self.allocator, choice.string);
+        };
+        try self.setProviderUi(.{
+            .kind = kind,
+            .attempt = current,
+            .id = string(value, "id"),
+            .title = string(value, "title"),
+            .message = string(value, "message"),
+            .placeholder = string(value, "placeholder"),
+            .url = string(value, "url"),
+            .options = options.items,
+            .secret = boolean(value, "secret"),
+        });
+        try self.publish();
     }
     fn readStderr(self: *Runtime) !void {
         var b: [4096]u8 = undefined;
@@ -558,6 +727,8 @@ pub const Runtime = struct {
                 self.process.@"error" = -1;
                 break;
             }
+            // Authentication stderr is never retained: SDK diagnostics can contain secrets.
+            if (self.options.auth_only) continue;
             const id = try self.content(b[0..@intCast(n)], "text/plain");
             try self.store.?.addDiagnostic(self.state.session_file, self.state.runtime_id, "stderr", "Pi process stderr", id, 0);
         }
@@ -620,7 +791,7 @@ pub const Runtime = struct {
             }
         }
         try self.offerRecovery(draft.string);
-        try self.replace(&self.state.attention, "Cancelled queued messages retained in protocol cache");
+        try self.replace(&self.state.attention, "Queued messages cancelled; input retained");
     }
 
     fn recoverDrafts(self: *Runtime) !void {
@@ -766,6 +937,7 @@ pub const Runtime = struct {
                 try self.publish();
                 return;
             }
+            if (std.mem.eql(u8, string(value, "id"), "spica-refresh-models")) try self.queue(.{ .type = "get_available_models" });
             if (std.mem.eql(u8, command_name, "get_state")) {
                 try self.replace(&self.state.session_file, string(data, "sessionFile"));
                 try self.replace(&self.state.session_id, string(data, "sessionId"));
@@ -811,7 +983,7 @@ pub const Runtime = struct {
                 self.state.models = owned_models;
                 if (models == .array and models.array.items.len > 256) {
                     try self.inspect(raw, "model_display_budget", "Available model list exceeds first-pass display budget; complete list retained");
-                    try self.replace(&self.state.attention, "Available model list exceeds first-pass display budget");
+                    try self.replace(&self.state.attention, "Showing the first 256 models");
                 }
             } else if (std.mem.eql(u8, command_name, "get_available_thinking_levels")) {
                 const levels = child(data, "levels");
@@ -841,7 +1013,7 @@ pub const Runtime = struct {
                 try self.requestState();
             } else if (std.mem.eql(u8, command_name, "new_session")) {
                 if (boolean(data, "cancelled")) {
-                    try self.replace(&self.state.attention, "New session was cancelled; current thread retained");
+                    try self.replace(&self.state.attention, "New chat cancelled");
                 } else {
                     const generation = try std.math.add(i64, self.state.generation, 1);
                     try self.store.?.clearLiveGeneration(self.state.runtime_id, self.state.generation);
@@ -1012,7 +1184,7 @@ pub const Runtime = struct {
             self.state.visible_revision += 1;
         } else if (std.mem.eql(u8, ty, "extension_ui_request")) {
             try self.inspect(raw, "pending_extension_request", string(value, "method"));
-            try self.replace(&self.state.attention, "Extension request pending: inspect retained protocol record; no response was invented");
+            try self.replace(&self.state.attention, "Extension input isn't supported");
         } else if (std.mem.eql(u8, ty, "extension_error")) {
             try self.replace(&self.state.error_message, string(value, "error"));
             try self.inspect(raw, "extension_error", self.state.error_message);
@@ -1021,6 +1193,12 @@ pub const Runtime = struct {
         }
         try self.publish();
     }
+    fn setProviderUi(self: *Runtime, ui: ProviderUi) !void {
+        const owned = try ui.clone(self.allocator);
+        self.state.provider_ui.deinit(self.allocator);
+        self.state.provider_ui = owned;
+    }
+
     pub fn inspect(self: *Runtime, raw: storage.ContentId, kind: []const u8, summary: []const u8) !void {
         try self.store.?.addDiagnostic(self.state.session_file, self.state.runtime_id, kind, summary[0..@min(summary.len, 2048)], raw, 0);
     }
@@ -1194,7 +1372,7 @@ const Sink = struct {
                 else => {
                     self.runtime.entries_again = false;
                     try self.runtime.inspect(self.id, "unsupported_entries_shape", @errorName(err));
-                    try self.runtime.replace(&self.runtime.state.attention, "Unsupported canonical entry shape retained for inspection");
+                    try self.runtime.replace(&self.runtime.state.attention, "Couldn't display chat history; raw data saved");
                     try self.runtime.publish();
                     return;
                 },
@@ -1208,7 +1386,7 @@ const Sink = struct {
         }
         if (source.length > record_limit) {
             try self.runtime.inspect(self.id, "unsupported_oversized_record", "Record exceeds bounded reducer; complete raw bytes retained");
-            try self.runtime.replace(&self.runtime.state.attention, "Oversized protocol record retained on disk for inspection");
+            try self.runtime.replace(&self.runtime.state.attention, "Pi response too large to display; raw data saved");
             try self.runtime.publish();
             return;
         }
@@ -1225,7 +1403,7 @@ const Sink = struct {
             error.OutOfMemory, error.SqliteFailure => return err,
             else => {
                 try self.runtime.inspect(self.id, "unsupported_protocol_fields", @errorName(err));
-                try self.runtime.replace(&self.runtime.state.attention, "Unsupported protocol fields retained for inspection");
+                try self.runtime.replace(&self.runtime.state.attention, "Unsupported Pi response; raw data saved");
                 try self.runtime.publish();
             },
         };
@@ -1264,4 +1442,65 @@ test "completed agents reconcile idle state while queued work remains streaming"
         try runtime.event(parsed.value, @splat(0));
         try std.testing.expectEqual(if (index == events.len - 1) Status.ready else Status.streaming, runtime.snapshot.?.status);
     }
+}
+
+test "only the auth worker accepts provider records and replies" {
+    const allocator = std.testing.allocator;
+    const mutex = native.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer native.SDL_DestroyMutex(mutex);
+    var runtime = Runtime{
+        .allocator = allocator,
+        .io = undefined,
+        .options_arena = undefined,
+        .options = .{ .database_path = "", .project_path = "", .node_path = "", .pi_entrypoint = "", .wake_event = native.SDL_EVENT_USER + 3 },
+        .mutex = mutex,
+        .wake = undefined,
+        .state = try copySnapshot(allocator, .{ .allocator = allocator }),
+        .auth_attempt = 2,
+    };
+    defer runtime.state.deinit();
+    defer if (runtime.snapshot) |*snapshot| snapshot.deinit();
+    const forged = try std.json.parseFromSlice(Value, allocator,
+        \\{"type":"provider_ui","attempt":2,"kind":"input","id":"foreign","title":"Connect provider: [secret] API key"}
+    , .{});
+    defer forged.deinit();
+    try runtime.authEvent(forged.value);
+    try std.testing.expectEqual(.closed, runtime.state.provider_ui.kind);
+    try std.testing.expectError(error.InvalidRuntimeMode, runtime.respondProvider(2, "foreign", "credential"));
+    try std.testing.expectError(error.InvalidRuntimeMode, runtime.connectProvider());
+    try std.testing.expectError(error.InvalidRuntimeMode, runtime.cancelProvider(2));
+    try std.testing.expectEqual(@as(usize, 0), runtime.inputs.items.len);
+}
+
+test "late provider cancellation cannot replace a newer authentication prompt" {
+    const allocator = std.testing.allocator;
+    const mutex = native.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer native.SDL_DestroyMutex(mutex);
+    var runtime = Runtime{
+        .allocator = allocator,
+        .io = undefined,
+        .options_arena = undefined,
+        .options = .{ .database_path = "", .project_path = "", .node_path = "", .pi_entrypoint = "", .wake_event = native.SDL_EVENT_USER + 3, .auth_only = true },
+        .mutex = mutex,
+        .wake = undefined,
+        .state = try copySnapshot(allocator, .{ .allocator = allocator }),
+        .auth_attempt = 2,
+    };
+    defer runtime.state.deinit();
+    defer if (runtime.snapshot) |*snapshot| snapshot.deinit();
+    const current = try std.json.parseFromSlice(Value, allocator,
+        \\{"type":"provider_ui","attempt":2,"kind":"input","id":"new-prompt","message":"Authorization code","url":"https://example.com/auth","secret":true}
+    , .{});
+    defer current.deinit();
+    try runtime.authEvent(current.value);
+    const late = try std.json.parseFromSlice(Value, allocator,
+        \\{"type":"provider_ui","attempt":1,"kind":"closed","id":""}
+    , .{});
+    defer late.deinit();
+    try runtime.authEvent(late.value);
+    try std.testing.expectEqual(.input, runtime.state.provider_ui.kind);
+    try std.testing.expectEqualStrings("new-prompt", runtime.state.provider_ui.id);
+    try std.testing.expectEqualStrings("https://example.com/auth", runtime.state.provider_ui.url);
+    try std.testing.expect(runtime.state.provider_ui.secret);
+    try std.testing.expectError(error.StaleProviderResponse, runtime.respondProvider(1, "old-prompt", "old-code"));
 }

@@ -16,9 +16,10 @@ const build_options = @import("build_options");
 const SessionCatalog = @import("core/catalog.zig");
 const Settings = @import("ui/settings.zig");
 const Library = @import("ui/library.zig");
+const Providers = @import("ui/providers.zig");
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
-const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
+const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, connect_provider, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
 const ThreadTarget = struct { path: ?[:0]u8, cwd: [:0]u8, archived: bool = false };
 const SubmittedPrompt = struct { token: u64, draft_revision: u64 };
 const ChatView = enum { new_thread, opening, existing };
@@ -133,6 +134,8 @@ pub const App = struct {
     draft_writer: *Draft.Writer,
     runtime: ?*pi.Runtime = null,
     runtime_snapshot: ?pi.Snapshot = null,
+    auth_runtime: ?*pi.Runtime = null,
+    auth_snapshot: ?pi.Snapshot = null,
     parked_chats: std.ArrayList(ParkedChat) = .empty,
     chat_id: u64 = 1,
     next_chat_id: u64 = 2,
@@ -157,6 +160,7 @@ pub const App = struct {
     run_elapsed: ?u64 = null,
     appearance: Settings.Values = .{},
     settings_open: bool = false,
+    providers: Providers.Panel = .{},
     projects: std.ArrayList([:0]u8) = .empty,
     catalog_error: ?anyerror = null,
     collapsed_folders: std.ArrayList([]u8) = .empty,
@@ -326,6 +330,9 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         if (self.runtime) |runtime| runtime.destroy() catch |err| std.log.err("Runtime shutdown invariant: {s}", .{@errorName(err)});
+        if (self.auth_runtime) |runtime| runtime.destroy() catch |err| std.log.err("Authentication shutdown invariant: {s}", .{@errorName(err)});
+        if (self.auth_snapshot) |*snapshot| snapshot.deinit();
+        self.providers.deinit(self.allocator);
         if (self.runtime_snapshot) |*snapshot| snapshot.deinit();
         for (self.parked_chats.items) |*chat| chat.deinit(self.allocator);
         self.parked_chats.deinit(self.allocator);
@@ -421,7 +428,7 @@ pub const App = struct {
     }
 
     fn report(self: *App, operation: []const u8, err: anyerror) void {
-        const text = std.fmt.bufPrint(&self.error_text, "{s}: {s}", .{ operation, @errorName(err) }) catch "Error message exceeds display budget";
+        const text = std.fmt.bufPrint(&self.error_text, "{s}: {s}", .{ operation, @errorName(err) }) catch "Error details unavailable";
         self.error_len = text.len;
         self.formatting_error = false;
         std.log.err("{s}", .{text});
@@ -738,12 +745,16 @@ pub const App = struct {
 
     fn ownedRuntimesFinished(self: *const App) bool {
         if (self.runtime) |runtime| if (!runtime.isFinished()) return false;
+        if (self.auth_runtime) |runtime| if (!runtime.isFinished()) return false;
         for (self.parked_chats.items) |chat| if (chat.runtime) |runtime| if (!runtime.isFinished()) return false;
         return true;
     }
 
     fn shutdownOwned(self: *App) !void {
         var failure: ?anyerror = null;
+        if (self.auth_runtime) |runtime| if (!runtime.isFinished()) runtime.shutdown() catch |err| {
+            failure = err;
+        };
         if (self.runtime) |runtime| if (!runtime.isFinished()) {
             runtime.shutdown() catch |err| {
                 failure = err;
@@ -760,6 +771,9 @@ pub const App = struct {
 
     fn needsForceStop(self: *const App) bool {
         if (self.runtime) |runtime| if (!runtime.isFinished() and self.runtimeStatus() == .needs_force_stop) return true;
+        if (self.auth_runtime) |runtime| if (!runtime.isFinished()) {
+            if (self.auth_snapshot) |snapshot| if (snapshot.status == .needs_force_stop) return true;
+        };
         for (self.parked_chats.items) |chat| if (chat.runtime) |runtime| if (!runtime.isFinished()) {
             if (chat.snapshot) |snapshot| if (snapshot.status == .needs_force_stop) return true;
         };
@@ -768,6 +782,13 @@ pub const App = struct {
 
     fn forceOwned(self: *App) !void {
         var failure: ?anyerror = null;
+        if (self.auth_runtime) |runtime| if (!runtime.isFinished() and
+            (self.closing or (self.auth_snapshot != null and self.auth_snapshot.?.status == .needs_force_stop)))
+        {
+            runtime.forceTerminate() catch |err| {
+                failure = err;
+            };
+        };
         if (self.runtime) |runtime| if (!runtime.isFinished() and (self.closing or self.runtimeStatus() == .needs_force_stop)) {
             runtime.forceTerminate() catch |err| {
                 failure = err;
@@ -792,6 +813,11 @@ pub const App = struct {
 
     fn requestClose(self: *App) !void {
         if (!self.closing) {
+            if (self.providers.open) {
+                self.providers.wipe();
+                if (self.auth_runtime) |runtime| runtime.cancelProvider(self.providers.attempt) catch {};
+                self.providers.close();
+            }
             try self.saveDraft();
             self.closing = true;
             self.focused_editor = false;
@@ -1242,7 +1268,170 @@ pub const App = struct {
         }
     }
 
+    fn consumeAuth(self: *App) void {
+        const runtime = self.auth_runtime orelse return;
+        if (runtime.takeSnapshot()) |incoming| {
+            const new_connection = incoming.provider_ui.kind == .done and
+                incoming.provider_ui.attempt == self.providers.attempt and
+                (self.auth_snapshot == null or self.auth_snapshot.?.provider_ui.kind != .done or
+                    self.auth_snapshot.?.provider_ui.attempt != incoming.provider_ui.attempt);
+            if (self.auth_snapshot) |*old| old.deinit();
+            self.auth_snapshot = incoming;
+            if (incoming.provider_ui.attempt == self.providers.attempt and self.providers.attempt != 0)
+                self.providers.observe(self, incoming.provider_ui);
+            if (self.providers.open and self.providers.active and
+                (incoming.status == .failed or incoming.status == .exited or incoming.status == .needs_force_stop))
+            {
+                self.providers.active = false;
+                self.providers.fail("Sign-in stopped. Retry.");
+                _ = c.SDL_ClearComposition(self.window);
+                _ = c.SDL_StopTextInput(self.window);
+            }
+            if (new_connection) {
+                if (self.runtimeStatus() == .ready) {
+                    if (self.runtime) |chat| chat.refreshModels() catch |err| self.report("Refreshing models", err);
+                } else self.beginRuntime() catch |err| self.report("Starting pi", err);
+            }
+            self.dirty = true;
+        }
+    }
+
+    fn providerUi(self: *const App) pi.ProviderUi {
+        if (self.auth_snapshot) |snapshot| if (snapshot.provider_ui.attempt == self.providers.attempt)
+            return snapshot.provider_ui;
+        return .{ .kind = .waiting };
+    }
+
+    fn connectProvider(self: *App) void {
+        self.providers.begin();
+        self.settings_open = false;
+        self.model_menu = false;
+        self.thinking_menu = false;
+        self.focused_editor = false;
+        self.dragging = false;
+        self.preedit.clearRetainingCapacity();
+        _ = c.SDL_ClearComposition(self.window);
+        _ = c.SDL_StopTextInput(self.window);
+        self.dirty = true;
+        if (self.options.fixture) {
+            self.providers.fail("Sign-in unavailable in demo mode");
+            return;
+        }
+        if (self.pending_thread != null or self.closing or self.runtime_retiring) {
+            self.providers.fail("Wait for the chat to finish opening or closing.");
+            return;
+        }
+        if (self.runtimeStatus() == .streaming or self.bashRunning() or self.submitted_prompt != null) {
+            self.providers.fail("Stop the current run to sign in.");
+            return;
+        }
+        if (self.runtimeStatus() == .starting or self.runtimeStatus() == .stopping or self.runtimeStatus() == .needs_force_stop) {
+            self.providers.fail("Wait for Pi to finish starting or stopping.");
+            return;
+        }
+        if (self.auth_runtime) |runtime| if (runtime.isFinished()) {
+            runtime.destroy() catch {
+                self.providers.fail("Couldn't restart sign-in.");
+                return;
+            };
+            self.auth_runtime = null;
+            if (self.auth_snapshot) |*snapshot| snapshot.deinit();
+            self.auth_snapshot = null;
+        };
+        if (self.auth_runtime == null) {
+            self.auth_runtime = pi.Runtime.create(self.allocator, self.io, .{
+                .database_path = self.paths.database,
+                .project_path = self.project_path,
+                .node_path = self.options.node_path,
+                .pi_entrypoint = self.options.pi_entrypoint,
+                .wake_event = self.wake_event,
+                .auth_only = true,
+            }) catch {
+                self.providers.fail("Couldn't start sign-in.");
+                return;
+            };
+            self.auth_runtime.?.start() catch {
+                self.auth_runtime.?.shutdown() catch {};
+                self.providers.fail("Couldn't start sign-in.");
+                return;
+            };
+        }
+        self.providers.attempt = self.auth_runtime.?.connectProvider() catch {
+            self.providers.fail("Couldn't start sign-in. Retry.");
+            return;
+        };
+        self.providers.active = true;
+    }
+
+    fn closeProvider(self: *App) void {
+        self.providers.close();
+        self.focused_editor = true;
+        _ = c.SDL_ClearComposition(self.window);
+        _ = c.SDL_StartTextInput(self.window);
+        self.dirty = true;
+    }
+
+    fn providerIntent(self: *App, intent: Providers.Intent) !void {
+        switch (intent) {
+            .cancel => {
+                self.providers.wipe();
+                _ = c.SDL_ClearComposition(self.window);
+                if (self.providers.active) if (self.auth_runtime) |runtime| runtime.cancelProvider(self.providers.attempt) catch {
+                    self.providers.input_error = "Could not cancel provider connection. Try Cancel again.";
+                    self.dirty = true;
+                    return;
+                };
+                self.providers.active = false;
+                self.closeProvider();
+            },
+            .close => {
+                if (self.providers.active) try self.providerIntent(.cancel) else self.closeProvider();
+            },
+            .retry => {
+                if (self.providers.active) {
+                    try self.providerIntent(.cancel);
+                    if (self.providers.active) return;
+                }
+                self.connectProvider();
+            },
+            .url => {
+                const ui = self.providerUi();
+                if (ui.url.len == 0) return;
+                const url = try self.allocator.dupeZ(u8, ui.url);
+                defer self.allocator.free(url);
+                if (!c.SDL_OpenURL(url.ptr)) self.providers.input_error = "Could not open the browser. Open the displayed URL manually.";
+            },
+            .respond => {
+                if (self.providers.pending or self.providers.failure != null) return;
+                const ui = self.providerUi();
+                const value = switch (ui.kind) {
+                    .input => self.providers.input[0..self.providers.input_len],
+                    .select => if (self.providers.selected < ui.options.len) ui.options[self.providers.selected] else return,
+                    else => return,
+                };
+                defer self.providers.wipe();
+                const runtime = self.auth_runtime orelse {
+                    self.providers.fail("Pi exited during provider connection.");
+                    return;
+                };
+                runtime.respondProvider(self.providers.attempt, ui.id, value) catch {
+                    self.providers.fail("Couldn't send the response. Retry sign-in.");
+                    return;
+                };
+                self.providers.pending = true;
+                self.providers.target_count = 0;
+                _ = c.SDL_ClearComposition(self.window);
+                _ = c.SDL_StopTextInput(self.window);
+            },
+        }
+        self.dirty = true;
+    }
+
     fn act(self: *App, action: Action) !void {
+        if (self.providers.open) switch (action) {
+            .force_stop, .wait => {},
+            else => return error.ProviderConnectionInProgress,
+        };
         switch (action) {
             .start => try self.beginRuntime(),
             .new_thread => try self.newThreadIn(self.project_path),
@@ -1280,6 +1469,7 @@ pub const App = struct {
                 self.folder_pending = true;
                 c.SDL_ShowOpenFolderDialog(folderChosen, @ptrFromInt(self.wake_event), self.window, self.project_path.ptr, false);
             },
+            .connect_provider => self.connectProvider(),
             .settings => {
                 self.settings_open = !self.settings_open;
                 self.model_menu = false;
@@ -1395,8 +1585,8 @@ pub const App = struct {
             try self.rectangle(x + 1, y + 1, width - 2, 258, 7, colors.panel);
             if (self.runtime_snapshot) |snapshot| {
                 if (snapshot.models.len == 0) try self.label("No configured models", x + 12, y + 16, 13, colors.muted);
-                self.model_first = @min(self.model_first, snapshot.models.len -| 1);
-                const end = @min(snapshot.models.len, self.model_first + 6);
+                self.model_first = @min(self.model_first, snapshot.models.len);
+                const end = @min(snapshot.models.len, self.model_first + 5);
                 for (snapshot.models[self.model_first..end], self.model_first..) |model, index| {
                     const row_y = y + 8 + @as(f32, @floatFromInt(index - self.model_first)) * 40;
                     const row_clip = c.SDL_Rect{ .x = @intFromFloat(x + 8), .y = @intFromFloat(row_y), .w = @intFromFloat(width - 16), .h = 38 };
@@ -1406,7 +1596,10 @@ pub const App = struct {
                     try self.label(clippedLabel(model.provider), x + 12, row_y + 23, 10, colors.muted);
                     _ = c.SDL_SetRenderClipRect(self.renderer, null);
                 }
-            } else try self.label("Start pi to discover models", x + 12, y + 16, 13, colors.muted);
+            } else try self.label("Models unavailable", x + 12, y + 16, 13, colors.muted);
+            const connect_selected = if (self.runtime_snapshot) |snapshot| self.model_first == snapshot.models.len else true;
+            if (connect_selected) try self.rectangle(x + 8, y + 216, width - 16, 34, 5, colors.raised);
+            try self.flatButton(.connect_provider, "Connect a provider", .{ .x = x + 8, .y = y + 216, .w = width - 16, .h = 34 });
         }
         if (self.thinking_menu) {
             if (self.runtime_snapshot) |snapshot| {
@@ -1419,19 +1612,26 @@ pub const App = struct {
             }
         }
         if (self.closing or self.force_dialog) {
-            const x = self.shell.conversation.x + 36;
-            try self.rectangle(x, 110, self.shell.conversation.width - 72, 166, 10, colors.panel);
-            try self.label(if (self.force_dialog) "Pi has not exited" else "Closing pi gracefully...", x + 20, 130, 18, colors.text);
-            try self.label("The window stays alive until its owned process exits.", x + 20, 164, 13, colors.muted);
+            const canvas_width = self.shell.sidebar.width + self.shell.conversation.width;
+            const canvas_height = self.shell.header.height + self.shell.conversation.height + self.shell.composer.height;
+            const width = @min(@as(f32, 420), canvas_width - 32);
+            const height: f32 = if (self.force_dialog) 164 else 100;
+            const x = (canvas_width - width) / 2;
+            const y = (canvas_height - height) / 2;
+            try self.rectangle(x, y, width, height, 10, colors.panel);
+            try self.label(if (self.force_dialog) "Pi has not exited" else "Closing...", x + 20, y + 18, 18, colors.text);
+            try self.label(if (self.force_dialog) "Force stops Pi and its running tasks." else "Spica will close when Pi exits.", x + 20, y + 50, 13, colors.muted);
             if (self.force_dialog) {
-                try self.button(.wait, "Wait", .{ .x = x + 20, .y = 213, .w = 80, .h = 34 });
-                try self.button(.force_stop, "Force owned tree · Ctrl+Shift+Esc", .{ .x = x + 114, .y = 213, .w = 258, .h = 34 });
+                try self.label("Unsaved work may be lost.", x + 20, y + 70, 13, colors.muted);
+                try self.button(.wait, "Wait", .{ .x = x + 20, .y = y + 110, .w = 80, .h = 34 });
+                try self.button(.force_stop, "Force", .{ .x = x + 114, .y = y + 110, .w = 76, .h = 34 });
             }
         }
     }
 
     fn consume(self: *App) void {
         self.consumeRuntime();
+        self.consumeAuth();
         self.consumeParked();
         while (self.catalog_worker.takeMutation()) |result| {
             if (self.pending_mutation) |value| {
@@ -1765,9 +1965,9 @@ pub const App = struct {
         try self.iconButton(.sidebar, .sidebar, .{ .x = 12, .y = 9, .w = 30, .h = 30 }, colors.muted);
         try self.label("Spica", 50, 17, 15, colors.text);
         try self.button(.new_thread, "New thread", .{ .x = 12, .y = 46, .w = width - 24, .h = 30 });
-        try self.flatButton(.{ .open_library = .workspace }, if (builtin.os.tag == .macos) "Search chats    Cmd+K" else "Search chats    Ctrl+K", .{ .x = 12, .y = 80, .w = width - 24, .h = 30 });
+        try self.flatButton(.{ .open_library = .workspace }, "Search chats", .{ .x = 12, .y = 80, .w = width - 24, .h = 30 });
         try self.label("Projects", 20, 128, 12, colors.muted);
-        try self.flatButton(.add_project, "+ Add folder", .{ .x = width - 108, .y = 120, .w = 100, .h = 30 });
+        try self.flatButton(.add_project, "Add folder", .{ .x = width - 108, .y = 120, .w = 100, .h = 30 });
         const visible: usize = @intFromFloat(@max(1, @floor((height - 262) / 38)));
         self.sidebar_first = @min(self.sidebar_first, self.sidebarRows() -| visible);
         if (self.sidebar_reveal_current) if (self.currentSidebarRow()) |selected_row| {
@@ -1901,12 +2101,10 @@ pub const App = struct {
             (self.transcript.items.items.len == 0 and !self.content_pending and !self.conversation_dirty and self.runtimeStatus() == .ready)))
         {
             const empty_y = body_top + @min(96, viewport_height * 0.2);
-            try self.label(if (self.chat_view == .opening) self.title() else if (self.chat_view == .existing) "No messages in this chat" else "New thread", content_x + 16, empty_y, @intFromFloat(self.theme.metrics.body_px + 5), colors.text);
-            try self.fitLabel(clippedLabel(displayed_project), content_x + 16, empty_y + 38, content_width - 32, 13, colors.muted);
-            const description = if (self.chat_view == .opening)
-                (if (self.runtimeStatus() == .failed) "Unable to open chat." else "Opening chat...")
-            else if (self.chat_view == .existing) "This saved chat has no messages." else "Describe what you want to build or change.";
-            try self.fitLabel(description, content_x + 16, empty_y + 64, content_width - 32, 13, colors.muted);
+            const message = if (self.chat_view == .opening)
+                (if (self.runtimeStatus() == .failed) "Unable to open chat" else "Opening chat...")
+            else if (self.chat_view == .existing) "No messages" else "New thread";
+            try self.label(message, content_x + 16, empty_y, @intFromFloat(self.theme.metrics.body_px + 5), colors.text);
         }
         if (!self.follow_bottom and self.transcript.height > viewport_height) try self.flatButton(.latest, "Jump to latest", .{ .x = content_x + content_width - 128, .y = conversation.y + conversation.height - 33, .w = 128, .h = 28 });
         self.composer_bounds = .{ .x = content_x, .y = self.shell.composer.y + 8, .w = content_width, .h = @min(144, self.shell.composer.height - 44) };
@@ -1954,8 +2152,7 @@ pub const App = struct {
             }
         }
         try widgets.icon(self.renderer, .folder, .{ .x = composer.x + 2, .y = composer.y + composer.h + 13, .w = 12, .h = 12 }, colors.muted);
-        try self.label("Local checkout", composer.x + 22, composer.y + composer.h + 13, 11, colors.muted);
-        try self.fitLabel(project, composer.x + 130, composer.y + composer.h + 13, @max(0, composer.w - 130), 11, colors.muted);
+        try self.fitLabel(clippedLabel(displayed_project), composer.x + 22, composer.y + composer.h + 13, @max(0, composer.w - 22), 11, colors.muted);
         if (self.error_len != 0) {
             try self.fitLabel(clippedLabel(self.error_text[0..self.error_len]), composer.x, composer.y - 25, composer.w, 12, colors.error_color);
         } else if (self.runtime_snapshot) |snapshot| {
@@ -1977,6 +2174,7 @@ pub const App = struct {
             self.button_count = 0;
             try self.drawOverlays();
         }
+        if (self.providers.open and !self.closing and !self.force_dialog) try self.providers.draw(self, self.providerUi());
         if (!self.captured and self.options.capture != null and self.transcript.wanted == null and !self.content_pending and !self.conversation_dirty and (if (self.options.fixture) self.transcript.items.items.len != 0 else self.runtimeStatus() == .ready)) {
             const surface = c.SDL_RenderReadPixels(self.renderer, null) orelse return error.ScreenCapture;
             defer c.SDL_DestroySurface(surface);
@@ -2030,7 +2228,7 @@ pub const App = struct {
                 if (!c.SDL_SetRenderDrawBlendMode(self.renderer, c.SDL_BLENDMODE_BLEND) or !c.SDL_SetRenderDrawColor(self.renderer, colors.accent.r, colors.accent.g, colors.accent.b, 60) or !c.SDL_RenderFillRects(self.renderer, &rects, @intCast(count))) return error.SelectionDraw;
             }
             if (!c.spica_text_layout_draw(self.text, layout, bounds.x + 12, bounds.y + 10 - self.editor_scroll, rgba(colors.text))) return error.EditorDraw;
-            if (self.editor.len == 0) try self.label("Ask for changes or send a follow-up", bounds.x + 12, bounds.y + 10, @intFromFloat(self.theme.metrics.body_px), colors.muted);
+            if (self.editor.len == 0) try self.label("Message", bounds.x + 12, bounds.y + 10, @intFromFloat(self.theme.metrics.body_px), colors.muted);
         }
         if (self.preedit.items.len != 0) try self.label(clippedLabel(self.preedit.items), bounds.x + 12, bounds.y + 66, 15, colors.accent);
         if (self.focused_editor and has_caret) try self.rectangle(bounds.x + 12 + caret.x, bounds.y + 10 + caret.y - self.editor_scroll, 2, caret.h, 0, colors.text);
@@ -2047,14 +2245,14 @@ pub const App = struct {
             if (self.needsForceStop() and !prompted) {
                 prompted = true;
                 const buttons = [_]c.SDL_MessageBoxButtonData{
-                    .{ .flags = c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, .buttonID = 0, .text = "Keep waiting" },
-                    .{ .flags = 0, .buttonID = 1, .text = "Force owned process tree" },
+                    .{ .flags = c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, .buttonID = 0, .text = "Wait" },
+                    .{ .flags = 0, .buttonID = 1, .text = "Force" },
                 };
                 const dialog = c.SDL_MessageBoxData{
                     .flags = c.SDL_MESSAGEBOX_ERROR,
                     .window = self.window,
                     .title = "Spica — UI failure",
-                    .message = "Pi has not exited. Spica will retain ownership until it exits.\nCtrl+Shift+Esc reopens this choice.",
+                    .message = "Pi has not exited. Spica will close when Pi exits.\nForce stops Pi and its running tasks. Unsaved work may be lost.",
                     .numbuttons = buttons.len,
                     .buttons = &buttons,
                     .colorScheme = null,
@@ -2131,6 +2329,13 @@ pub const App = struct {
             self.consume();
             return;
         }
+        if (self.providers.open and !self.closing and !self.force_dialog) switch (event.type) {
+            c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_TEXT_INPUT, c.SDL_EVENT_TEXT_EDITING, c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_BUTTON_UP, c.SDL_EVENT_MOUSE_MOTION, c.SDL_EVENT_MOUSE_WHEEL, c.SDL_EVENT_WINDOW_FOCUS_LOST => {
+                if (try self.providers.handle(self, self.providerUi(), event)) |intent| try self.providerIntent(intent);
+                return;
+            },
+            else => {},
+        };
         if (event.type == c.SDL_EVENT_KEY_DOWN and !self.closing and !self.force_dialog) {
             const command = (event.key.mod & (c.SDL_KMOD_CTRL | c.SDL_KMOD_GUI)) != 0;
             if (command and event.key.key == c.SDLK_K) {
@@ -2184,7 +2389,7 @@ pub const App = struct {
                 }
                 if (self.settings_open) return;
                 if (self.model_menu) {
-                    const last = if (self.runtime_snapshot) |snapshot| snapshot.models.len -| 1 else 0;
+                    const last = if (self.runtime_snapshot) |snapshot| snapshot.models.len else 0;
                     self.model_first = if (event.wheel.y > 0) self.model_first -| 1 else @min(last, self.model_first + 1);
                 } else if (!self.closing) {
                     if (self.sidebar_visible and event.wheel.mouse_x < self.shell.sidebar.width) {
@@ -2292,11 +2497,13 @@ pub const App = struct {
                         self.dirty = true;
                     }
                     if (event.key.key == c.SDLK_DOWN) {
-                        const last = if (self.runtime_snapshot) |snapshot| snapshot.models.len -| 1 else 0;
+                        const last = if (self.runtime_snapshot) |snapshot| snapshot.models.len else 0;
                         self.model_first = @min(last, self.model_first + 1);
                         self.dirty = true;
                     }
-                    if (event.key.key == c.SDLK_RETURN) try self.act(.{ .select_model = self.model_first });
+                    if (event.key.key == c.SDLK_RETURN) {
+                        if (self.runtime_snapshot == null or self.model_first >= self.runtime_snapshot.?.models.len) try self.act(.connect_provider) else try self.act(.{ .select_model = self.model_first });
+                    }
                     return;
                 }
                 if (command and event.key.key == c.SDLK_P) {

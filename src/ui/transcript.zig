@@ -547,7 +547,7 @@ pub const View = struct {
             }
             if (item.entry.reasoning != null) {
                 try self.chevron(renderer, x + 2, top + 10, item.expanded, palette.muted);
-                try self.caption(engine, renderer, if (item.expanded) "Reasoning" else "Thought · Show reasoning", x + 22, top + 8, width - 22, 12, palette.muted);
+                try self.caption(engine, renderer, "Reasoning", x + 22, top + 8, width - 22, 12, palette.muted);
                 self.disclosure(.{ .ordinal = item.entry.ordinal, .kind = .reasoning }, .{ .x = x, .y = top, .w = width, .h = 32 });
             }
             const visible_body = self.bodyVisible(index);
