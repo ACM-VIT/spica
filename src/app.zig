@@ -29,6 +29,14 @@ const ModelRestore = struct {
     model: []u8,
     thinking: []u8,
 
+    fn copy(allocator: std.mem.Allocator, provider: []const u8, model: []const u8, thinking: []const u8) !ModelRestore {
+        const owned_provider = try allocator.dupe(u8, provider);
+        errdefer allocator.free(owned_provider);
+        const owned_model = try allocator.dupe(u8, model);
+        errdefer allocator.free(owned_model);
+        return .{ .provider = owned_provider, .model = owned_model, .thinking = try allocator.dupe(u8, thinking) };
+    }
+
     fn deinit(self: *ModelRestore, allocator: std.mem.Allocator) void {
         allocator.free(self.provider);
         allocator.free(self.model);
@@ -592,39 +600,52 @@ pub const App = struct {
 
     fn chooseFolder(self: *App, path: []const u8) !void {
         if (self.current_member or self.submitted_prompt != null or self.enrollment_intent or self.run_started != null) return;
-        const id = self.chat_id;
-        const draft = try self.allocator.dupe(u8, self.editor.textBytes());
-        defer self.allocator.free(draft);
-        const caret = self.editor.caret;
-        const anchor = self.editor.anchor;
+        if (self.pending_thread != null or self.closing) return error.ThreadSwitchPending;
+        if (self.pending_mutation) |mutation| if (!mutation.automatic) return error.WorkspaceMutationPending;
+        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
+        var transferred = false;
+        defer if (!transferred) self.allocator.free(cwd);
+        var dir = try std.Io.Dir.cwd().openDir(self.io, cwd, .{});
+        dir.close(self.io);
+        if (std.mem.eql(u8, cwd, self.project_path)) {
+            try self.addProject(cwd);
+            self.folder_selected = true;
+            self.folder_picker_open = false;
+            self.focused_editor = true;
+            _ = c.SDL_StartTextInput(self.window);
+            self.revealCurrentFolder();
+            self.draft_due = c.SDL_GetTicks() + 250;
+            return;
+        }
         var restore: ?ModelRestore = null;
         defer if (restore) |*settings| settings.deinit(self.allocator);
-        if (self.runtime_snapshot) |snapshot| {
-            const provider = try self.allocator.dupe(u8, snapshot.provider);
-            errdefer self.allocator.free(provider);
-            const model = try self.allocator.dupe(u8, snapshot.model);
-            errdefer self.allocator.free(model);
-            const thinking = try self.allocator.dupe(u8, snapshot.thinking_level);
-            restore = .{ .provider = provider, .model = model, .thinking = thinking };
+        if (self.model_restore) |settings| {
+            restore = try ModelRestore.copy(self.allocator, settings.provider, settings.model, settings.thinking);
+        } else if (self.runtime_snapshot) |snapshot| {
+            restore = try ModelRestore.copy(self.allocator, snapshot.provider, snapshot.model, snapshot.thinking_level);
         }
-        try self.newThreadIn(path);
+        try self.addProject(cwd);
+        try self.parkCurrent();
+        // Retire the old folder's child separately. The tab, draft revision,
+        // selection, and composer undo history keep their existing identity.
+        const retired = &self.parked_chats.items[self.parked_chats.items.len - 1];
+        retired.id = self.next_chat_id;
+        self.next_chat_id += 1;
+        retired.closed = true;
+        self.project_path = cwd;
+        transferred = true;
+        self.folder_selected = true;
+        self.options.resume_file = null;
+        self.options.trust_project = false;
         self.model_restore = restore;
         restore = null;
-        // A folder choice replaces this empty tab's runtime, not the tab itself.
-        const replacement_id = self.chat_id;
-        self.chat_id = id;
-        for (self.parked_chats.items) |*chat| if (chat.id == id) {
-            chat.id = replacement_id;
-            chat.closed = true;
-            break;
-        };
-        try self.editor.setText(draft);
-        self.editor.setCaret(anchor, false);
-        self.editor.setCaret(caret, true);
-        self.edited();
-        self.folder_picker_open = false;
+        self.enrollment_failed = false;
+        self.error_len = 0;
+        self.resetChatViewport();
+        self.revealCurrentFolder();
         self.focused_editor = true;
         _ = c.SDL_StartTextInput(self.window);
+        try self.beginRuntime();
     }
 
     fn leaveClosedCurrent(self: *App) !void {
