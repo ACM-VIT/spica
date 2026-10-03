@@ -97,7 +97,8 @@ pub const help =
     \\Scrolling upward stops auto-follow; Jump to latest or clicking the current thread resumes it.
     \\Vertical and horizontal tabs share folder groups and their own wheel scroll. Ctrl+B hides/shows it; Ctrl/Cmd+R refreshes theme/library.
     \\Settings / Ctrl+, switches tab layouts and opens appearance: text 12–24px, UI scale 75–175%, reading width 560–1120px.
-    \\Dark/light themes, tab layout, appearance values, and recent folders persist across restarts.
+    \\Settings > Animations toggles short tab entrances and sidebar sliding; Off applies immediately.
+    \\Dark/light themes, tab layout, animations, appearance values, and recent folders persist across restarts.
     \\UI scale changes layout and hit targets; text rasterizes at native output DPI.
     \\Ctrl+Plus/Minus or Ctrl+wheel zooms; Ctrl+0 resets UI scale to 100%.
     \\Ctrl+L also switches dark/light. Settings has Reset and Done; Escape closes it.

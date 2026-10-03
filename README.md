@@ -18,6 +18,8 @@ The + opens a plain chat at the right end. Its composer has a folder control wit
 
 Ctrl/Cmd+T (or Ctrl/Cmd+N) opens a tab; Ctrl/Cmd+W closes it. Stop a running prompt before closing its tab.
 
+Vertical folder rows show their + only on hover. Settings > Animations toggles short tab entrance and sidebar slide transitions. Off takes effect immediately, and the preference persists across restarts.
+
 <img width="1813" height="1187" alt="image" src="https://github.com/user-attachments/assets/6892b4eb-ef3a-43cf-a70c-c642789d5347" />
 
 
