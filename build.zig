@@ -70,5 +70,5 @@ fn nativeDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const 
         module.linkFramework("CoreFoundation", .{});
     }
     module.addIncludePath(b.path(".deps/src/cmark-gfm-0.29.0.gfm.13/src"));
-    module.addIncludePath(b.path(".deps/build/cmark-gfm/src"));
+    module.addIncludePath(b.path(b.fmt(".deps/build/{s}-{s}/cmark-gfm/src", .{ @tagName(module.resolved_target.?.result.os.tag), @tagName(module.resolved_target.?.result.cpu.arch) })));
 }

@@ -239,12 +239,13 @@ def main():
     machine = {'amd64': 'x86_64', 'arm64': 'aarch64'}.get(machine, machine)
     system = {'darwin': 'macos', 'windows': 'windows'}.get(platform.system().lower(), platform.system().lower())
     prefix = CACHE / 'install' / (system + '-' + machine)
+    build_root = CACHE / 'build' / (system + '-' + machine)
     build_highlighting(prefix, fingerprint)
     library = prefix / 'lib' / ('libSDL3.dylib' if system == 'macos' else 'libSDL3.so')
     sdl_stamp = prefix / '.sdl-allocator-config'
     if not build_is_current(library, sdl_stamp, fingerprint):
         log('building SDL')
-        build = CACHE / 'build' / 'sdl'
+        build = build_root / 'sdl'
         subprocess.run(['cmake', '-S', str(sdl), '-B', str(build), '-DCMAKE_BUILD_TYPE=Release',
                         f'-DCMAKE_INSTALL_PREFIX={prefix}', '-DSDL_SHARED=ON', '-DSDL_STATIC=OFF',
                         '-DSDL_TEST_LIBRARY=OFF', '-DSDL_TESTS=OFF', '-DSDL_EXAMPLES=OFF',
@@ -260,7 +261,7 @@ def main():
     image_stamp = prefix / '.image-allocator-config'
     if not build_is_current(image_library, image_stamp, fingerprint):
         log('building SDL_image')
-        build = CACHE / 'build' / 'sdl-image'
+        build = build_root / 'sdl-image'
         subprocess.run(['cmake', '-S', str(image), '-B', str(build),
                         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
                         f'-DCMAKE_PREFIX_PATH={prefix}', '-DBUILD_SHARED_LIBS=ON',
@@ -283,9 +284,10 @@ def main():
             raise RuntimeError(f'SDL_image install did not produce {image_library}')
         image_stamp.write_text(fingerprint)
     cmark_library = prefix / 'lib' / 'libcmark-gfm.a'
-    if not cmark_library.exists():
+    build = build_root / 'cmark-gfm'
+    # The app also includes cmark's private headers, which need this generated config.
+    if not cmark_library.exists() or not (build / 'src' / 'config.h').exists():
         log('building cmark-gfm')
-        build = CACHE / 'build' / 'cmark-gfm'
         subprocess.run(['cmake', '-S', str(markdown), '-B', str(build),
                         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
                         '-DCMAKE_POLICY_VERSION_MINIMUM=3.5',
@@ -295,13 +297,12 @@ def main():
         if not cmark_library.exists():
             raise RuntimeError(f'cmark install did not produce {cmark_library}')
     suffix = '.dylib' if system == 'macos' else '.so'
-    tools = CACHE / 'tools'
-    tools.mkdir(exist_ok=True)
+    tools = build_root / 'ninja'
+    tools.mkdir(parents=True, exist_ok=True)
     ninja_binary = tools / 'ninja'
     if not ninja_binary.exists():
         log('building ninja')
-        subprocess.run([sys.executable, 'configure.py', '--bootstrap'], cwd=ninja, check=True)
-        shutil.copy2(ninja / 'ninja', ninja_binary)
+        subprocess.run([sys.executable, str(ninja / 'configure.py'), '--bootstrap'], cwd=tools, check=True)
     child_env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ.get('PATH', ''))
     pkg_config = str(prefix / 'lib' / 'pkgconfig')
     child_env['PKG_CONFIG_PATH'] = pkg_config + os.pathsep + child_env.get('PKG_CONFIG_PATH', '')
@@ -327,7 +328,7 @@ def main():
         png_config = fingerprint + '\n' + ' '.join(zlib_options)
         if not build_is_current(png_library, png_stamp, png_config):
             log('building libpng')
-            build = CACHE / 'build' / (system + '-' + machine) / 'libpng'
+            build = build_root / 'libpng'
             shutil.rmtree(build, ignore_errors=True)
             subprocess.run(['cmake', '-S', str(codecs['libpng']), '-B', str(build),
                             '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
@@ -344,7 +345,7 @@ def main():
     freetype_config = fingerprint + '\n' + ' '.join(freetype_options)
     if not build_is_current(freetype_library, freetype_stamp, freetype_config):
         log('building FreeType')
-        build = CACHE / 'build' / 'freetype'
+        build = build_root / 'freetype'
         shutil.rmtree(build, ignore_errors=True)  # a cached configure keeps old library lookups
         subprocess.run(['cmake', '-S', str(freetype), '-B', str(build),
                         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
@@ -357,7 +358,7 @@ def main():
     harfbuzz_library = prefix / 'lib' / ('libharfbuzz' + suffix)
     if not harfbuzz_library.exists():
         log('building HarfBuzz')
-        build = CACHE / 'build' / (system + '-' + machine) / 'harfbuzz'
+        build = build_root / 'harfbuzz'
         subprocess.run([sys.executable, str(meson / 'meson.py'), 'setup', str(build), str(harfbuzz),
                         '--prefix', str(prefix), '--buildtype=release',
                         '-Ddefault_library=shared', '-Dfreetype=enabled',
@@ -374,7 +375,7 @@ def main():
     if not unibreak_library.exists():
         log('building libunibreak')
         subprocess.run(['autoreconf', '-fi'], cwd=unibreak, check=True)
-        build = CACHE / 'build' / 'libunibreak'
+        build = build_root / 'libunibreak'
         build.mkdir(parents=True, exist_ok=True)
         subprocess.run([str(unibreak / 'configure'), f'--prefix={prefix}'], cwd=build, check=True)
         subprocess.run(['make', '-j4'], cwd=build, check=True)
@@ -384,7 +385,7 @@ def main():
     fribidi_library = prefix / 'lib' / ('libfribidi' + suffix)
     if not fribidi_library.exists():
         log('building FriBidi')
-        build = CACHE / 'build' / (system + '-' + machine) / 'fribidi'
+        build = build_root / 'fribidi'
         subprocess.run([sys.executable, str(meson / 'meson.py'), 'setup', str(build), str(fribidi),
                         '--prefix', str(prefix), '--buildtype=release',
                         '-Ddefault_library=shared', '-Ddocs=false', '-Dbin=false',

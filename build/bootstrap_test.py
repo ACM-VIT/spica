@@ -14,9 +14,8 @@ class BootstrapTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         (self.root / 'deps.lock.json').write_bytes((bootstrap.ROOT / 'deps.lock.json').read_bytes())
         self.cache = self.root / '.deps'
-        (self.cache / 'tools').mkdir(parents=True)
-        (self.cache / 'tools' / 'ninja').touch()
         self.commands = []
+        self.invocations = []
         self.configures = {}
         for target, replacement in (
                 ('ROOT', self.root), ('CACHE', self.cache),
@@ -39,6 +38,7 @@ class BootstrapTests(unittest.TestCase):
 
     def run_command(self, command, **kwargs):
         self.commands.append(command)
+        self.invocations.append((command, kwargs))
         if command[0] == 'cmake' and '-S' in command:
             build = command[command.index('-B') + 1]
             source = Path(command[command.index('-S') + 1]).name
@@ -46,15 +46,31 @@ class BootstrapTests(unittest.TestCase):
             self.configures[build] = (source, Path(prefix))
         elif command[:2] == ['cmake', '--install']:
             source, prefix = self.configures[command[2]]
-            library = {'libpng': 'libpng16.dylib', 'FreeType': 'libfreetype.dylib'}[source]
+            suffix = '.dylib' if prefix.name.startswith('macos-') else '.so'
+            library = {'SDL': 'libSDL3' + suffix, 'SDL_image': 'libSDL3_image' + suffix,
+                       'cmark-gfm': 'libcmark-gfm.a', 'libpng': 'libpng16' + suffix,
+                       'FreeType': 'libfreetype' + suffix}[source]
             (prefix / 'lib' / library).touch()
+            if source == 'cmark-gfm':
+                headers = Path(command[2]) / 'src'
+                headers.mkdir(parents=True, exist_ok=True)
+                (headers / 'config.h').touch()
+        elif '--bootstrap' in command:
+            (kwargs['cwd'] / 'ninja').touch()
         elif 'setup' in command:
             build = command[command.index('setup') + 1]
             prefix = Path(command[command.index('--prefix') + 1])
             self.configures[build] = (Path(build).name, prefix)
+        elif command[0] == 'make' and command[-1] == 'install':
+            _, prefix = self.configures[str(kwargs['cwd'])]
+            (prefix / 'lib' / 'libunibreak.a').touch()
         elif command[-1] == 'install':
             source, prefix = self.configures[command[command.index('-C') + 1]]
-            (prefix / 'lib' / ('lib' + source + '.dylib')).touch()
+            suffix = '.dylib' if prefix.name.startswith('macos-') else '.so'
+            (prefix / 'lib' / ('lib' + source + suffix)).touch()
+        elif Path(command[0]).name == 'configure':
+            prefix = Path(command[1].split('=', 1)[1])
+            self.configures[str(kwargs['cwd'])] = ('libunibreak', prefix)
 
     def seed_install(self, machine):
         prefix = self.cache / 'install' / ('macos-' + machine)
@@ -65,6 +81,12 @@ class BootstrapTests(unittest.TestCase):
             (prefix / 'lib' / ('lib' + library + '.a')).touch()
         for stamp in ('.sdl-allocator-config', '.image-allocator-config'):
             (prefix / stamp).write_text(bootstrap.allocator_fingerprint())
+        tools = self.cache / 'build' / ('macos-' + machine) / 'ninja'
+        tools.mkdir(parents=True, exist_ok=True)
+        (tools / 'ninja').touch()
+        headers = tools.parent / 'cmark-gfm' / 'src'
+        headers.mkdir(parents=True, exist_ok=True)
+        (headers / 'config.h').touch()
         return prefix
 
     def cmake_sources(self):
@@ -118,6 +140,61 @@ class BootstrapTests(unittest.TestCase):
                     self.assertEqual(build.parent.name, 'macos-' + machine)
                     builds.append(build)
         self.assertEqual(len(set(builds)), 4)
+
+    @patch.object(bootstrap.platform, 'system', return_value='Darwin')
+    @patch.object(bootstrap.platform, 'machine', return_value='arm64')
+    def test_existing_cmark_install_regenerates_platform_headers(self, *unused):
+        self.seed_install('aarch64')
+        headers = self.cache / 'build/macos-aarch64/cmark-gfm/src/config.h'
+        headers.unlink()
+        legacy = self.cache / 'build/cmark-gfm/src'
+        legacy.mkdir(parents=True)
+        (legacy / 'config.h').touch()
+        bootstrap.main()
+        self.assertIn('cmark-gfm', self.cmake_sources())
+        self.assertTrue(headers.exists())
+
+    def test_all_builds_and_ninja_are_platform_specific(self):
+        # Legacy shared Ninja must never be reused.
+        (self.cache / 'tools').mkdir(parents=True)
+        (self.cache / 'tools' / 'ninja').write_text('wrong platform')
+        builds = set()
+        for system, host, target in (
+                ('Darwin', 'arm64', 'macos-aarch64'),
+                ('Darwin', 'x86_64', 'macos-x86_64'),
+                ('Linux', 'aarch64', 'linux-aarch64'),
+                ('Linux', 'AMD64', 'linux-x86_64')):
+            with self.subTest(target=target), \
+                    patch.object(bootstrap.platform, 'system', return_value=system), \
+                    patch.object(bootstrap.platform, 'machine', return_value=host):
+                prefix = self.cache / 'install' / target
+                (prefix / 'lib').mkdir(parents=True)
+                build_root = self.cache / 'build' / target
+                self.commands.clear()
+                self.invocations.clear()
+                bootstrap.main()
+                expected = {'sdl', 'sdl-image', 'cmark-gfm', 'ninja', 'freetype',
+                            'harfbuzz', 'libunibreak', 'fribidi'}
+                if system == 'Darwin':
+                    expected.add('libpng')
+                self.assertEqual(set(self.configures) - builds,
+                                 {str(build_root / name) for name in expected - {'ninja'}})
+                builds.update(self.configures)
+                ninja = build_root / 'ninja' / 'ninja'
+                self.assertTrue(ninja.exists())
+                for command, kwargs in self.invocations:
+                    if '--bootstrap' in command:
+                        self.assertEqual(command[1], str(self.cache / 'src/ninja/configure.py'))
+                        self.assertEqual(kwargs['cwd'], ninja.parent)
+                    if '-C' in command:
+                        self.assertEqual(command[0], str(ninja))
+                        self.assertEqual(Path(command[command.index('-C') + 1]).parent, build_root)
+                    if 'env' in kwargs:
+                        self.assertEqual(kwargs['env']['PATH'].split(bootstrap.os.pathsep)[0],
+                                         str(ninja.parent))
+                self.commands.clear()
+                bootstrap.main()
+                self.assertEqual(self.commands, [])
 
 
 if __name__ == '__main__':
