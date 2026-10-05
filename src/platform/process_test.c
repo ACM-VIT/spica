@@ -47,15 +47,13 @@ static int probe_list(pid_t pid, void *buffer, int size) {
         ((pid_t *)buffer)[i] = ROOT_PID + i + 1;
     return count;
 }
-static void *probe_malloc(size_t size) {
-    return allocation_failure ? NULL : malloc(size);
-}
+static void *probe_malloc(size_t size) { return allocation_failure ? NULL : malloc(size); }
 
 #define kill probe_kill
 #define proc_pidinfo probe_info
 #define proc_listchildpids probe_list
 #define malloc probe_malloc
-#include "process.c"
+#include "process_macos.c"
 
 static void reset(void) {
     memset(stopped, 0, sizeof(stopped));
@@ -64,25 +62,25 @@ static void reset(void) {
 }
 int main(void) {
     reset();
-    if (force_owned(ROOT_PID, 0) || !grew)
+    if (spica_process_force_owned(ROOT_PID, -1) || !grew)
         return 1;
     for (int i = 0; i <= CHILDREN; ++i)
         if (!killed[i])
             return 2;
     reset();
     allocation_failure = 1;
-    if (force_owned(ROOT_PID, 0) != -1 || errno != ENOMEM || stopped[0] || killed[0])
+    if (spica_process_force_owned(ROOT_PID, -1) != -1 || errno != ENOMEM || stopped[0] || killed[0])
         return 3;
     allocation_failure = 0;
-    if (force_owned(ROOT_PID, 0))
+    if (spica_process_force_owned(ROOT_PID, -1))
         return 4;
     reset();
     enumeration_failure = ROOT_PID + 1;
-    if (force_owned(ROOT_PID, 0) != -1 || errno != EIO)
+    if (spica_process_force_owned(ROOT_PID, -1) != -1 || errno != EIO)
         return 5;
     for (int i = 0; i <= CHILDREN; ++i)
         if (stopped[i] || killed[i])
             return 6;
     enumeration_failure = 0;
-    return force_owned(ROOT_PID, 0) ? 7 : 0;
+    return spica_process_force_owned(ROOT_PID, -1) ? 7 : 0;
 }

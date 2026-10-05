@@ -51,7 +51,15 @@ fn nativeDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const 
         module.addCSourceFile(.{ .file = b.path("src/native/" ++ name ++ ".c"), .flags = &.{ "-std=c11", "-O2" } });
     }
     module.addCSourceFile(.{ .file = b.path("src/native/fuzzy.cpp"), .flags = &.{ "-std=c++17", "-O2" } });
-    module.addCSourceFile(.{ .file = b.path("src/platform/process.c"), .flags = &.{ "-std=c11", "-O2" } });
+    // Compile shared POSIX logic plus exactly one target-OS backend. The linker resolves
+    // process_internal.h hooks to that backend; process.h stays the shared Zig-facing API.
+    module.addCSourceFile(.{ .file = b.path("src/platform/process_posix.c"), .flags = &.{ "-std=c11", "-O2" } });
+    const process_backend = switch (module.resolved_target.?.result.os.tag) {
+        .linux => "src/platform/process_linux.c",
+        .macos => "src/platform/process_macos.c",
+        else => @panic("Process support requires Linux or macOS"),
+    };
+    module.addCSourceFile(.{ .file = b.path(process_backend), .flags = &.{ "-std=c11", "-O2" } });
     module.addCSourceFile(.{ .file = b.path("src/platform/database.c"), .flags = &.{ "-std=c11", "-D_DEFAULT_SOURCE", "-O2" } });
     module.addLibraryPath(b.path(b.fmt("{s}/lib", .{prefix})));
     module.addRPath(b.path(b.fmt("{s}/lib", .{prefix})));
