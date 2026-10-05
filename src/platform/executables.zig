@@ -106,7 +106,11 @@ fn shimEntry(allocator: std.mem.Allocator, io: std.Io, shim: []const u8) !?[:0]u
 }
 
 fn inDirectory(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, name: []const u8, js: bool) !?[:0]u8 {
-    const joined = try std.fs.path.join(allocator, &.{ if (directory.len == 0) "." else directory, name });
+    // Discovery must not load code from the launch directory: empty and relative
+    // PATH entries can select files controlled by an untrusted project. Explicit
+    // --node/--pi-entry overrides still go through candidate directly.
+    if (!std.fs.path.isAbsolute(directory)) return null;
+    const joined = try std.fs.path.join(allocator, &.{ directory, name });
     defer allocator.free(joined);
     const resolved = (try candidate(allocator, io, joined, js)) orelse return null;
     if (js and !javascript(resolved)) {
@@ -205,6 +209,68 @@ test "PATH precedes platform fallbacks, resolves symlinks and skips directories 
     try std.testing.expectEqualStrings(found.entry, overridden.entry);
     try std.testing.expectError(error.NodeNotFound, discover(a, io, &process, null, null, null, &.{}));
     try std.testing.expectError(error.PiEntryNotFound, discover(a, io, &process, found.node, null, null, &.{}));
+}
+
+test "automatic discovery skips project-controlled empty and relative PATH entries" {
+    const posix = @cImport({
+        @cInclude("unistd.h");
+    });
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Stand-in Node executes the fixture entries through sh, as in the npm test.
+    try testFile(tmp.dir, "project/node", "#!/bin/sh\nexec /bin/sh \"$@\"\n", true);
+    try tmp.dir.symLink(io, "payload.js", "project/pi", .{});
+    try tmp.dir.symLink(io, "payload.js", "project/npm", .{});
+    try tmp.dir.createDirPath(io, "project/bin");
+    inline for (.{ "node", "pi", "npm" }) |name| {
+        try tmp.dir.symLink(io, "../" ++ name, "project/bin/" ++ name, .{});
+    }
+    try testFile(tmp.dir, "installed/node", "#!/bin/sh\nexec /bin/sh \"$@\"\n", true);
+    try testFile(tmp.dir, "installed/cli.js", "printf '1.0.0\\n'\n", false);
+    try tmp.dir.symLink(io, "cli.js", "installed/pi", .{});
+    try tmp.dir.symLink(io, "cli.js", "installed/npm", .{});
+    const installed = try tmp.dir.realPathFileAlloc(io, "installed", a);
+    defer a.free(installed);
+    const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+    defer a.free(project);
+    const payload = try std.fmt.allocPrint(a, "printf ran > \"{s}/executed\"\nprintf '1.0.0\\n'\n", .{project});
+    defer a.free(payload);
+    try testFile(tmp.dir, "project/payload.js", payload, false);
+    const original_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+    defer a.free(original_cwd);
+    // Restore the process-wide cwd before any other test or fixture cleanup.
+    try std.testing.expectEqual(@as(c_int, 0), posix.chdir(project));
+    defer std.debug.assert(posix.chdir(original_cwd) == 0);
+    var process = testProcess();
+    defer c.spica_process_dispose(&process);
+    for ([_][]const u8{ "", ".", "bin", "./bin", "../project/bin", ":.", ".:", "::" }) |unsafe_path| {
+        inline for (.{ "node", "pi", "npm" }) |name| {
+            const js = !std.mem.eql(u8, name, "node");
+            const unsafe = try find(a, io, name, unsafe_path, &.{}, js);
+            defer if (unsafe) |value| a.free(value);
+            try std.testing.expect(unsafe == null);
+            const expected = (try inDirectory(a, io, installed, name, js)).?;
+            defer a.free(expected);
+            const fallback = (try find(a, io, name, unsafe_path, &.{installed}, js)).?;
+            defer a.free(fallback);
+            try std.testing.expectEqualStrings(expected, fallback);
+        }
+        const mixed_path = try std.fmt.allocPrint(a, "{s}:{s}", .{ unsafe_path, installed });
+        defer a.free(mixed_path);
+        const found = try discover(a, io, &process, null, null, mixed_path, &.{});
+        defer found.deinit(a);
+        try std.testing.expect(std.mem.endsWith(u8, found.node, "/installed/node"));
+        try std.testing.expect(std.mem.endsWith(u8, found.entry, "/installed/cli.js"));
+        try std.testing.expectEqual(@as(c_int, 0), c.spica_process_version(&process, found.node, found.entry));
+    }
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "project/executed", .{}));
+    // Project-local tools remain available when explicitly selected by the user.
+    const overridden = try discover(a, io, &process, "node", "pi", "", &.{});
+    defer overridden.deinit(a);
+    try std.testing.expect(std.mem.endsWith(u8, overridden.node, "/project/node"));
+    try std.testing.expect(std.mem.endsWith(u8, overridden.entry, "/project/payload.js"));
 }
 
 test "npm fallback uses resolved Node, global lookup and bounded output without a shell" {
