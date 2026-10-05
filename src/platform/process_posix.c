@@ -189,15 +189,30 @@ static long long ms(void) {
     return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 uint64_t spica_monotonic_ms(void) { return (uint64_t)ms(); }
-int spica_process_version(SpicaProcess *p, const char *node, const char *entry) {
-    char *argv[] = {(char *)node, (char *)entry, "--version", 0};
+static void capture_stdout(SpicaProcess *p, char *out, size_t capacity, size_t *n, int *overflow) {
+    /* Bound each drain so continuous output cannot bypass the deadline. */
+    for (int i = 0; i < 64; i++) {
+        char b[1024];
+        long r = spica_process_read(p->output, b, sizeof b);
+        if (r <= 0)
+            break;
+        size_t add = (size_t)r;
+        if (add > capacity - *n) {
+            add = capacity - *n;
+            *overflow = 1;
+        }
+        memcpy(out + *n, b, add);
+        *n += add;
+    }
+}
+static int capture(SpicaProcess *p, const char *node, char *const argv[], char *out,
+                   size_t capacity, size_t *length) {
     if (spawn(p, node, argv, "/"))
         return -1;
     spica_close(p->input);
     p->input = -1;
-    char out[256];
     size_t n = 0;
-    int result = -1, status = 0;
+    int result = -1, status = 0, overflow = 0;
     long long deadline = ms() + 5000;
     for (;;) {
         struct pollfd f[3] = {
@@ -210,20 +225,11 @@ int spica_process_version(SpicaProcess *p, const char *node, const char *entry) 
             continue;
         if (rc <= 0)
             break;
-        if (f[0].revents) {
-            char b[256];
-            long r;
-            while ((r = spica_process_read(p->output, b, sizeof b)) > 0) {
-                size_t add = (size_t)r;
-                if (add > sizeof(out) - n)
-                    add = sizeof(out) - n;
-                memcpy(out + n, b, add);
-                n += add;
-            }
-        }
+        if (f[0].revents)
+            capture_stdout(p, out, capacity, &n, &overflow);
         if (f[1].revents) {
             char b[1024];
-            while (spica_process_read(p->error, b, sizeof b) > 0) {
+            for (int i = 0; i < 64 && spica_process_read(p->error, b, sizeof b) > 0; i++) {
             }
         }
         if (f[2].revents) {
@@ -231,18 +237,8 @@ int spica_process_version(SpicaProcess *p, const char *node, const char *entry) 
             if (reaped < 0)
                 break;
             if (reaped == 1) {
-                while (n < sizeof(out)) {
-                    long r = spica_process_read(p->output, out + n, sizeof(out) - n);
-                    if (r <= 0)
-                        break;
-                    n += (size_t)r;
-                }
-                result = WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
-                                 ((n == 6 && out[5] == '\n') ||
-                                  (n == 7 && out[5] == '\r' && out[6] == '\n')) &&
-                                 !memcmp(out, "1.0.0", 5)
-                             ? 0
-                             : -1;
+                capture_stdout(p, out, capacity, &n, &overflow);
+                result = WIFEXITED(status) && WEXITSTATUS(status) == 0 && !overflow ? 0 : -1;
                 break;
             }
         }
@@ -250,5 +246,23 @@ int spica_process_version(SpicaProcess *p, const char *node, const char *entry) 
     /* A timed-out verifier is still owned by the runtime; only explicit Force kills it. */
     if (p->pid == 0)
         spica_process_dispose(p);
+    *length = n;
     return result;
+}
+int spica_process_version(SpicaProcess *p, const char *node, const char *entry) {
+    char *argv[] = {(char *)node, (char *)entry, "--version", 0};
+    char out[256];
+    size_t n = 0;
+    if (capture(p, node, argv, out, sizeof out, &n))
+        return -1;
+    return ((n == 6 && out[5] == '\n') || (n == 7 && out[5] == '\r' && out[6] == '\n')) &&
+                   !memcmp(out, "1.0.0", 5)
+               ? 0
+               : -1;
+}
+int spica_process_npm_root(SpicaProcess *p, const char *node, const char *npm, char *output,
+                           size_t capacity, size_t *length) {
+    /* npm is its resolved JS entry, not a shell command; Finder need not expose node on PATH. */
+    char *argv[] = {(char *)node, (char *)npm, "root", "-g", "--loglevel=error", 0};
+    return capture(p, node, argv, output, capacity, length);
 }

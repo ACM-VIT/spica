@@ -36,7 +36,9 @@ zig build
 
 Configure provider credentials through Pi. Dependencies are pinned in [`deps.lock.json`](./deps.lock.json); keep `.deps/` and `assets/` with the checkout and rebuild after moving it.
 
-Spica defaults to `/usr/bin/node` and `/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`. Use `--node` and `--pi-entry` if your installation differs, as it does on macOS or with nvm, fnm, or pnpm:
+Spica honors `--node` and `--pi-entry` first. Otherwise it searches `PATH` for Node and Pi's JavaScript entry (following executable symlinks and reading pnpm's `cmd-shim-target` metadata), then platform bin directories: `/opt/homebrew/bin`, `/usr/local/bin`, and `/usr/bin` on macOS; `/usr/local/bin` and `/usr/bin` on Linux. If Pi is still missing, it checks the global package directory from `npm root -g`, running npm with the resolved Node executable. Discovery runs off the UI thread; the npm lookup has a five-second timeout and bounded output. Shell wrappers are never executed during discovery.
+
+Terminal launches normally pick up nvm/fnm through `PATH`. Finder launches may not see those installations; launch from your terminal or use explicit paths. Older pnpm shims without target metadata and other unrecognized wrappers may also need an override:
 
 ```sh
 # npm (including nvm and fnm)

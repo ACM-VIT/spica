@@ -49,8 +49,8 @@ zig build test
 ```
 
 Configure provider credentials through Pi to use models. Building and running regressions does not require provider credentials or model calls.
-Spica defaults to `/usr/bin/node` and `/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`.
-Use `--node /path/to/node` and `--pi-entry /path/to/cli.js` when those installations differ.
+Spica discovers Node and Pi through `PATH`, platform bin directories, then `npm root -g`.
+Use `--node /path/to/node` and `--pi-entry /path/to/cli.js` to override discovery (for example, nvm/fnm installations unavailable to Finder or shell wrappers without recognized target metadata).
 Keep `.deps/` and `assets/` with the checkout and rebuild after moving it.
 
 ## Checks required before pushing

@@ -9,8 +9,8 @@ pub const Options = struct {
     light: bool = false,
     help: bool = false,
     project: []const u8 = ".",
-    node_path: []const u8 = "/usr/bin/node",
-    pi_entrypoint: []const u8 = "/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+    node_path: ?[]const u8 = null,
+    pi_entrypoint: ?[]const u8 = null,
     resume_file: ?[]const u8 = null,
     trust_project: ?bool = null,
 
@@ -51,8 +51,8 @@ pub const help =
     \\Software is the lower-residency default. Neither backend has passed the 32 MiB gate.
     \\Pi starts automatically. Project resources are disabled unless --trust-project is given.
     \\The real-process application runs on Linux and macOS, pinned to Pi 1.0.0.
-    \\Executable defaults match a Linux system Node and npm installation.
-    \\Elsewhere (macOS, nvm, fnm, pnpm) pass --node and --pi-entry; the README shows how.
+    \\Node and Pi are discovered through PATH, platform bin directories, then npm root -g.
+    \\--node and --pi-entry override discovery; the README shows manual examples.
     \\--resume is explicit, not replay.
     \\Checkout demo libraries, fonts and themes resolve independently of the launch directory.
     \\Keep the checkout's .deps and assets directories; rebuild after moving the checkout.
@@ -112,3 +112,15 @@ pub const help =
     \\Measure the desktop and its pi/Node child separately; the desktop RSS is not total application cost.
     \\
 ;
+
+test "executable paths default to discovery and flags remain independent overrides" {
+    const defaults = try Options.parse(&.{"spica"});
+    try std.testing.expect(defaults.node_path == null);
+    try std.testing.expect(defaults.pi_entrypoint == null);
+    const node_only = try Options.parse(&.{ "spica", "--node", "/custom/node" });
+    try std.testing.expectEqualStrings("/custom/node", node_only.node_path.?);
+    try std.testing.expect(node_only.pi_entrypoint == null);
+    const entry_only = try Options.parse(&.{ "spica", "--pi-entry", "/custom/cli.js" });
+    try std.testing.expect(entry_only.node_path == null);
+    try std.testing.expectEqualStrings("/custom/cli.js", entry_only.pi_entrypoint.?);
+}

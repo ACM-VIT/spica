@@ -1,9 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const native = @import("../native/bindings.zig").c;
-const p = @cImport({
-    @cInclude("../platform/process.h");
-});
+const executables = @import("../platform/executables.zig");
+const p = executables.c;
 const storage = @import("store.zig");
 const protocol = @import("protocol.zig");
 const session = @import("session.zig");
@@ -16,8 +15,8 @@ pub const Model = struct { provider: []const u8, id: []const u8, name: []const u
 pub const Options = struct {
     database_path: []const u8,
     project_path: []const u8,
-    node_path: []const u8,
-    pi_entrypoint: []const u8,
+    node_path: ?[]const u8 = null,
+    pi_entrypoint: ?[]const u8 = null,
     trust_project: bool = false,
     resume_file: ?[]const u8 = null,
     wake_event: u32,
@@ -189,7 +188,10 @@ pub const Runtime = struct {
         errdefer arena.deinit();
         const temp = arena.allocator();
         var owned = options;
-        inline for (.{ "database_path", "project_path", "node_path", "pi_entrypoint" }) |field| @field(owned, field) = try temp.dupeZ(u8, @field(options, field));
+        inline for (.{ "database_path", "project_path" }) |field| @field(owned, field) = try temp.dupeZ(u8, @field(options, field));
+        inline for (.{ "node_path", "pi_entrypoint" }) |field| if (@field(options, field)) |path| {
+            @field(owned, field) = try temp.dupeZ(u8, path);
+        };
         if (options.resume_file) |file| owned.resume_file = try temp.dupeZ(u8, file);
         var state = try copySnapshot(a, .{ .allocator = a, .runtime_id = p.spica_runtime_id() });
         errdefer state.deinit();
@@ -333,7 +335,7 @@ pub const Runtime = struct {
         }
     }
     fn fail(self: *Runtime, err: anyerror) void {
-        self.replace(&self.state.error_message, @errorName(err)) catch {};
+        self.replace(&self.state.error_message, executables.errorMessage(err) orelse @errorName(err)) catch {};
         self.recoverDrafts() catch {};
         self.state.status = .failed;
         self.publish() catch {};
@@ -509,10 +511,10 @@ pub const Runtime = struct {
     fn launch(self: *Runtime) !void {
         self.state.status = .starting;
         try self.publish();
-        const node = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.options.node_path, self.allocator);
-        defer self.allocator.free(node);
-        const entry = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.options.pi_entrypoint, self.allocator);
-        defer self.allocator.free(entry);
+        const paths = try executables.resolve(self.allocator, self.io, &self.process, self.options.node_path, self.options.pi_entrypoint);
+        defer paths.deinit(self.allocator);
+        const node = paths.node;
+        const entry = paths.entry;
         if (p.spica_process_version(&self.process, node, entry) != 0) return error.PiVersionMismatchOrVerificationFailed;
         const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.options.project_path, self.allocator);
         defer self.allocator.free(cwd);
