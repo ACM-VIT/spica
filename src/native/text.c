@@ -529,8 +529,8 @@ static int system_face(SpicaText *t, const FriBidiChar *chars, unsigned count, u
     return face;
 }
 #elif defined(__APPLE__)
-/* CoreText's fallback choice is the macOS counterpart of the fontconfig match above. Without it, any
- * grapheme the bundled fonts lack (CJK, many symbols) failed layout, and the composer's failure
+/* CoreText's fallback choice is the macOS counterpart of the fontconfig match above. Without it,
+ * any grapheme the bundled fonts lack (CJK, many symbols) failed layout, and the composer's failure
  * closed the app. CoreText names a file and a PostScript name; collections (.ttc, as CJK fonts
  * ship) need the face index, so the faces are probed for that name. */
 static long collection_index(SpicaText *t, const char *path, const char *name) {
@@ -587,7 +587,7 @@ static int system_face(SpicaText *t, const FriBidiChar *chars, unsigned count, u
             emoji = true;
     CFStringRef text = CFStringCreateWithBytes(NULL, (const UInt8 *)chars, count * sizeof(*chars),
                                                kCFStringEncodingUTF32LE, false);
-    CTFontRef base = CTFontCreateWithName(emoji                          ? CFSTR("Apple Color Emoji")
+    CTFontRef base = CTFontCreateWithName(emoji ? CFSTR("Apple Color Emoji")
                                           : style & SPICA_TEXT_MONOSPACE ? CFSTR("Menlo")
                                                                          : CFSTR("Helvetica"),
                                           15, NULL);
@@ -610,7 +610,8 @@ static int system_face(SpicaText *t, const FriBidiChar *chars, unsigned count, u
     }
     /* CoreText's first choice can be a font FreeType cannot read (on macOS 27 the PingFang UI faces
      * fail to open), so walk the rest of the same ordered cascade list. */
-    CFArrayRef cascade = face < 0 && base ? CTFontCopyDefaultCascadeListForLanguages(base, NULL) : NULL;
+    CFArrayRef cascade =
+        face < 0 && base ? CTFontCopyDefaultCascadeListForLanguages(base, NULL) : NULL;
     for (CFIndex i = 0; cascade && face < 0 && i < CFArrayGetCount(cascade); ++i) {
         CTFontRef font = CTFontCreateWithFontDescriptor(
             (CTFontDescriptorRef)CFArrayGetValueAtIndex(cascade, i), 15, NULL);

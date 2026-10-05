@@ -186,8 +186,8 @@ done:
  * then a no-op. A missing destination is created empty, and the store adds the schema. */
 static int switch_to_wal(const char *destination) {
     sqlite3 *database = NULL;
-    int rc = sqlite3_open_v2(destination, &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                             NULL);
+    int rc =
+        sqlite3_open_v2(destination, &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
     if (rc == SQLITE_OK)
         rc = sqlite3_exec(database, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
     if (database && sqlite3_close(database) != SQLITE_OK && rc == SQLITE_OK)

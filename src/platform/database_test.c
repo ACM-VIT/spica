@@ -5,7 +5,8 @@
 static int value(sqlite3 *database) {
     sqlite3_stmt *statement = NULL;
     int result = -1;
-    if (sqlite3_prepare_v2(database, "SELECT value FROM history", -1, &statement, NULL) == SQLITE_OK &&
+    if (sqlite3_prepare_v2(database, "SELECT value FROM history", -1, &statement, NULL) ==
+            SQLITE_OK &&
         sqlite3_step(statement) == SQLITE_ROW)
         result = sqlite3_column_int(statement, 0);
     sqlite3_finalize(statement);
@@ -19,8 +20,10 @@ int main(int argc, char **argv) {
     sqlite3 *database = NULL;
     if (sqlite3_open("legacy.sqlite", &database) != SQLITE_OK)
         return 2;
-    int rc = sqlite3_exec(database, "CREATE TABLE history(value); INSERT INTO history VALUES(42);"
-                          "PRAGMA user_version=6", NULL, NULL, NULL);
+    int rc = sqlite3_exec(database,
+                          "CREATE TABLE history(value); INSERT INTO history VALUES(42);"
+                          "PRAGMA user_version=6",
+                          NULL, NULL, NULL);
     if (rc == SQLITE_OK && wal)
         rc = sqlite3_exec(database, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
     sqlite3_close(database);
@@ -50,5 +53,6 @@ int main(int argc, char **argv) {
     sqlite3_close(database);
     if (original != 42)
         return 10;
-    return spica_database_cutover("history.sqlite", "legacy.sqlite", "staging.sqlite", ".") != SQLITE_OK;
+    return spica_database_cutover("history.sqlite", "legacy.sqlite", "staging.sqlite", ".") !=
+           SQLITE_OK;
 }
