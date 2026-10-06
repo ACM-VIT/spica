@@ -154,6 +154,7 @@ pub const App = struct {
     force_dialog: bool = false,
     model_menu: bool = false,
     model_first: usize = 0,
+    model_selection_cleared: bool = false,
     model_search: ModelSearch = .{},
     thinking_menu: bool = false,
     sidebar_visible: bool = true,
@@ -840,10 +841,12 @@ pub const App = struct {
             const session_changed = incoming.session_file.len != 0 and (self.runtime_snapshot == null or !std.mem.eql(u8, self.runtime_snapshot.?.session_file, incoming.session_file));
             const changed_error = incoming.error_message.len != 0 and (self.runtime_snapshot == null or !std.mem.eql(u8, self.runtime_snapshot.?.error_message, incoming.error_message));
             const recovery_changed = incoming.recovery_revision != 0 and (self.runtime_snapshot == null or incoming.recovery_revision != self.runtime_snapshot.?.recovery_revision);
-            if (self.runtime_snapshot == null or !modelsEqual(self.runtime_snapshot.?.models, incoming.models)) {
+            self.updateModelSearch(incoming.models) catch |err| {
                 self.model_search.invalidate();
-                if (self.model_menu) self.button_count = 0;
-            }
+                self.model_selection_cleared = true;
+                self.button_count = 0;
+                self.report("Refreshing model choices", err);
+            };
             if (self.runtime_snapshot) |*old| old.deinit();
             self.runtime_snapshot = incoming;
             const snapshot = &self.runtime_snapshot.?;
@@ -1352,6 +1355,7 @@ pub const App = struct {
                     self.library.resetQuery();
                     self.model_search.invalidate();
                     self.model_first = 0;
+                    self.model_selection_cleared = false;
                     self.model_menu = true;
                     self.dragging = false;
                     self.preedit.clearRetainingCapacity();
@@ -1453,10 +1457,49 @@ pub const App = struct {
         return self.model_search.index(ranked_index);
     }
 
+    fn selectedModelIndex(self: *App) !?usize {
+        if (self.model_selection_cleared) return null;
+        return self.modelIndex(self.model_first);
+    }
+
+    // Called before releasing the old snapshot, so identity comparisons borrow
+    // its strings and retain only an index into the incoming model list.
+    fn updateModelSearch(self: *App, models: []const pi.Model) !void {
+        if (self.runtime_snapshot) |old| if (modelsEqual(old.models, models)) return;
+        const selected = if (self.model_menu) try self.selectedModelIndex() else null;
+        var retained: ?usize = null;
+        if (selected) |index| {
+            const previous = self.runtime_snapshot.?.models[index];
+            for (models, 0..) |model, incoming_index| {
+                if (std.mem.eql(u8, previous.provider, model.provider) and std.mem.eql(u8, previous.id, model.id)) {
+                    retained = incoming_index;
+                    break;
+                }
+            }
+        }
+        self.model_search.invalidate();
+        if (!self.model_menu) return;
+        self.button_count = 0;
+        if (selected != null) self.model_selection_cleared = true;
+        try self.model_search.rebuild(models, self.library.queryBytes());
+        self.model_first = @min(self.model_first, self.model_search.len -| 1);
+        if (retained) |index| {
+            for (self.model_search.matches[0..self.model_search.len], 0..) |match, rank| {
+                if (match.index == index) {
+                    self.model_first = rank;
+                    self.model_selection_cleared = false;
+                    break;
+                }
+            }
+        }
+        if (self.model_selection_cleared) self.model_first = 0;
+    }
+
     fn editModelQuery(self: *App, event: *const c.SDL_Event) !void {
         if (try self.library.handleQuery(self, event)) {
             self.model_search.invalidate();
             self.model_first = 0;
+            self.model_selection_cleared = false;
             self.button_count = 0;
         }
     }
@@ -1482,7 +1525,7 @@ pub const App = struct {
                     const index = match.index;
                     const model = snapshot.models[index];
                     const row_y = y + 8 + @as(f32, @floatFromInt(filtered_index - self.model_first)) * 40;
-                    if (filtered_index == self.model_first) try self.rectangle(x + 8, row_y, width - 16, 38, 5, colors.raised);
+                    if (!self.model_selection_cleared and filtered_index == self.model_first) try self.rectangle(x + 8, row_y, width - 16, 38, 5, colors.raised);
                     const row_clip = c.SDL_Rect{ .x = @intFromFloat(x + 8), .y = @intFromFloat(row_y), .w = @intFromFloat(width - 16), .h = 38 };
                     _ = c.SDL_SetRenderClipRect(self.renderer, &row_clip);
                     try self.hit(.{ .select_model = index }, .{ .x = x + 8, .y = row_y, .w = width - 16, .h = 38 });
@@ -2281,6 +2324,7 @@ pub const App = struct {
                     const last = (try self.modelCount()) -| 1;
                     const direction = event.wheel.y * (if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) @as(f32, -1) else 1);
                     self.model_first = if (direction > 0) self.model_first -| 1 else if (direction < 0) @min(last, self.model_first + 1) else self.model_first;
+                    if (direction != 0) self.model_selection_cleared = false;
                     self.button_count = 0;
                 } else if (!self.closing) {
                     if (self.sidebar_visible and event.wheel.mouse_x < self.shell.sidebar.width) {
@@ -2413,23 +2457,26 @@ pub const App = struct {
                         return;
                     }
                     if (event.key.key == c.SDLK_ESCAPE) {
+                        self.focused_editor = true;
                         self.closeModelMenu();
                         self.dirty = true;
                         return;
                     }
                     if (event.key.key == c.SDLK_UP) {
                         self.model_first -|= 1;
+                        self.model_selection_cleared = false;
                         self.button_count = 0;
                         self.dirty = true;
                     }
                     if (event.key.key == c.SDLK_DOWN) {
                         const last = (try self.modelCount()) -| 1;
-                        self.model_first = @min(last, self.model_first + 1);
+                        self.model_first = if (self.model_selection_cleared) 0 else @min(last, self.model_first + 1);
+                        self.model_selection_cleared = false;
                         self.button_count = 0;
                         self.dirty = true;
                     }
                     if (event.key.key == c.SDLK_RETURN or event.key.key == c.SDLK_KP_ENTER) {
-                        if (try self.modelIndex(self.model_first)) |index| try self.act(.{ .select_model = index });
+                        if (try self.selectedModelIndex()) |index| try self.act(.{ .select_model = index });
                     } else try self.editModelQuery(event);
                     return;
                 }
@@ -2628,6 +2675,12 @@ test "model search filters names IDs and providers without editing the draft" {
     const allocator = std.testing.allocator;
     var app: App = undefined;
     try std.testing.expect(c.spica_image_install_sdl_allocator());
+    try std.testing.expect(c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "dummy"));
+    defer _ = c.SDL_ResetHint(c.SDL_HINT_VIDEO_DRIVER);
+    try std.testing.expect(c.SDL_InitSubSystem(c.SDL_INIT_VIDEO));
+    defer c.SDL_QuitSubSystem(c.SDL_INIT_VIDEO);
+    app.window = c.SDL_CreateWindow("Model picker regression", 640, 480, c.SDL_WINDOW_HIDDEN) orelse return error.Window;
+    defer c.SDL_DestroyWindow(app.window);
     const surface = c.SDL_CreateSurface(640, 480, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
     defer c.SDL_DestroySurface(surface);
     app.renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
@@ -2641,6 +2694,7 @@ test "model search filters names IDs and providers without editing the draft" {
     app.focused_editor = false;
     app.options = .{};
     app.model_search = .{};
+    app.model_selection_cleared = false;
     app.library = try Library.Panel.init(allocator);
     defer app.library.deinit();
     app.library.resetQuery();
@@ -2731,6 +2785,139 @@ test "model search filters names IDs and providers without editing the draft" {
     event.key.mod = 0;
     try app.handle(&event);
     try std.testing.expect(app.library.input_err == null);
+
+    // Exercise Enter through the existing set_model action without starting Pi.
+    const p = @import("platform/executables.zig").c;
+    const mutex = c.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer c.SDL_DestroyMutex(mutex);
+    var wake: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), p.spica_wake_create(&wake));
+    defer p.spica_close(wake[0]);
+    defer p.spica_close(wake[1]);
+    var runtime: pi.Runtime = .{
+        .allocator = allocator,
+        .io = undefined,
+        .options = .{ .database_path = "", .project_path = "", .wake_event = 0 },
+        .options_arena = undefined,
+        .mutex = mutex,
+        .wake = wake,
+        .state = .{ .allocator = allocator },
+    };
+    defer {
+        for (runtime.inputs.items) |input| if (input == .bytes) allocator.free(input.bytes.data);
+        runtime.inputs.deinit(allocator);
+    }
+    app.runtime = &runtime;
+    app.runtime_retiring = false;
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_DOWN;
+    try app.handle(&event);
+    event.key.key = c.SDLK_RETURN;
+    try app.handle(&event);
+    try std.testing.expect(!app.model_menu);
+    try std.testing.expectEqual(@as(usize, 1), runtime.inputs.items.len);
+    const command = try std.json.parseFromSlice(std.json.Value, allocator, runtime.inputs.items[0].bytes.data, .{});
+    defer command.deinit();
+    try std.testing.expectEqualStrings("set_model", command.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("anthropic", command.value.object.get("provider").?.string);
+    try std.testing.expectEqualStrings("claude-opus-4-6", command.value.object.get("modelId").?.string);
+
+    app.model_menu = true;
+    const remaining = [_]pi.Model{models[1]};
+    try app.updateModelSearch(&remaining);
+    app.runtime_snapshot.?.models = @constCast(&remaining);
+    try std.testing.expectEqual(@as(usize, 1), try app.modelCount());
+    try app.handle(&event);
+    try std.testing.expect(app.model_menu);
+    try std.testing.expectEqual(@as(usize, 1), runtime.inputs.items.len);
+    event.key.key = c.SDLK_DOWN;
+    try app.handle(&event);
+    try std.testing.expectEqual(@as(?usize, 0), try app.selectedModelIndex());
+    event.key.key = c.SDLK_RETURN;
+    try app.handle(&event);
+    try std.testing.expect(!app.model_menu);
+    try std.testing.expectEqual(@as(usize, 2), runtime.inputs.items.len);
+
+    app.model_menu = true;
+    app.runtime_snapshot.?.models = &.{};
+    app.model_search.invalidate();
+    try app.handle(&event);
+    try std.testing.expect(app.model_menu);
+    try std.testing.expectEqual(@as(usize, 2), runtime.inputs.items.len);
+
+    app.focused_editor = false;
+    app.editor.setCaret(9, true);
+    const draft_selection = app.editor.selection();
+    event.key.key = c.SDLK_ESCAPE;
+    try app.handle(&event);
+    try std.testing.expect(!app.model_menu);
+    try std.testing.expect(app.focused_editor);
+    try std.testing.expect(c.SDL_TextInputActive(app.window));
+    try std.testing.expectEqualStrings("keep this message draft", app.editor.textBytes());
+    try std.testing.expectEqual(draft_selection, app.editor.selection());
+}
+
+test "model picker snapshot refresh preserves identity and clears disappeared selections" {
+    const allocator = std.testing.allocator;
+    var app: App = undefined;
+    app.model_menu = true;
+    app.model_first = 1;
+    app.model_selection_cleared = false;
+    app.model_search = .{};
+    app.button_count = 2;
+    app.dirty = false;
+    app.library = try Library.Panel.init(allocator);
+    defer app.library.deinit();
+    try app.library.editor.setText("opus");
+    const original = [_]pi.Model{
+        .{ .name = "Other", .id = "other", .provider = "local" },
+        .{ .name = "Opus One", .id = "shared-id", .provider = "one" },
+        .{ .name = "Opus Two", .id = "shared-id", .provider = "two" },
+    };
+    app.runtime_snapshot = .{ .allocator = allocator, .models = @constCast(&original) };
+    try std.testing.expectEqual(@as(?usize, 2), try app.selectedModelIndex());
+
+    const reordered = [_]pi.Model{
+        .{ .name = "Opus renamed", .id = "shared-id", .provider = "two" },
+        original[0],
+        original[1],
+    };
+    try app.updateModelSearch(&reordered);
+    app.runtime_snapshot.?.models = @constCast(&reordered);
+    try std.testing.expectEqual(@as(usize, 0), app.button_count);
+    try std.testing.expectEqual(@as(usize, 0), app.model_first);
+    try std.testing.expectEqual(@as(?usize, 0), try app.selectedModelIndex());
+    try std.testing.expectEqualStrings("opus", app.library.queryBytes());
+
+    // Same ID from a different provider must not replace the disappeared choice.
+    const removed = [_]pi.Model{original[1]};
+    try app.updateModelSearch(&removed);
+    app.runtime_snapshot.?.models = @constCast(&removed);
+    try std.testing.expectEqual(@as(usize, 1), try app.modelCount());
+    try std.testing.expect(try app.selectedModelIndex() == null);
+    const restored = [_]pi.Model{ original[1], reordered[0] };
+    try app.updateModelSearch(&restored);
+    app.runtime_snapshot.?.models = @constCast(&restored);
+    try std.testing.expect(try app.selectedModelIndex() == null);
+
+    // A deliberate query edit re-enables selection.
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_TEXT_INPUT;
+    event.text.text = " ";
+    try app.editModelQuery(&event);
+    try std.testing.expectEqual(@as(?usize, 0), try app.selectedModelIndex());
+    const renamed = [_]pi.Model{
+        .{ .name = "Different", .id = "shared-id", .provider = "one" },
+        reordered[0],
+    };
+    try app.updateModelSearch(&renamed);
+    app.runtime_snapshot.?.models = @constCast(&renamed);
+    try std.testing.expectEqual(@as(usize, 1), try app.modelCount());
+    try std.testing.expect(try app.selectedModelIndex() == null);
+    try app.updateModelSearch(&.{});
+    app.runtime_snapshot.?.models = &.{};
+    try std.testing.expectEqual(@as(usize, 0), try app.modelCount());
+    try std.testing.expect(try app.selectedModelIndex() == null);
 }
 
 test "background prompt acknowledgements clear only the submitted chat revision" {
