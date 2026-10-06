@@ -80,8 +80,7 @@ pub const Panel = struct {
         self.scroll_x = 0;
         self.err = null;
         self.input_err = null;
-        self.editor.setText("") catch unreachable;
-        self.layout_dirty = true;
+        self.resetQuery();
     }
 
     pub fn close(self: *Panel) void {
@@ -102,6 +101,16 @@ pub const Panel = struct {
 
     pub fn queryBytes(self: *const Panel) []const u8 {
         return self.editor.textBytes();
+    }
+
+    // The model picker reuses this editor while the library is closed.
+    pub fn resetQuery(self: *Panel) void {
+        self.editor.setText("") catch unreachable;
+        self.preedit_len = 0;
+        self.dragging = false;
+        self.scroll_x = 0;
+        self.input_err = null;
+        self.layout_dirty = true;
     }
 
     pub fn begin(self: *Panel, generation: u64) void {
@@ -280,7 +289,7 @@ pub const Panel = struct {
         }
         self.query_bounds = .{ .x = left, .y = y + 77, .w = inner, .h = 34 };
         try app.rectangle(left, self.query_bounds.y, inner, 34, 5, colors.raised);
-        try self.drawQuery(app);
+        try self.drawQuery(app, if (self.scope == .import_pi) "Search Pi titles and folders" else "Search titles, folders and messages");
         var status_buffer: [128]u8 = undefined;
         const current_error: ?anyerror = if (self.input_err) |err| err else self.err;
         const status: []const u8 = if (current_error) |err|
@@ -347,7 +356,7 @@ pub const Panel = struct {
         self.layout_dirty = false;
     }
 
-    fn drawQuery(self: *Panel, app: anytype) !void {
+    pub fn drawQuery(self: *Panel, app: anytype, placeholder: []const u8) !void {
         try self.ensureLayout(app);
         const layout = self.layout orelse return;
         const bounds = self.query_bounds;
@@ -379,7 +388,7 @@ pub const Panel = struct {
             const n = c.spica_text_layout_selection_rects(layout, range.start, range.start + self.preedit_len, &rects, rects.len);
             if (n > rects.len) return error.LibrarySelectionBudget;
             for (rects[0..n]) |rect| try app.rectangle(tx + rect.x, ty + rect.y + rect.h - 1, rect.w, 1, 0, colors.accent);
-        } else if (self.editor.len == 0) try app.label(if (self.scope == .import_pi) "Search Pi titles and folders" else "Search titles, folders and messages", bounds.x + 8, ty, 13, colors.muted);
+        } else if (self.editor.len == 0) try app.label(placeholder, bounds.x + 8, ty, 13, colors.muted);
         try app.rectangle(tx + caret.x, ty + caret.y, 1, caret.h, 0, colors.text);
         var input_x: f32 = 0;
         var input_y: f32 = 0;
@@ -417,7 +426,7 @@ pub const Panel = struct {
         if (!c.SDL_SetClipboardText(@ptrCast(&self.copy))) return error.ClipboardWrite;
     }
 
-    fn hitQuery(self: *Panel, app: anytype, x: f32, y: f32, extend: bool) !void {
+    pub fn hitQuery(self: *Panel, app: anytype, x: f32, y: f32, extend: bool) !void {
         if (self.preedit_len != 0) {
             self.preedit_len = 0;
             _ = c.SDL_ClearComposition(app.window);
@@ -425,6 +434,114 @@ pub const Panel = struct {
         }
         try self.ensureLayout(app);
         if (self.layout) |layout| self.editor.setCaret(c.spica_text_layout_hit_test(layout, x - self.query_bounds.x - 8 + self.scroll_x, y - self.query_bounds.y - 7), extend);
+    }
+
+    /// Edits only the query, returning whether its committed text changed.
+    pub fn handleQuery(self: *Panel, app: anytype, event: *const c.SDL_Event) !bool {
+        app.dirty = true;
+        switch (event.type) {
+            c.SDL_EVENT_TEXT_EDITING => {
+                const bytes = std.mem.span(event.edit.text);
+                if (bytes.len > self.preedit.len or !std.unicode.utf8ValidateSlice(bytes)) {
+                    self.input_err = error.PreeditBudgetExceeded;
+                    self.preedit_len = 0;
+                    self.layout_dirty = true;
+                    _ = c.SDL_ClearComposition(app.window);
+                    return false;
+                }
+                for (bytes, 0..) |byte, index| self.preedit[index] = if (byte == '\r' or byte == '\n') ' ' else byte;
+                self.preedit_len = bytes.len;
+                self.preedit_start = scalarOffset(bytes, event.edit.start);
+                self.preedit_end = scalarOffset(bytes, @as(i64, event.edit.start) + event.edit.length);
+                self.layout_dirty = true;
+            },
+            c.SDL_EVENT_TEXT_INPUT => {
+                self.insert(std.mem.span(event.text.text), if (self.preedit_len != 0) .ime else .typing) catch |err| {
+                    self.preedit_len = 0;
+                    self.layout_dirty = true;
+                    self.input_err = err;
+                    return false;
+                };
+                self.preedit_len = 0;
+                self.layout_dirty = true;
+                self.input_err = null;
+                return true;
+            },
+            c.SDL_EVENT_KEY_DOWN => {
+                const key = event.key.key;
+                const mods = event.key.mod;
+                const command = (mods & (c.SDL_KMOD_CTRL | c.SDL_KMOD_GUI)) != 0;
+                const shift = (mods & c.SDL_KMOD_SHIFT) != 0;
+                const word = command or (mods & c.SDL_KMOD_ALT) != 0;
+                if (self.preedit_len != 0) {
+                    if (key == c.SDLK_ESCAPE) {
+                        self.preedit_len = 0;
+                        self.layout_dirty = true;
+                        _ = c.SDL_ClearComposition(app.window);
+                    }
+                    return false;
+                }
+                if (key == c.SDLK_HOME or key == c.SDLK_END) {
+                    self.editor.setCaret(if (key == c.SDLK_END) self.editor.len else 0, shift);
+                    return false;
+                }
+                if (key == c.SDLK_LEFT or key == c.SDLK_RIGHT) {
+                    const direction: @import("../text/composer.zig").Direction = if (key == c.SDLK_LEFT) .backward else .forward;
+                    if (word) self.editor.moveWord(direction, shift) else self.editor.moveGrapheme(direction, shift);
+                    return false;
+                }
+                if (command and key == c.SDLK_A) {
+                    self.editor.selectAll();
+                    return false;
+                }
+                if (command and key == c.SDLK_C) {
+                    try self.copySelection();
+                    return false;
+                }
+                var before: [query_limit]u8 = undefined;
+                const old_len = self.editor.len;
+                @memcpy(before[0..old_len], self.editor.textBytes());
+                if (command) switch (key) {
+                    c.SDLK_X => {
+                        try self.copySelection();
+                        try self.editor.insert("", .paste);
+                    },
+                    c.SDLK_V => {
+                        const clipboard = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+                        defer c.SDL_free(clipboard);
+                        self.insert(std.mem.span(clipboard), .paste) catch |err| {
+                            self.input_err = err;
+                            return false;
+                        };
+                    },
+                    c.SDLK_Z => {
+                        _ = if (shift) self.editor.redo() else self.editor.undo();
+                    },
+                    c.SDLK_Y => {
+                        _ = self.editor.redo();
+                    },
+                    else => {},
+                };
+                if (key == c.SDLK_BACKSPACE) {
+                    if (word) try self.editor.deleteWord(.backward) else try self.editor.backspace();
+                } else if (key == c.SDLK_DELETE) {
+                    if (word) try self.editor.deleteWord(.forward) else try self.editor.deleteForward();
+                }
+                if (!std.mem.eql(u8, before[0..old_len], self.editor.textBytes())) {
+                    self.layout_dirty = true;
+                    self.input_err = null;
+                    return true;
+                }
+            },
+            c.SDL_EVENT_WINDOW_FOCUS_LOST => {
+                self.dragging = false;
+                self.preedit_len = 0;
+                self.layout_dirty = true;
+                _ = c.SDL_ClearComposition(app.window);
+            },
+            else => {},
+        }
+        return false;
     }
 
     /// Receives logical/render coordinates, after SDL_ConvertEventToRenderCoordinates.
@@ -463,39 +580,9 @@ pub const Panel = struct {
                     self.invalidateTargets();
                 }
             },
-            c.SDL_EVENT_TEXT_EDITING => {
-                const bytes = std.mem.span(event.edit.text);
-                if (bytes.len > self.preedit.len or !std.unicode.utf8ValidateSlice(bytes)) {
-                    self.input_err = error.PreeditBudgetExceeded;
-                    self.preedit_len = 0;
-                    self.layout_dirty = true;
-                    _ = c.SDL_ClearComposition(app.window);
-                    return null;
-                }
-                for (bytes, 0..) |byte, index| self.preedit[index] = if (byte == '\r' or byte == '\n') ' ' else byte;
-                self.preedit_len = bytes.len;
-                self.preedit_start = scalarOffset(bytes, event.edit.start);
-                self.preedit_end = scalarOffset(bytes, @as(i64, event.edit.start) + event.edit.length);
-                self.layout_dirty = true;
-            },
-            c.SDL_EVENT_TEXT_INPUT => {
-                self.insert(std.mem.span(event.text.text), if (self.preedit_len != 0) .ime else .typing) catch |err| {
-                    self.preedit_len = 0;
-                    self.layout_dirty = true;
-                    self.input_err = err;
-                    return null;
-                };
-                self.preedit_len = 0;
-                self.layout_dirty = true;
-                self.input_err = null;
-                return self.request(true);
-            },
+            c.SDL_EVENT_TEXT_EDITING, c.SDL_EVENT_TEXT_INPUT => if (try self.handleQuery(app, event)) return self.request(true),
             c.SDL_EVENT_KEY_DOWN => {
                 const key = event.key.key;
-                const mods = event.key.mod;
-                const command = (mods & (c.SDL_KMOD_CTRL | c.SDL_KMOD_GUI)) != 0;
-                const shift = (mods & c.SDL_KMOD_SHIFT) != 0;
-                const word = command or (mods & c.SDL_KMOD_ALT) != 0;
                 if (key == c.SDLK_ESCAPE) {
                     if (self.preedit_len != 0) {
                         self.preedit_len = 0;
@@ -520,64 +607,9 @@ pub const Panel = struct {
                 }
                 if (key == c.SDLK_PAGEUP) return self.act(.previous);
                 if (key == c.SDLK_PAGEDOWN) return self.act(.next);
-                if (key == c.SDLK_HOME or key == c.SDLK_END) {
-                    self.editor.setCaret(if (key == c.SDLK_END) self.editor.len else 0, shift);
-                    return null;
-                }
-                if (key == c.SDLK_LEFT or key == c.SDLK_RIGHT) {
-                    const direction: @import("../text/composer.zig").Direction = if (key == c.SDLK_LEFT) .backward else .forward;
-                    if (word) self.editor.moveWord(direction, shift) else self.editor.moveGrapheme(direction, shift);
-                    return null;
-                }
-                if (command and key == c.SDLK_A) {
-                    self.editor.selectAll();
-                    return null;
-                }
-                if (command and key == c.SDLK_C) {
-                    try self.copySelection();
-                    return null;
-                }
-                var before: [query_limit]u8 = undefined;
-                const old_len = self.editor.len;
-                @memcpy(before[0..old_len], self.editor.textBytes());
-                if (command) switch (key) {
-                    c.SDLK_X => {
-                        try self.copySelection();
-                        try self.editor.insert("", .paste);
-                    },
-                    c.SDLK_V => {
-                        const clipboard = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
-                        defer c.SDL_free(clipboard);
-                        self.insert(std.mem.span(clipboard), .paste) catch |err| {
-                            self.input_err = err;
-                            return null;
-                        };
-                    },
-                    c.SDLK_Z => {
-                        _ = if (shift) self.editor.redo() else self.editor.undo();
-                    },
-                    c.SDLK_Y => {
-                        _ = self.editor.redo();
-                    },
-                    else => {},
-                };
-                if (key == c.SDLK_BACKSPACE) {
-                    if (word) try self.editor.deleteWord(.backward) else try self.editor.backspace();
-                } else if (key == c.SDLK_DELETE) {
-                    if (word) try self.editor.deleteWord(.forward) else try self.editor.deleteForward();
-                }
-                if (!std.mem.eql(u8, before[0..old_len], self.editor.textBytes())) {
-                    self.layout_dirty = true;
-                    self.input_err = null;
-                    return self.request(true);
-                }
+                if (try self.handleQuery(app, event)) return self.request(true);
             },
-            c.SDL_EVENT_WINDOW_FOCUS_LOST => {
-                self.dragging = false;
-                self.preedit_len = 0;
-                self.layout_dirty = true;
-                _ = c.SDL_ClearComposition(app.window);
-            },
+            c.SDL_EVENT_WINDOW_FOCUS_LOST => _ = try self.handleQuery(app, event),
             else => {},
         }
         return null;
