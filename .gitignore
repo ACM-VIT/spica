@@ -3,3 +3,4 @@
 zig-out/
 dist/
 .tokensave/
+build/__pycache__/

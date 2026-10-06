@@ -8,6 +8,18 @@ import bootstrap
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_macos_cmake_overrides_cached_sdk(self):
+        with patch.object(bootstrap.platform, 'system', return_value='Darwin'), \
+             patch.dict(bootstrap.os.environ, {'SDKROOT': '/selected.sdk'}):
+            self.assertEqual(bootstrap.cmake_sdk_options(), ['-DCMAKE_OSX_SYSROOT=/selected.sdk'])
+
+    def test_sdk_change_invalidates_native_fingerprint(self):
+        with patch.object(bootstrap.platform, 'system', return_value='Darwin'):
+            with patch.dict(bootstrap.os.environ, {'SDKROOT': '/first.sdk'}):
+                first = bootstrap.allocator_fingerprint()
+            with patch.dict(bootstrap.os.environ, {'SDKROOT': '/second.sdk'}):
+                self.assertNotEqual(first, bootstrap.allocator_fingerprint())
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

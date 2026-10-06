@@ -166,7 +166,16 @@ def allocator_fingerprint():
     digest = hashlib.sha256(Path(__file__).read_bytes())
     digest.update((ROOT / 'deps.lock.json').read_bytes())
     digest.update((platform.system() + platform.machine()).encode())
+    if platform.system() == 'Darwin':
+        digest.update(os.environ.get('SDKROOT', '').encode())
     return digest.hexdigest()
+
+
+def cmake_sdk_options():
+    # Override cached CMake SDK paths when the driver selects another SDK.
+    if platform.system() == 'Darwin' and os.environ.get('SDKROOT'):
+        return ['-DCMAKE_OSX_SYSROOT=' + os.environ['SDKROOT']]
+    return []
 
 
 def build_is_current(library, stamp, fingerprint):
@@ -246,7 +255,7 @@ def main():
     if not build_is_current(library, sdl_stamp, fingerprint):
         log('building SDL')
         build = build_root / 'sdl'
-        subprocess.run(['cmake', '-S', str(sdl), '-B', str(build), '-DCMAKE_BUILD_TYPE=Release',
+        subprocess.run(['cmake', *cmake_sdk_options(), '-S', str(sdl), '-B', str(build), '-DCMAKE_BUILD_TYPE=Release',
                         f'-DCMAKE_INSTALL_PREFIX={prefix}', '-DSDL_SHARED=ON', '-DSDL_STATIC=OFF',
                         '-DSDL_TEST_LIBRARY=OFF', '-DSDL_TESTS=OFF', '-DSDL_EXAMPLES=OFF',
                         '-DSDL_AUDIO=OFF', '-DSDL_JOYSTICK=OFF', '-DSDL_HAPTIC=OFF',
@@ -262,7 +271,7 @@ def main():
     if not build_is_current(image_library, image_stamp, fingerprint):
         log('building SDL_image')
         build = build_root / 'sdl-image'
-        subprocess.run(['cmake', '-S', str(image), '-B', str(build),
+        subprocess.run(['cmake', *cmake_sdk_options(), '-S', str(image), '-B', str(build),
                         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
                         f'-DCMAKE_PREFIX_PATH={prefix}', '-DBUILD_SHARED_LIBS=ON',
                         '-DSDLIMAGE_VENDORED=ON', '-DSDLIMAGE_STRICT=ON',
@@ -288,7 +297,7 @@ def main():
     # The app also includes cmark's private headers, which need this generated config.
     if not cmark_library.exists() or not (build / 'src' / 'config.h').exists():
         log('building cmark-gfm')
-        subprocess.run(['cmake', '-S', str(markdown), '-B', str(build),
+        subprocess.run(['cmake', *cmake_sdk_options(), '-S', str(markdown), '-B', str(build),
                         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
                         '-DCMAKE_POLICY_VERSION_MINIMUM=3.5',
                         '-DCMARK_TESTS=OFF', '-DCMARK_SHARED=OFF', '-DCMARK_STATIC=ON'], check=True)
@@ -330,7 +339,7 @@ def main():
             log('building libpng')
             build = build_root / 'libpng'
             shutil.rmtree(build, ignore_errors=True)
-            subprocess.run(['cmake', '-S', str(codecs['libpng']), '-B', str(build),
+            subprocess.run(['cmake', *cmake_sdk_options(), '-S', str(codecs['libpng']), '-B', str(build),
                             '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
                             '-DPNG_SHARED=ON', '-DPNG_STATIC=OFF', '-DPNG_FRAMEWORK=OFF',
                             '-DPNG_TESTS=OFF', '-DPNG_TOOLS=OFF', *zlib_options], check=True)
@@ -347,7 +356,7 @@ def main():
         log('building FreeType')
         build = build_root / 'freetype'
         shutil.rmtree(build, ignore_errors=True)  # a cached configure keeps old library lookups
-        subprocess.run(['cmake', '-S', str(freetype), '-B', str(build),
+        subprocess.run(['cmake', *cmake_sdk_options(), '-S', str(freetype), '-B', str(build),
                         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_INSTALL_PREFIX={prefix}',
                         '-DBUILD_SHARED_LIBS=ON', *freetype_options], check=True)
         subprocess.run(['cmake', '--build', str(build), '--parallel', '4'], check=True)

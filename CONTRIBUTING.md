@@ -18,6 +18,7 @@ Run commands from the repository root.
 | Pi coding agent | **1.0.0** | Chat runtime |
 | Git | Available on `PATH` | Checkout and source enumeration for formatting |
 | CMake, Make, C/C++ toolchain, pkg-config | Available on `PATH` | Build native dependencies |
+| Autoconf, Automake, libtool | Available on `PATH` | Build libunibreak |
 | SQLite development files | With FTS5 support | Storage and search |
 | X11/Wayland development libraries | For SDL3 | Linux windowing support |
 
@@ -49,6 +50,9 @@ zig build test
 ```
 
 Configure provider credentials through Pi to use models. Building and running regressions does not require provider credentials or model calls.
+On macOS, replace `zig build [args]` with `python3 build/driver.py [args]`
+to select an SDK compatible with both the native compiler and Zig.
+Use `mise exec --` if mise supplies the tools.
 Spica discovers Node and Pi through `PATH`, platform bin directories, then `npm root -g`.
 Use `--node /path/to/node` and `--pi-entry /path/to/cli.js` to override discovery (for example, nvm/fnm installations unavailable to Finder or shell wrappers without recognized target metadata).
 Keep `.deps/` and `assets/` with the checkout and rebuild after moving it.

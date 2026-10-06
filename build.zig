@@ -11,11 +11,8 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "asset_directory", b.path("assets").getPath(b));
     options.addOption([]const u8, "font_directory", b.path(".deps/install/fonts").getPath(b));
 
-    // macOS 27 SDK: Zig 0.16 cannot build its bundled libc++ ("use of undeclared identifier
-    // 'INFINITY'"). The SDK's math.h leaves INFINITY to float.h when clang modules are on, and
-    // Zig's float.h does not provide it under -std=c++23. Point Zig at the 26.x SDK instead:
-    //   zig libc > macos-26.libc, replace the MacOSX27.0.sdk paths with
-    //   /Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk, then set env var ZIG_LIBC to that file.
+    // build/driver.py probes installed macOS SDKs and supplies SDKROOT/ZIG_LIBC
+    // so native dependencies and Zig's bundled libc++ use a compatible SDK.
     const module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
     module.addOptions("build_options", options);
     if (target.result.os.tag == .linux) module.addRPathSpecial(b.fmt("$ORIGIN/../../{s}/lib", .{prefix}));
