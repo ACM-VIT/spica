@@ -16,6 +16,7 @@ const build_options = @import("build_options");
 const SessionCatalog = @import("core/catalog.zig");
 const Settings = @import("ui/settings.zig");
 const Library = @import("ui/library.zig");
+const ModelSearch = @import("ui/model_search.zig").Search;
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
 const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
@@ -101,12 +102,12 @@ const PendingMutation = struct {
 };
 const Button = struct { bounds: c.SDL_FRect, action: Action };
 
-fn modelMatches(model: pi.Model, query: []const u8) bool {
-    var terms = std.mem.tokenizeAny(u8, query, " \t\r\n");
-    while (terms.next()) |term| {
-        if (std.ascii.indexOfIgnoreCase(model.name, term) == null and
-            std.ascii.indexOfIgnoreCase(model.id, term) == null and
-            std.ascii.indexOfIgnoreCase(model.provider, term) == null) return false;
+fn modelsEqual(a: []const pi.Model, b: []const pi.Model) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left.name, right.name) or
+            !std.mem.eql(u8, left.id, right.id) or
+            !std.mem.eql(u8, left.provider, right.provider)) return false;
     }
     return true;
 }
@@ -153,6 +154,7 @@ pub const App = struct {
     force_dialog: bool = false,
     model_menu: bool = false,
     model_first: usize = 0,
+    model_search: ModelSearch = .{},
     thinking_menu: bool = false,
     sidebar_visible: bool = true,
     editor_bounds: c.SDL_FRect = undefined,
@@ -838,6 +840,10 @@ pub const App = struct {
             const session_changed = incoming.session_file.len != 0 and (self.runtime_snapshot == null or !std.mem.eql(u8, self.runtime_snapshot.?.session_file, incoming.session_file));
             const changed_error = incoming.error_message.len != 0 and (self.runtime_snapshot == null or !std.mem.eql(u8, self.runtime_snapshot.?.error_message, incoming.error_message));
             const recovery_changed = incoming.recovery_revision != 0 and (self.runtime_snapshot == null or incoming.recovery_revision != self.runtime_snapshot.?.recovery_revision);
+            if (self.runtime_snapshot == null or !modelsEqual(self.runtime_snapshot.?.models, incoming.models)) {
+                self.model_search.invalidate();
+                if (self.model_menu) self.button_count = 0;
+            }
             if (self.runtime_snapshot) |*old| old.deinit();
             self.runtime_snapshot = incoming;
             const snapshot = &self.runtime_snapshot.?;
@@ -1344,6 +1350,7 @@ pub const App = struct {
                 } else {
                     // Mutually exclusive popups share the library's bounded query editor.
                     self.library.resetQuery();
+                    self.model_search.invalidate();
                     self.model_first = 0;
                     self.model_menu = true;
                     self.dragging = false;
@@ -1430,26 +1437,25 @@ pub const App = struct {
         if (self.focused_editor) _ = c.SDL_StartTextInput(self.window) else _ = c.SDL_StopTextInput(self.window);
     }
 
-    fn modelCount(self: *const App) usize {
-        var count: usize = 0;
-        if (self.runtime_snapshot) |snapshot| for (snapshot.models) |model| {
-            if (modelMatches(model, self.library.queryBytes())) count += 1;
-        };
-        return count;
+    fn refreshModelSearch(self: *App) !void {
+        if (!self.model_search.dirty) return;
+        const models = if (self.runtime_snapshot) |snapshot| snapshot.models else &.{};
+        try self.model_search.rebuild(models, self.library.queryBytes());
     }
 
-    fn modelIndex(self: *const App, filtered_index: usize) ?usize {
-        var at: usize = 0;
-        if (self.runtime_snapshot) |snapshot| for (snapshot.models, 0..) |model, index| {
-            if (!modelMatches(model, self.library.queryBytes())) continue;
-            if (at == filtered_index) return index;
-            at += 1;
-        };
-        return null;
+    fn modelCount(self: *App) !usize {
+        try self.refreshModelSearch();
+        return self.model_search.len;
+    }
+
+    fn modelIndex(self: *App, ranked_index: usize) !?usize {
+        try self.refreshModelSearch();
+        return self.model_search.index(ranked_index);
     }
 
     fn editModelQuery(self: *App, event: *const c.SDL_Event) !void {
         if (try self.library.handleQuery(self, event)) {
+            self.model_search.invalidate();
             self.model_first = 0;
             self.button_count = 0;
         }
@@ -1467,16 +1473,13 @@ pub const App = struct {
             try self.rectangle(x, y, width, height, 8, colors.border);
             try self.rectangle(x + 1, y + 1, width - 2, height - 2, 7, colors.panel);
             if (self.runtime_snapshot) |snapshot| {
-                const count = self.modelCount();
+                const count = try self.modelCount();
                 if (count == 0) try self.label(if (snapshot.models.len == 0) "No configured models" else "No matching models", x + 12, y + 16, 13, colors.muted);
                 self.model_first = @min(self.model_first, count -| 1);
-                var at: usize = 0;
-                for (snapshot.models, 0..) |model, index| {
-                    if (!modelMatches(model, self.library.queryBytes())) continue;
-                    const filtered_index = at;
-                    at += 1;
-                    if (filtered_index < self.model_first) continue;
-                    if (filtered_index - self.model_first >= visible) break;
+                const end = @min(count, self.model_first + visible);
+                for (self.model_search.matches[self.model_first..end], self.model_first..) |match, filtered_index| {
+                    const index = match.index;
+                    const model = snapshot.models[index];
                     const row_y = y + 8 + @as(f32, @floatFromInt(filtered_index - self.model_first)) * 40;
                     if (filtered_index == self.model_first) try self.rectangle(x + 8, row_y, width - 16, 38, 5, colors.raised);
                     const row_clip = c.SDL_Rect{ .x = @intFromFloat(x + 8), .y = @intFromFloat(row_y), .w = @intFromFloat(width - 16), .h = 38 };
@@ -2269,7 +2272,7 @@ pub const App = struct {
                 }
                 if (self.settings_open) return;
                 if (self.model_menu) {
-                    const last = self.modelCount() -| 1;
+                    const last = (try self.modelCount()) -| 1;
                     const direction = event.wheel.y * (if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) @as(f32, -1) else 1);
                     self.model_first = if (direction > 0) self.model_first -| 1 else if (direction < 0) @min(last, self.model_first + 1) else self.model_first;
                     self.button_count = 0;
@@ -2414,13 +2417,13 @@ pub const App = struct {
                         self.dirty = true;
                     }
                     if (event.key.key == c.SDLK_DOWN) {
-                        const last = self.modelCount() -| 1;
+                        const last = (try self.modelCount()) -| 1;
                         self.model_first = @min(last, self.model_first + 1);
                         self.button_count = 0;
                         self.dirty = true;
                     }
                     if (event.key.key == c.SDLK_RETURN or event.key.key == c.SDLK_KP_ENTER) {
-                        if (self.modelIndex(self.model_first)) |index| try self.act(.{ .select_model = index });
+                        if (try self.modelIndex(self.model_first)) |index| try self.act(.{ .select_model = index });
                     } else try self.editModelQuery(event);
                     return;
                 }
@@ -2631,6 +2634,7 @@ test "model search filters names IDs and providers without editing the draft" {
     app.thinking_menu = false;
     app.focused_editor = false;
     app.options = .{};
+    app.model_search = .{};
     app.library = try Library.Panel.init(allocator);
     defer app.library.deinit();
     app.library.resetQuery();
@@ -2654,10 +2658,10 @@ test "model search filters names IDs and providers without editing the draft" {
     try std.testing.expect(app.dirty);
     try std.testing.expectEqual(@as(usize, 0), app.model_first);
     try std.testing.expectEqual(@as(usize, 0), app.button_count);
-    try std.testing.expectEqual(@as(usize, 2), app.modelCount());
-    try std.testing.expectEqual(@as(?usize, 1), app.modelIndex(0));
-    try std.testing.expectEqual(@as(?usize, 3), app.modelIndex(1));
-    try std.testing.expect(app.modelIndex(2) == null);
+    try std.testing.expectEqual(@as(usize, 2), try app.modelCount());
+    try std.testing.expectEqual(@as(?usize, 1), try app.modelIndex(0));
+    try std.testing.expectEqual(@as(?usize, 3), try app.modelIndex(1));
+    try std.testing.expect(try app.modelIndex(2) == null);
 
     event.type = c.SDL_EVENT_KEY_DOWN;
     event.key.key = c.SDLK_A;
@@ -2666,8 +2670,8 @@ test "model search filters names IDs and providers without editing the draft" {
     event.type = c.SDL_EVENT_TEXT_INPUT;
     event.text.text = "ANTHROPIC haiku-4";
     try app.handle(&event);
-    try std.testing.expectEqual(@as(usize, 1), app.modelCount());
-    try std.testing.expectEqual(@as(?usize, 2), app.modelIndex(0));
+    try std.testing.expectEqual(@as(usize, 1), try app.modelCount());
+    try std.testing.expectEqual(@as(?usize, 2), try app.modelIndex(0));
 
     event.type = c.SDL_EVENT_KEY_DOWN;
     event.key.key = c.SDLK_A;
@@ -2676,8 +2680,8 @@ test "model search filters names IDs and providers without editing the draft" {
     event.type = c.SDL_EVENT_TEXT_INPUT;
     event.text.text = "missing model";
     try app.handle(&event);
-    try std.testing.expectEqual(@as(usize, 0), app.modelCount());
-    try std.testing.expect(app.modelIndex(0) == null);
+    try std.testing.expectEqual(@as(usize, 0), try app.modelCount());
+    try std.testing.expect(try app.modelIndex(0) == null);
     event.type = c.SDL_EVENT_KEY_DOWN;
     event.key.key = c.SDLK_RETURN;
     try app.handle(&event);
@@ -2691,7 +2695,22 @@ test "model search filters names IDs and providers without editing the draft" {
     event.key.mod = 0;
     try app.handle(&event);
     try std.testing.expectEqualStrings("", app.library.queryBytes());
-    try std.testing.expectEqual(@as(usize, 4), app.modelCount());
+    try std.testing.expectEqual(@as(usize, 4), try app.modelCount());
+    event.type = c.SDL_EVENT_TEXT_INPUT;
+    event.text.text = "opsu";
+    try app.handle(&event);
+    try std.testing.expectEqual(@as(usize, 2), try app.modelCount());
+    try std.testing.expectEqual(@as(?usize, 1), try app.modelIndex(0));
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_DOWN;
+    event.key.mod = 0;
+    try app.handle(&event);
+    try std.testing.expectEqual(@as(usize, 1), app.model_first);
+    try std.testing.expect(!app.model_search.dirty);
+    try std.testing.expectEqual(@as(?usize, 3), try app.modelIndex(app.model_first));
+    event.key.key = c.SDLK_UP;
+    try app.handle(&event);
+    try std.testing.expectEqual(@as(usize, 0), app.model_first);
     try std.testing.expectEqualStrings("keep this message draft", app.editor.textBytes());
 }
 
