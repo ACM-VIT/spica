@@ -15,6 +15,10 @@ typedef struct {
     bool subsequence;
 } SpicaFuzzyScore;
 
+/* Unicode case folding can expand one scalar into up to three scalars.
+ * out must have room for three values; returns the number written. */
+size_t spica_fuzzy_case_fold(uint32_t scalar, uint32_t out[3]);
+
 /* Inputs are Unicode codepoints normalized by the caller. The query owns its
  * caches; candidates are borrowed for scoring. NULL is valid for empty input.
  * Ratio is RapidFuzz's similarity directly, on a 0..100 scale. */

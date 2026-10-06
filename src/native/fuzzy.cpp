@@ -3,6 +3,15 @@
 #include <rapidfuzz/distance/LCSseq.hpp>
 #include <rapidfuzz/fuzz.hpp>
 
+extern "C" size_t spica_fuzzy_case_fold(uint32_t c, uint32_t out[3]) {
+    size_t length = 0;
+    // Reuse the Unicode table from the locked cmark dependency without allocating.
+#define bufpush(x) out[length++] = (x)
+#include "case_fold_switch.inc"
+#undef bufpush
+    return length;
+}
+
 struct SpicaFuzzyQuery {
     size_t length;
     rapidfuzz::fuzz::CachedRatio<uint32_t> ratio;
