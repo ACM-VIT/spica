@@ -1466,8 +1466,9 @@ pub const App = struct {
         if (self.model_menu) {
             const x = self.model_bounds.x;
             const width: f32 = @min(360, self.composer_bounds.w - 16);
-            const visible: usize = @intFromFloat(@max(1, @min(6, @floor((self.composer_bounds.y - 66) / 40))));
-            const height = @as(f32, @floatFromInt(visible)) * 40 + 56;
+            const error_height: f32 = if (self.library.input_err != null) 20 else 0;
+            const visible: usize = @intFromFloat(@max(1, @min(6, @floor((self.composer_bounds.y - 66 - error_height) / 40))));
+            const height = @as(f32, @floatFromInt(visible)) * 40 + 56 + error_height;
             const y = self.composer_bounds.y - height - 10;
             self.model_popup_bounds = .{ .x = x, .y = y, .w = width, .h = height };
             try self.rectangle(x, y, width, height, 8, colors.border);
@@ -1490,11 +1491,16 @@ pub const App = struct {
                     _ = c.SDL_SetRenderClipRect(self.renderer, null);
                 }
             } else try self.label("Start pi to discover models", x + 12, y + 16, 13, colors.muted);
-            const query_y = y + height - 42;
+            const query_y = y + height - 42 - error_height;
             try self.rectangle(x + 8, query_y - 5, width - 16, 1, 0, colors.border);
             self.library.query_bounds = .{ .x = x + 8, .y = query_y, .w = width - 16, .h = 34 };
             try self.rectangle(x + 8, query_y, width - 16, 34, 5, colors.raised);
             try self.library.drawQuery(self, "Search models...");
+            if (self.library.input_err) |err| {
+                var buffer: [128]u8 = undefined;
+                const message = try std.fmt.bufPrint(&buffer, "Error: {s}", .{@errorName(err)});
+                try self.fitLabel(message, x + 12, query_y + 36, width - 24, 12, colors.error_color);
+            }
         }
         if (self.thinking_menu) {
             if (self.runtime_snapshot) |snapshot| {
@@ -2712,6 +2718,19 @@ test "model search filters names IDs and providers without editing the draft" {
     try app.handle(&event);
     try std.testing.expectEqual(@as(usize, 0), app.model_first);
     try std.testing.expectEqualStrings("keep this message draft", app.editor.textBytes());
+
+    // Rejected input keeps the current results and leaves an error for the popup.
+    event.type = c.SDL_EVENT_TEXT_INPUT;
+    event.text.text = "x" ** 257;
+    try app.handle(&event);
+    try std.testing.expectEqual(error.QueryTooLarge, app.library.input_err.?);
+    try std.testing.expectEqualStrings("opsu", app.library.queryBytes());
+    try std.testing.expectEqual(@as(usize, 2), try app.modelCount());
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_BACKSPACE;
+    event.key.mod = 0;
+    try app.handle(&event);
+    try std.testing.expect(app.library.input_err == null);
 }
 
 test "background prompt acknowledgements clear only the submitted chat revision" {
