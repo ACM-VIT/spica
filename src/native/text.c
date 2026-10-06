@@ -16,6 +16,8 @@
 #include <string.h>
 #ifdef __linux__
 #include <fontconfig/fontconfig.h>
+#elif defined(__APPLE__)
+#include <CoreText/CoreText.h>
 #endif
 
 #define CHAR_LIMIT 8192u
@@ -374,8 +376,15 @@ static bool face_style(const Face *f, unsigned style) {
            (!(style & SPICA_TEXT_BOLD) || (f->face->style_flags & FT_STYLE_FLAG_BOLD) ||
             f->variable_bold);
 }
+static unsigned available_style(const Face *f, unsigned style) {
+    /* Color emoji fonts commonly have only a regular face. Keep their color artwork when a
+     * surrounding Markdown span requests an unavailable style, without synthesizing glyphs. */
+    if (FT_HAS_COLOR(f->face) && !face_style(f, style))
+        style &= ~(SPICA_TEXT_BOLD | SPICA_TEXT_ITALIC);
+    return style;
+}
 static bool select_style(Face *f, unsigned style) {
-    style &= SPICA_TEXT_BOLD | SPICA_TEXT_ITALIC;
+    style = available_style(f, style) & (SPICA_TEXT_BOLD | SPICA_TEXT_ITALIC);
     if (!face_style(f, style))
         return error("requested font style is unavailable");
     if (f->active_style == style)
@@ -425,7 +434,7 @@ static bool ignorable(uint32_t c) {
            c == 0x200e || c == 0x200f || c == 0xad;
 }
 static bool covers(Face *f, const FriBidiChar *chars, unsigned count, unsigned style) {
-    if (!face_style(f, style))
+    if (!face_style(f, available_style(f, style)))
         return false;
     for (unsigned i = 0; i < count; ++i) {
         if (chars[i] == 0xfe0f && i && !FT_HAS_COLOR(f->face) &&
@@ -517,6 +526,106 @@ static int system_face(SpicaText *t, const FriBidiChar *chars, unsigned count, u
     t->pattern_destroy(request);
     if (face >= 0 && !covers(&t->faces[face], chars, count, style))
         face = -1;
+    return face;
+}
+#elif defined(__APPLE__)
+/* CoreText's fallback choice is the macOS counterpart of the fontconfig match above. Without it,
+ * any grapheme the bundled fonts lack (CJK, many symbols) failed layout, and the composer's failure
+ * closed the app. CoreText names a file and a PostScript name; collections (.ttc, as CJK fonts
+ * ship) need the face index, so the faces are probed for that name. */
+static long collection_index(SpicaText *t, const char *path, const char *name) {
+    FT_Face face;
+    if (FT_New_Face(t->library, path, -1, &face))
+        return -1;
+    long count = face->num_faces;
+    FT_Done_Face(face);
+    for (long i = 0; i < count; ++i) {
+        if (FT_New_Face(t->library, path, i, &face))
+            continue;
+        const char *candidate = FT_Get_Postscript_Name(face);
+        bool match = candidate && !strcmp(candidate, name);
+        FT_Done_Face(face);
+        if (match)
+            return i;
+    }
+    return -1;
+}
+static int open_system_font(SpicaText *t, CTFontRef font, const FriBidiChar *chars, unsigned count,
+                            unsigned style) {
+    CFCharacterSetRef set = CTFontCopyCharacterSet(font);
+    bool coverable = set != NULL;
+    for (unsigned i = 0; coverable && i < count; ++i)
+        if (!ignorable(chars[i]) && chars[i] != '\t')
+            coverable = CFCharacterSetIsLongCharacterMember(set, chars[i]);
+    if (set)
+        CFRelease(set);
+    if (!coverable)
+        return -1;
+    CFURLRef url = CTFontCopyAttribute(font, kCTFontURLAttribute);
+    CFStringRef postscript = CTFontCopyPostScriptName(font);
+    char path[1024], name[256];
+    int face = -1;
+    if (url && postscript &&
+        CFURLGetFileSystemRepresentation(url, true, (UInt8 *)path, sizeof(path)) &&
+        CFStringGetCString(postscript, name, sizeof(name), kCFStringEncodingUTF8)) {
+        long index = collection_index(t, path, name);
+        if (index >= 0)
+            face = open_face(t, path, index, false);
+    }
+    if (postscript)
+        CFRelease(postscript);
+    if (url)
+        CFRelease(url);
+    if (face >= 0 && !covers(&t->faces[face], chars, count, style))
+        face = -1;
+    return face;
+}
+static int system_face(SpicaText *t, const FriBidiChar *chars, unsigned count, unsigned style) {
+    bool emoji = false;
+    for (unsigned i = 0; i < count; ++i)
+        if (chars[i] == 0xfe0f || (chars[i] >= 0x1f000 && chars[i] <= 0x1faff))
+            emoji = true;
+    CFStringRef text = CFStringCreateWithBytes(NULL, (const UInt8 *)chars, count * sizeof(*chars),
+                                               kCFStringEncodingUTF32LE, false);
+    CTFontRef base = CTFontCreateWithName(emoji ? CFSTR("Apple Color Emoji")
+                                          : style & SPICA_TEXT_MONOSPACE ? CFSTR("Menlo")
+                                                                         : CFSTR("Helvetica"),
+                                          15, NULL);
+    CTFontSymbolicTraits traits = (style & SPICA_TEXT_BOLD ? kCTFontBoldTrait : 0) |
+                                  (style & SPICA_TEXT_ITALIC ? kCTFontItalicTrait : 0);
+    if (base && traits) {
+        CTFontRef styled = CTFontCreateCopyWithSymbolicTraits(base, 0, NULL, traits, traits);
+        if (styled) {
+            CFRelease(base);
+            base = styled;
+        }
+    }
+    int face = -1;
+    CTFontRef match =
+        text && base ? CTFontCreateForString(base, text, CFRangeMake(0, CFStringGetLength(text)))
+                     : NULL;
+    if (match) {
+        face = open_system_font(t, match, chars, count, style);
+        CFRelease(match);
+    }
+    /* CoreText's first choice can be a font FreeType cannot read (on macOS 27 the PingFang UI faces
+     * fail to open), so walk the rest of the same ordered cascade list. */
+    CFArrayRef cascade =
+        face < 0 && base ? CTFontCopyDefaultCascadeListForLanguages(base, NULL) : NULL;
+    for (CFIndex i = 0; cascade && face < 0 && i < CFArrayGetCount(cascade); ++i) {
+        CTFontRef font = CTFontCreateWithFontDescriptor(
+            (CTFontDescriptorRef)CFArrayGetValueAtIndex(cascade, i), 15, NULL);
+        if (font) {
+            face = open_system_font(t, font, chars, count, style);
+            CFRelease(font);
+        }
+    }
+    if (cascade)
+        CFRelease(cascade);
+    if (base)
+        CFRelease(base);
+    if (text)
+        CFRelease(text);
     return face;
 }
 #else
@@ -950,8 +1059,10 @@ SpicaTextLayout *spica_text_layout_create_spans(SpicaText *t, const char *utf8, 
             faces |= (uint16_t)(1u << f);
             ++t->faces[f].pins;
         }
-        for (unsigned c = i; c < end; ++c)
+        for (unsigned c = i; c < end; ++c) {
             t->char_faces[c] = (uint16_t)f;
+            t->styles[c] = (uint16_t)available_style(&t->faces[f], t->styles[c]);
+        }
         i = end;
     }
     unsigned glyph_count = 0, caret_count = 0, line_count = 0, p = 0;

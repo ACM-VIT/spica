@@ -1,5 +1,6 @@
 test {
     _ = @import("app.zig");
+    _ = @import("platform/executables.zig");
     _ = @import("core/protocol_test.zig");
     _ = @import("core/store_test.zig");
     _ = @import("core/catalog.zig");

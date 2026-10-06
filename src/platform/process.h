@@ -12,6 +12,10 @@ int spica_process_spawn(SpicaProcess *p, const char *node, const char *entry, co
                         const char *resume, int trust);
 /* A verifier that fails while still alive remains owned in p for explicit shutdown. */
 int spica_process_version(SpicaProcess *p, const char *node, const char *entry);
+/* Bounded, five-second global npm lookup, run with the resolved Node executable.
+ * A failed lookup still alive remains owned in p, just like the version verifier. */
+int spica_process_npm_root(SpicaProcess *p, const char *node, const char *npm, char *output,
+                           size_t capacity, size_t *length);
 /* bits: wake=1 stdout=2 stderr=4 writable=8 exited=16 */
 int spica_process_poll(SpicaProcess *p, int wake, int want_write, int timeout_ms);
 long spica_process_read(int fd, void *bytes, size_t size);

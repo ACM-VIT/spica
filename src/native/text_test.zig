@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @cImport({
     @cInclude("text.h");
 });
@@ -173,10 +174,12 @@ test "DPR transitions rebuild raster pixels without changing wrapping or logical
 test "bitmap color ZWJ emoji and adjacent flag have distinct logical advances" {
     const f = try Fixture.init();
     defer f.deinit();
-    const font = "/usr/share/fonts/noto/NotoColorEmoji.ttf";
-    const io = c.SDL_IOFromFile(font, "rb") orelse return error.SkipZigTest;
-    _ = c.SDL_CloseIO(io);
-    try std.testing.expect(c.spica_text_add_fallback(f.engine, font, 0));
+    if (builtin.os.tag != .macos) {
+        const font = "/usr/share/fonts/noto/NotoColorEmoji.ttf";
+        const io = c.SDL_IOFromFile(font, "rb") orelse return error.SkipZigTest;
+        _ = c.SDL_CloseIO(io);
+        try std.testing.expect(c.spica_text_add_fallback(f.engine, font, 0));
+    }
     const woman = "👩‍💻";
     const flag = "🇮🇳";
     const source = woman ++ flag;
@@ -218,6 +221,56 @@ test "bitmap color ZWJ emoji and adjacent flag have distinct logical advances" {
         const separate = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
         defer c.SDL_DestroySurface(separate);
         try expectSamePixels(adjacent, separate);
+    }
+}
+
+test "macOS CoreText cascade renders CJK and preserves color emoji in styled spans" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const f = try Fixture.init();
+    defer f.deinit();
+    // No registered system fallback: both scripts must go through the CoreText cascade.
+    const cjk = "漢字";
+    const cjk_layout = c.spica_text_layout_create(f.engine, cjk, cjk.len, 200, 15, false) orelse return error.Layout;
+    defer c.spica_text_layout_release(cjk_layout);
+    try f.clear();
+    try std.testing.expect(c.spica_text_layout_draw(f.engine, cjk_layout, 5, 4, white));
+    var cjk_line: c.SpicaTextLine = undefined;
+    try std.testing.expect(c.spica_text_layout_line(cjk_layout, 0, &cjk_line));
+    try std.testing.expect(cjk_line.width > 0);
+
+    const emoji = "👩‍💻🇮🇳";
+    const plain = c.spica_text_layout_create(f.engine, emoji, emoji.len, 200, 15, false) orelse return error.Layout;
+    defer c.spica_text_layout_release(plain);
+    var baseline: c.SpicaTextLine = undefined;
+    try std.testing.expect(c.spica_text_layout_line(plain, 0, &baseline));
+    try f.clear();
+    try std.testing.expect(c.spica_text_layout_draw(f.engine, plain, 5, 4, white));
+    const pixels = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
+    defer c.SDL_DestroySurface(pixels);
+    var colored = false;
+    for (0..50) |y| {
+        for (0..80) |x| {
+            var r: u8 = 0;
+            var g: u8 = 0;
+            var b: u8 = 0;
+            var a: u8 = 0;
+            try std.testing.expect(c.SDL_ReadSurfacePixel(pixels, @intCast(x), @intCast(y), &r, &g, &b, &a));
+            colored = colored or (a != 0 and (r != g or g != b));
+        }
+    }
+    try std.testing.expect(colored);
+    for ([_]c_uint{ c.SPICA_TEXT_BOLD, c.SPICA_TEXT_ITALIC, c.SPICA_TEXT_BOLD | c.SPICA_TEXT_ITALIC }) |style| {
+        const span = c.SpicaTextSpan{ .byte_start = 0, .byte_end = emoji.len, .style = style };
+        const styled = c.spica_text_layout_create_spans(f.engine, emoji, emoji.len, 200, 15, false, &span, 1) orelse return error.Layout;
+        defer c.spica_text_layout_release(styled);
+        var line: c.SpicaTextLine = undefined;
+        try std.testing.expect(c.spica_text_layout_line(styled, 0, &line));
+        try std.testing.expectEqual(baseline.width, line.width);
+        try f.clear();
+        try std.testing.expect(c.spica_text_layout_draw(f.engine, styled, 5, 4, white));
+        const rendered = c.SDL_RenderReadPixels(f.renderer, null) orelse return error.ReadPixels;
+        defer c.SDL_DestroySurface(rendered);
+        try expectSamePixels(pixels, rendered);
     }
 }
 

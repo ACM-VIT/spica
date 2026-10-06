@@ -30,6 +30,25 @@ static int validate(sqlite3 *database) {
     return rc == SQLITE_OK ? final : rc;
 }
 
+static int open_validated(const char *path, sqlite3 **database) {
+    int rc = sqlite3_open_v2(path, database, SQLITE_OPEN_READONLY, NULL);
+    if (rc == SQLITE_OK)
+        rc = validate(*database);
+#ifdef __APPLE__
+    /* macOS SQLite may need write access to recreate missing WAL sidecars. Try reads first:
+     * a legacy database can be read-only, and existing sidecars or DELETE mode need no writes. */
+    if ((rc & 0xff) == SQLITE_CANTOPEN || (rc & 0xff) == SQLITE_READONLY) {
+        if (*database)
+            sqlite3_close(*database);
+        *database = NULL;
+        rc = sqlite3_open_v2(path, database, SQLITE_OPEN_READWRITE, NULL);
+        if (rc == SQLITE_OK)
+            rc = validate(*database);
+    }
+#endif
+    return rc;
+}
+
 static int discard_staging(const char *temporary) {
     char sidecar[8192];
     const char *suffixes[] = {"", "-wal", "-shm", "-journal"};
@@ -43,18 +62,37 @@ static int discard_staging(const char *temporary) {
     return SQLITE_OK;
 }
 
-/* Called under the application instance lock. Legacy files are never modified. */
-int spica_database_cutover(const char *destination, const char *legacy, const char *temporary,
-                           const char *directory) {
+/* Bind helpers for Zig callers (store.zig, search_sql.zig). They live in C, not Zig, because
+ * Zig cannot pass SQLITE_TRANSIENT on aarch64.
+ *
+ * SQLITE_TRANSIENT tells SQLite to copy the bytes before the bind call returns, so the caller's
+ * slice only has to live for the duration of the call. SQLite defines it as
+ * ((sqlite3_destructor_type)-1): an all-ones sentinel in a function-pointer slot that SQLite
+ * compares against but never calls.
+ *
+ * @cImport does not bring that macro over, so the Zig code used to rebuild it with
+ * @ptrFromInt(maxInt(usize)). Zig checks that an address converted to a function pointer meets
+ * the target's code alignment. x86_64 needs 1 byte, so the all-ones address compiled there;
+ * aarch64 needs 4, so Zig rejects it ("requires aligned address") and the build fails on Apple
+ * Silicon and ARM Linux. C performs no such check, so these wrappers use SQLite's own macro and
+ * pass exactly the value SQLite expects, with the same code on every architecture. */
+int spica_database_bind_text(sqlite3_stmt *statement, int index, const char *text, int length) {
+    return sqlite3_bind_text(statement, index, text, length, SQLITE_TRANSIENT);
+}
+
+int spica_database_bind_blob(sqlite3_stmt *statement, int index, const void *data, int length) {
+    return sqlite3_bind_blob(statement, index, data, length, SQLITE_TRANSIENT);
+}
+
+static int cutover(const char *destination, const char *legacy, const char *temporary,
+                   const char *directory) {
     sqlite3 *source = NULL, *target = NULL;
     sqlite3_backup *backup = NULL;
     int rc = SQLITE_OK;
     FILE *probe = fopen(destination, "rb");
     if (probe) {
         fclose(probe);
-        rc = sqlite3_open_v2(destination, &target, SQLITE_OPEN_READONLY, NULL);
-        if (rc == SQLITE_OK)
-            rc = validate(target);
+        rc = open_validated(destination, &target);
         if (target && sqlite3_close(target) != SQLITE_OK && rc == SQLITE_OK)
             rc = SQLITE_BUSY;
         return rc;
@@ -69,10 +107,7 @@ int spica_database_cutover(const char *destination, const char *legacy, const ch
     rc = discard_staging(temporary);
     if (rc != SQLITE_OK)
         return rc;
-    rc = sqlite3_open_v2(legacy, &source, SQLITE_OPEN_READONLY, NULL);
-    if (rc != SQLITE_OK)
-        goto done;
-    rc = validate(source);
+    rc = open_validated(legacy, &source);
     if (rc != SQLITE_OK)
         goto done;
     rc = sqlite3_open_v2(temporary, &target, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
@@ -141,4 +176,29 @@ done:
         return SQLITE_IOERR_FSYNC;
 #endif
     return SQLITE_OK;
+}
+
+/* The store's worker connections (runtime, catalog) open this database concurrently, and each runs
+ * PRAGMA journal_mode=WAL. Switching a database into WAL needs the only connection, and SQLite
+ * returns SQLITE_BUSY for that at once, without waiting on busy_timeout. A new or migrated
+ * (DELETE-mode) database therefore lost that race on first launch ("Pi: SqliteFailure"). WAL is
+ * persistent in the file, so switch it here while nothing else has it open; the workers' pragma is
+ * then a no-op. A missing destination is created empty, and the store adds the schema. */
+static int switch_to_wal(const char *destination) {
+    sqlite3 *database = NULL;
+    int rc =
+        sqlite3_open_v2(destination, &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_exec(database, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+    if (database && sqlite3_close(database) != SQLITE_OK && rc == SQLITE_OK)
+        rc = SQLITE_BUSY;
+    return rc;
+}
+
+/* Called under the application instance lock, before any worker opens the database. Legacy files
+ * are never modified. */
+int spica_database_cutover(const char *destination, const char *legacy, const char *temporary,
+                           const char *directory) {
+    int rc = cutover(destination, legacy, temporary, directory);
+    return rc == SQLITE_OK ? switch_to_wal(destination) : rc;
 }

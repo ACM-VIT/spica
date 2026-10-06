@@ -11,6 +11,8 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "asset_directory", b.path("assets").getPath(b));
     options.addOption([]const u8, "font_directory", b.path(".deps/install/fonts").getPath(b));
 
+    // build/driver.py probes installed macOS SDKs and supplies SDKROOT/ZIG_LIBC
+    // so native dependencies and Zig's bundled libc++ use a compatible SDK.
     const module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
     module.addOptions("build_options", options);
     if (target.result.os.tag == .linux) module.addRPathSpecial(b.fmt("$ORIGIN/../../{s}/lib", .{prefix}));
@@ -27,7 +29,11 @@ pub fn build(b: *std.Build) void {
     nativeDependencies(b, test_module, prefix);
     test_module.addCSourceFile(.{ .file = b.path("src/native/parse_arena_test.c"), .flags = &.{ "-std=c11", "-O2" } });
     const tests = b.addTest(.{ .root_module = test_module });
-    b.step("test", "Run protocol, storage, Unicode, Markdown, image, and highlighting regressions").dependOn(&b.addRunArtifact(tests).step);
+    const test_step = b.step("test", "Run protocol, storage, Unicode, Markdown, image, and highlighting regressions");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    const bootstrap_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "build", "-p", "*_test.py" });
+    bootstrap_tests.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    test_step.dependOn(&bootstrap_tests.step);
 }
 
 fn nativeDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const u8) void {
@@ -42,13 +48,32 @@ fn nativeDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const 
         module.addCSourceFile(.{ .file = b.path("src/native/" ++ name ++ ".c"), .flags = &.{ "-std=c11", "-O2" } });
     }
     module.addCSourceFile(.{ .file = b.path("src/native/fuzzy.cpp"), .flags = &.{ "-std=c++17", "-O2" } });
-    module.addCSourceFile(.{ .file = b.path("src/platform/process.c"), .flags = &.{ "-std=c11", "-O2" } });
+    // Compile shared POSIX logic plus exactly one target-OS backend. The linker resolves
+    // process_internal.h hooks to that backend; process.h stays the shared Zig-facing API.
+    module.addCSourceFile(.{ .file = b.path("src/platform/process_posix.c"), .flags = &.{ "-std=c11", "-O2" } });
+    const process_backend = switch (module.resolved_target.?.result.os.tag) {
+        .linux => "src/platform/process_linux.c",
+        .macos => "src/platform/process_macos.c",
+        else => @panic("Process support requires Linux or macOS"),
+    };
+    module.addCSourceFile(.{ .file = b.path(process_backend), .flags = &.{ "-std=c11", "-O2" } });
     module.addCSourceFile(.{ .file = b.path("src/platform/database.c"), .flags = &.{ "-std=c11", "-D_DEFAULT_SOURCE", "-O2" } });
     module.addLibraryPath(b.path(b.fmt("{s}/lib", .{prefix})));
     module.addRPath(b.path(b.fmt("{s}/lib", .{prefix})));
     inline for (.{ "SDL3_image", "SDL3", "freetype", "harfbuzz", "unibreak", "fribidi", "cmark-gfm-extensions", "cmark-gfm", "tree-sitter", "sqlite3" }) |name| {
-        module.linkSystemLibrary(name, .{});
+        // Link only the locked builds in .deps. With pkg-config on (Zig's default), any library that
+        // also has a system install with a .pc file (Homebrew, apt, etc.) resolves to that copy
+        // instead, and its directory can land ahead of .deps in the rpath. System copies are other
+        // versions and lack the allocator hooks bootstrap.py configures, which crashes the
+        // allocation-failure tests. Libraries not built into .deps (sqlite3) still resolve from the
+        // standard system library directories.
+        module.linkSystemLibrary(name, .{ .use_pkg_config = .no });
+    }
+    // text.c finds fallback fonts through CoreText on macOS (fontconfig, loaded at runtime, on Linux).
+    if (module.resolved_target.?.result.os.tag == .macos) {
+        module.linkFramework("CoreText", .{});
+        module.linkFramework("CoreFoundation", .{});
     }
     module.addIncludePath(b.path(".deps/src/cmark-gfm-0.29.0.gfm.13/src"));
-    module.addIncludePath(b.path(".deps/build/cmark-gfm/src"));
+    module.addIncludePath(b.path(b.fmt(".deps/build/{s}-{s}/cmark-gfm/src", .{ @tagName(module.resolved_target.?.result.os.tag), @tagName(module.resolved_target.?.result.cpu.arch) })));
 }

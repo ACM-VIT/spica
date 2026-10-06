@@ -31,9 +31,14 @@ pub const Db = struct {
         return stmt orelse error.SqliteFailure;
     }
 };
+// Binding goes through a C helper in src/platform/database.c instead of calling
+// c.sqlite3_bind_text directly. SQLite's SQLITE_TRANSIENT (copy the bytes now) is the value -1
+// cast to a function pointer. Zig requires function pointers to be aligned, 4 bytes on aarch64,
+// so rebuilding it here with @ptrFromInt fails to compile on ARM; it only ever compiled on x86_64.
+// C has no such check, so the helper passes SQLite's own macro. Same code on every architecture.
+extern fn spica_database_bind_text(stmt: *c.sqlite3_stmt, index: c_int, text: [*]const u8, length: c_int) c_int;
 pub fn bindText(stmt: *c.sqlite3_stmt, index: c_int, text: []const u8) !void {
-    const transient: c.sqlite3_destructor_type = @ptrFromInt(std.math.maxInt(usize));
-    if (c.sqlite3_bind_text(stmt, index, text.ptr, @intCast(text.len), transient) != c.SQLITE_OK) return error.SqliteFailure;
+    if (spica_database_bind_text(stmt, index, text.ptr, @intCast(text.len)) != c.SQLITE_OK) return error.SqliteFailure;
 }
 pub fn bindInt(stmt: *c.sqlite3_stmt, index: c_int, value: i64) !void {
     if (c.sqlite3_bind_int64(stmt, index, value) != c.SQLITE_OK) return error.SqliteFailure;

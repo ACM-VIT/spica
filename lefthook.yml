@@ -5,6 +5,6 @@ pre-push:
     formatting:
       run: python3 tools/format.py --check
     build:
-      run: zig build
+      run: python3 build/driver.py
     regressions:
-      run: zig build test
+      run: python3 build/driver.py test

@@ -864,12 +864,18 @@ fn field(value: []const u8, max: usize) !void {
 fn optionalField(value: ?[]const u8, max: usize) !void {
     if (value) |v| try field(v, max);
 }
-const transient: c.sqlite3_destructor_type = @ptrFromInt(std.math.maxInt(usize));
+// Binding goes through C helpers in src/platform/database.c instead of calling
+// c.sqlite3_bind_text/blob directly. SQLite's SQLITE_TRANSIENT (copy the bytes now) is the value
+// -1 cast to a function pointer. Zig requires function pointers to be aligned, 4 bytes on aarch64,
+// so rebuilding it here with @ptrFromInt fails to compile on ARM; it only ever compiled on x86_64.
+// C has no such check, so the helpers pass SQLite's own macro. Same code on every architecture.
+extern fn spica_database_bind_text(stmt: *c.sqlite3_stmt, index: c_int, text: [*]const u8, length: c_int) c_int;
+extern fn spica_database_bind_blob(stmt: *c.sqlite3_stmt, index: c_int, data: [*]const u8, length: c_int) c_int;
 fn bindText(stmt: *c.sqlite3_stmt, index: c_int, value: []const u8) !void {
-    if (c.sqlite3_bind_text(stmt, index, value.ptr, @intCast(value.len), transient) != c.SQLITE_OK) return error.SqliteFailure;
+    if (spica_database_bind_text(stmt, index, value.ptr, @intCast(value.len)) != c.SQLITE_OK) return error.SqliteFailure;
 }
 fn bindBlob(stmt: *c.sqlite3_stmt, index: c_int, value: []const u8) !void {
-    if (c.sqlite3_bind_blob(stmt, index, value.ptr, @intCast(value.len), transient) != c.SQLITE_OK) return error.SqliteFailure;
+    if (spica_database_bind_blob(stmt, index, value.ptr, @intCast(value.len)) != c.SQLITE_OK) return error.SqliteFailure;
 }
 fn bindOptionalText(stmt: *c.sqlite3_stmt, index: c_int, value: ?[]const u8) !void {
     if (value) |v| try bindText(stmt, index, v);
