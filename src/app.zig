@@ -161,6 +161,8 @@ pub const App = struct {
     model_search: ModelSearch = .{},
     thinking_menu: bool = false,
     thinking_highlight: usize = 0,
+    // A menu hover that arrived while row targets were cleared, retried after the next paint.
+    pending_hover: ?[2]f32 = null,
     sidebar_visible: bool = true,
     editor_bounds: c.SDL_FRect = undefined,
     model_bounds: c.SDL_FRect = undefined,
@@ -1458,7 +1460,18 @@ pub const App = struct {
         const index = self.selectedThinkingIndex() orelse return;
         self.thinking_highlight = if (down) index + 1 else index -| 1;
         _ = self.selectedThinkingIndex();
+        self.pending_hover = null;
         self.dirty = true;
+    }
+
+    fn hoverMenu(self: *App, x: f32, y: f32) void {
+        if (self.button_count == 0) {
+            self.pending_hover = .{ x, y };
+            self.dirty = true;
+            return;
+        }
+        self.pending_hover = null;
+        if (self.model_menu) self.hoverModel(x, y) else if (self.thinking_menu) self.hoverThinking(x, y);
     }
 
     fn hoverThinking(self: *App, x: f32, y: f32) void {
@@ -1516,6 +1529,7 @@ pub const App = struct {
         self.model_highlight = if (self.model_selection_cleared) @min(last, self.model_first) else if (down) @min(last, self.model_highlight + 1) else self.model_highlight -| 1;
         self.model_selection_cleared = false;
         self.revealModelHighlight();
+        self.pending_hover = null;
         self.button_count = 0;
         self.dirty = true;
     }
@@ -2218,6 +2232,10 @@ pub const App = struct {
             self.presented = true;
         }
         self.dirty = false;
+        if (self.pending_hover) |point| {
+            self.pending_hover = null;
+            if (self.button_count != 0) self.hoverMenu(point[0], point[1]);
+        }
     }
 
     fn drawEditor(self: *App) !void {
@@ -2487,9 +2505,9 @@ pub const App = struct {
                 if (self.library.dragging) {
                     try self.library.hitQuery(self, event.motion.x, event.motion.y, true);
                     self.dirty = true;
-                } else self.hoverModel(event.motion.x, event.motion.y);
+                } else self.hoverMenu(event.motion.x, event.motion.y);
             } else if (self.thinking_menu) {
-                self.hoverThinking(event.motion.x, event.motion.y);
+                self.hoverMenu(event.motion.x, event.motion.y);
             } else if (self.dragging and !self.settings_open) {
                 if (self.editor_layout) |layout| self.editor.setCaret(self.editor_start + c.spica_text_layout_hit_test(layout, event.motion.x - self.editor_bounds.x - 12, event.motion.y - self.editor_bounds.y - 10 + self.editor_scroll), true);
                 self.dirty = true;
@@ -3102,6 +3120,26 @@ test "model menu hover highlights the row under the cursor without scrolling" {
     app.hoverModel(300, 300);
     try std.testing.expectEqual(@as(usize, 2), app.model_highlight);
     try std.testing.expect(!app.dirty);
+
+    // A hover with cleared row targets waits for the next paint, and a key press cancels it.
+    app.model_menu = true;
+    app.thinking_menu = false;
+    app.button_count = 0;
+    app.hoverMenu(20, 20);
+    try std.testing.expect(app.pending_hover != null);
+    try std.testing.expectEqual(@as(usize, 2), app.model_highlight);
+    app.button_count = 2;
+    app.hoverMenu(app.pending_hover.?[0], app.pending_hover.?[1]);
+    try std.testing.expect(app.pending_hover == null);
+    try std.testing.expectEqual(@as(usize, 1), app.model_highlight);
+    app.button_count = 0;
+    app.hoverMenu(20, 60);
+    try app.moveModelHighlight(false);
+    try std.testing.expect(app.pending_hover == null);
+    try std.testing.expectEqual(@as(usize, 0), app.model_highlight);
+    app.model_first = 1;
+    app.model_highlight = 2;
+    app.button_count = 2;
 
     // Hovering restores a selection that a snapshot refresh cleared.
     app.model_selection_cleared = true;
