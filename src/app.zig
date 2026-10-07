@@ -1457,6 +1457,19 @@ pub const App = struct {
         self.dirty = true;
     }
 
+    fn hoverThinking(self: *App, x: f32, y: f32) void {
+        for (self.buttons[0..self.button_count]) |hovered| switch (hovered.action) {
+            .select_thinking => |index| if (contains(hovered.bounds, x, y)) {
+                if (self.thinking_highlight != index) {
+                    self.thinking_highlight = index;
+                    self.dirty = true;
+                }
+                return;
+            },
+            else => {},
+        };
+    }
+
     fn closeModelMenu(self: *App) void {
         if (!self.model_menu) return;
         self.model_menu = false;
@@ -2427,6 +2440,8 @@ pub const App = struct {
                     try self.library.hitQuery(self, event.motion.x, event.motion.y, true);
                     self.dirty = true;
                 }
+            } else if (self.thinking_menu) {
+                self.hoverThinking(event.motion.x, event.motion.y);
             } else if (self.dragging and !self.settings_open) {
                 if (self.editor_layout) |layout| self.editor.setCaret(self.editor_start + c.spica_text_layout_hit_test(layout, event.motion.x - self.editor_bounds.x - 12, event.motion.y - self.editor_bounds.y - 10 + self.editor_scroll), true);
                 self.dirty = true;
@@ -2988,6 +3003,32 @@ test "thinking menu keyboard highlight follows Pi's levels and clamps" {
     try std.testing.expect(app.selectedThinkingIndex() == null);
     app.runtime_snapshot = null;
     try std.testing.expect(app.selectedThinkingIndex() == null);
+}
+
+test "thinking menu hover moves the shared highlight only when the row changes" {
+    var app: App = undefined;
+    app.thinking_highlight = 0;
+    app.dirty = false;
+    app.buttons[0] = .{ .action = .thinking, .bounds = .{ .x = 0, .y = 0, .w = 200, .h = 200 } };
+    app.buttons[1] = .{ .action = .{ .select_thinking = 0 }, .bounds = .{ .x = 4, .y = 8, .w = 122, .h = 30 } };
+    app.buttons[2] = .{ .action = .{ .select_thinking = 1 }, .bounds = .{ .x = 4, .y = 40, .w = 122, .h = 30 } };
+    app.button_count = 3;
+
+    app.hoverThinking(20, 50);
+    try std.testing.expectEqual(@as(usize, 1), app.thinking_highlight);
+    try std.testing.expect(app.dirty);
+
+    app.dirty = false;
+    app.hoverThinking(60, 55);
+    try std.testing.expect(!app.dirty);
+
+    app.hoverThinking(150, 150);
+    try std.testing.expectEqual(@as(usize, 1), app.thinking_highlight);
+    try std.testing.expect(!app.dirty);
+
+    app.hoverThinking(20, 10);
+    try std.testing.expectEqual(@as(usize, 0), app.thinking_highlight);
+    try std.testing.expect(app.dirty);
 }
 
 test "thinking menu keys choose through Pi and held Enter never sends the draft" {
