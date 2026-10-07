@@ -153,7 +153,10 @@ pub const App = struct {
     closing: bool = false,
     force_dialog: bool = false,
     model_menu: bool = false,
+    // Ranks into model_search: the first visible row and the highlighted row.
     model_first: usize = 0,
+    model_highlight: usize = 0,
+    model_visible: usize = 1,
     model_selection_cleared: bool = false,
     model_search: ModelSearch = .{},
     thinking_menu: bool = false,
@@ -1356,6 +1359,7 @@ pub const App = struct {
                     self.library.resetQuery();
                     self.model_search.invalidate();
                     self.model_first = 0;
+                    self.model_highlight = 0;
                     self.model_selection_cleared = false;
                     self.model_menu = true;
                     self.dragging = false;
@@ -1499,7 +1503,40 @@ pub const App = struct {
 
     fn selectedModelIndex(self: *App) !?usize {
         if (self.model_selection_cleared) return null;
-        return self.modelIndex(self.model_first);
+        return self.modelIndex(self.model_highlight);
+    }
+
+    fn revealModelHighlight(self: *App) void {
+        if (self.model_highlight < self.model_first) self.model_first = self.model_highlight;
+        if (self.model_highlight >= self.model_first + self.model_visible) self.model_first = self.model_highlight + 1 - self.model_visible;
+    }
+
+    fn moveModelHighlight(self: *App, down: bool) !void {
+        const last = (try self.modelCount()) -| 1;
+        self.model_highlight = if (self.model_selection_cleared) @min(last, self.model_first) else if (down) @min(last, self.model_highlight + 1) else self.model_highlight -| 1;
+        self.model_selection_cleared = false;
+        self.revealModelHighlight();
+        self.button_count = 0;
+        self.dirty = true;
+    }
+
+    fn hoverModel(self: *App, x: f32, y: f32) void {
+        for (self.buttons[0..self.button_count]) |hovered| switch (hovered.action) {
+            .select_model => |index| if (contains(hovered.bounds, x, y)) {
+                const end = @min(self.model_search.len, self.model_first + self.model_visible);
+                for (self.model_search.matches[self.model_first..end], self.model_first..) |match, rank| {
+                    if (match.index != index) continue;
+                    if (self.model_selection_cleared or self.model_highlight != rank) {
+                        self.model_highlight = rank;
+                        self.model_selection_cleared = false;
+                        self.dirty = true;
+                    }
+                    return;
+                }
+                return;
+            },
+            else => {},
+        };
     }
 
     // Called before releasing the old snapshot, so identity comparisons borrow
@@ -1526,19 +1563,24 @@ pub const App = struct {
         if (retained) |index| {
             for (self.model_search.matches[0..self.model_search.len], 0..) |match, rank| {
                 if (match.index == index) {
-                    self.model_first = rank;
+                    self.model_highlight = rank;
                     self.model_selection_cleared = false;
+                    self.revealModelHighlight();
                     break;
                 }
             }
         }
-        if (self.model_selection_cleared) self.model_first = 0;
+        if (self.model_selection_cleared) {
+            self.model_first = 0;
+            self.model_highlight = 0;
+        }
     }
 
     fn editModelQuery(self: *App, event: *const c.SDL_Event) !void {
         if (try self.library.handleQuery(self, event)) {
             self.model_search.invalidate();
             self.model_first = 0;
+            self.model_highlight = 0;
             self.model_selection_cleared = false;
             self.button_count = 0;
         }
@@ -1559,13 +1601,16 @@ pub const App = struct {
             if (self.runtime_snapshot) |snapshot| {
                 const count = try self.modelCount();
                 if (count == 0) try self.label(if (snapshot.models.len == 0) "No configured models" else "No matching models", x + 12, y + 16, 13, colors.muted);
+                self.model_visible = visible;
+                self.model_highlight = @min(self.model_highlight, count -| 1);
                 self.model_first = @min(self.model_first, count -| 1);
+                self.revealModelHighlight();
                 const end = @min(count, self.model_first + visible);
                 for (self.model_search.matches[self.model_first..end], self.model_first..) |match, filtered_index| {
                     const index = match.index;
                     const model = snapshot.models[index];
                     const row_y = y + 8 + @as(f32, @floatFromInt(filtered_index - self.model_first)) * 40;
-                    if (!self.model_selection_cleared and filtered_index == self.model_first) try self.rectangle(x + 8, row_y, width - 16, 38, 5, colors.raised);
+                    if (!self.model_selection_cleared and filtered_index == self.model_highlight) try self.rectangle(x + 8, row_y, width - 16, 38, 5, colors.raised);
                     const row_clip = c.SDL_Rect{ .x = @intFromFloat(x + 8), .y = @intFromFloat(row_y), .w = @intFromFloat(width - 16), .h = 38 };
                     _ = c.SDL_SetRenderClipRect(self.renderer, &row_clip);
                     try self.hit(.{ .select_model = index }, .{ .x = x + 8, .y = row_y, .w = width - 16, .h = 38 });
@@ -2367,7 +2412,10 @@ pub const App = struct {
                 if (self.model_menu) {
                     const last = (try self.modelCount()) -| 1;
                     const direction = event.wheel.y * (if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) @as(f32, -1) else 1);
+                    const before = self.model_first;
                     self.model_first = if (direction > 0) self.model_first -| 1 else if (direction < 0) @min(last, self.model_first + 1) else self.model_first;
+                    // The highlight scrolls with its row so it stays under the cursor.
+                    if (self.model_selection_cleared) self.model_highlight = self.model_first else self.model_highlight = @min(last, (self.model_highlight + self.model_first) -| before);
                     if (direction != 0) self.model_selection_cleared = false;
                     self.button_count = 0;
                 } else if (!self.closing) {
@@ -2439,7 +2487,7 @@ pub const App = struct {
                 if (self.library.dragging) {
                     try self.library.hitQuery(self, event.motion.x, event.motion.y, true);
                     self.dirty = true;
-                }
+                } else self.hoverModel(event.motion.x, event.motion.y);
             } else if (self.thinking_menu) {
                 self.hoverThinking(event.motion.x, event.motion.y);
             } else if (self.dragging and !self.settings_open) {
@@ -2513,19 +2561,7 @@ pub const App = struct {
                         self.dirty = true;
                         return;
                     }
-                    if (event.key.key == c.SDLK_UP) {
-                        self.model_first -|= 1;
-                        self.model_selection_cleared = false;
-                        self.button_count = 0;
-                        self.dirty = true;
-                    }
-                    if (event.key.key == c.SDLK_DOWN) {
-                        const last = (try self.modelCount()) -| 1;
-                        self.model_first = if (self.model_selection_cleared) 0 else @min(last, self.model_first + 1);
-                        self.model_selection_cleared = false;
-                        self.button_count = 0;
-                        self.dirty = true;
-                    }
+                    if (event.key.key == c.SDLK_UP or event.key.key == c.SDLK_DOWN) try self.moveModelHighlight(event.key.key == c.SDLK_DOWN);
                     if (event.key.key == c.SDLK_RETURN or event.key.key == c.SDLK_KP_ENTER) {
                         if (try self.selectedModelIndex()) |index| try self.act(.{ .select_model = index });
                     } else try self.editModelQuery(event);
@@ -2763,6 +2799,8 @@ test "model search filters names IDs and providers without editing the draft" {
     };
     app.runtime_snapshot = .{ .allocator = allocator, .models = @constCast(&models) };
     app.model_first = 3;
+    app.model_highlight = 3;
+    app.model_visible = 6;
     app.button_count = 4;
     app.dirty = false;
     var event = std.mem.zeroes(c.SDL_Event);
@@ -2771,6 +2809,7 @@ test "model search filters names IDs and providers without editing the draft" {
     try app.handle(&event);
     try std.testing.expect(app.dirty);
     try std.testing.expectEqual(@as(usize, 0), app.model_first);
+    try std.testing.expectEqual(@as(usize, 0), app.model_highlight);
     try std.testing.expectEqual(@as(usize, 0), app.button_count);
     try std.testing.expectEqual(@as(usize, 2), try app.modelCount());
     try std.testing.expectEqual(@as(?usize, 1), try app.modelIndex(0));
@@ -2819,12 +2858,12 @@ test "model search filters names IDs and providers without editing the draft" {
     event.key.key = c.SDLK_DOWN;
     event.key.mod = 0;
     try app.handle(&event);
-    try std.testing.expectEqual(@as(usize, 1), app.model_first);
+    try std.testing.expectEqual(@as(usize, 1), app.model_highlight);
     try std.testing.expect(!app.model_search.dirty);
-    try std.testing.expectEqual(@as(?usize, 3), try app.modelIndex(app.model_first));
+    try std.testing.expectEqual(@as(?usize, 3), try app.modelIndex(app.model_highlight));
     event.key.key = c.SDLK_UP;
     try app.handle(&event);
-    try std.testing.expectEqual(@as(usize, 0), app.model_first);
+    try std.testing.expectEqual(@as(usize, 0), app.model_highlight);
     try std.testing.expectEqualStrings("keep this message draft", app.editor.textBytes());
 
     // Rejected input keeps the current results and leaves an error for the popup.
@@ -2915,7 +2954,9 @@ test "model picker snapshot refresh preserves identity and clears disappeared se
     const allocator = std.testing.allocator;
     var app: App = undefined;
     app.model_menu = true;
-    app.model_first = 1;
+    app.model_first = 0;
+    app.model_highlight = 1;
+    app.model_visible = 6;
     app.model_selection_cleared = false;
     app.model_search = .{};
     app.button_count = 2;
@@ -2939,7 +2980,7 @@ test "model picker snapshot refresh preserves identity and clears disappeared se
     try app.updateModelSearch(&reordered);
     app.runtime_snapshot.?.models = @constCast(&reordered);
     try std.testing.expectEqual(@as(usize, 0), app.button_count);
-    try std.testing.expectEqual(@as(usize, 0), app.model_first);
+    try std.testing.expectEqual(@as(usize, 0), app.model_highlight);
     try std.testing.expectEqual(@as(?usize, 0), try app.selectedModelIndex());
     try std.testing.expectEqualStrings("opus", app.library.queryBytes());
 
@@ -3028,6 +3069,44 @@ test "thinking menu hover moves the shared highlight only when the row changes" 
 
     app.hoverThinking(20, 10);
     try std.testing.expectEqual(@as(usize, 0), app.thinking_highlight);
+    try std.testing.expect(app.dirty);
+}
+
+test "model menu hover highlights the row under the cursor without scrolling" {
+    var app: App = undefined;
+    const models = [_]pi.Model{
+        .{ .name = "One", .id = "one", .provider = "local" },
+        .{ .name = "Two", .id = "two", .provider = "local" },
+        .{ .name = "Three", .id = "three", .provider = "local" },
+    };
+    app.model_search = .{};
+    try app.model_search.rebuild(&models, "");
+    app.model_first = 1;
+    app.model_highlight = 1;
+    app.model_visible = 2;
+    app.model_selection_cleared = false;
+    app.dirty = false;
+    app.buttons[0] = .{ .action = .{ .select_model = app.model_search.index(1).? }, .bounds = .{ .x = 8, .y = 8, .w = 200, .h = 38 } };
+    app.buttons[1] = .{ .action = .{ .select_model = app.model_search.index(2).? }, .bounds = .{ .x = 8, .y = 48, .w = 200, .h = 38 } };
+    app.button_count = 2;
+
+    app.hoverModel(20, 60);
+    try std.testing.expectEqual(@as(usize, 2), app.model_highlight);
+    try std.testing.expectEqual(@as(usize, 1), app.model_first);
+    try std.testing.expect(app.dirty);
+
+    app.dirty = false;
+    app.hoverModel(100, 70);
+    try std.testing.expect(!app.dirty);
+
+    app.hoverModel(300, 300);
+    try std.testing.expectEqual(@as(usize, 2), app.model_highlight);
+    try std.testing.expect(!app.dirty);
+
+    // Hovering restores a selection that a snapshot refresh cleared.
+    app.model_selection_cleared = true;
+    app.hoverModel(20, 60);
+    try std.testing.expect(!app.model_selection_cleared);
     try std.testing.expect(app.dirty);
 }
 
