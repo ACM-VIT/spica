@@ -157,6 +157,7 @@ pub const App = struct {
     model_selection_cleared: bool = false,
     model_search: ModelSearch = .{},
     thinking_menu: bool = false,
+    thinking_highlight: usize = 0,
     sidebar_visible: bool = true,
     editor_bounds: c.SDL_FRect = undefined,
     model_bounds: c.SDL_FRect = undefined,
@@ -1368,6 +1369,7 @@ pub const App = struct {
             },
             .thinking => {
                 self.thinking_menu = !self.thinking_menu;
+                if (self.thinking_menu) self.highlightCurrentThinking();
                 self.closeModelMenu();
             },
             .select_thinking => |index| {
@@ -1428,6 +1430,31 @@ pub const App = struct {
 
     fn contains(bounds: c.SDL_FRect, x: f32, y: f32) bool {
         return x >= bounds.x and x < bounds.x + bounds.w and y >= bounds.y and y < bounds.y + bounds.h;
+    }
+
+    fn highlightCurrentThinking(self: *App) void {
+        self.thinking_highlight = 0;
+        const snapshot = self.runtime_snapshot orelse return;
+        for (snapshot.thinking_levels, 0..) |level, index| {
+            if (std.mem.eql(u8, level, snapshot.thinking_level)) {
+                self.thinking_highlight = index;
+                return;
+            }
+        }
+    }
+
+    fn selectedThinkingIndex(self: *App) ?usize {
+        const snapshot = self.runtime_snapshot orelse return null;
+        if (snapshot.thinking_levels.len == 0) return null;
+        self.thinking_highlight = @min(self.thinking_highlight, snapshot.thinking_levels.len - 1);
+        return self.thinking_highlight;
+    }
+
+    fn moveThinkingHighlight(self: *App, down: bool) void {
+        const index = self.selectedThinkingIndex() orelse return;
+        self.thinking_highlight = if (down) index + 1 else index -| 1;
+        _ = self.selectedThinkingIndex();
+        self.dirty = true;
     }
 
     fn closeModelMenu(self: *App) void {
@@ -1552,7 +1579,11 @@ pub const App = struct {
                 const y = self.composer_bounds.y - height - 10;
                 try self.rectangle(x, y, 130, height, 8, colors.border);
                 try self.rectangle(x + 1, y + 1, 128, height - 2, 7, colors.panel);
-                for (snapshot.thinking_levels, 0..) |level, index| try self.flatButton(.{ .select_thinking = index }, level, .{ .x = x + 4, .y = y + 8 + @as(f32, @floatFromInt(index)) * 32, .w = 122, .h = 30 });
+                const highlight = self.selectedThinkingIndex();
+                for (snapshot.thinking_levels, 0..) |level, index| {
+                    if (highlight == index) try self.rectangle(x + 4, y + 8 + @as(f32, @floatFromInt(index)) * 32, 122, 30, 5, colors.raised);
+                    try self.flatButton(.{ .select_thinking = index }, level, .{ .x = x + 4, .y = y + 8 + @as(f32, @floatFromInt(index)) * 32, .w = 122, .h = 30 });
+                }
             }
         }
         if (self.closing or self.force_dialog) {
@@ -2445,9 +2476,14 @@ pub const App = struct {
                     return;
                 }
                 if (self.thinking_menu) {
-                    if (event.key.key == c.SDLK_ESCAPE) {
-                        self.thinking_menu = false;
-                        self.dirty = true;
+                    switch (event.key.key) {
+                        c.SDLK_ESCAPE => {
+                            self.thinking_menu = false;
+                            self.dirty = true;
+                        },
+                        c.SDLK_UP, c.SDLK_DOWN => self.moveThinkingHighlight(event.key.key == c.SDLK_DOWN),
+                        c.SDLK_RETURN, c.SDLK_KP_ENTER => if (self.selectedThinkingIndex()) |index| try self.act(.{ .select_thinking = index }),
+                        else => {},
                     }
                     return;
                 }
@@ -2492,7 +2528,7 @@ pub const App = struct {
                     try self.act(.stop);
                     return;
                 }
-                if (command and event.key.key == c.SDLK_RETURN and self.preedit.items.len == 0 and !self.options.fixture) {
+                if (command and event.key.key == c.SDLK_RETURN and !event.key.repeat and self.preedit.items.len == 0 and !self.options.fixture) {
                     try self.submit();
                     return;
                 }
@@ -2599,7 +2635,10 @@ pub const App = struct {
                         self.dirty = true;
                     },
                     c.SDLK_RETURN, c.SDLK_KP_ENTER => {
-                        if (self.runtime != null and !shift) try self.submit() else {
+                        // A held Enter must not send: its repeats can outlive the menu that consumed the first press.
+                        if (self.runtime != null and !shift) {
+                            if (!event.key.repeat) try self.submit();
+                        } else {
                             try self.editor.insert("\n", .paste);
                             self.edited();
                         }
@@ -2918,6 +2957,136 @@ test "model picker snapshot refresh preserves identity and clears disappeared se
     app.runtime_snapshot.?.models = &.{};
     try std.testing.expectEqual(@as(usize, 0), try app.modelCount());
     try std.testing.expect(try app.selectedModelIndex() == null);
+}
+
+test "thinking menu keyboard highlight follows Pi's levels and clamps" {
+    const allocator = std.testing.allocator;
+    var app: App = undefined;
+    app.dirty = false;
+    var levels = [_][]const u8{ "off", "low", "medium", "high" };
+    app.runtime_snapshot = .{ .allocator = allocator, .thinking_levels = &levels, .thinking_level = "medium" };
+
+    app.highlightCurrentThinking();
+    try std.testing.expectEqual(@as(?usize, 2), app.selectedThinkingIndex());
+    app.moveThinkingHighlight(true);
+    app.moveThinkingHighlight(true);
+    try std.testing.expectEqual(@as(?usize, 3), app.selectedThinkingIndex());
+    for (0..5) |_| app.moveThinkingHighlight(false);
+    try std.testing.expectEqual(@as(?usize, 0), app.selectedThinkingIndex());
+    try std.testing.expect(app.dirty);
+
+    app.runtime_snapshot.?.thinking_level = "custom";
+    app.highlightCurrentThinking();
+    try std.testing.expectEqual(@as(?usize, 0), app.selectedThinkingIndex());
+
+    app.thinking_highlight = 3;
+    app.runtime_snapshot.?.thinking_levels = levels[0..2];
+    try std.testing.expectEqual(@as(?usize, 1), app.selectedThinkingIndex());
+    app.runtime_snapshot.?.thinking_levels = &.{};
+    try std.testing.expect(app.selectedThinkingIndex() == null);
+    app.moveThinkingHighlight(true);
+    try std.testing.expect(app.selectedThinkingIndex() == null);
+    app.runtime_snapshot = null;
+    try std.testing.expect(app.selectedThinkingIndex() == null);
+}
+
+test "thinking menu keys choose through Pi and held Enter never sends the draft" {
+    const allocator = std.testing.allocator;
+    var app: App = undefined;
+    try std.testing.expect(c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "dummy"));
+    defer _ = c.SDL_ResetHint(c.SDL_HINT_VIDEO_DRIVER);
+    try std.testing.expect(c.SDL_InitSubSystem(c.SDL_INIT_VIDEO));
+    defer c.SDL_QuitSubSystem(c.SDL_INIT_VIDEO);
+    app.window = c.SDL_CreateWindow("Thinking menu regression", 640, 480, c.SDL_WINDOW_HIDDEN) orelse return error.Window;
+    defer c.SDL_DestroyWindow(app.window);
+    const surface = c.SDL_CreateSurface(640, 480, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    app.renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(app.renderer);
+    app.wake_event = 0;
+    app.closing = false;
+    app.force_dialog = false;
+    app.settings_open = false;
+    app.model_menu = false;
+    app.thinking_menu = true;
+    app.focused_editor = true;
+    app.options = .{};
+    app.preedit = .empty;
+    app.preferred_caret_x = null;
+    app.library = try Library.Panel.init(allocator);
+    defer app.library.deinit();
+    app.editor = try Composer.init(allocator);
+    defer app.editor.deinit();
+    try app.editor.setText("unfinished draft");
+    app.editor.setCaret(3, true);
+    const draft_selection = app.editor.selection();
+    var levels = [_][]const u8{ "off", "low", "medium", "high" };
+    app.runtime_snapshot = .{ .allocator = allocator, .thinking_levels = &levels, .thinking_level = "low" };
+    app.highlightCurrentThinking();
+
+    const p = @import("platform/executables.zig").c;
+    const mutex = c.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer c.SDL_DestroyMutex(mutex);
+    var wake: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), p.spica_wake_create(&wake));
+    defer p.spica_close(wake[0]);
+    defer p.spica_close(wake[1]);
+    var runtime: pi.Runtime = .{
+        .allocator = allocator,
+        .io = undefined,
+        .options = .{ .database_path = "", .project_path = "", .wake_event = 0 },
+        .options_arena = undefined,
+        .mutex = mutex,
+        .wake = wake,
+        .state = .{ .allocator = allocator },
+    };
+    defer {
+        for (runtime.inputs.items) |input| if (input == .bytes) allocator.free(input.bytes.data);
+        runtime.inputs.deinit(allocator);
+    }
+    app.runtime = &runtime;
+    app.runtime_retiring = false;
+
+    // Escape closes without choosing and leaves the draft and its selection alone.
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_ESCAPE;
+    try app.handle(&event);
+    try std.testing.expect(!app.thinking_menu);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inputs.items.len);
+    try std.testing.expectEqualStrings("unfinished draft", app.editor.textBytes());
+    try std.testing.expectEqual(draft_selection, app.editor.selection());
+
+    // Enter sends the highlighted level and closes the menu.
+    try app.act(.thinking);
+    try std.testing.expectEqual(@as(?usize, 1), app.selectedThinkingIndex());
+    event.key.key = c.SDLK_DOWN;
+    try app.handle(&event);
+    event.key.key = c.SDLK_RETURN;
+    try app.handle(&event);
+    try std.testing.expect(!app.thinking_menu);
+    try std.testing.expectEqual(@as(usize, 1), runtime.inputs.items.len);
+    const command = try std.json.parseFromSlice(std.json.Value, allocator, runtime.inputs.items[0].bytes.data, .{});
+    defer command.deinit();
+    try std.testing.expectEqualStrings("set_thinking_level", command.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("medium", command.value.object.get("level").?.string);
+
+    // Repeats of that held Enter reach the focused editor but must not submit.
+    event.key.repeat = true;
+    try app.handle(&event);
+    event.key.mod = c.SDL_KMOD_CTRL;
+    try app.handle(&event);
+    try std.testing.expectEqual(@as(usize, 1), runtime.inputs.items.len);
+    try std.testing.expectEqualStrings("unfinished draft", app.editor.textBytes());
+    event.key.repeat = false;
+    event.key.mod = 0;
+
+    // An empty level list leaves nothing to choose.
+    app.thinking_menu = true;
+    app.runtime_snapshot.?.thinking_levels = &.{};
+    try app.handle(&event);
+    try std.testing.expect(app.thinking_menu);
+    try std.testing.expectEqual(@as(usize, 1), runtime.inputs.items.len);
 }
 
 test "background prompt acknowledgements clear only the submitted chat revision" {
