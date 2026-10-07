@@ -83,15 +83,34 @@ pub const Document = struct {
         errdefer result.deinit(allocator);
         var offset: usize = 0;
         for (self.blocks.items) |block| {
-            if (block.kind != .item) continue;
+            switch (block.kind) {
+                .item, .paragraph, .heading, .code, .html, .rule, .table_row => {},
+                else => continue,
+            }
             try result.appendSlice(allocator, self.text.items[offset..block.text_start]);
-            if (result.items.len != 0 and result.items[result.items.len - 1] != '\n') try result.append(allocator, '\n');
+            var indent: usize = 0;
             var parent = block.parent;
             while (parent) |index| {
                 const ancestor = self.blocks.items[index];
-                if (ancestor.kind == .item) try result.appendSlice(allocator, "  ");
+                if (ancestor.kind == .item) indent += 2;
                 parent = ancestor.parent;
             }
+            if (block.kind != .item) {
+                // Each child block keeps its list depth, including continuation
+                // lines. Prefix the projection without touching code's own spaces.
+                var start: usize = block.text_start;
+                while (start < block.text_end) {
+                    if (result.items.len == 0 or result.items[result.items.len - 1] == '\n')
+                        try result.appendNTimes(allocator, ' ', indent);
+                    const end = if (std.mem.indexOfScalarPos(u8, self.text.items[0..block.text_end], start, '\n')) |newline| newline + 1 else block.text_end;
+                    try result.appendSlice(allocator, self.text.items[start..end]);
+                    start = end;
+                }
+                offset = block.text_end;
+                continue;
+            }
+            if (result.items.len != 0 and result.items[result.items.len - 1] != '\n') try result.append(allocator, '\n');
+            try result.appendNTimes(allocator, ' ', indent);
             const list = self.blocks.items[block.parent.?];
             if (list.ordered) {
                 var buffer: [32]u8 = undefined;

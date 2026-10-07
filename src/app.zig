@@ -3188,8 +3188,46 @@ test "background prompt acknowledgements clear only the submitted chat revision"
     }
 }
 
-test "assistant copy controls use SDL clipboard without changing the composer or footer layout" {
+test "assistant copy controls paint in both themes and use SDL clipboard without changing layout" {
     const allocator = std.testing.allocator;
+    const Paint = struct {
+        fn clear(renderer: *c.SDL_Renderer, palette: theme_module.Palette) !void {
+            try std.testing.expect(c.SDL_SetRenderDrawColor(renderer, palette.canvas.r, palette.canvas.g, palette.canvas.b, 255));
+            try std.testing.expect(c.SDL_RenderClear(renderer));
+            // App.paint installs the transcript viewport clip before draw.
+            const clip = c.SDL_Rect{ .x = 0, .y = 0, .w = 640, .h = 400 };
+            try std.testing.expect(c.SDL_SetRenderClipRect(renderer, &clip));
+        }
+
+        fn expectInk(pixels: *c.SDL_Surface, rect: c.SDL_Rect, color: theme_module.Color, tolerance: u8) !void {
+            var count: usize = 0;
+            for (0..@as(usize, @intCast(rect.h))) |y| {
+                for (0..@as(usize, @intCast(rect.w))) |x| {
+                    var r: u8 = 0;
+                    var g: u8 = 0;
+                    var b: u8 = 0;
+                    try std.testing.expect(c.SDL_ReadSurfacePixel(pixels, rect.x + @as(c_int, @intCast(x)), rect.y + @as(c_int, @intCast(y)), &r, &g, &b, null));
+                    if (@abs(@as(i16, r) - color.r) <= tolerance and @abs(@as(i16, g) - color.g) <= tolerance and @abs(@as(i16, b) - color.b) <= tolerance) count += 1;
+                }
+            }
+            try std.testing.expect(count > 8);
+        }
+
+        fn expectControl(renderer: *c.SDL_Renderer, y: f32, palette: theme_module.Palette, feedback: ?bool) !void {
+            const pixels = c.SDL_RenderReadPixels(renderer, null) orelse return error.ReadPixels;
+            defer c.SDL_DestroySurface(pixels);
+            const top: c_int = @intFromFloat(y);
+            // Separate regions ensure the panel or icon cannot stand in for text.
+            try expectInk(pixels, .{ .x = 534, .y = top + 5, .w = 4, .h = 12 }, palette.raised, 0);
+            // Text is antialiased; neither theme's panel falls within this tolerance.
+            if (feedback) |success| {
+                try expectInk(pixels, .{ .x = 540, .y = top + 3, .w = 80, .h = 19 }, if (success) palette.accent else palette.error_color, 32);
+            } else {
+                try expectInk(pixels, .{ .x = 540, .y = top + 3, .w = 16, .h = 16 }, palette.muted, 32);
+                try expectInk(pixels, .{ .x = 564, .y = top + 3, .w = 56, .h = 19 }, palette.muted, 32);
+            }
+        }
+    };
     try std.testing.expect(c.spica_image_install_sdl_allocator());
     try std.testing.expect(c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "dummy"));
     defer _ = c.SDL_ResetHint(c.SDL_HINT_VIDEO_DRIVER);
@@ -3249,7 +3287,9 @@ test "assistant copy controls use SDL clipboard without changing the composer or
     app.transcript.toggle(.{ .ordinal = 20, .kind = .reasoning });
     var scroll: f32 = 0;
     for ([_]bool{ false, true }) |light| {
-        try app.transcript.draw(engine, renderer, 0, 0, 640, 400, &scroll, false, appearance.metrics, if (light) appearance.light else appearance.dark, light);
+        const palette = if (light) appearance.light else appearance.dark;
+        try Paint.clear(renderer, palette);
+        try app.transcript.draw(engine, renderer, 0, 0, 640, 400, &scroll, false, appearance.metrics, palette, light);
         const height = app.transcript.height;
         var targets: [2]f32 = undefined;
         for ([_]usize{ 20, 30 }, 0..) |ordinal, slot| {
@@ -3263,6 +3303,7 @@ test "assistant copy controls use SDL clipboard without changing the composer or
                 }
             }
             try std.testing.expect(found);
+            try Paint.expectControl(renderer, targets[slot], palette, null);
         }
         try std.testing.expect(c.SDL_SetClipboardText("unchanged"));
         var event = std.mem.zeroes(c.SDL_Event);
@@ -3287,11 +3328,22 @@ test "assistant copy controls use SDL clipboard without changing the composer or
             try std.testing.expectEqual(@as(usize, 0), app.editor.anchor);
             const due = app.transcript.copyDeadline().?;
             try std.testing.expect(!app.transcript.expireCopyFeedback(due - 1));
-            try app.transcript.draw(engine, renderer, 0, 0, 640, 400, &scroll, false, appearance.metrics, if (light) appearance.light else appearance.dark, light);
+            try Paint.clear(renderer, palette);
+            try app.transcript.draw(engine, renderer, 0, 0, 640, 400, &scroll, false, appearance.metrics, palette, light);
+            try Paint.expectControl(renderer, y, palette, true);
             try std.testing.expectEqual(height, app.transcript.height);
             try std.testing.expect(app.transcript.expireCopyFeedback(due));
             try std.testing.expect(app.transcript.copyDeadline() == null);
+            try Paint.clear(renderer, palette);
+            try app.transcript.draw(engine, renderer, 0, 0, 640, 400, &scroll, false, appearance.metrics, palette, light);
+            try Paint.expectControl(renderer, y, palette, null);
         }
+        app.transcript.copied(20, false, 0);
+        try Paint.clear(renderer, palette);
+        try app.transcript.draw(engine, renderer, 0, 0, 640, 400, &scroll, false, appearance.metrics, palette, light);
+        try Paint.expectControl(renderer, targets[0], palette, false);
+        try std.testing.expectEqual(height, app.transcript.height);
+        try std.testing.expect(app.transcript.expireCopyFeedback(app.transcript.copyDeadline().?));
     }
     // Composer copy still uses its selected text and original fixed buffer.
     try app.copySelection();

@@ -29,6 +29,26 @@ test "clipboard projection copies beyond composer capacity and rejects unavailab
     try std.testing.expectError(error.FormattingUnavailable, unavailable.clipboardText(allocator));
 }
 
+test "clipboard projection indents multiline list blocks without removing code spaces" {
+    const cases = [_]struct { source: []const u8, expected: []const u8 }{
+        .{
+            .source = "- parent\n  - child\n    continued\n",
+            .expected = "• parent\n  • child\n    continued\n",
+        },
+        .{
+            .source = "3. parent\n   continued  \n   hard break\n\n   - child\n     continued\n\n     another paragraph\n\n     ```zig\n     if (ok) {\n       work();\n     }\n     ```\n\n   back to parent\n4. next\n\n```zig\n  outside();\n```\n",
+            .expected = "3. parent\n  continued\n  hard break\n  • child\n    continued\n    another paragraph\n    if (ok) {\n      work();\n    }\n  back to parent\n4. next\n  outside();\n",
+        },
+    };
+    for (cases) |case| {
+        var doc = try md.parse(std.testing.allocator, source_id, case.source);
+        defer doc.deinit();
+        const bytes = try doc.clipboardText(std.testing.allocator);
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualStrings(case.expected, bytes);
+    }
+}
+
 fn blockOf(doc: *const md.Document, kind: md.BlockKind) ?md.Block {
     for (doc.blocks.items) |block| if (block.kind == kind) return block;
     return null;
