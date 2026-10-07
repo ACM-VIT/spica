@@ -157,6 +157,7 @@ pub const App = struct {
     model_selection_cleared: bool = false,
     model_search: ModelSearch = .{},
     thinking_menu: bool = false,
+    thinking_highlight: usize = 0,
     sidebar_visible: bool = true,
     editor_bounds: c.SDL_FRect = undefined,
     model_bounds: c.SDL_FRect = undefined,
@@ -1368,6 +1369,7 @@ pub const App = struct {
             },
             .thinking => {
                 self.thinking_menu = !self.thinking_menu;
+                if (self.thinking_menu) self.highlightCurrentThinking();
                 self.closeModelMenu();
             },
             .select_thinking => |index| {
@@ -1428,6 +1430,31 @@ pub const App = struct {
 
     fn contains(bounds: c.SDL_FRect, x: f32, y: f32) bool {
         return x >= bounds.x and x < bounds.x + bounds.w and y >= bounds.y and y < bounds.y + bounds.h;
+    }
+
+    fn highlightCurrentThinking(self: *App) void {
+        self.thinking_highlight = 0;
+        const snapshot = self.runtime_snapshot orelse return;
+        for (snapshot.thinking_levels, 0..) |level, index| {
+            if (std.mem.eql(u8, level, snapshot.thinking_level)) {
+                self.thinking_highlight = index;
+                return;
+            }
+        }
+    }
+
+    fn selectedThinkingIndex(self: *App) ?usize {
+        const snapshot = self.runtime_snapshot orelse return null;
+        if (snapshot.thinking_levels.len == 0) return null;
+        self.thinking_highlight = @min(self.thinking_highlight, snapshot.thinking_levels.len - 1);
+        return self.thinking_highlight;
+    }
+
+    fn moveThinkingHighlight(self: *App, down: bool) void {
+        const index = self.selectedThinkingIndex() orelse return;
+        self.thinking_highlight = if (down) index + 1 else index -| 1;
+        _ = self.selectedThinkingIndex();
+        self.dirty = true;
     }
 
     fn closeModelMenu(self: *App) void {
@@ -1552,7 +1579,11 @@ pub const App = struct {
                 const y = self.composer_bounds.y - height - 10;
                 try self.rectangle(x, y, 130, height, 8, colors.border);
                 try self.rectangle(x + 1, y + 1, 128, height - 2, 7, colors.panel);
-                for (snapshot.thinking_levels, 0..) |level, index| try self.flatButton(.{ .select_thinking = index }, level, .{ .x = x + 4, .y = y + 8 + @as(f32, @floatFromInt(index)) * 32, .w = 122, .h = 30 });
+                const highlight = self.selectedThinkingIndex();
+                for (snapshot.thinking_levels, 0..) |level, index| {
+                    if (highlight == index) try self.rectangle(x + 4, y + 8 + @as(f32, @floatFromInt(index)) * 32, 122, 30, 5, colors.raised);
+                    try self.flatButton(.{ .select_thinking = index }, level, .{ .x = x + 4, .y = y + 8 + @as(f32, @floatFromInt(index)) * 32, .w = 122, .h = 30 });
+                }
             }
         }
         if (self.closing or self.force_dialog) {
@@ -2445,9 +2476,14 @@ pub const App = struct {
                     return;
                 }
                 if (self.thinking_menu) {
-                    if (event.key.key == c.SDLK_ESCAPE) {
-                        self.thinking_menu = false;
-                        self.dirty = true;
+                    switch (event.key.key) {
+                        c.SDLK_ESCAPE => {
+                            self.thinking_menu = false;
+                            self.dirty = true;
+                        },
+                        c.SDLK_UP, c.SDLK_DOWN => self.moveThinkingHighlight(event.key.key == c.SDLK_DOWN),
+                        c.SDLK_RETURN, c.SDLK_KP_ENTER => if (self.selectedThinkingIndex()) |index| try self.act(.{ .select_thinking = index }),
+                        else => {},
                     }
                     return;
                 }
@@ -2918,6 +2954,37 @@ test "model picker snapshot refresh preserves identity and clears disappeared se
     app.runtime_snapshot.?.models = &.{};
     try std.testing.expectEqual(@as(usize, 0), try app.modelCount());
     try std.testing.expect(try app.selectedModelIndex() == null);
+}
+
+test "thinking menu keyboard highlight follows Pi's levels and clamps" {
+    const allocator = std.testing.allocator;
+    var app: App = undefined;
+    app.dirty = false;
+    var levels = [_][]const u8{ "off", "low", "medium", "high" };
+    app.runtime_snapshot = .{ .allocator = allocator, .thinking_levels = &levels, .thinking_level = "medium" };
+
+    app.highlightCurrentThinking();
+    try std.testing.expectEqual(@as(?usize, 2), app.selectedThinkingIndex());
+    app.moveThinkingHighlight(true);
+    app.moveThinkingHighlight(true);
+    try std.testing.expectEqual(@as(?usize, 3), app.selectedThinkingIndex());
+    for (0..5) |_| app.moveThinkingHighlight(false);
+    try std.testing.expectEqual(@as(?usize, 0), app.selectedThinkingIndex());
+    try std.testing.expect(app.dirty);
+
+    app.runtime_snapshot.?.thinking_level = "custom";
+    app.highlightCurrentThinking();
+    try std.testing.expectEqual(@as(?usize, 0), app.selectedThinkingIndex());
+
+    app.thinking_highlight = 3;
+    app.runtime_snapshot.?.thinking_levels = levels[0..2];
+    try std.testing.expectEqual(@as(?usize, 1), app.selectedThinkingIndex());
+    app.runtime_snapshot.?.thinking_levels = &.{};
+    try std.testing.expect(app.selectedThinkingIndex() == null);
+    app.moveThinkingHighlight(true);
+    try std.testing.expect(app.selectedThinkingIndex() == null);
+    app.runtime_snapshot = null;
+    try std.testing.expect(app.selectedThinkingIndex() == null);
 }
 
 test "background prompt acknowledgements clear only the submitted chat revision" {
