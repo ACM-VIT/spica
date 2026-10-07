@@ -153,7 +153,6 @@ pub const App = struct {
     closing: bool = false,
     force_dialog: bool = false,
     model_menu: bool = false,
-    // Ranks into model_search: the first visible row and the highlighted row.
     model_first: usize = 0,
     model_highlight: usize = 0,
     model_visible: usize = 1,
@@ -161,7 +160,6 @@ pub const App = struct {
     model_search: ModelSearch = .{},
     thinking_menu: bool = false,
     thinking_highlight: usize = 0,
-    // A menu hover that arrived while row targets were cleared, retried after the next paint.
     pending_hover: ?[2]f32 = null,
     sidebar_visible: bool = true,
     editor_bounds: c.SDL_FRect = undefined,
@@ -1465,6 +1463,7 @@ pub const App = struct {
     }
 
     fn hoverMenu(self: *App, x: f32, y: f32) void {
+        if (self.closing or self.force_dialog) return;
         if (self.button_count == 0) {
             self.pending_hover = .{ x, y };
             self.dirty = true;
@@ -1519,16 +1518,10 @@ pub const App = struct {
         return self.modelIndex(self.model_highlight);
     }
 
-    fn revealModelHighlight(self: *App) void {
-        if (self.model_highlight < self.model_first) self.model_first = self.model_highlight;
-        if (self.model_highlight >= self.model_first + self.model_visible) self.model_first = self.model_highlight + 1 - self.model_visible;
-    }
-
     fn moveModelHighlight(self: *App, down: bool) !void {
         const last = (try self.modelCount()) -| 1;
         self.model_highlight = if (self.model_selection_cleared) @min(last, self.model_first) else if (down) @min(last, self.model_highlight + 1) else self.model_highlight -| 1;
         self.model_selection_cleared = false;
-        self.revealModelHighlight();
         self.pending_hover = null;
         self.button_count = 0;
         self.dirty = true;
@@ -1571,6 +1564,7 @@ pub const App = struct {
         self.model_search.invalidate();
         if (!self.model_menu) return;
         self.button_count = 0;
+        self.pending_hover = null;
         if (selected != null) self.model_selection_cleared = true;
         try self.model_search.rebuild(models, self.library.queryBytes());
         self.model_first = @min(self.model_first, self.model_search.len -| 1);
@@ -1579,7 +1573,6 @@ pub const App = struct {
                 if (match.index == index) {
                     self.model_highlight = rank;
                     self.model_selection_cleared = false;
-                    self.revealModelHighlight();
                     break;
                 }
             }
@@ -1596,6 +1589,7 @@ pub const App = struct {
             self.model_first = 0;
             self.model_highlight = 0;
             self.model_selection_cleared = false;
+            self.pending_hover = null;
             self.button_count = 0;
         }
     }
@@ -1618,7 +1612,8 @@ pub const App = struct {
                 self.model_visible = visible;
                 self.model_highlight = @min(self.model_highlight, count -| 1);
                 self.model_first = @min(self.model_first, count -| 1);
-                self.revealModelHighlight();
+                if (self.model_highlight < self.model_first) self.model_first = self.model_highlight;
+                if (self.model_highlight >= self.model_first + visible) self.model_first = self.model_highlight + 1 - visible;
                 const end = @min(count, self.model_first + visible);
                 for (self.model_search.matches[self.model_first..end], self.model_first..) |match, filtered_index| {
                     const index = match.index;
@@ -2232,10 +2227,6 @@ pub const App = struct {
             self.presented = true;
         }
         self.dirty = false;
-        if (self.pending_hover) |point| {
-            self.pending_hover = null;
-            if (self.button_count != 0) self.hoverMenu(point[0], point[1]);
-        }
     }
 
     fn drawEditor(self: *App) !void {
@@ -2328,7 +2319,14 @@ pub const App = struct {
                 self.saveDraft() catch |err| self.report("Saving draft", err);
                 self.draft_due = null;
             };
-            if (self.dirty and !self.minimized) try self.paint();
+            if (self.dirty and !self.minimized) {
+                try self.paint();
+                if (self.pending_hover) |point| {
+                    self.pending_hover = null;
+                    if (self.button_count != 0) self.hoverMenu(point[0], point[1]);
+                    if (self.dirty) try self.paint();
+                }
+            }
             self.pumpContent() catch |err| self.report("Loading viewport", err);
             var timeout: c_int = -1;
             if (self.quit_due) |due| timeout = @intCast(@min(2147483647, due -| c.SDL_GetTicks()));
@@ -2432,7 +2430,6 @@ pub const App = struct {
                     const direction = event.wheel.y * (if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) @as(f32, -1) else 1);
                     const before = self.model_first;
                     self.model_first = if (direction > 0) self.model_first -| 1 else if (direction < 0) @min(last, self.model_first + 1) else self.model_first;
-                    // The highlight scrolls with its row so it stays under the cursor.
                     if (self.model_selection_cleared) self.model_highlight = self.model_first else self.model_highlight = @min(last, (self.model_highlight + self.model_first) -| before);
                     if (direction != 0) self.model_selection_cleared = false;
                     self.button_count = 0;
@@ -2995,9 +2992,11 @@ test "model picker snapshot refresh preserves identity and clears disappeared se
         original[0],
         original[1],
     };
+    app.pending_hover = .{ 20, 60 };
     try app.updateModelSearch(&reordered);
     app.runtime_snapshot.?.models = @constCast(&reordered);
     try std.testing.expectEqual(@as(usize, 0), app.button_count);
+    try std.testing.expect(app.pending_hover == null);
     try std.testing.expectEqual(@as(usize, 0), app.model_highlight);
     try std.testing.expectEqual(@as(?usize, 0), try app.selectedModelIndex());
     try std.testing.expectEqualStrings("opus", app.library.queryBytes());
@@ -3014,11 +3013,13 @@ test "model picker snapshot refresh preserves identity and clears disappeared se
     try std.testing.expect(try app.selectedModelIndex() == null);
 
     // A deliberate query edit re-enables selection.
+    app.pending_hover = .{ 20, 60 };
     var event = std.mem.zeroes(c.SDL_Event);
     event.type = c.SDL_EVENT_TEXT_INPUT;
     event.text.text = " ";
     try app.editModelQuery(&event);
     try std.testing.expectEqual(@as(?usize, 0), try app.selectedModelIndex());
+    try std.testing.expect(app.pending_hover == null);
     const renamed = [_]pi.Model{
         .{ .name = "Different", .id = "shared-id", .provider = "one" },
         reordered[0],
@@ -3121,9 +3122,14 @@ test "model menu hover highlights the row under the cursor without scrolling" {
     try std.testing.expectEqual(@as(usize, 2), app.model_highlight);
     try std.testing.expect(!app.dirty);
 
-    // A hover with cleared row targets waits for the next paint, and a key press cancels it.
     app.model_menu = true;
     app.thinking_menu = false;
+    app.closing = true;
+    app.force_dialog = false;
+    app.pending_hover = null;
+    app.hoverMenu(20, 20);
+    try std.testing.expectEqual(@as(usize, 2), app.model_highlight);
+    app.closing = false;
     app.button_count = 0;
     app.hoverMenu(20, 20);
     try std.testing.expect(app.pending_hover != null);
@@ -3137,11 +3143,11 @@ test "model menu hover highlights the row under the cursor without scrolling" {
     try app.moveModelHighlight(false);
     try std.testing.expect(app.pending_hover == null);
     try std.testing.expectEqual(@as(usize, 0), app.model_highlight);
+    try std.testing.expectEqual(@as(usize, 1), app.model_first);
     app.model_first = 1;
     app.model_highlight = 2;
     app.button_count = 2;
 
-    // Hovering restores a selection that a snapshot refresh cleared.
     app.model_selection_cleared = true;
     app.hoverModel(20, 60);
     try std.testing.expect(!app.model_selection_cleared);
