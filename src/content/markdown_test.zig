@@ -3,6 +3,32 @@ const md = @import("markdown.zig");
 
 const source_id: md.ContentId = [_]u8{0xA5} ** 16;
 
+test "clipboard projection preserves readable Markdown and list semantics" {
+    const source = "# Résumé 👩‍💻\n\n**bold** and *soft* [label](https://example.test)\n\n3. parent\n   - [x] done\n   - [ ] pending\n4. next\n\n| Name | Value |\n|---|---|\n| café | 42 |\n\n```zig\nconst x = \"**literal**\";\n```\n\n> quote\n\n![alt](image.png)\n";
+    var doc = try md.parse(std.testing.allocator, source_id, source);
+    defer doc.deinit();
+    const bytes = try doc.clipboardText(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("Résumé 👩‍💻\nbold and soft label\n3. parent\n  • [x] done\n  • [ ] pending\n4. next\nName\tValue\ncafé\t42\nconst x = \"**literal**\";\nquote\nalt\n", bytes);
+    try std.testing.expectEqual(@as(u8, 0), bytes[bytes.len]);
+}
+
+test "clipboard projection copies beyond composer capacity and rejects unavailable formatting" {
+    const allocator = std.testing.allocator;
+    const source = try allocator.alloc(u8, 90_000);
+    defer allocator.free(source);
+    @memset(source, 'a');
+    var doc = try md.parse(allocator, source_id, source);
+    defer doc.deinit();
+    const bytes = try doc.clipboardText(allocator);
+    defer allocator.free(bytes);
+    try std.testing.expectEqual(@as(usize, 90_001), bytes.len);
+    try std.testing.expectEqualSlices(u8, source, bytes[0..source.len]);
+    var unavailable = try md.parse(allocator, source_id, "before\x00after");
+    defer unavailable.deinit();
+    try std.testing.expectError(error.FormattingUnavailable, unavailable.clipboardText(allocator));
+}
+
 fn blockOf(doc: *const md.Document, kind: md.BlockKind) ?md.Block {
     for (doc.blocks.items) |block| if (block.kind == kind) return block;
     return null;

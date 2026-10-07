@@ -12,6 +12,10 @@ const item_gap: f32 = 16;
 const footer_gap: f32 = 8;
 const footer_height: f32 = 22;
 const scrollbar_gutter: f32 = 12;
+const copy_width: f32 = 96;
+const copy_feedback_ms = 1800;
+
+const CopyFeedback = struct { ordinal: usize, success: bool, due: u64 };
 
 fn arrayBytes(array: anytype) usize {
     return array.capacity * @sizeOf(@TypeOf(array.items[0]));
@@ -97,6 +101,9 @@ pub const View = struct {
     disclosures: [32]Disclosure = undefined,
     disclosure_count: usize = 0,
     draw_top: f32 = 0,
+    draw_x: f32 = 0,
+    draw_width: f32 = 0,
+    copy_feedback: ?CopyFeedback = null,
 
     pub fn init(allocator: std.mem.Allocator) View {
         return .{ .allocator = allocator };
@@ -107,6 +114,8 @@ pub const View = struct {
         for (&self.captions) |*cached| if (cached.layout) |layout| c.spica_text_layout_release(layout);
     }
     pub fn clear(self: *View) void {
+        self.draw_width = 0;
+        self.copy_feedback = null;
         for (self.resident) |slot| if (slot) |index| self.items.items[index].loaded.?.destroy(self.allocator);
         self.items.clearRetainingCapacity();
         self.resident = [_]?usize{null} ** resident_slots;
@@ -115,6 +124,7 @@ pub const View = struct {
         self.wanted_reasoning = false;
     }
     pub fn invalidateLayouts(self: *View) void {
+        self.draw_width = 0;
         for (self.resident) |slot| if (slot) |index| {
             const loaded = self.items.items[index].loaded.?;
             loaded.view.width = 0;
@@ -178,7 +188,7 @@ pub const View = struct {
             } else {
                 const thought_height: f32 = if (item.entry.reasoning != null) 36 + (if (item.expanded) item.reasoning_height else @as(f32, 0)) else 0;
                 item.height = if (item.entry.length == 0) thought_height else self.bodyTop(index) + item.body_height +
-                    (if (hasTimestamp(item)) footer_gap + footer_height else @as(f32, 0)) + body_padding + item_gap;
+                    (if (hasFooter(item)) footer_gap + footer_height else @as(f32, 0)) + body_padding + item_gap;
             }
             item.top = top;
             top += item.height;
@@ -199,6 +209,7 @@ pub const View = struct {
         }
     }
     pub fn update(self: *View, entries: []const storage.ConversationEntry) !void {
+        self.draw_width = 0;
         if (self.items.items.len == entries.len) {
             var same_order = true;
             for (self.items.items, entries) |item, entry| if (item.entry.ordinal != entry.ordinal) {
@@ -386,6 +397,7 @@ pub const View = struct {
         self.resident[free.?] = index;
     }
     pub fn toggle(self: *View, target: Toggle) void {
+        self.draw_width = 0;
         for (self.items.items) |*item| if (item.entry.ordinal == target.ordinal) {
             switch (target.kind) {
                 .reasoning => if (item.entry.reasoning != null) {
@@ -419,6 +431,46 @@ pub const View = struct {
     fn hasTimestamp(item: *const Item) bool {
         return !isTool(item) and item.entry.length != 0 and item.entry.timestamp > 0 and item.entry.timestamp <= std.math.maxInt(i64) / 1000000;
     }
+    fn hasCopy(item: *const Item) bool {
+        return item.entry.role == .assistant and item.entry.length != 0;
+    }
+    fn hasFooter(item: *const Item) bool {
+        return hasTimestamp(item) or hasCopy(item);
+    }
+    fn copyBounds(self: *const View, index: usize) c.SDL_FRect {
+        const item = &self.items.items[index];
+        const width = @min(copy_width, self.draw_width);
+        return .{ .x = self.draw_x + self.draw_width - width, .y = self.draw_top + item.top - self.viewport_scroll + self.bodyTop(index) + item.body_height + footer_gap, .w = width, .h = footer_height };
+    }
+    /// Hit-test only the painted footer, without a fixed-size target list that
+    /// could omit controls in a tall viewport. Layout lookup is logarithmic.
+    pub fn copyAt(self: *const View, x: f32, y: f32) ?usize {
+        if (self.draw_width <= 0 or y < self.draw_top or y >= self.draw_top + self.viewport_height) return null;
+        const index = self.firstVisible(self.viewport_scroll + y - self.draw_top);
+        if (index >= self.items.items.len or !hasCopy(&self.items.items[index])) return null;
+        const bounds = self.copyBounds(index);
+        if (x < bounds.x or x >= bounds.x + bounds.w or y < bounds.y or y >= bounds.y + bounds.h) return null;
+        return self.items.items[index].entry.ordinal;
+    }
+    pub fn copyText(self: *const View, ordinal: usize) ![:0]u8 {
+        for (self.items.items) |*item| if (item.entry.ordinal == ordinal) {
+            if (!hasCopy(item) or !current(item)) return error.ResponseUnavailable;
+            return item.loaded.?.ready.document.clipboardText(self.allocator);
+        };
+        return error.ResponseUnavailable;
+    }
+    pub fn copied(self: *View, ordinal: usize, success: bool, now: u64) void {
+        self.copy_feedback = .{ .ordinal = ordinal, .success = success, .due = now + copy_feedback_ms };
+    }
+    pub fn copyDeadline(self: *const View) ?u64 {
+        return if (self.copy_feedback) |feedback| feedback.due else null;
+    }
+    pub fn expireCopyFeedback(self: *View, now: u64) bool {
+        const due = self.copyDeadline() orelse return false;
+        if (now < due) return false;
+        self.copy_feedback = null;
+        return true;
+    }
     fn bodyWidth(item: *const Item, width: f32) f32 {
         return @max(1, if (item.entry.role == .user) width * 0.8 - 2 * body_padding else if (isTool(item)) width - 28 else width);
     }
@@ -443,6 +495,8 @@ pub const View = struct {
         self.wanted_reasoning = false;
         self.disclosure_count = 0;
         self.draw_top = y;
+        self.draw_x = x;
+        self.draw_width = width;
         self.viewport_height = viewport_height;
         scroll.* = if (follow_bottom) @max(0, self.height - viewport_height) else @min(scroll.*, @max(0, self.height - viewport_height));
         for (self.resident) |slot| if (slot) |index| {
@@ -583,8 +637,20 @@ pub const View = struct {
                 if (c.SDL_TimeToDateTime(item.entry.timestamp * 1000000, &date, false)) {
                     var buffer: [64]u8 = undefined;
                     const stamp = std.fmt.bufPrint(&buffer, "{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} UTC", .{ date.year, @as(u32, @intCast(date.month)), @as(u32, @intCast(date.day)), @as(u32, @intCast(date.hour)), @as(u32, @intCast(date.minute)) }) catch unreachable;
-                    try self.caption(engine, renderer, stamp, body_x, top + self.bodyTop(index) + item.body_height + footer_gap, body_width, 10, palette.muted);
+                    try self.caption(engine, renderer, stamp, body_x, top + self.bodyTop(index) + item.body_height + footer_gap, @max(1, body_width - (if (hasCopy(item)) copy_width + 8 else @as(f32, 0))), 10, palette.muted);
                 }
+            }
+            if (hasCopy(item)) {
+                const bounds = self.copyBounds(index);
+                try widgets.panel(renderer, bounds, 4, palette.raised);
+                if (self.copy_feedback) |feedback| {
+                    if (feedback.ordinal == item.entry.ordinal) {
+                        try self.caption(engine, renderer, if (feedback.success) "Copied" else "Copy failed", bounds.x + 8, bounds.y + 3, @max(1, bounds.w - 16), 11, if (feedback.success) palette.accent else palette.error_color);
+                        continue;
+                    }
+                }
+                try widgets.icon(renderer, .copy, .{ .x = bounds.x + 8, .y = bounds.y + 3, .w = 16, .h = 16 }, palette.muted);
+                try self.caption(engine, renderer, "Copy", bounds.x + 32, bounds.y + 3, @max(1, bounds.w - 40), 11, palette.muted);
             }
         }
         // Drawing can grow retained syntax-color scratch.
@@ -687,4 +753,29 @@ test "removing expanded reasoning preserves the answer across conversation updat
             try std.testing.expectEqual(content.Role.user, next.role);
         } else try std.testing.expectEqual(@as(?content.Request, null), view.request(3));
     }
+}
+
+test "copy hit geometry is clipped and has no visible target count limit" {
+    var view = View.init(std.testing.allocator);
+    defer view.deinit();
+    var entries: [64]storage.ConversationEntry = undefined;
+    for (&entries, 0..) |*entry, index| entry.* = .{ .ordinal = index * 2, .role = if (index == 0) .user else .assistant, .content_id = @splat(1), .length = 1 };
+    try view.update(&entries);
+    view.draw_x = 20;
+    view.draw_top = 10;
+    view.draw_width = 400;
+    view.viewport_height = view.height;
+    for (view.items.items, 0..) |item, index| {
+        const bounds = view.copyBounds(index);
+        try std.testing.expectEqual(if (index == 0) @as(?usize, null) else item.entry.ordinal, view.copyAt(bounds.x + 1, bounds.y + 1));
+    }
+    const bounds = view.copyBounds(1);
+    view.viewport_height = bounds.y - view.draw_top + 5;
+    try std.testing.expectEqual(@as(?usize, 2), view.copyAt(bounds.x + 1, bounds.y + 1));
+    try std.testing.expect(view.copyAt(bounds.x + 1, bounds.y + 6) == null);
+    try std.testing.expect(view.copyAt(bounds.x - 1, bounds.y + 1) == null);
+    try std.testing.expect(view.copyAt(bounds.x + bounds.w, bounds.y + 1) == null);
+    try std.testing.expectError(error.ResponseUnavailable, view.copyText(2));
+    view.clear();
+    try std.testing.expect(view.copyAt(bounds.x + 1, bounds.y + 1) == null);
 }

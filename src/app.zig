@@ -1397,6 +1397,7 @@ pub const App = struct {
             },
             .wait => self.force_dialog = false,
         }
+        self.transcript.draw_width = 0;
         self.dirty = true;
     }
 
@@ -2243,6 +2244,7 @@ pub const App = struct {
         while (self.running) {
             self.consume();
             const now = c.SDL_GetTicks();
+            if (self.transcript.expireCopyFeedback(now)) self.dirty = true;
             if (self.quit_due) |due| if (now >= due) {
                 self.quit_due = null;
                 try self.requestClose();
@@ -2260,6 +2262,10 @@ pub const App = struct {
                 const remaining: c_int = @intCast(@min(2147483647, due -| c.SDL_GetTicks()));
                 timeout = if (timeout == -1) remaining else @min(timeout, remaining);
             }
+            if (self.transcript.copyDeadline()) |due| {
+                const remaining: c_int = @intCast(@min(2147483647, due -| c.SDL_GetTicks()));
+                timeout = if (timeout == -1) remaining else @min(timeout, remaining);
+            }
             var event: c.SDL_Event = undefined;
             if (c.SDL_WaitEventTimeout(&event, timeout)) {
                 self.handle(&event) catch |err| self.report("Input", err);
@@ -2274,6 +2280,18 @@ pub const App = struct {
         if (bytes.len == 0) return;
         self.copy_buffer[bytes.len] = 0;
         if (!c.SDL_SetClipboardText(@ptrCast(self.copy_buffer.ptr))) return error.ClipboardWrite;
+    }
+
+    fn copyResponse(self: *App, ordinal: usize) !void {
+        var success = false;
+        defer {
+            self.transcript.copied(ordinal, success, c.SDL_GetTicks());
+            self.dirty = true;
+        }
+        const bytes = try self.transcript.copyText(ordinal);
+        defer self.allocator.free(bytes);
+        if (!c.SDL_SetClipboardText(bytes.ptr)) return error.ClipboardWrite;
+        success = true;
     }
 
     fn handle(self: *App, incoming: *const c.SDL_Event) !void {
@@ -2335,6 +2353,7 @@ pub const App = struct {
             c.SDL_EVENT_WINDOW_EXPOSED => self.dirty = true,
             c.SDL_EVENT_WINDOW_RESIZED, c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED => {
                 self.button_count = 0;
+                self.transcript.draw_width = 0;
                 self.library.invalidateTargets();
                 self.dirty = true;
             },
@@ -2363,6 +2382,7 @@ pub const App = struct {
                         self.sidebar_first = if (event.wheel.y > 0) self.sidebar_first -| 1 else @min(last, self.sidebar_first + 1);
                     } else {
                         self.follow_bottom = false;
+                        self.transcript.draw_width = 0;
                         self.scroll = @max(0, self.scroll - event.wheel.y * 60);
                         if (event.wheel.y < 0 and self.scroll >= @max(0, self.transcript.height - self.transcript.viewport_height)) self.follow_bottom = true;
                     }
@@ -2407,6 +2427,12 @@ pub const App = struct {
                     self.thinking_menu = false;
                     self.dirty = true;
                     return;
+                }
+                if (event.button.button == c.SDL_BUTTON_LEFT) {
+                    if (self.transcript.copyAt(event.button.x, event.button.y)) |ordinal| {
+                        try self.copyResponse(ordinal);
+                        return;
+                    }
                 }
                 const inside = contains(self.editor_bounds, event.button.x, event.button.y);
                 self.focused_editor = inside;
@@ -2534,6 +2560,7 @@ pub const App = struct {
                 }
                 if (event.key.key == c.SDLK_PAGEUP or event.key.key == c.SDLK_PAGEDOWN) {
                     self.follow_bottom = false;
+                    self.transcript.draw_width = 0;
                     const amount = @max(100, self.transcript.viewport_height - 48);
                     self.scroll = @max(0, self.scroll + (if (event.key.key == c.SDLK_PAGEUP) -amount else amount));
                     if (self.scroll >= @max(0, self.transcript.height - self.transcript.viewport_height)) self.follow_bottom = true;
@@ -2541,6 +2568,7 @@ pub const App = struct {
                     return;
                 }
                 if (command and !self.focused_editor and (event.key.key == c.SDLK_HOME or event.key.key == c.SDLK_END)) {
+                    self.transcript.draw_width = 0;
                     self.follow_bottom = event.key.key == c.SDLK_END;
                     self.scroll = if (self.follow_bottom) @max(0, self.transcript.height - self.transcript.viewport_height) else 0;
                     self.dirty = true;
@@ -3158,4 +3186,127 @@ test "background prompt acknowledgements clear only the submitted chat revision"
         try std.testing.expectEqualStrings(if (edited_after_send) text else "recovered background input", chat.draft);
         try std.testing.expectEqualStrings("active chat draft", app.editor.textBytes());
     }
+}
+
+test "assistant copy controls use SDL clipboard without changing the composer or footer layout" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(c.spica_image_install_sdl_allocator());
+    try std.testing.expect(c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "dummy"));
+    defer _ = c.SDL_ResetHint(c.SDL_HINT_VIDEO_DRIVER);
+    try std.testing.expect(c.SDL_InitSubSystem(c.SDL_INIT_VIDEO));
+    defer c.SDL_QuitSubSystem(c.SDL_INIT_VIDEO);
+    const window = c.SDL_CreateWindow("Copy regression", 640, 480, c.SDL_WINDOW_HIDDEN) orelse return error.Window;
+    defer c.SDL_DestroyWindow(window);
+    const surface = c.SDL_CreateSurface(640, 480, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const engine = c.spica_text_create(renderer, ".deps/install/fonts/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(engine);
+    try std.testing.expect(c.spica_text_set_monospace(engine, ".deps/install/fonts/JetBrainsMono-Regular.ttf"));
+    const theme_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "assets/theme.json", allocator, .limited(16384));
+    defer allocator.free(theme_bytes);
+    const appearance = try theme_module.parse(allocator, theme_bytes);
+    const md = @import("content/markdown.zig");
+    const store = @import("core/store.zig");
+    const first = "**First** café 👩‍💻";
+    const second = "[Second](https://example.test)\n\n```sh\necho hello\n```";
+    const thought = "Private reasoning";
+    var entries = [_]store.ConversationEntry{
+        .{ .ordinal = 10, .role = .user, .content_id = @splat(1), .length = 4 },
+        .{ .ordinal = 20, .role = .assistant, .content_id = @splat(2), .length = first.len, .timestamp = 1_700_000_000_000, .reasoning = .{ .content_ref = @splat(4), .length = thought.len } },
+        .{ .ordinal = 30, .role = .assistant, .content_id = @splat(3), .length = second.len },
+    };
+    var app: App = undefined;
+    app.allocator = allocator;
+    app.window = window;
+    app.renderer = renderer;
+    app.wake_event = 0;
+    app.closing = false;
+    app.force_dialog = false;
+    app.settings_open = false;
+    app.model_menu = false;
+    app.thinking_menu = false;
+    app.focused_editor = true;
+    app.editor_bounds = .{ .x = 0, .y = 400, .w = 640, .h = 80 };
+    app.button_count = 0;
+    app.dirty = false;
+    app.library = try Library.Panel.init(allocator);
+    defer app.library.deinit();
+    app.editor = try Composer.init(allocator);
+    defer app.editor.deinit();
+    try app.editor.setText("composer selection");
+    app.editor.anchor = 0;
+    app.copy_buffer = try allocator.alloc(u8, 65537);
+    defer allocator.free(app.copy_buffer);
+    app.transcript = TranscriptView.init(allocator);
+    defer app.transcript.deinit();
+    try app.transcript.update(&entries);
+    for ([_][]const u8{ "User", first, second }, entries) |source, entry| {
+        try app.transcript.accept(renderer, .{ .generation = 1, .ordinal = entry.ordinal, .document = try md.parse(allocator, entry.content_id, source) });
+    }
+    try app.transcript.accept(renderer, .{ .generation = 1, .ordinal = 20, .document = try md.parse(allocator, @splat(4), thought) });
+    app.transcript.toggle(.{ .ordinal = 20, .kind = .reasoning });
+    var scroll: f32 = 0;
+    for ([_]bool{ false, true }) |light| {
+        try app.transcript.draw(engine, renderer, 0, 0, 640, 400, &scroll, false, appearance.metrics, if (light) appearance.light else appearance.dark, light);
+        const height = app.transcript.height;
+        var targets: [2]f32 = undefined;
+        for ([_]usize{ 20, 30 }, 0..) |ordinal, slot| {
+            var found = false;
+            for (0..400) |row| {
+                const y: f32 = @floatFromInt(row);
+                if (app.transcript.copyAt(600, y) == ordinal) {
+                    targets[slot] = y;
+                    found = true;
+                    break;
+                }
+            }
+            try std.testing.expect(found);
+        }
+        try std.testing.expect(c.SDL_SetClipboardText("unchanged"));
+        var event = std.mem.zeroes(c.SDL_Event);
+        event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+        event.button.button = c.SDL_BUTTON_RIGHT;
+        event.button.x = 600;
+        event.button.y = targets[0];
+        try app.handle(&event);
+        try std.testing.expect(app.transcript.copyDeadline() == null);
+        app.focused_editor = true;
+        event.button.button = c.SDL_BUTTON_LEFT;
+        for ([_][]const u8{ "First café 👩‍💻\n", "Second\necho hello\n" }, targets, [_]usize{ 20, 30 }) |expected, y, ordinal| {
+            event.button.y = y;
+            try app.handle(&event);
+            const actual = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+            defer c.SDL_free(actual);
+            try std.testing.expectEqualStrings(expected, std.mem.span(actual));
+            try std.testing.expectEqual(ordinal, app.transcript.copy_feedback.?.ordinal);
+            try std.testing.expect(app.transcript.copy_feedback.?.success);
+            try std.testing.expect(app.focused_editor and app.dirty);
+            try std.testing.expectEqualStrings("composer selection", app.editor.textBytes());
+            try std.testing.expectEqual(@as(usize, 0), app.editor.anchor);
+            const due = app.transcript.copyDeadline().?;
+            try std.testing.expect(!app.transcript.expireCopyFeedback(due - 1));
+            try app.transcript.draw(engine, renderer, 0, 0, 640, 400, &scroll, false, appearance.metrics, if (light) appearance.light else appearance.dark, light);
+            try std.testing.expectEqual(height, app.transcript.height);
+            try std.testing.expect(app.transcript.expireCopyFeedback(due));
+            try std.testing.expect(app.transcript.copyDeadline() == null);
+        }
+    }
+    // Composer copy still uses its selected text and original fixed buffer.
+    try app.copySelection();
+    const selected = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+    defer c.SDL_free(selected);
+    try std.testing.expectEqualStrings("composer selection", std.mem.span(selected));
+    // A streaming update invalidates hit geometry and cannot copy the old cache.
+    entries[1].length += 1;
+    try app.transcript.update(&entries);
+    try std.testing.expect(app.transcript.copyAt(600, 100) == null);
+    try std.testing.expectError(error.ResponseUnavailable, app.copyResponse(20));
+    try std.testing.expect(!app.transcript.copy_feedback.?.success);
+    const untouched = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+    defer c.SDL_free(untouched);
+    try std.testing.expectEqualStrings("composer selection", std.mem.span(untouched));
+    app.transcript.clear();
+    try std.testing.expect(app.transcript.copyDeadline() == null);
 }

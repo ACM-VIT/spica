@@ -75,6 +75,39 @@ pub const Document = struct {
     text: std.ArrayList(u8) = .empty,
     metadata: std.ArrayList(u8) = .empty,
 
+    /// Copy the readable projection, including list markers drawn separately by
+    /// the UI. Source Markdown and inert metadata never enter the clipboard.
+    pub fn clipboardText(self: *const Document, allocator: std.mem.Allocator) ![:0]u8 {
+        if (self.state != .rich) return error.FormattingUnavailable;
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
+        var offset: usize = 0;
+        for (self.blocks.items) |block| {
+            if (block.kind != .item) continue;
+            try result.appendSlice(allocator, self.text.items[offset..block.text_start]);
+            if (result.items.len != 0 and result.items[result.items.len - 1] != '\n') try result.append(allocator, '\n');
+            var parent = block.parent;
+            while (parent) |index| {
+                const ancestor = self.blocks.items[index];
+                if (ancestor.kind == .item) try result.appendSlice(allocator, "  ");
+                parent = ancestor.parent;
+            }
+            const list = self.blocks.items[block.parent.?];
+            if (list.ordered) {
+                var buffer: [32]u8 = undefined;
+                try result.appendSlice(allocator, try std.fmt.bufPrint(&buffer, "{d}{s} ", .{ block.number, if (list.paren_delimiter) ")" else "." }));
+            } else try result.appendSlice(allocator, "• ");
+            switch (block.task) {
+                .checked => try result.appendSlice(allocator, "[x] "),
+                .unchecked => try result.appendSlice(allocator, "[ ] "),
+                .none => {},
+            }
+            offset = block.text_start;
+        }
+        try result.appendSlice(allocator, self.text.items[offset..]);
+        return result.toOwnedSliceSentinel(allocator, 0);
+    }
+
     pub fn deinit(self: *Document) void {
         self.blocks.deinit(self.allocator);
         self.runs.deinit(self.allocator);
