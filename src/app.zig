@@ -3362,3 +3362,28 @@ test "assistant copy controls paint in both themes and use SDL clipboard without
     app.transcript.clear();
     try std.testing.expect(app.transcript.copyDeadline() == null);
 }
+
+test "SDL clipboard write failure records failed response feedback" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(c.SDL_InitFlags, 0), c.SDL_WasInit(c.SDL_INIT_VIDEO));
+    const surface = c.SDL_CreateSurface(32, 32, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const md = @import("content/markdown.zig");
+    const id: md.ContentId = @splat(1);
+    const body = "An available answer";
+    var app: App = undefined;
+    app.allocator = allocator;
+    app.dirty = false;
+    app.transcript = TranscriptView.init(allocator);
+    defer app.transcript.deinit();
+    try app.transcript.update(&.{.{ .ordinal = 0, .role = .assistant, .content_id = id, .length = body.len }});
+    try app.transcript.accept(renderer, .{ .generation = 1, .ordinal = 0, .document = try md.parse(allocator, id, body) });
+    // No video subsystem: this exercises SDL's real failure return, rather
+    // than the unavailable-document path or manually injected feedback.
+    try std.testing.expectError(error.ClipboardWrite, app.copyResponse(0));
+    try std.testing.expect(app.dirty);
+    try std.testing.expect(!app.transcript.copy_feedback.?.success);
+    try std.testing.expect(app.transcript.copyDeadline() != null);
+}

@@ -79,6 +79,7 @@ pub const Document = struct {
     /// the UI. Source Markdown and inert metadata never enter the clipboard.
     pub fn clipboardText(self: *const Document, allocator: std.mem.Allocator) ![:0]u8 {
         if (self.state != .rich) return error.FormattingUnavailable;
+        if (!std.unicode.utf8ValidateSlice(self.text.items)) return error.InvalidUtf8;
         var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
         var offset: usize = 0;

@@ -3,6 +3,13 @@ const md = @import("markdown.zig");
 
 const source_id: md.ContentId = [_]u8{0xA5} ** 16;
 
+test "clipboard projection rejects malformed UTF-8 before calling the native clipboard" {
+    var doc = try md.parse(std.testing.allocator, source_id, "valid\n");
+    defer doc.deinit();
+    doc.text.items[0] = 0xff;
+    try std.testing.expectError(error.InvalidUtf8, doc.clipboardText(std.testing.allocator));
+}
+
 test "clipboard projection preserves readable Markdown and list semantics" {
     const source = "# Résumé 👩‍💻\n\n**bold** and *soft* [label](https://example.test)\n\n3. parent\n   - [x] done\n   - [ ] pending\n4. next\n\n| Name | Value |\n|---|---|\n| café | 42 |\n\n```zig\nconst x = \"**literal**\";\n```\n\n> quote\n\n![alt](image.png)\n";
     var doc = try md.parse(std.testing.allocator, source_id, source);
