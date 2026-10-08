@@ -1146,6 +1146,7 @@ pub const App = struct {
     }
 
     fn submit(self: *App) !void {
+        if (self.runtime_snapshot) |snapshot| if (snapshot.model_availability_pending) return error.ModelAvailabilityRefreshing;
         if (self.runtime_snapshot) |snapshot| if (snapshot.model_unavailable) return error.ChooseAvailableModelBeforeSending;
         if (self.current_archived) return error.RestoreArchivedChatBeforeSending;
         if (self.enrollment_intent) return error.WorkspaceEnrollmentPending;
@@ -1623,9 +1624,10 @@ pub const App = struct {
             const active_count = self.model_search.active_len;
             const hidden_count = self.model_search.len - active_count;
             const expanded = self.model_hidden_expanded and hidden_count != 0;
-            const capacity: usize = @intFromFloat(@max(2, @min(8, @floor((self.composer_bounds.y - 130 - error_height) / 44))));
-            const hidden_rows: usize = if (expanded) @min(hidden_count, @max(1, capacity / 3)) else 0;
-            const active_rows = @min(@max(1, active_count), capacity - hidden_rows);
+            const available_height = @max(0, self.composer_bounds.y - 130 - error_height);
+            const capacity: usize = @intFromFloat(@min(8, @floor(available_height / 44)));
+            const hidden_rows: usize = if (expanded and capacity != 0) @min(hidden_count, @max(1, capacity / 3)) else 0;
+            const active_rows = @min(if (active_count == 0 and capacity != 0) @as(usize, 1) else active_count, capacity - hidden_rows);
             const height = @as(f32, @floatFromInt(active_rows + hidden_rows)) * 44 + 120 + error_height;
             const y = self.composer_bounds.y - height - 10;
             self.model_popup_bounds = .{ .x = x, .y = y, .w = width, .h = height };
@@ -2881,6 +2883,15 @@ test "model search filters names IDs and providers without editing the draft" {
     app.model_first = 0;
     app.button_count = 0;
     try app.drawOverlays();
+    app.composer_bounds.y = 200;
+    app.button_count = 0;
+    try app.drawOverlays();
+    try std.testing.expect(app.model_popup_bounds.y >= 0);
+    try std.testing.expect(app.library.query_bounds.y >= app.model_popup_bounds.y);
+    try std.testing.expect(app.model_popup_bounds.y + app.model_popup_bounds.h <= app.composer_bounds.y);
+    app.composer_bounds.y = 440;
+    app.button_count = 0;
+    try app.drawOverlays();
     var hide_bounds: ?c.SDL_FRect = null;
     for (app.buttons[0..app.button_count]) |button_value| {
         if (button_value.action == .toggle_model_visibility and button_value.action.toggle_model_visibility == 2) hide_bounds = button_value.bounds;
@@ -3144,6 +3155,16 @@ test "confirmed unavailable current models keep the user's draft and require a c
     defer app.editor.deinit();
     try app.editor.setText("keep this draft");
     try std.testing.expectError(error.ChooseAvailableModelBeforeSending, app.submit());
+    try std.testing.expectEqualStrings("keep this draft", app.editor.textBytes());
+}
+
+test "pending credential refresh keeps the user's draft and requires completion" {
+    var app: App = undefined;
+    app.runtime_snapshot = .{ .allocator = std.testing.allocator, .model_availability_pending = true };
+    app.editor = try Composer.init(std.testing.allocator);
+    defer app.editor.deinit();
+    try app.editor.setText("keep this draft");
+    try std.testing.expectError(error.ModelAvailabilityRefreshing, app.submit());
     try std.testing.expectEqualStrings("keep this draft", app.editor.textBytes());
 }
 

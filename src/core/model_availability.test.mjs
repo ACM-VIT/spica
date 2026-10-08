@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { resolveAvailability as resolveDetailed } from "./model_availability.mjs";
 
 // Most resolver tests assert public availability, independently of cache metadata.
@@ -126,6 +131,19 @@ test("Anthropic and Google use different paginated authenticated catalogs", asyn
   ]);
 });
 
+test("Gemini rejects malformed page tokens instead of accepting a partial catalog", async () => {
+  for (const nextPageToken of [false, 0, {}, []]) {
+    const result = await resolveAvailability({
+      credentials: { google: { type: "api_key", key: "g" } }, env: {}, version: "1.0.0",
+      fetchImpl: async () => reply({
+        models: [{ name: "models/partial", supportedGenerationMethods: ["generateContent"] }],
+        nextPageToken,
+      }),
+    });
+    assert.deepEqual(result.providers, []);
+  }
+});
+
 test("failures and incomplete pages become unknown, never empty entitlements", async () => {
   const result = await resolveAvailability({ credentials: {
     "openai-codex": { type: "oauth", access: "x", accountId: "a", expires: Date.now() + 60000 },
@@ -191,4 +209,79 @@ test("logout is distinct from unreadable credentials and unsupported auth never 
     fetchImpl: () => { throw new Error("must not use a different authentication context"); },
   });
   assert.deepEqual(result.providers, [{ provider: "openrouter", availableIds: [] }]);
+});
+
+function piFixture() {
+  const root = mkdtempSync(join(tmpdir(), "spica-pi-layout-"));
+  const agent = join(root, "agent");
+  mkdirSync(join(root, "dist/bundle"), { recursive: true });
+  mkdirSync(join(root, "dist/core"), { recursive: true });
+  mkdirSync(join(root, "node_modules/@earendil-works/pi-ai/dist/auth/oauth"), { recursive: true });
+  mkdirSync(agent);
+  writeFileSync(join(root, "package.json"), JSON.stringify({ type: "module", version: "fixture" }));
+  writeFileSync(join(root, "dist/bundle/cli.js"), "");
+  writeFileSync(join(root, "dist/config.js"), `
+    export const getAgentDir = () => process.env.PI_CODING_AGENT_DIR;
+    export const getModelsPath = () => process.env.PI_CODING_AGENT_DIR + "/models.json";
+  `);
+  writeFileSync(join(root, "dist/core/auth-storage.js"), `
+    import { readFile, writeFile } from "node:fs/promises";
+    export class AuthStorage {
+      static create(path) { return new AuthStorage(path); }
+      constructor(path) { this.path = path; }
+      async read(provider) { return JSON.parse(await readFile(this.path, "utf8"))[provider]; }
+      async modify(provider, update) {
+        const all = JSON.parse(await readFile(this.path, "utf8"));
+        const changed = await update(all[provider]);
+        if (changed !== undefined) { all[provider] = changed; await writeFile(this.path, JSON.stringify(all)); }
+        return all[provider];
+      }
+    }
+  `);
+  writeFileSync(join(root, "node_modules/@earendil-works/pi-ai/dist/auth/oauth/load.js"), `
+    const flow = async () => ({ refresh: async () => ({ type: "unknown" }) });
+    export const loadOpenAICodexOAuth = flow;
+    export const loadOpenAIChatGPTOAuth = flow;
+  `);
+  return { root, agent, entry: join(root, "dist/bundle/cli.js") };
+}
+
+function runFixture(fixture) {
+  return spawnSync(process.execPath, [resolve(dirname(fileURLToPath(import.meta.url)), "model_availability.mjs"), fixture.entry], {
+    encoding: "utf8", env: { ...process.env, PI_CODING_AGENT_DIR: fixture.agent },
+  });
+}
+
+test("helper starts against Pi's package layout and handles expired or unreadable credentials safely", () => {
+  const fixture = piFixture();
+  try {
+    writeFileSync(join(fixture.agent, "auth.json"), JSON.stringify({
+      openai: { type: "oauth", access: "expired", refresh: "refresh", expires: 0 },
+    }));
+    writeFileSync(join(fixture.agent, "models.json"), JSON.stringify({ providers: { openai: {} } }));
+    let child = runFixture(fixture);
+    assert.equal(child.status, 0, child.stderr);
+    assert.deepEqual(JSON.parse(child.stdout).providers.map(({ provider }) => provider).sort(),
+      ["anthropic", "google", "groq", "openai-codex", "openrouter"].sort());
+
+    writeFileSync(join(fixture.agent, "auth.json"), "not json");
+    child = runFixture(fixture);
+    assert.equal(child.status, 0, child.stderr);
+    assert.deepEqual(JSON.parse(child.stdout), { providers: [] });
+
+    writeFileSync(join(fixture.agent, "auth.json"), "{}");
+    writeFileSync(join(fixture.agent, "models.json"), "not json");
+    child = runFixture(fixture);
+    assert.equal(child.status, 0, child.stderr);
+    assert.deepEqual(JSON.parse(child.stdout), { providers: [] });
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("helper startup failures are observable instead of masquerading as normal unknown availability", () => {
+  const child = spawnSync(process.execPath, [resolve(dirname(fileURLToPath(import.meta.url)), "model_availability.mjs"), "/missing/pi/dist/bundle/cli.js"], { encoding: "utf8" });
+  assert.notEqual(child.status, 0);
+  assert.equal(child.stdout, "");
+  assert.match(child.stderr, /Cannot find module|ENOENT/);
 });

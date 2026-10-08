@@ -108,7 +108,7 @@ async function googleModels(key, fetchImpl) {
       if (!Array.isArray(model.supportedGenerationMethods)) throw new Error("invalid Gemini model methods");
       if (model.supportedGenerationMethods.includes("generateContent")) ids.push(model.name.replace(/^models\//, ""));
     }
-    if (!result.nextPageToken) return ids;
+    if (result.nextPageToken === undefined || result.nextPageToken === null || result.nextPageToken === "") return ids;
     if (typeof result.nextPageToken !== "string" || result.nextPageToken === pageToken || !names.length) {
       throw new Error("incomplete Gemini model list");
     }
@@ -246,7 +246,14 @@ async function main() {
   try {
     const config = JSON.parse(await readFile(getModelsPath(), "utf8"));
     overriddenProviders = Object.keys(config.providers ?? {});
-  } catch { /* no overrides */ }
+  } catch (error) {
+    // A missing file means there are no overrides. Any other read or parse
+    // failure leaves every provider unknown because overrides cannot be ruled out.
+    if (error?.code !== "ENOENT") {
+      process.stdout.write('{"providers":[]}');
+      return;
+    }
+  }
   let previousPolicy;
   try { previousPolicy = JSON.parse(process.argv[3]); } catch { /* first lookup */ }
   const result = await resolveAvailability({ credentials, env: process.env, version, overriddenProviders, previousPolicy });
@@ -254,5 +261,8 @@ async function main() {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().catch(() => process.stdout.write('{"providers":[]}'));
+  main().catch((error) => {
+    process.stderr.write(`${error?.message ?? "model availability startup failed"}\n`);
+    process.exitCode = 1;
+  });
 }
