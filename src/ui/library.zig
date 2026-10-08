@@ -4,6 +4,12 @@ const catalog = @import("../core/catalog.zig");
 const Composer = @import("../text/composer.zig").Composer;
 const GroupKind = @import("../text/composer.zig").GroupKind;
 const Color = @import("theme.zig").Color;
+const widgets = @import("widgets.zig");
+const utf8 = @import("../text/utf8.zig");
+const clipboard = @import("clipboard.zig");
+const HitTargets = @import("hit_targets.zig").HitTargets;
+const contains = widgets.contains;
+const Clip = widgets.Clip;
 
 pub const Action = union(enum) {
     scope: catalog.Scope,
@@ -22,7 +28,6 @@ pub const Intent = union(enum) {
     restore,
     close,
 };
-const Target = struct { bounds: c.SDL_FRect, action: Action };
 const query_limit = 256;
 const preedit_limit = 4096;
 const row_height: f32 = 66;
@@ -44,8 +49,7 @@ pub const Panel = struct {
     err: ?anyerror = null,
     input_err: ?anyerror = null,
     dragging: bool = false,
-    targets: [40]Target = undefined,
-    target_count: usize = 0,
+    targets: HitTargets(Action, 40) = .{},
     query_bounds: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     results_bounds: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     layout: ?*c.SpicaTextLayout = null,
@@ -96,7 +100,7 @@ pub const Panel = struct {
     }
 
     pub fn invalidateTargets(self: *Panel) void {
-        self.target_count = 0;
+        self.targets.clear();
     }
 
     pub fn queryBytes(self: *const Panel) []const u8 {
@@ -249,15 +253,9 @@ pub const Panel = struct {
         if (self.selected >= self.first + self.visible) self.first = self.selected + 1 -| self.visible;
     }
 
-    fn addTarget(self: *Panel, action: Action, bounds: c.SDL_FRect) void {
-        std.debug.assert(self.target_count < self.targets.len);
-        self.targets[self.target_count] = .{ .action = action, .bounds = bounds };
-        self.target_count += 1;
-    }
-
     fn button(self: *Panel, app: anytype, action: Action, text: []const u8, bounds: c.SDL_FRect) !void {
         try app.button(.{ .library = action }, text, bounds);
-        self.addTarget(action, bounds);
+        try self.targets.add(action, bounds);
     }
 
     pub fn draw(self: *Panel, app: anytype) !void {
@@ -322,7 +320,7 @@ pub const Panel = struct {
                 try clippedLabel(app, if (thread.cwd.len != 0) thread.cwd else thread.path, left + 8, top + 24, inner - 16, 11, colors.muted);
                 const excerpt = if (thread.snippet.len != 0) thread.snippet else if (!thread.available) "Source unavailable; cached result" else thread.path;
                 try clippedLabel(app, excerpt, left + 8, top + 42, inner - 16, 11, colors.muted);
-                if (!self.waiting and !self.busy and page.generation == self.generation and page.scope == self.scope and page.offset == self.offset and bounds.y + bounds.h <= self.results_bounds.y + self.results_bounds.h) self.addTarget(.{ .select = index }, bounds);
+                if (!self.waiting and !self.busy and page.generation == self.generation and page.scope == self.scope and page.offset == self.offset and bounds.y + bounds.h <= self.results_bounds.y + self.results_bounds.h) try self.targets.add(.{ .select = index }, bounds);
             }
         }
         clip.restore(app.renderer);
@@ -383,7 +381,7 @@ pub const Panel = struct {
             rect.y += ty;
         }
         if (!c.SDL_SetRenderDrawBlendMode(app.renderer, c.SDL_BLENDMODE_BLEND) or !c.SDL_SetRenderDrawColor(app.renderer, colors.accent.r, colors.accent.g, colors.accent.b, 60) or !c.SDL_RenderFillRects(app.renderer, &rects, @intCast(count))) return error.LibrarySelectionDraw;
-        if (!c.spica_text_layout_draw(app.text, layout, tx, ty, rgba(colors.text))) return error.LibraryQueryDraw;
+        if (!c.spica_text_layout_draw(app.text, layout, tx, ty, widgets.rgba(colors.text))) return error.LibraryQueryDraw;
         if (self.preedit_len != 0) {
             const n = c.spica_text_layout_selection_rects(layout, range.start, range.start + self.preedit_len, &rects, rects.len);
             if (n > rects.len) return error.LibrarySelectionBudget;
@@ -417,13 +415,6 @@ pub const Panel = struct {
         const selection = self.editor.selection();
         if (n > query_limit - (self.editor.len - (selection.end - selection.start))) return error.QueryTooLarge;
         try self.editor.insert(normalized[0..n], kind);
-    }
-
-    fn copySelection(self: *Panel) !void {
-        const bytes = try self.editor.copySelection(self.copy[0..query_limit]);
-        if (bytes.len == 0) return;
-        self.copy[bytes.len] = 0;
-        if (!c.SDL_SetClipboardText(@ptrCast(&self.copy))) return error.ClipboardWrite;
     }
 
     pub fn hitQuery(self: *Panel, app: anytype, x: f32, y: f32, extend: bool) !void {
@@ -495,7 +486,7 @@ pub const Panel = struct {
                     return false;
                 }
                 if (command and key == c.SDLK_C) {
-                    try self.copySelection();
+                    try clipboard.copySelection(&self.editor, &self.copy);
                     return false;
                 }
                 var before: [query_limit]u8 = undefined;
@@ -503,13 +494,13 @@ pub const Panel = struct {
                 @memcpy(before[0..old_len], self.editor.textBytes());
                 if (command) switch (key) {
                     c.SDLK_X => {
-                        try self.copySelection();
+                        try clipboard.copySelection(&self.editor, &self.copy);
                         try self.editor.insert("", .paste);
                     },
                     c.SDLK_V => {
-                        const clipboard = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
-                        defer c.SDL_free(clipboard);
-                        self.insert(std.mem.span(clipboard), .paste) catch |err| {
+                        const pasted = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+                        defer c.SDL_free(pasted);
+                        self.insert(std.mem.span(pasted), .paste) catch |err| {
                             self.input_err = err;
                             return false;
                         };
@@ -558,11 +549,7 @@ pub const Panel = struct {
                     _ = c.SDL_StartTextInput(app.window);
                     return null;
                 }
-                var index = self.target_count;
-                while (index > 0) {
-                    index -= 1;
-                    const target = self.targets[index];
-                    if (!contains(target.bounds, event.button.x, event.button.y)) continue;
+                if (self.targets.topmost(event.button.x, event.button.y)) |target| {
                     const intent = self.act(target.action);
                     if (target.action == .select and event.button.clicks >= 2) return self.act(.activate);
                     if (target.action == .scope) _ = c.SDL_ClearComposition(app.window);
@@ -625,47 +612,9 @@ fn scalarOffset(bytes: []const u8, requested: i64) usize {
     return @min(offset, bytes.len);
 }
 
-fn contains(bounds: c.SDL_FRect, x: f32, y: f32) bool {
-    return x >= bounds.x and x < bounds.x + bounds.w and y >= bounds.y and y < bounds.y + bounds.h;
-}
-
-fn rgba(color: Color) c.SDL_Color {
-    return .{ .r = color.r, .g = color.g, .b = color.b, .a = 255 };
-}
-
-// Both labels and native query drawing preserve an enclosing renderer clip.
-const Clip = struct {
-    previous: c.SDL_Rect,
-    enabled: bool,
-    restored: bool = false,
-
-    fn push(renderer: *c.SDL_Renderer, bounds: c.SDL_FRect) Clip {
-        var result = Clip{ .previous = undefined, .enabled = c.SDL_RenderClipEnabled(renderer) };
-        _ = c.SDL_GetRenderClipRect(renderer, &result.previous);
-        var next = c.SDL_Rect{ .x = @intFromFloat(bounds.x), .y = @intFromFloat(bounds.y), .w = @intFromFloat(@max(0, bounds.w)), .h = @intFromFloat(@max(0, bounds.h)) };
-        if (result.enabled) {
-            const right = @min(next.x + next.w, result.previous.x + result.previous.w);
-            const bottom = @min(next.y + next.h, result.previous.y + result.previous.h);
-            next.x = @max(next.x, result.previous.x);
-            next.y = @max(next.y, result.previous.y);
-            next.w = @max(0, right - next.x);
-            next.h = @max(0, bottom - next.y);
-        }
-        _ = c.SDL_SetRenderClipRect(renderer, &next);
-        return result;
-    }
-
-    fn restore(self: *Clip, renderer: *c.SDL_Renderer) void {
-        if (self.restored) return;
-        _ = c.SDL_SetRenderClipRect(renderer, if (self.enabled) &self.previous else null);
-        self.restored = true;
-    }
-};
-
 fn clippedLabel(app: anytype, bytes: []const u8, x: f32, y: f32, width: f32, size: c_uint, color: Color) !void {
     if (width <= 0) return;
-    var length = @min(bytes.len, 128);
-    if (length < bytes.len) while (length > 0 and (bytes[length] & 0xc0) == 0x80) : (length -= 1) {};
+    const length = utf8.prefix(bytes, 128).len;
     var clip = Clip.push(app.renderer, .{ .x = x, .y = y, .w = width, .h = @as(f32, @floatFromInt(size)) + 5 });
     defer clip.restore(app.renderer);
     // Newlines in excerpts must not produce rows outside the result cell.
