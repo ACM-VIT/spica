@@ -39,7 +39,14 @@ test("Codex OAuth uses its account catalog while API-key OpenAI uses the API cat
   assert.equal(calls[1][1].Authorization, "Bearer api-secret");
 });
 
-test("Sign in with ChatGPT uses the OAuth account catalog, not the API-key data list", async () => {
+test("Sign in with ChatGPT follows OpenAI's documented OAuth models/slug catalog", async () => {
+  // Representative of the documented Sign in with ChatGPT response: models,
+  // slug, display_name, visibility. supported_in_api is optional metadata.
+  // https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference
+  const oauthCatalog = { models: [
+    { slug: "plan-model", display_name: "Plan Model", visibility: "list" },
+    { slug: "hidden-model", display_name: "Hidden Model", visibility: "hide" },
+  ] };
   const result = await resolveAvailability({
     credentials: { openai: {
       type: "oauth", access: "oauth-secret", expires: Date.now() + 60000,
@@ -49,14 +56,25 @@ test("Sign in with ChatGPT uses the OAuth account catalog, not the API-key data 
     fetchImpl: async (url, options) => {
       assert.equal(String(url), "https://api.openai.com/v1/models");
       assert.equal(options.headers.Authorization, "Bearer oauth-secret");
-      return reply({ models: [
-        { slug: "plan-model", visibility: "list", supported_in_api: true },
-        { slug: "hidden-model", visibility: "hide", supported_in_api: true },
-        { slug: "unsupported-route", visibility: "list", supported_in_api: false },
-      ] });
+      return reply(oauthCatalog);
     },
   });
   assert.deepEqual(result.providers, [{ provider: "openai", availableIds: ["plan-model"] }]);
+});
+
+test("an API-key-shaped or malformed response to ChatGPT OAuth stays unknown", async () => {
+  const credentials = { openai: {
+    type: "oauth", access: "oauth-secret", expires: Date.now() + 60000,
+    scopes: ["chatgpt.tokens.use.direct"],
+  } };
+  for (const catalog of [
+    { data: [{ id: "api-only" }] },
+    { models: [{ id: "wrong-field", visibility: "list" }] },
+    { models: [{ slug: "bad-visibility", visibility: "unknown" }] },
+  ]) {
+    const result = await resolveAvailability({ credentials, env: {}, version: "1.0.0", fetchImpl: async () => reply(catalog) });
+    assert.deepEqual(result.providers, []);
+  }
 });
 
 test("an explicit identity-only OpenAI grant cannot use plan models", async () => {

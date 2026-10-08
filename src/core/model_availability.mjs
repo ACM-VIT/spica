@@ -63,8 +63,9 @@ async function openaiOAuthModels(credential, fetchImpl) {
   // An explicit identity-only grant cannot power plan-backed inference.
   // Missing/malformed scope metadata remains unknown instead.
   if (!credential.scopes.includes("chatgpt.tokens.use.direct")) return [];
-  // OpenAI's Sign in with ChatGPT guide specifies this account catalog for pickers.
-  // It has {models:[{slug,visibility}]} rather than the API-key {data:[{id}]} shape.
+  // Sign in with ChatGPT documents this OAuth-specific /v1/models response as
+  // {models:[{slug,display_name,visibility}]}; API keys receive {data:[{id}]}.
+  // https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference
   const result = await jsonResponse("https://api.openai.com/v1/models", {
     Authorization: `Bearer ${credential.access}`,
   }, fetchImpl);

@@ -76,6 +76,89 @@ test "completed availability filters currently displayed rows before publication
     a.free(runtime.state.models);
     runtime.model_policy = null;
 }
+
+fn oauthPolicyForIntegrationTest(a: std.mem.Allocator, scenario: []const u8, access: []const u8, previous: []const u8) !std.json.Parsed(Value) {
+    // Exercise the production resolver with a deterministic, local catalog.
+    // The returned JSON is consumed by the same runtime path as the helper.
+    const script =
+        \\import { pathToFileURL } from "node:url";
+        \\const { resolveAvailability } = await import(pathToFileURL(process.argv[2]).href);
+        \\const [scenario, access, previous] = process.argv.slice(3);
+        \\const catalog = scenario === "first" ? { models: [{ slug: "current", display_name: "Current", visibility: "list" }] } :
+        \\  scenario === "second" ? { models: [{ slug: "other", display_name: "Other", visibility: "list" }] } :
+        \\  { data: [{ id: "unexpected-shape" }] };
+        \\const result = await resolveAvailability({
+        \\  credentials: { openai: { type: "oauth", access, expires: Date.now() + 60000, scopes: ["chatgpt.tokens.use.direct"] } },
+        \\  env: {}, version: "test", previousPolicy: JSON.parse(previous),
+        \\  fetchImpl: async (url, options) => {
+        \\    if (String(url) !== "https://api.openai.com/v1/models" || options.headers.Authorization !== `Bearer ${access}`) throw Error("wrong credential or endpoint");
+        \\    return new Response(JSON.stringify(catalog), { status: scenario === "failed" ? 503 : 200 });
+        \\  },
+        \\});
+        \\process.stdout.write(JSON.stringify(result));
+    ;
+    const result = try std.process.run(a, std.testing.io, .{
+        .argv = &.{ "node", "--input-type=module", "-e", script, "integration-harness", @import("build_options").model_availability_helper, scenario, access, previous },
+        .stdout_limit = .limited(128 * 1024),
+        .stderr_limit = .limited(4096),
+        .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } },
+    });
+    defer a.free(result.stdout);
+    defer a.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return error.AvailabilityIntegrationChildFailed;
+    return std.json.parseFromSlice(Value, a, result.stdout, .{ .allocate = .alloc_always });
+}
+
+test "OAuth credential changes flow through lookup policy runtime filtering and picker snapshots" {
+    const a = std.testing.allocator;
+    const mutex = native.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer native.SDL_DestroyMutex(mutex);
+    var runtime: Runtime = .{
+        .allocator = a,
+        .io = undefined,
+        .options = .{ .database_path = "", .project_path = "", .wake_event = native.SDL_EVENT_USER },
+        .options_arena = undefined,
+        .mutex = mutex,
+        .wake = undefined,
+        .state = try copySnapshot(a, .{ .allocator = a, .provider = "openai", .model = "current" }),
+    };
+    defer runtime.state.deinit();
+    defer if (runtime.snapshot) |*snapshot| snapshot.deinit();
+    defer if (runtime.model_policy) |*policy| policy.deinit();
+    const pi_models = try std.json.parseFromSlice(Value, a,
+        \\{"type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"openai","id":"current","name":"Current"},{"provider":"openai","id":"other","name":"Other"}]}}
+    , .{});
+    defer pi_models.deinit();
+
+    try runtime.applyModelAvailability(try oauthPolicyForIntegrationTest(a, "first", "account-a", "{}"));
+    try runtime.event(pi_models.value, @splat(0));
+    try std.testing.expectEqual(@as(usize, 1), runtime.snapshot.?.models.len);
+    try std.testing.expectEqualStrings("current", runtime.snapshot.?.models[0].id);
+    try std.testing.expect(!runtime.snapshot.?.model_unavailable);
+    const old_policy = try std.json.Stringify.valueAlloc(a, runtime.model_policy.?.value, .{});
+    defer a.free(old_policy);
+
+    // A different credential with a failed lookup must not inherit account A's filter.
+    try runtime.applyModelAvailability(try oauthPolicyForIntegrationTest(a, "failed", "account-b", old_policy));
+    try runtime.event(pi_models.value, @splat(0));
+    try std.testing.expectEqual(@as(usize, 2), runtime.snapshot.?.models.len);
+    try std.testing.expect(!runtime.snapshot.?.model_unavailable);
+
+    // The successful catalog for account B immediately removes the old row and
+    // flags the selected model before the next Pi model-list response arrives.
+    try runtime.applyModelAvailability(try oauthPolicyForIntegrationTest(a, "second", "account-b", old_policy));
+    try std.testing.expectEqual(@as(usize, 1), runtime.snapshot.?.models.len);
+    try std.testing.expectEqualStrings("other", runtime.snapshot.?.models[0].id);
+    try std.testing.expect(runtime.snapshot.?.model_unavailable);
+    const second_policy = try std.json.Stringify.valueAlloc(a, runtime.model_policy.?.value, .{});
+    defer a.free(second_policy);
+
+    // An unexpected OAuth response shape for another credential remains unknown.
+    try runtime.applyModelAvailability(try oauthPolicyForIntegrationTest(a, "malformed", "account-c", second_policy));
+    try runtime.event(pi_models.value, @splat(0));
+    try std.testing.expectEqual(@as(usize, 2), runtime.snapshot.?.models.len);
+    try std.testing.expect(!runtime.snapshot.?.model_unavailable);
+}
 pub const Options = struct {
     database_path: []const u8,
     project_path: []const u8,
@@ -665,13 +748,15 @@ pub const Runtime = struct {
     fn consumeModelAvailability(self: *Runtime) !void {
         const result = self.availability_worker.take() orelse return;
         defer if (result.bytes) |bytes| self.allocator.free(bytes);
-        var policy: ?std.json.Parsed(Value) = if (result.bytes) |bytes|
+        const policy: ?std.json.Parsed(Value) = if (result.bytes) |bytes|
             std.json.parseFromSlice(Value, self.allocator, bytes, .{ .allocate = .alloc_always }) catch null
         else
             null;
+        try self.applyModelAvailability(policy);
+    }
+    fn applyModelAvailability(self: *Runtime, policy: ?std.json.Parsed(Value)) !void {
         if (self.model_policy) |*previous| previous.deinit();
         self.model_policy = policy;
-        policy = null;
         self.state.model_availability_pending = false;
         try self.filterCurrentModels();
         self.checkSelectedModel();
