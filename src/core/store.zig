@@ -1,4 +1,5 @@
 const std = @import("std");
+const utf8 = @import("../text/utf8.zig");
 
 // One C boundary for the derived cache. This connection belongs to the core writer;
 // readers open their own read-only connection rather than sharing its statements.
@@ -120,10 +121,9 @@ pub const Activity = struct {
     len: u8 = 0,
 
     pub fn append(self: *Activity, text: []const u8) void {
-        var size = @min(text.len, self.bytes.len - self.len);
-        while (size > 0 and size < text.len and (text[size] & 0xc0) == 0x80) size -= 1;
-        @memcpy(self.bytes[self.len..][0..size], text[0..size]);
-        self.len += @intCast(size);
+        const kept = utf8.prefix(text, self.bytes.len - self.len);
+        @memcpy(self.bytes[self.len..][0..kept.len], kept);
+        self.len += @intCast(kept.len);
     }
 
     pub fn slice(self: *const Activity) []const u8 {

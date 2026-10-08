@@ -6,12 +6,34 @@ const p = executables.c;
 const storage = @import("store.zig");
 const protocol = @import("protocol.zig");
 const session = @import("session.zig");
+const utf8 = @import("../text/utf8.zig");
 const Value = std.json.Value;
 const record_limit = 1024 * 1024;
 
 pub const Behavior = enum { prompt, steer, follow_up };
 pub const Status = enum { stopped, starting, ready, streaming, stopping, needs_force_stop, exited, failed };
-pub const Model = struct { provider: []const u8, id: []const u8, name: []const u8 };
+pub const Model = struct {
+    provider: []const u8,
+    id: []const u8,
+    name: []const u8,
+
+    pub fn sameIdentity(self: Model, other: Model) bool {
+        return std.mem.eql(u8, self.provider, other.provider) and std.mem.eql(u8, self.id, other.id);
+    }
+
+    pub fn listsEqual(a: []const Model, b: []const Model) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |left, right| {
+            if (!std.mem.eql(u8, left.name, right.name) or !left.sameIdentity(right)) return false;
+        }
+        return true;
+    }
+};
+pub const PromptOutcome = enum { pending, accepted, rejected };
+
+pub fn commandId(buffer: *[32]u8, token: u64) []const u8 {
+    return std.fmt.bufPrint(buffer, "desktop-{d}", .{token}) catch unreachable;
+}
 pub const Options = struct {
     database_path: []const u8,
     project_path: []const u8,
@@ -54,16 +76,35 @@ pub const Snapshot = struct {
     role: []const u8 = "assistant",
     kind: []const u8 = "message",
     content_status: []const u8 = "",
-    pub fn deinit(self: *Snapshot) void {
-        inline for (.{ "model", "provider", "session_file", "session_id", "session_name", "thinking_level", "error_message", "attention", "pending_draft", "rejected_command_id", "accepted_command_id", "role", "kind", "content_status" }) |field| self.allocator.free(@field(self, field));
-        for (self.models) |m| {
-            self.allocator.free(m.provider);
-            self.allocator.free(m.id);
-            self.allocator.free(m.name);
+
+    pub fn promptOutcome(self: *const Snapshot, token: u64) PromptOutcome {
+        var buffer: [32]u8 = undefined;
+        const id = commandId(&buffer, token);
+        if (std.mem.eql(u8, self.accepted_command_id, id)) return .accepted;
+        if (std.mem.eql(u8, self.rejected_command_id, id)) return .rejected;
+        return .pending;
+    }
+
+    pub fn runCompleted(self: *const Snapshot, base_revision: u64) bool {
+        return self.status == .ready and self.visible_revision > base_revision and std.mem.eql(u8, self.content_status, "complete");
+    }
+
+    pub fn releaseChoices(self: *Snapshot) void {
+        for (self.models) |model| {
+            self.allocator.free(model.provider);
+            self.allocator.free(model.id);
+            self.allocator.free(model.name);
         }
         self.allocator.free(self.models);
+        self.models = &.{};
         for (self.thinking_levels) |level| self.allocator.free(level);
         self.allocator.free(self.thinking_levels);
+        self.thinking_levels = &.{};
+    }
+
+    pub fn deinit(self: *Snapshot) void {
+        inline for (.{ "model", "provider", "session_file", "session_id", "session_name", "thinking_level", "error_message", "attention", "pending_draft", "rejected_command_id", "accepted_command_id", "role", "kind", "content_status" }) |field| self.allocator.free(@field(self, field));
+        self.releaseChoices();
     }
 };
 
@@ -128,10 +169,9 @@ const Tool = struct {
 
     fn caption(self: *Tool, name: []const u8, args: Value) void {
         if (name.len > 0) {
-            var size = @min(name.len, self.name.len);
-            while (size > 0 and size < name.len and (name[size] & 0xc0) == 0x80) size -= 1;
-            @memcpy(self.name[0..size], name[0..size]);
-            self.name_len = @intCast(size);
+            const kept = utf8.prefix(name, self.name.len);
+            @memcpy(self.name[0..kept.len], kept);
+            self.name_len = @intCast(kept.len);
         }
         if (args != .null or self.activity.len == 0) self.activity = session.toolActivity(self.name[0..self.name_len], args);
     }
@@ -293,8 +333,8 @@ pub const Runtime = struct {
         if (self.worker_done or !self.accepting) return error.RuntimeClosed;
         if (self.inputs.items.len >= 128) return error.CommandQueueFull;
         const token = self.next_id;
-        const id = try std.fmt.allocPrint(self.allocator, "desktop-{d}", .{self.next_id});
-        defer self.allocator.free(id);
+        var id_buffer: [32]u8 = undefined;
+        const id = commandId(&id_buffer, self.next_id);
         self.next_id += 1;
         const base = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
         defer self.allocator.free(base);
@@ -632,7 +672,7 @@ pub const Runtime = struct {
     }
     fn rejectUnsent(self: *Runtime, token: u64) !void {
         var id_buffer: [32]u8 = undefined;
-        const id = try std.fmt.bufPrint(&id_buffer, "desktop-{d}", .{token});
+        const id = commandId(&id_buffer, token);
         native.SDL_LockMutex(self.mutex);
         defer native.SDL_UnlockMutex(self.mutex);
         try self.replace(&self.state.rejected_command_id, id);
