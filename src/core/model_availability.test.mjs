@@ -246,9 +246,11 @@ function piFixture() {
   return { root, agent, entry: join(root, "dist/bundle/cli.js") };
 }
 
-function runFixture(fixture) {
+function runFixture(fixture, inherited = {}) {
+  const env = { ...process.env, ...inherited, PI_CODING_AGENT_DIR: fixture.agent };
+  for (const key of ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY"]) delete env[key];
   return spawnSync(process.execPath, [resolve(dirname(fileURLToPath(import.meta.url)), "model_availability.mjs"), fixture.entry], {
-    encoding: "utf8", env: { ...process.env, PI_CODING_AGENT_DIR: fixture.agent },
+    encoding: "utf8", env,
   });
 }
 
@@ -259,7 +261,7 @@ test("helper starts against Pi's package layout and handles expired or unreadabl
       openai: { type: "oauth", access: "expired", refresh: "refresh", expires: 0 },
     }));
     writeFileSync(join(fixture.agent, "models.json"), JSON.stringify({ providers: { openai: {} } }));
-    let child = runFixture(fixture);
+    let child = runFixture(fixture, { GROQ_API_KEY: "must-never-reach-a-provider" });
     assert.equal(child.status, 0, child.stderr);
     assert.deepEqual(JSON.parse(child.stdout).providers.map(({ provider }) => provider).sort(),
       ["anthropic", "google", "groq", "openai-codex", "openrouter"].sort());

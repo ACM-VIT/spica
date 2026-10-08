@@ -1147,6 +1147,7 @@ pub const App = struct {
 
     fn submit(self: *App) !void {
         if (self.runtime_snapshot) |snapshot| if (snapshot.model_availability_pending) return error.ModelAvailabilityRefreshing;
+        if (self.runtime_snapshot) |snapshot| if (snapshot.model_change_pending) return error.ModelChangePending;
         if (self.runtime_snapshot) |snapshot| if (snapshot.model_unavailable) return error.ChooseAvailableModelBeforeSending;
         if (self.current_archived) return error.RestoreArchivedChatBeforeSending;
         if (self.enrollment_intent) return error.WorkspaceEnrollmentPending;
@@ -1626,8 +1627,19 @@ pub const App = struct {
             const expanded = self.model_hidden_expanded and hidden_count != 0;
             const available_height = @max(0, self.composer_bounds.y - 130 - error_height);
             const capacity: usize = @intFromFloat(@min(8, @floor(available_height / 44)));
-            const hidden_rows: usize = if (expanded and capacity != 0) @min(hidden_count, @max(1, capacity / 3)) else 0;
-            const active_rows = @min(if (active_count == 0 and capacity != 0) @as(usize, 1) else active_count, capacity - hidden_rows);
+            const selected_hidden = expanded and !self.model_selection_cleared and self.model_first >= active_count;
+            var hidden_rows: usize = 0;
+            var active_rows: usize = 0;
+            if (capacity == 1) {
+                if (selected_hidden or active_count == 0) hidden_rows = @min(hidden_count, 1) else active_rows = @min(active_count, 1);
+            } else if (capacity > 1) {
+                hidden_rows = if (expanded) @min(hidden_count, @max(1, capacity / 3)) else 0;
+                active_rows = @min(if (active_count == 0) @as(usize, 1) else active_count, capacity - hidden_rows);
+                if (active_count != 0 and active_rows == 0) {
+                    active_rows = 1;
+                    hidden_rows -|= 1;
+                }
+            }
             const height = @as(f32, @floatFromInt(active_rows + hidden_rows)) * 44 + 120 + error_height;
             const y = self.composer_bounds.y - height - 10;
             self.model_popup_bounds = .{ .x = x, .y = y, .w = width, .h = height };
@@ -2922,6 +2934,18 @@ test "model search filters names IDs and providers without editing the draft" {
     try std.testing.expect(app.model_hidden_expanded);
     try std.testing.expectEqual(@as(usize, 4), try app.modelCount());
     try std.testing.expectEqual(@as(?usize, 2), try app.modelIndex(3));
+    app.composer_bounds.y = 200;
+    app.model_first = 0;
+    app.button_count = 0;
+    try app.drawOverlays();
+    try std.testing.expectEqual(@as(f32, 44), app.model_section_bounds[0].h);
+    try std.testing.expectEqual(@as(f32, 0), app.model_section_bounds[1].h);
+    app.model_first = 3;
+    app.button_count = 0;
+    try app.drawOverlays();
+    try std.testing.expectEqual(@as(f32, 0), app.model_section_bounds[0].h);
+    try std.testing.expectEqual(@as(f32, 44), app.model_section_bounds[1].h);
+    app.composer_bounds.y = 440;
     app.button_count = 0;
     try app.drawOverlays();
     try std.testing.expect(app.model_section_bounds[1].y > app.model_section_bounds[0].y);
@@ -3165,6 +3189,16 @@ test "pending credential refresh keeps the user's draft and requires completion"
     defer app.editor.deinit();
     try app.editor.setText("keep this draft");
     try std.testing.expectError(error.ModelAvailabilityRefreshing, app.submit());
+    try std.testing.expectEqualStrings("keep this draft", app.editor.textBytes());
+}
+
+test "pending model changes keep the user's draft and require confirmation" {
+    var app: App = undefined;
+    app.runtime_snapshot = .{ .allocator = std.testing.allocator, .model_change_pending = true };
+    app.editor = try Composer.init(std.testing.allocator);
+    defer app.editor.deinit();
+    try app.editor.setText("keep this draft");
+    try std.testing.expectError(error.ModelChangePending, app.submit());
     try std.testing.expectEqualStrings("keep this draft", app.editor.textBytes());
 }
 

@@ -45,6 +45,37 @@ test "selected model availability follows the cached credential policy and prese
     runtime.checkSelectedModel();
     try std.testing.expect(!runtime.state.model_unavailable);
 }
+
+test "completed availability filters currently displayed rows before publication" {
+    const a = std.testing.allocator;
+    var policy = try std.json.parseFromSlice(Value, a,
+        \\{"providers":[{"provider":"one","availableIds":["allowed"]}]}
+    , .{});
+    defer policy.deinit();
+    const models = try a.alloc(Model, 2);
+    models[0] = .{ .provider = try a.dupe(u8, "one"), .id = try a.dupe(u8, "allowed"), .name = try a.dupe(u8, "Allowed") };
+    models[1] = .{ .provider = try a.dupe(u8, "one"), .id = try a.dupe(u8, "blocked"), .name = try a.dupe(u8, "Blocked") };
+    var runtime: Runtime = .{
+        .allocator = a,
+        .io = undefined,
+        .options = undefined,
+        .options_arena = undefined,
+        .mutex = undefined,
+        .wake = undefined,
+        .state = .{ .allocator = a, .models = models },
+        .model_policy = policy,
+    };
+    try runtime.filterCurrentModels();
+    try std.testing.expectEqual(@as(usize, 1), runtime.state.models.len);
+    try std.testing.expectEqualStrings("allowed", runtime.state.models[0].id);
+    for (runtime.state.models) |model| {
+        a.free(model.provider);
+        a.free(model.id);
+        a.free(model.name);
+    }
+    a.free(runtime.state.models);
+    runtime.model_policy = null;
+}
 pub const Options = struct {
     database_path: []const u8,
     project_path: []const u8,
@@ -80,6 +111,7 @@ pub const Snapshot = struct {
     models: []Model = &.{},
     model_unavailable: bool = false,
     model_availability_pending: bool = false,
+    model_change_pending: bool = false,
     thinking_levels: [][]const u8 = &.{},
     visible_content_ref: ?storage.ContentId = null,
     visible_revision: u64 = 0,
@@ -145,7 +177,7 @@ fn copySnapshot(a: std.mem.Allocator, original: Snapshot) !Snapshot {
     }
     return result;
 }
-const QueuedBytes = struct { data: []u8, command_id: ?u64 = null, prompt: bool = false, bash: bool = false, stop: bool = false };
+const QueuedBytes = struct { data: []u8, command_id: ?u64 = null, prompt: bool = false, model_change: bool = false, bash: bool = false, stop: bool = false };
 const Input = union(enum) { start, refresh_models, bytes: QueuedBytes, shutdown, force };
 const Pending = struct { id: []u8, draft: []u8 };
 const Block = struct { index: i64, id: storage.ContentId, length: u64 = 0 };
@@ -298,7 +330,6 @@ pub const Runtime = struct {
     pub fn destroy(self: *Runtime) !void {
         if (!self.isFinished()) return error.RuntimeStillRunning;
         self.thread.?.join();
-        self.availability_worker.destroy();
         for (self.inputs.items) |input| if (input == .bytes) self.allocator.free(input.bytes.data);
         self.inputs.deinit(self.allocator);
         if (self.snapshot) |*snap| snap.deinit();
@@ -358,7 +389,13 @@ pub const Runtime = struct {
             const pending_draft = try self.allocator.dupe(u8, text);
             self.pending.appendAssumeCapacity(.{ .id = pending_id, .draft = pending_draft });
         }
-        self.inputs.appendAssumeCapacity(.{ .bytes = .{ .data = line, .command_id = token, .prompt = draft != null, .bash = std.mem.eql(u8, value.type, "bash") } });
+        self.inputs.appendAssumeCapacity(.{ .bytes = .{
+            .data = line,
+            .command_id = token,
+            .prompt = draft != null,
+            .model_change = std.mem.eql(u8, value.type, "set_model"),
+            .bash = std.mem.eql(u8, value.type, "bash"),
+        } });
         p.spica_wake(self.wake[1]);
         return token;
     }
@@ -391,6 +428,9 @@ pub const Runtime = struct {
     fn run(self: *Runtime) void {
         defer native.SDL_CleanupTLS();
         defer {
+            // The runtime worker owns helper teardown. It may wait for the
+            // bounded child, but the UI only observes worker_done afterwards.
+            self.availability_worker.destroy();
             native.SDL_LockMutex(self.mutex);
             self.accepting = false;
             self.worker_done = true;
@@ -531,9 +571,11 @@ pub const Runtime = struct {
                     try self.replace(&self.state.error_message, "Pi is not accepting commands; unsent draft retained");
                     if (queued.command_id) |token| try self.rejectUnsent(token);
                     try self.publish();
-                } else if (queued.prompt and (self.state.model_availability_pending or self.state.model_unavailable)) {
+                } else if (queued.prompt and (self.state.model_availability_pending or self.state.model_change_pending or self.state.model_unavailable)) {
                     try self.replace(&self.state.error_message, if (self.state.model_availability_pending)
                         "Model access is still refreshing; draft retained"
+                    else if (self.state.model_change_pending)
+                        "Model change is still being confirmed; draft retained"
                     else
                         "Choose an available model before sending; draft retained");
                     if (queued.command_id) |token| try self.rejectUnsent(token);
@@ -542,6 +584,10 @@ pub const Runtime = struct {
                     if (self.outgoing.items.len + queued.data.len > 2 * 1024 * 1024) return error.OutgoingQueueFull;
                     try self.outgoing.appendSlice(self.allocator, queued.data);
                     if (queued.stop) self.stop_requested = true;
+                    if (queued.model_change) {
+                        self.state.model_change_pending = true;
+                        try self.publish();
+                    }
                     if (queued.bash) {
                         self.state.bash_running = true;
                         self.state.thinking_content_ref = null;
@@ -625,9 +671,40 @@ pub const Runtime = struct {
         self.model_policy = policy;
         policy = null;
         self.state.model_availability_pending = false;
+        try self.filterCurrentModels();
         self.checkSelectedModel();
         if (self.process.pid != 0 and self.process.input >= 0) try self.queue(.{ .type = "get_available_models" });
         try self.publish();
+    }
+    fn filterCurrentModels(self: *Runtime) !void {
+        const policy = self.model_policy orelse return;
+        var next: std.ArrayList(Model) = .empty;
+        errdefer {
+            for (next.items) |model| {
+                self.allocator.free(model.provider);
+                self.allocator.free(model.id);
+                self.allocator.free(model.name);
+            }
+            next.deinit(self.allocator);
+        }
+        for (self.state.models) |model| {
+            if (!availability.keep(policy.value, model)) continue;
+            const provider = try self.allocator.dupe(u8, model.provider);
+            errdefer self.allocator.free(provider);
+            const id = try self.allocator.dupe(u8, model.id);
+            errdefer self.allocator.free(id);
+            const name = try self.allocator.dupe(u8, model.name);
+            errdefer self.allocator.free(name);
+            try next.append(self.allocator, .{ .provider = provider, .id = id, .name = name });
+        }
+        const owned = try next.toOwnedSlice(self.allocator);
+        for (self.state.models) |model| {
+            self.allocator.free(model.provider);
+            self.allocator.free(model.id);
+            self.allocator.free(model.name);
+        }
+        self.allocator.free(self.state.models);
+        self.state.models = owned;
     }
     fn checkSelectedModel(self: *Runtime) void {
         self.state.model_unavailable = if (self.model_policy) |policy|
@@ -876,6 +953,7 @@ pub const Runtime = struct {
                 const model = child(data, "model");
                 try self.replace(&self.state.model, string(model, "id"));
                 try self.replace(&self.state.provider, string(model, "provider"));
+                self.state.model_change_pending = false;
                 self.checkSelectedModel();
                 self.state.status = if (self.closing) .stopping else if (boolean(data, "isStreaming")) .streaming else .ready;
                 if (self.state.session_file.len > 0) {
