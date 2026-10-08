@@ -48,7 +48,7 @@ const ParkedChat = struct {
     trust: ?bool,
     model_restore: ?ModelRestore = null,
     attachments: Attachments.List = .{},
-    cleared_attachments: Attachments.List = .{},
+    cleared_attachments: Attachments.Submissions = .{},
     draft: []u8,
     caret: usize,
     anchor: usize,
@@ -108,6 +108,11 @@ const PendingMutation = struct {
 };
 const Button = struct { bounds: c.SDL_FRect, action: Action };
 
+fn acceptedToken(id: []const u8) u64 {
+    if (!std.mem.startsWith(u8, id, "desktop-")) return 0;
+    return std.fmt.parseInt(u64, id[8..], 10) catch 0;
+}
+
 fn modelsEqual(a: []const pi.Model, b: []const pi.Model) bool {
     if (a.len != b.len) return false;
     for (a, b) |left, right| {
@@ -156,10 +161,10 @@ pub const App = struct {
     model_restore: ?ModelRestore = null,
     runtime_retiring: bool = false,
     attachments: Attachments.List = .{},
-    accepted_attachments: Attachments.List = .{},
+    accepted_attachments: Attachments.Submissions = .{},
     next_attachment_id: u64 = 1,
     attachment_first: usize = 0,
-    file_picker_pending: bool = false,
+    file_picker_pending: ?*AttachmentPlatform.Selection = null,
     accepted_draft: ?[]u8 = null,
     closing: bool = false,
     force_dialog: bool = false,
@@ -367,6 +372,7 @@ pub const App = struct {
         if (self.model_restore) |*settings| settings.deinit(self.allocator);
         if (self.accepted_draft) |draft| self.allocator.free(draft);
         self.saveDraft() catch |err| std.log.err("final draft queue: {s}", .{@errorName(err)});
+        if (self.file_picker_pending) |selection| selection.destroy();
         self.attachments.deinit(self.allocator);
         self.accepted_attachments.deinit(self.allocator);
         self.draft_writer.destroy();
@@ -828,7 +834,7 @@ pub const App = struct {
     }
 
     fn closeSettled(self: *const App) bool {
-        if (self.file_picker_pending) return false;
+        if (self.file_picker_pending != null) return false;
         if (!self.ownedRuntimesFinished() or self.pending_mutation != null or self.submitted_prompt != null or
             (self.enrollment_intent and !self.enrollment_failed)) return false;
         for (self.parked_chats.items) |chat| if (chat.submitted != null or (chat.enrollment_intent and !chat.enrollment_failed)) return false;
@@ -923,11 +929,13 @@ pub const App = struct {
                             self.report("Retaining accepted draft", err);
                             return;
                         };
+                        self.accepted_attachments.accept(self.allocator, submitted.token, saved, &self.attachments) catch |err| {
+                            self.allocator.free(saved);
+                            self.report("Retaining accepted attachments", err);
+                            return;
+                        };
                         if (self.accepted_draft) |old| self.allocator.free(old);
                         self.accepted_draft = saved;
-                        self.accepted_attachments.deinit(self.allocator);
-                        self.accepted_attachments = self.attachments;
-                        self.attachments = .{};
                         self.editor.selectAll();
                         self.editor.insert("", .paste) catch |err| {
                             self.report("Clearing accepted draft", err);
@@ -941,10 +949,7 @@ pub const App = struct {
                 }
             }
             if (recovery_changed and snapshot.pending_draft.len != 0 and self.editor.len == 0 and self.attachments.items.items.len == 0 and self.submitted_prompt == null) {
-                const recovered = Attachments.recover(self.allocator, snapshot.pending_draft, self.accepted_draft, &self.accepted_attachments, &self.attachments) catch |err| {
-                    self.report("Recovering attachments", err);
-                    return;
-                };
+                const recovered = self.accepted_attachments.recover(snapshot.recovery_token, snapshot.pending_draft, &self.attachments);
                 self.editor.insert(recovered, .paste) catch |err| {
                     self.report("Recovering cancelled input; raw source retained", err);
                     return;
@@ -963,8 +968,7 @@ pub const App = struct {
             }
             if (changed_error and snapshot.visible_length == 0 and snapshot.status == .ready and self.run_started != null and self.accepted_clear_revision == self.draft_revision and self.editor.len == 0) {
                 if (self.attachments.items.items.len == 0) {
-                    self.attachments = self.accepted_attachments;
-                    self.accepted_attachments = .{};
+                    _ = self.accepted_attachments.recover(acceptedToken(snapshot.accepted_command_id), self.accepted_draft orelse "", &self.attachments);
                 }
                 if (self.editor.undo()) {
                     self.edited();
@@ -973,6 +977,7 @@ pub const App = struct {
                     self.edited();
                 }
             }
+            self.accepted_attachments.prune(self.allocator, snapshot.recoverable_tokens[0..snapshot.recoverable_count], snapshot.recovery_token);
             if (self.run_started) |started| {
                 if (snapshot.status == .ready and snapshot.visible_revision > self.run_base_revision and std.mem.eql(u8, snapshot.content_status, "complete")) {
                     self.run_elapsed = c.SDL_GetTicks() - started;
@@ -1053,12 +1058,10 @@ pub const App = struct {
                 if (chat.draft_revision == submitted.draft_revision) {
                     const cleared = try self.allocator.dupe(u8, chat.draft);
                     errdefer self.allocator.free(cleared);
+                    try chat.cleared_attachments.accept(self.allocator, submitted.token, cleared, &chat.attachments);
                     try self.replaceParkedDraft(chat, "");
                     if (chat.cleared_draft) |draft| self.allocator.free(draft);
                     chat.cleared_draft = cleared;
-                    chat.cleared_attachments.deinit(self.allocator);
-                    chat.cleared_attachments = chat.attachments;
-                    chat.attachments = .{};
                     chat.accepted_clear_revision = chat.draft_revision;
                 }
             } else if (std.mem.eql(u8, incoming.rejected_command_id, id) or chat.runtime.?.isFinished()) {
@@ -1066,7 +1069,7 @@ pub const App = struct {
             }
         }
         if (recovery_changed and incoming.pending_draft.len != 0 and chat.draft.len == 0 and chat.attachments.items.items.len == 0 and chat.submitted == null) {
-            const recovered = try Attachments.recover(self.allocator, incoming.pending_draft, chat.cleared_draft, &chat.cleared_attachments, &chat.attachments);
+            const recovered = chat.cleared_attachments.recover(incoming.recovery_token, incoming.pending_draft, &chat.attachments);
             try self.replaceParkedDraft(chat, recovered);
         }
         if (incoming.session_file.len != 0 and (chat.path == null or !std.mem.eql(u8, chat.path.?, incoming.session_file))) {
@@ -1079,10 +1082,10 @@ pub const App = struct {
         {
             if (chat.cleared_draft) |draft| try self.replaceParkedDraft(chat, draft);
             if (chat.attachments.items.items.len == 0) {
-                chat.attachments = chat.cleared_attachments;
-                chat.cleared_attachments = .{};
+                _ = chat.cleared_attachments.recover(acceptedToken(incoming.accepted_command_id), chat.cleared_draft orelse "", &chat.attachments);
             }
         }
+        chat.cleared_attachments.prune(self.allocator, incoming.recoverable_tokens[0..incoming.recoverable_count], incoming.recovery_token);
         if (chat.run_started) |started| {
             if (incoming.status == .ready and incoming.visible_revision > chat.run_base_revision and std.mem.eql(u8, incoming.content_status, "complete")) {
                 chat.run_elapsed = c.SDL_GetTicks() - started;
@@ -1324,9 +1327,8 @@ pub const App = struct {
 
     fn act(self: *App, action: Action) !void {
         switch (action) {
-            .add_files => if (!self.file_picker_pending) {
-                try AttachmentPlatform.pick(self.window, self.wake_event, self.chat_id);
-                self.file_picker_pending = true;
+            .add_files => if (self.file_picker_pending == null) {
+                self.file_picker_pending = try AttachmentPlatform.pick(self.window, self.wake_event, self.chat_id);
             },
             .remove_attachment => |index| if (index < self.attachments.items.items.len) {
                 self.attachments.remove(self.allocator, index);
@@ -1664,7 +1666,20 @@ pub const App = struct {
         }
     }
 
+    fn consumeFilePicker(self: *App) !void {
+        const selection = self.file_picker_pending orelse return;
+        if (!selection.completed.load(.acquire)) return;
+        self.file_picker_pending = null;
+        defer selection.destroy();
+        self.dirty = true;
+        if (selection.failure) |err| return err;
+        if (!self.closing) {
+            for (selection.paths) |path| if (path) |chosen| self.queueAttachment(selection.chat_id, chosen, null) catch |err| self.report("Adding file", err);
+        }
+    }
+
     fn consume(self: *App) void {
+        self.consumeFilePicker() catch |err| self.report("Choosing files", err);
         self.consumeRuntime();
         self.consumeParked();
         while (self.catalog_worker.takeMutation()) |result| {
@@ -2443,6 +2458,7 @@ pub const App = struct {
                 const remaining: c_int = @intCast(@min(2147483647, due -| c.SDL_GetTicks()));
                 timeout = if (timeout == -1) remaining else @min(timeout, remaining);
             }
+            if (self.file_picker_pending != null) timeout = if (timeout == -1) 100 else @min(timeout, 100);
             var event: c.SDL_Event = undefined;
             if (c.SDL_WaitEventTimeout(&event, timeout)) {
                 self.handle(&event) catch |err| self.report("Input", err);
@@ -2465,14 +2481,7 @@ pub const App = struct {
         const event = &logical;
         if (event.type == self.wake_event) {
             if (event.user.code == 3) {
-                self.file_picker_pending = false;
-                const selection: *AttachmentPlatform.Selection = @ptrCast(@alignCast(event.user.data1.?));
-                defer selection.destroy();
-                if (selection.failure) |err| return err;
-                if (!self.closing) {
-                    for (selection.paths) |path| if (path) |chosen| self.queueAttachment(selection.chat_id, chosen, null) catch |err| self.report("Adding file", err);
-                }
-                self.dirty = true;
+                try self.consumeFilePicker();
                 return;
             }
             if (event.user.code == 2) {
@@ -3334,6 +3343,8 @@ test "background prompt acknowledgements clear only the submitted chat revision"
             .allocator = allocator,
             .status = .streaming,
             .accepted_command_id = try allocator.dupe(u8, "desktop-11"),
+            .recoverable_tokens = .{11} ++ @as([127]u64, @splat(0)),
+            .recoverable_count = 1,
             .role = try allocator.dupe(u8, "assistant"),
             .kind = try allocator.dupe(u8, "message"),
         };
@@ -3347,7 +3358,7 @@ test "background prompt acknowledgements clear only the submitted chat revision"
         }
         try std.testing.expectEqualStrings("active chat draft", app.editor.textBytes());
         try std.testing.expectEqual(@as(usize, @intFromBool(edited_after_send)), chat.attachments.items.items.len);
-        try std.testing.expectEqual(@as(usize, @intFromBool(!edited_after_send)), chat.cleared_attachments.items.items.len);
+        try std.testing.expectEqual(@as(usize, @intFromBool(!edited_after_send)), chat.cleared_attachments.entries.items.len);
         const recovery = pi.Snapshot{
             .allocator = allocator,
             .status = .streaming,
@@ -3391,4 +3402,143 @@ test "asynchronous attachment results route to parked draft and removal discards
     result.chat_id = 99;
     try app.acceptAttachment(&result);
     try std.testing.expectEqual(@as(usize, 1), app.attachments.items.items.len);
+}
+
+fn attachmentTestChat(a: std.mem.Allocator, id: u64) !ParkedChat {
+    return .{
+        .id = id,
+        .runtime = null,
+        .snapshot = .{ .allocator = a, .status = .ready, .role = try a.dupe(u8, "assistant"), .kind = try a.dupe(u8, "message") },
+        .cwd = try a.dupeZ(u8, "/project"),
+        .path = null,
+        .trust = false,
+        .draft = try a.dupe(u8, ""),
+        .caret = 0,
+        .anchor = 0,
+        .draft_revision = 0,
+        .submitted = null,
+        .accepted_clear_revision = null,
+        .title = undefined,
+        .title_len = 0,
+        .view = .existing,
+        .archived = false,
+        .member = true,
+        .enrollment_intent = false,
+        .accepted_enrollment = false,
+        .enrollment_failed = false,
+        .run_started = null,
+        .run_base_revision = 0,
+        .run_elapsed = null,
+        .behavior = .prompt,
+        .error_text = undefined,
+        .error_len = 0,
+        .scroll = 0,
+    };
+}
+
+test "completed parked submissions release the global budget before another image is admitted" {
+    const a = std.testing.allocator;
+    var app: App = undefined;
+    app.allocator = a;
+    app.chat_id = 99;
+    app.attachments = .{};
+    defer app.attachments.deinit(a);
+    app.accepted_attachments = .{};
+    defer app.accepted_attachments.deinit(a);
+    app.parked_chats = .empty;
+    defer {
+        for (app.parked_chats.items) |*chat| chat.deinit(a);
+        app.parked_chats.deinit(a);
+    }
+    app.dirty = false;
+    app.force_dialog = false;
+    for (0..4) |index| {
+        var chat = try attachmentTestChat(a, index + 1);
+        const data = try std.heap.page_allocator.alloc(u8, 4 * 1024 * 1024);
+        @memset(data, 'A');
+        try chat.attachments.items.append(a, .{ .id = index + 1, .name = try a.dupe(u8, "3 MiB image"), .image = .{ .data = data, .mimeType = "image/png" }, .loading = false });
+        try chat.cleared_attachments.accept(a, 1, "completed", &chat.attachments);
+        try app.parked_chats.append(a, chat);
+    }
+    try std.testing.expectEqual(Attachments.max_retained_bytes, app.retainedAttachmentBytes());
+    for (app.parked_chats.items) |*chat| {
+        try app.consumeParkedSnapshot(chat, .{ .allocator = a, .status = .ready, .role = try a.dupe(u8, "assistant"), .kind = try a.dupe(u8, "message") });
+    }
+    try std.testing.expectEqual(@as(usize, 0), app.retainedAttachmentBytes());
+    const surface = c.SDL_CreateSurface(100, 100, c.SDL_PIXELFORMAT_RGBA32) orelse return error.SurfaceCreation;
+    defer c.SDL_DestroySurface(surface);
+    app.renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.RendererCreation;
+    defer {
+        app.attachments.deinit(a);
+        c.SDL_DestroyRenderer(app.renderer);
+    }
+    try app.attachments.items.append(a, .{ .id = 100, .name = try a.dupe(u8, "new image") });
+    var prepared = try Attachments.prepare(std.testing.io, .{ .chat_id = 99, .id = 100, .path = @constCast(".deps/src/sdl_image-release-3.4.6/test/sample.png") });
+    defer prepared.deinit();
+    try app.acceptAttachment(&prepared);
+    try std.testing.expect(app.attachments.ready());
+    try std.testing.expect(app.attachments.items.items[0].image != null);
+}
+
+test "parked cancellation recovers an older image after accepting a later steer" {
+    const a = std.testing.allocator;
+    var app: App = undefined;
+    app.allocator = a;
+    app.dirty = false;
+    app.force_dialog = false;
+    var chat = try attachmentTestChat(a, 7);
+    defer chat.deinit(a);
+    for ([_]u64{ 11, 12 }) |token| {
+        try app.replaceParkedDraft(&chat, if (token == 11) "older follow-up" else "later steer");
+        try chat.attachments.items.append(a, .{ .id = token, .name = try a.dupe(u8, "image"), .image = .{ .data = try std.heap.page_allocator.dupe(u8, if (token == 11) "YWJj" else "ZGVm"), .mimeType = "image/png" }, .loading = false });
+        chat.submitted = .{ .token = token, .draft_revision = chat.draft_revision };
+        var snapshot: pi.Snapshot = .{
+            .allocator = a,
+            .status = .ready,
+            .accepted_command_id = try std.fmt.allocPrint(a, "desktop-{d}", .{token}),
+            .role = try a.dupe(u8, "assistant"),
+            .kind = try a.dupe(u8, "message"),
+            .recoverable_count = if (token == 11) 1 else 2,
+        };
+        snapshot.recoverable_tokens[0] = 11;
+        snapshot.recoverable_tokens[1] = 12;
+        try app.consumeParkedSnapshot(&chat, snapshot);
+    }
+    try std.testing.expectEqual(@as(usize, 2), chat.cleared_attachments.entries.items.len);
+    try app.consumeParkedSnapshot(&chat, .{
+        .allocator = a,
+        .status = .ready,
+        .pending_draft = try a.dupe(u8, "older follow-up"),
+        .recovery_revision = 1,
+        .recovery_token = 11,
+        .role = try a.dupe(u8, "assistant"),
+        .kind = try a.dupe(u8, "message"),
+    });
+    try std.testing.expectEqualStrings("older follow-up", chat.draft);
+    try std.testing.expectEqual(@as(usize, 1), chat.attachments.items.items.len);
+    try std.testing.expectEqual(@as(u64, 11), chat.attachments.items.items[0].id);
+    try std.testing.expectEqualStrings("YWJj", chat.attachments.items.items[0].image.?.data);
+    try std.testing.expectEqual(@as(usize, 0), chat.cleared_attachments.bytes());
+}
+
+test "polling picker completion clears pending state and allows close without a wake event" {
+    var app: App = undefined;
+    app.closing = true;
+    app.dirty = false;
+    app.runtime = null;
+    app.parked_chats = .empty;
+    app.pending_mutation = null;
+    app.submitted_prompt = null;
+    app.enrollment_intent = false;
+    app.enrollment_failed = false;
+    const selection = try std.heap.page_allocator.create(AttachmentPlatform.Selection);
+    selection.* = .{ .event = 0, .chat_id = 7 };
+    app.file_picker_pending = selection;
+    try std.testing.expect(!app.closeSettled());
+    try app.consumeFilePicker();
+    try std.testing.expect(app.file_picker_pending != null);
+    selection.completed.store(true, .release);
+    try app.consumeFilePicker();
+    try std.testing.expect(app.file_picker_pending == null);
+    try std.testing.expect(app.closeSettled());
 }

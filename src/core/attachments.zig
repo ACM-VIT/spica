@@ -72,18 +72,55 @@ pub fn message(allocator: std.mem.Allocator, text: []const u8, items: []const It
     return std.fmt.allocPrint(allocator, "{s}\n\nAttached local files (absolute paths; use your file tools to read them):\n{s}", .{ body, references });
 }
 
-/// Queue recovery supplies only Pi's message string. Restore images only when
-/// it matches the retained submission, never onto an unrelated recovered draft.
-pub fn recover(allocator: std.mem.Allocator, recovered: []const u8, text: ?[]const u8, accepted: *List, target: *List) ![]const u8 {
-    if (accepted.items.items.len == 0 or target.items.items.len != 0) return recovered;
-    const original = text orelse return recovered;
-    const sent = try message(allocator, original, accepted.items.items);
-    defer allocator.free(sent);
-    if (!std.mem.eql(u8, sent, recovered)) return recovered;
-    target.* = accepted.*;
-    accepted.* = .{};
-    return original;
-}
+/// Accepted drafts stay tied to their RPC token until Pi consumes or cancels
+/// them. A later acknowledgement must not replace an earlier queued image.
+pub const Submissions = struct {
+    const Entry = struct { token: u64, text: []u8, attachments: List };
+    entries: std.ArrayList(Entry) = .empty,
+
+    pub fn deinit(self: *Submissions, allocator: std.mem.Allocator) void {
+        for (self.entries.items) |*entry| {
+            allocator.free(entry.text);
+            entry.attachments.deinit(allocator);
+        }
+        self.entries.deinit(allocator);
+        self.* = .{};
+    }
+    pub fn bytes(self: Submissions) usize {
+        var total: usize = 0;
+        for (self.entries.items) |entry| total += entry.attachments.bytes();
+        return total;
+    }
+    pub fn accept(self: *Submissions, allocator: std.mem.Allocator, token: u64, text: []const u8, source: *List) !void {
+        if (source.items.items.len == 0) return;
+        const owned = try allocator.dupe(u8, text);
+        errdefer allocator.free(owned);
+        try self.entries.append(allocator, .{ .token = token, .text = owned, .attachments = source.* });
+        source.* = .{};
+    }
+    pub fn recover(self: *Submissions, token: u64, recovered: []const u8, target: *List) []const u8 {
+        if (target.items.items.len != 0) return recovered;
+        for (self.entries.items) |*entry| if (entry.token == token) {
+            target.* = entry.attachments;
+            entry.attachments = .{};
+            return entry.text;
+        };
+        return recovered;
+    }
+    pub fn prune(self: *Submissions, allocator: std.mem.Allocator, recoverable: []const u64, recovery: u64) void {
+        var index: usize = 0;
+        while (index < self.entries.items.len) {
+            const token = self.entries.items[index].token;
+            if (token == recovery or std.mem.indexOfScalar(u64, recoverable, token) != null) {
+                index += 1;
+                continue;
+            }
+            var entry = self.entries.orderedRemove(index);
+            allocator.free(entry.text);
+            entry.attachments.deinit(allocator);
+        }
+    }
+};
 
 pub const Request = struct {
     chat_id: u64,
@@ -206,22 +243,24 @@ test "image preparation preserves exact bytes and nonimages remain local paths" 
     try std.testing.expectError(error.ImagePreviewFailed, prepare(std.testing.io, .{ .chat_id = 1, .id = 1, .clipboard = @constCast("\x89PNG\r\n\x1a\ncorrupt") }));
 }
 
-test "only matching Pi queue recovery moves accepted attachments" {
+test "submission recovery preserves an older queued image after a later acknowledgement" {
     const a = std.testing.allocator;
-    var accepted: List = .{};
-    defer accepted.deinit(a);
-    var target: List = .{};
-    defer target.deinit(a);
-    try accepted.items.append(a, .{ .id = 1, .name = try a.dupe(u8, "doc"), .path = try a.dupeZ(u8, "/tmp/doc"), .loading = false });
-    const sent = try message(a, "", accepted.items.items);
-    defer a.free(sent);
-    try std.testing.expectEqualStrings("different draft", try recover(a, "different draft", "", &accepted, &target));
-    try std.testing.expectEqual(@as(usize, 1), accepted.items.items.len);
-    try std.testing.expectEqualStrings("", try recover(a, sent, "", &accepted, &target));
-    try std.testing.expectEqual(@as(usize, 0), accepted.items.items.len);
-    try std.testing.expectEqual(@as(usize, 1), target.items.items.len);
-    target.remove(a, 0);
-    try std.testing.expectEqual(@as(usize, 0), target.items.items.len);
+    var submissions: Submissions = .{};
+    defer submissions.deinit(a);
+    var draft: List = .{};
+    defer draft.deinit(a);
+    for ([_]u64{ 1, 2 }) |token| {
+        try draft.items.append(a, .{ .id = token, .name = try a.dupe(u8, "image"), .image = .{ .data = try std.heap.page_allocator.dupe(u8, "YWJj"), .mimeType = "image/png" }, .loading = false });
+        try submissions.accept(a, token, if (token == 1) "older follow-up" else "later steer", &draft);
+    }
+    submissions.prune(a, &.{1}, 1);
+    try std.testing.expectEqual(@as(usize, 4), submissions.bytes());
+    try std.testing.expectEqualStrings("unrelated", submissions.recover(99, "unrelated", &draft));
+    try std.testing.expectEqualStrings("older follow-up", submissions.recover(1, "wire text", &draft));
+    try std.testing.expectEqual(@as(u64, 1), draft.items.items[0].id);
+    try std.testing.expectEqualStrings("YWJj", draft.items.items[0].image.?.data);
+    submissions.prune(a, &.{}, 0);
+    try std.testing.expectEqual(@as(usize, 0), submissions.entries.items.len);
 }
 
 extern fn mkfifo(path: [*:0]const u8, mode: c_uint) c_int;
