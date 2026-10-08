@@ -1,7 +1,7 @@
 const std = @import("std");
 const storage = @import("store.zig");
 const Value = std.json.Value;
-const limit = 1024 * 1024;
+const limit = @import("attachments.zig").max_command_bytes;
 fn child(v: Value, key: []const u8) Value {
     return if (v == .object) v.object.get(key) orelse .null else .null;
 }

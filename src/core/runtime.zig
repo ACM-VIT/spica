@@ -7,7 +7,9 @@ const storage = @import("store.zig");
 const protocol = @import("protocol.zig");
 const session = @import("session.zig");
 const Value = std.json.Value;
-const record_limit = 1024 * 1024;
+const attachments = @import("attachments.zig");
+const record_limit = attachments.max_command_bytes;
+const wire_budget = 2 * attachments.max_command_bytes;
 
 pub const Behavior = enum { prompt, steer, follow_up };
 pub const Status = enum { stopped, starting, ready, streaming, stopping, needs_force_stop, exited, failed };
@@ -41,6 +43,9 @@ pub const Snapshot = struct {
     visible_active_ordinal: i64 = -1,
     pending_draft: []const u8 = "",
     recovery_revision: u64 = 0,
+    recovery_token: u64 = 0,
+    recoverable_tokens: [128]u64 = @splat(0),
+    recoverable_count: usize = 0,
     queued_count: usize = 0,
     rejected_command_id: []const u8 = "",
     accepted_command_id: []const u8 = "",
@@ -112,7 +117,22 @@ fn copySnapshot(a: std.mem.Allocator, original: Snapshot) !Snapshot {
 }
 const QueuedBytes = struct { data: []u8, command_id: ?u64 = null, bash: bool = false, stop: bool = false };
 const Input = union(enum) { start, bytes: QueuedBytes, shutdown, force };
-const Pending = struct { id: []u8, draft: []u8 };
+const Pending = struct {
+    id: []u8,
+    draft: []u8,
+    token: u64 = 0,
+    images_digest: [32]u8 = @splat(0),
+    accepted: bool = false,
+    consumed: bool = false,
+    cancelled: bool = false,
+};
+
+fn hashImage(hash: *std.crypto.hash.sha2.Sha256, data: []const u8, mime: []const u8) void {
+    hash.update(data);
+    hash.update("\x00");
+    hash.update(mime);
+    hash.update("\x00");
+}
 const Block = struct { index: i64, id: storage.ContentId, length: u64 = 0 };
 const Tool = struct {
     id: []u8,
@@ -154,6 +174,7 @@ pub const Runtime = struct {
     process: p.SpicaProcess = .{ .input = -1, .output = -1, .@"error" = -1, .exit_fd = -1, .pid = 0 },
     store: ?storage.Store = null,
     sink: Sink = undefined,
+    wire_bytes: usize = 0, // Protected by mutex; input queue + unwritten pipe bytes.
     next_id: u64 = 1,
     content_counter: u64 = 1,
     outgoing: std.ArrayList(u8) = .empty,
@@ -210,8 +231,16 @@ pub const Runtime = struct {
         try self.enqueue(.start);
     }
     pub fn sendPrompt(self: *Runtime, bytes: []const u8, behavior: Behavior) !u64 {
-        if (bytes.len == 0 or bytes.len > 65536) return error.InvalidPrompt;
-        return self.command(.{ .type = @tagName(behavior), .message = bytes }, bytes);
+        return self.sendAttachments(bytes, &.{}, behavior);
+    }
+    pub fn sendAttachments(self: *Runtime, bytes: []const u8, images: []const attachments.Image, behavior: Behavior) !u64 {
+        if (bytes.len == 0 or bytes.len > 128 * 1024 or images.len > attachments.max_count) return error.InvalidPrompt;
+        var size: usize = 0;
+        for (images) |image| {
+            if (image.data.len > attachments.max_draft_bytes - size) return error.ImageTooLarge;
+            size += image.data.len;
+        }
+        return self.command(.{ .type = @tagName(behavior), .message = bytes, .images = images }, bytes);
     }
     pub fn bash(self: *Runtime, bytes: []const u8) !void {
         _ = try self.command(.{ .type = "bash", .command = bytes }, null);
@@ -283,7 +312,10 @@ pub const Runtime = struct {
         defer native.SDL_UnlockMutex(self.mutex);
         if (self.worker_done or (!self.accepting and input != .force)) return error.RuntimeClosed;
         if (self.inputs.items.len >= 128) return error.CommandQueueFull;
+        const size = if (input == .bytes) input.bytes.data.len else 0;
+        if (size > wire_budget - self.wire_bytes) return error.OutgoingQueueFull;
         try self.inputs.append(self.allocator, input);
+        self.wire_bytes += size;
         if (input == .shutdown) self.accepting = false;
         p.spica_wake(self.wake[1]);
     }
@@ -300,7 +332,9 @@ pub const Runtime = struct {
         defer self.allocator.free(base);
         const line = try std.fmt.allocPrint(self.allocator, "{{\"id\":\"{s}\",{s}\n", .{ id, base[1..] });
         errdefer self.allocator.free(line);
-        if (line.len > 128 * 1024) return error.CommandTooLarge;
+        const command_limit: usize = if (@hasField(@TypeOf(value), "images")) attachments.max_command_bytes else 128 * 1024;
+        if (line.len > command_limit) return error.CommandTooLarge;
+        if (line.len > wire_budget - self.wire_bytes) return error.OutgoingQueueFull;
         try self.inputs.ensureUnusedCapacity(self.allocator, 1);
         if (draft) |text| {
             if (self.pending.items.len >= 128) return error.CommandQueueFull;
@@ -308,9 +342,12 @@ pub const Runtime = struct {
             const pending_id = try self.allocator.dupe(u8, id);
             errdefer self.allocator.free(pending_id);
             const pending_draft = try self.allocator.dupe(u8, text);
-            self.pending.appendAssumeCapacity(.{ .id = pending_id, .draft = pending_draft });
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            if (@hasField(@TypeOf(value), "images")) for (value.images) |image| hashImage(&hash, image.data, image.mimeType);
+            self.pending.appendAssumeCapacity(.{ .id = pending_id, .draft = pending_draft, .token = token, .images_digest = hash.finalResult() });
         }
         self.inputs.appendAssumeCapacity(.{ .bytes = .{ .data = line, .command_id = token, .bash = std.mem.eql(u8, value.type, "bash") } });
+        self.wire_bytes += line.len;
         p.spica_wake(self.wake[1]);
         return token;
     }
@@ -322,8 +359,13 @@ pub const Runtime = struct {
     }
     fn publish(self: *Runtime) !void {
         self.state.revision += 1;
-        const snap = try copySnapshot(self.allocator, self.state);
+        var snap = try copySnapshot(self.allocator, self.state);
         native.SDL_LockMutex(self.mutex);
+        snap.recoverable_count = 0;
+        for (self.pending.items) |item| if (!item.consumed) {
+            snap.recoverable_tokens[snap.recoverable_count] = item.token;
+            snap.recoverable_count += 1;
+        };
         const notify = self.snapshot == null;
         if (self.snapshot) |*old| old.deinit();
         self.snapshot = snap;
@@ -432,9 +474,17 @@ pub const Runtime = struct {
             if (bits & 8 != 0) {
                 const n = p.spica_process_write(self.process.input, self.outgoing.items.ptr + self.write_offset, self.outgoing.items.len - self.write_offset);
                 if (n == -1) return error.ProcessInputClosed;
-                if (n > 0) self.write_offset += @intCast(n);
+                if (n > 0) {
+                    self.write_offset += @intCast(n);
+                    native.SDL_LockMutex(self.mutex);
+                    self.wire_bytes -|= @intCast(n);
+                    native.SDL_UnlockMutex(self.mutex);
+                }
                 if (self.write_offset == self.outgoing.items.len) {
-                    self.outgoing.clearRetainingCapacity();
+                    if (self.outgoing.capacity > 128 * 1024) {
+                        self.outgoing.deinit(self.allocator);
+                        self.outgoing = .empty;
+                    } else self.outgoing.clearRetainingCapacity();
                     self.write_offset = 0;
                 }
             }
@@ -478,11 +528,15 @@ pub const Runtime = struct {
             },
             .bytes => |queued| {
                 if (self.process.pid == 0 or self.process.input < 0) {
+                    native.SDL_LockMutex(self.mutex);
+                    self.wire_bytes -|= queued.data.len;
+                    native.SDL_UnlockMutex(self.mutex);
                     try self.replace(&self.state.error_message, "Pi is not accepting commands; unsent draft retained");
                     if (queued.command_id) |token| try self.rejectUnsent(token);
                     try self.publish();
                 } else {
-                    if (self.outgoing.items.len + queued.data.len > 2 * 1024 * 1024) return error.OutgoingQueueFull;
+                    self.compactOutgoing();
+                    if (self.outgoing.items.len + queued.data.len > wire_budget) return error.OutgoingQueueFull;
                     try self.outgoing.appendSlice(self.allocator, queued.data);
                     if (queued.stop) self.stop_requested = true;
                     if (queued.bash) {
@@ -529,11 +583,24 @@ pub const Runtime = struct {
     fn requestState(self: *Runtime) !void {
         try self.queue(.{ .type = "get_state", .id = self.state.generation });
     }
+    fn compactOutgoing(self: *Runtime) void {
+        if (self.write_offset == 0) return;
+        const remaining = self.outgoing.items.len - self.write_offset;
+        std.mem.copyForwards(u8, self.outgoing.items[0..remaining], self.outgoing.items[self.write_offset..]);
+        self.outgoing.items.len = remaining;
+        self.write_offset = 0;
+    }
     fn queue(self: *Runtime, value: anytype) !void {
         const bytes = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
         defer self.allocator.free(bytes);
-        try self.outgoing.appendSlice(self.allocator, bytes);
-        try self.outgoing.append(self.allocator, '\n');
+        self.compactOutgoing();
+        native.SDL_LockMutex(self.mutex);
+        defer native.SDL_UnlockMutex(self.mutex);
+        if (bytes.len + 1 > wire_budget - self.wire_bytes) return error.OutgoingQueueFull;
+        try self.outgoing.ensureUnusedCapacity(self.allocator, bytes.len + 1);
+        self.outgoing.appendSliceAssumeCapacity(bytes);
+        self.outgoing.appendAssumeCapacity('\n');
+        self.wire_bytes += bytes.len + 1;
     }
     fn readStdout(self: *Runtime, framer: *protocol.Framer(Sink)) !void {
         var b: [65536]u8 = undefined;
@@ -603,6 +670,7 @@ pub const Runtime = struct {
     }
     fn offerRecovery(self: *Runtime, text: []const u8) !void {
         try self.replace(&self.state.pending_draft, text);
+        self.state.recovery_token = 0;
         if (text.len != 0) self.state.recovery_revision += 1;
     }
 
@@ -621,7 +689,36 @@ pub const Runtime = struct {
                 if (std.mem.eql(u8, item.string, self.last_prompt)) draft = item;
             }
         }
+        native.SDL_LockMutex(self.mutex);
+        defer native.SDL_UnlockMutex(self.mutex);
         try self.offerRecovery(draft.string);
+        // Pi returns strings, so prefer the newest matching local submission.
+        for (self.pending.items) |item| if (!item.consumed and std.mem.eql(u8, item.draft, draft.string)) {
+            self.state.recovery_token = item.token;
+        };
+        var index: usize = 0;
+        while (index < self.pending.items.len) {
+            const item = self.pending.items[index];
+            var cancelled = false;
+            inline for (.{ steering, follow_up }) |queue_value| {
+                for (queue_value.array.items) |entry| if (std.mem.eql(u8, item.draft, entry.string)) {
+                    cancelled = true;
+                };
+            }
+            if (!cancelled or item.consumed) {
+                index += 1;
+                continue;
+            }
+            if (!item.accepted) {
+                self.pending.items[index].consumed = true;
+                self.pending.items[index].cancelled = true;
+                index += 1;
+                continue;
+            }
+            self.allocator.free(item.id);
+            self.allocator.free(item.draft);
+            _ = self.pending.orderedRemove(index);
+        }
         try self.replace(&self.state.attention, "Cancelled queued messages retained in protocol cache");
     }
 
@@ -629,6 +726,7 @@ pub const Runtime = struct {
         native.SDL_LockMutex(self.mutex);
         defer native.SDL_UnlockMutex(self.mutex);
         try self.offerRecovery(if (self.pending.items.len > 0) self.pending.items[self.pending.items.len - 1].draft else self.last_prompt);
+        if (self.pending.items.len > 0) self.state.recovery_token = self.pending.items[self.pending.items.len - 1].token;
     }
     fn rejectUnsent(self: *Runtime, token: u64) !void {
         var id_buffer: [32]u8 = undefined;
@@ -638,6 +736,7 @@ pub const Runtime = struct {
         try self.replace(&self.state.rejected_command_id, id);
         for (self.pending.items, 0..) |item, i| if (std.mem.eql(u8, id, item.id)) {
             try self.offerRecovery(item.draft);
+            self.state.recovery_token = item.token;
             self.allocator.free(item.id);
             self.allocator.free(item.draft);
             _ = self.pending.orderedRemove(i);
@@ -651,6 +750,7 @@ pub const Runtime = struct {
             const latest = self.pending.items[self.pending.items.len - 1];
             try self.replace(&self.state.rejected_command_id, latest.id);
             try self.offerRecovery(latest.draft);
+            self.state.recovery_token = latest.token;
         }
         for (self.pending.items) |item| {
             self.allocator.free(item.id);
@@ -667,10 +767,20 @@ pub const Runtime = struct {
             if (boolean(value, "success")) {
                 try self.replace(&self.state.accepted_command_id, id);
                 try self.replace(&self.last_prompt, item.draft);
-                try self.replace(&self.state.pending_draft, "");
+                if (!item.cancelled) {
+                    try self.replace(&self.state.pending_draft, "");
+                    self.state.recovery_token = 0;
+                }
+                self.pending.items[i].accepted = true;
+                const disposition = string(child(value, "data"), "disposition");
+                // Started input has passed preflight (including normalization),
+                // and handled input is complete without a user-message event.
+                if (std.mem.eql(u8, disposition, "started") or std.mem.eql(u8, disposition, "handled")) self.pending.items[i].consumed = true;
+                if (!self.pending.items[i].consumed) break;
             } else {
                 try self.replace(&self.state.rejected_command_id, id);
                 try self.offerRecovery(item.draft);
+                self.state.recovery_token = item.token;
             }
             self.allocator.free(item.id);
             self.allocator.free(item.draft);
@@ -678,6 +788,49 @@ pub const Runtime = struct {
             break;
         };
     }
+    fn finishConsumedSubmissions(self: *Runtime) void {
+        // Extensions/templates can rewrite queued text. Once Pi reports idle
+        // with no queue, those accepted submissions no longer need recovery.
+        native.SDL_LockMutex(self.mutex);
+        defer native.SDL_UnlockMutex(self.mutex);
+        var index: usize = 0;
+        while (index < self.pending.items.len) {
+            const item = self.pending.items[index];
+            if (!item.accepted) {
+                index += 1;
+                continue;
+            }
+            self.allocator.free(item.id);
+            self.allocator.free(item.draft);
+            _ = self.pending.orderedRemove(index);
+        }
+    }
+
+    fn consumeSubmission(self: *Runtime, message: Value) !void {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(self.allocator);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        const content_value = child(message, "content");
+        if (content_value == .string) try text.appendSlice(self.allocator, content_value.string);
+        if (content_value == .array) for (content_value.array.items) |block| {
+            if (std.mem.eql(u8, string(block, "type"), "text")) try text.appendSlice(self.allocator, string(block, "text"));
+            if (std.mem.eql(u8, string(block, "type"), "image")) hashImage(&hash, string(block, "data"), string(block, "mimeType"));
+        };
+        const digest = hash.finalResult();
+        native.SDL_LockMutex(self.mutex);
+        defer native.SDL_UnlockMutex(self.mutex);
+        for (self.pending.items, 0..) |*item, index| {
+            if (item.consumed or !std.mem.eql(u8, item.draft, text.items) or !std.mem.eql(u8, &item.images_digest, &digest)) continue;
+            item.consumed = true;
+            if (item.accepted) {
+                self.allocator.free(item.id);
+                self.allocator.free(item.draft);
+                _ = self.pending.orderedRemove(index);
+            }
+            break;
+        }
+    }
+
     pub fn visible(self: *Runtime, id: storage.ContentId, length: u64, role: []const u8, kind: []const u8, status: []const u8) !void {
         self.state.visible_content_ref = id;
         self.state.visible_length = length;
@@ -777,6 +930,7 @@ pub const Runtime = struct {
                 try self.replace(&self.state.model, string(model, "id"));
                 try self.replace(&self.state.provider, string(model, "provider"));
                 self.state.status = if (self.closing) .stopping else if (boolean(data, "isStreaming")) .streaming else .ready;
+                if (!boolean(data, "isStreaming") and self.state.queued_count == 0) self.finishConsumedSubmissions();
                 if (self.state.session_file.len > 0) {
                     try self.persistSession();
                     try self.requestEntries();
@@ -912,6 +1066,7 @@ pub const Runtime = struct {
                 self.state.thinking_content_ref = null;
                 self.state.thinking_length = 0;
             } else if (std.mem.eql(u8, string(message, "role"), "user")) {
+                try self.consumeSubmission(message);
                 self.sequence += 1;
                 const text = try session.messageText(self.allocator, message);
                 defer self.allocator.free(text);
@@ -1266,4 +1421,154 @@ test "completed agents reconcile idle state while queued work remains streaming"
         try runtime.event(parsed.value, @splat(0));
         try std.testing.expectEqual(if (index == events.len - 1) Status.ready else Status.streaming, runtime.snapshot.?.status);
     }
+}
+
+test "RPC image payloads survive prompt steer follow-up and queue pressure rejects synchronously" {
+    const a = std.testing.allocator;
+    const mutex = native.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer native.SDL_DestroyMutex(mutex);
+    var wake: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), p.spica_wake_create(&wake));
+    defer p.spica_close(wake[0]);
+    defer p.spica_close(wake[1]);
+    var runtime: Runtime = .{
+        .allocator = a,
+        .io = undefined,
+        .options = undefined,
+        .options_arena = undefined,
+        .mutex = mutex,
+        .wake = wake,
+        .state = .{ .allocator = a },
+    };
+    defer {
+        for (runtime.inputs.items) |input| if (input == .bytes) a.free(input.bytes.data);
+        runtime.inputs.deinit(a);
+        for (runtime.pending.items) |item| {
+            a.free(item.id);
+            a.free(item.draft);
+        }
+        runtime.pending.deinit(a);
+    }
+    // Bigger than the previous 128 KiB command cap, without requiring a model.
+    const data = try a.alloc(u8, 256 * 1024);
+    defer a.free(data);
+    @memset(data, 'A');
+    const images = [_]attachments.Image{.{ .data = data, .mimeType = "image/png" }};
+    for ([_]Behavior{ .prompt, .steer, .follow_up }, 0..) |behavior, index| {
+        _ = try runtime.sendAttachments("inspect", &images, behavior);
+        const line = runtime.inputs.items[index].bytes.data;
+        var parsed = try std.json.parseFromSlice(Value, a, line, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(@tagName(behavior), parsed.value.object.get("type").?.string);
+        const image = parsed.value.object.get("images").?.array.items[0].object;
+        try std.testing.expectEqualStrings("image", image.get("type").?.string);
+        try std.testing.expectEqualStrings("image/png", image.get("mimeType").?.string);
+        try std.testing.expectEqualStrings(data, image.get("data").?.string);
+    }
+    runtime.wire_bytes = wire_budget;
+    try std.testing.expectError(error.OutgoingQueueFull, runtime.sendAttachments("inspect", &images, .prompt));
+    try std.testing.expectEqual(@as(usize, 3), runtime.inputs.items.len);
+    try std.testing.expectEqual(@as(usize, 3), runtime.pending.items.len);
+    try std.testing.expect(runtime.accepting and !runtime.worker_done);
+}
+
+test "queued submission tokens survive later consumption and cancellation selects the older token" {
+    const a = std.testing.allocator;
+    const mutex = native.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer native.SDL_DestroyMutex(mutex);
+    var wake: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), p.spica_wake_create(&wake));
+    defer p.spica_close(wake[0]);
+    defer p.spica_close(wake[1]);
+    var runtime: Runtime = .{
+        .allocator = a,
+        .io = undefined,
+        .options = .{ .database_path = "", .project_path = "", .wake_event = native.SDL_EVENT_USER },
+        .options_arena = undefined,
+        .mutex = mutex,
+        .wake = wake,
+        .state = try copySnapshot(a, .{ .allocator = a }),
+        .last_prompt = try a.dupe(u8, ""),
+    };
+    defer {
+        runtime.state.deinit();
+        if (runtime.snapshot) |*snapshot| snapshot.deinit();
+        a.free(runtime.last_prompt);
+        for (runtime.inputs.items) |input| a.free(input.bytes.data);
+        runtime.inputs.deinit(a);
+        for (runtime.pending.items) |item| {
+            a.free(item.id);
+            a.free(item.draft);
+        }
+        runtime.pending.deinit(a);
+    }
+    const image = [_]attachments.Image{.{ .data = "YWJj", .mimeType = "image/png" }};
+    _ = try runtime.sendAttachments("same text", &image, .follow_up);
+    const ack1 = try std.json.parseFromSlice(Value, a,
+        \\{"id":"desktop-1","success":true,"data":{"disposition":"queued"}}
+    , .{});
+    defer ack1.deinit();
+    try runtime.acknowledge(ack1.value);
+    _ = try runtime.sendAttachments("same text", &.{}, .steer);
+    const ack2 = try std.json.parseFromSlice(Value, a,
+        \\{"id":"desktop-2","success":true,"data":{"disposition":"queued"}}
+    , .{});
+    defer ack2.deinit();
+    try runtime.acknowledge(ack2.value);
+    const consumed = try std.json.parseFromSlice(Value, a,
+        \\{"role":"user","content":[{"type":"text","text":"same text"}]}
+    , .{});
+    defer consumed.deinit();
+    try runtime.consumeSubmission(consumed.value);
+    try runtime.publish();
+    try std.testing.expectEqual(@as(usize, 1), runtime.snapshot.?.recoverable_count);
+    try std.testing.expectEqual(@as(u64, 1), runtime.snapshot.?.recoverable_tokens[0]);
+    const cancelled = try std.json.parseFromSlice(Value, a,
+        \\{"steering":[],"followUp":["same text"]}
+    , .{});
+    defer cancelled.deinit();
+    try runtime.recoverCancelledQueue(cancelled.value);
+    try runtime.publish();
+    try std.testing.expectEqual(@as(u64, 1), runtime.snapshot.?.recovery_token);
+    try std.testing.expectEqualStrings("same text", runtime.snapshot.?.pending_draft);
+    try std.testing.expectEqual(@as(usize, 0), runtime.snapshot.?.recoverable_count);
+
+    // Completed, extension-handled prompts have no message_start event.
+    _ = try runtime.sendAttachments("handled", &image, .prompt);
+    const handled = try std.json.parseFromSlice(Value, a,
+        \\{"id":"desktop-3","success":true,"data":{"disposition":"handled"}}
+    , .{});
+    defer handled.deinit();
+    try runtime.acknowledge(handled.value);
+    try runtime.publish();
+    try std.testing.expectEqual(@as(usize, 0), runtime.snapshot.?.recoverable_count);
+    try std.testing.expectEqual(@as(u64, 0), runtime.snapshot.?.recovery_token);
+
+    // Consumption can precede the corresponding RPC acknowledgement.
+    _ = try runtime.sendAttachments("same text", &.{}, .follow_up);
+    try runtime.consumeSubmission(consumed.value);
+    const late_ack = try std.json.parseFromSlice(Value, a,
+        \\{"id":"desktop-4","success":true,"data":{"disposition":"queued"}}
+    , .{});
+    defer late_ack.deinit();
+    try runtime.acknowledge(late_ack.value);
+    try std.testing.expectEqual(@as(usize, 0), runtime.pending.items.len);
+
+    // clear_queue can also reply before the queued command is acknowledged.
+    _ = try runtime.sendAttachments("cancel before ack", &image, .follow_up);
+    const early_cancel = try std.json.parseFromSlice(Value, a,
+        \\{"steering":[],"followUp":["cancel before ack"]}
+    , .{});
+    defer early_cancel.deinit();
+    try runtime.recoverCancelledQueue(early_cancel.value);
+    const cancelled_ack = try std.json.parseFromSlice(Value, a,
+        \\{"id":"desktop-5","success":true,"data":{"disposition":"queued"}}
+    , .{});
+    defer cancelled_ack.deinit();
+    try runtime.acknowledge(cancelled_ack.value);
+    try runtime.publish();
+    try std.testing.expectEqualStrings("desktop-5", runtime.snapshot.?.accepted_command_id);
+    try std.testing.expectEqual(@as(u64, 5), runtime.snapshot.?.recovery_token);
+    try std.testing.expectEqualStrings("cancel before ack", runtime.snapshot.?.pending_draft);
+    try std.testing.expectEqual(@as(usize, 0), runtime.snapshot.?.recoverable_count);
 }
