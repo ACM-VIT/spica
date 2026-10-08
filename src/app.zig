@@ -1434,7 +1434,12 @@ pub const App = struct {
             },
             .toggle_hidden_models => {
                 self.model_hidden_expanded = !self.model_hidden_expanded;
-                self.model_first = @min(self.model_first, (try self.modelCount()) -| 1);
+                const count = try self.modelCount();
+                if (self.model_hidden_expanded and self.model_search.active_len < count) {
+                    // The disclosure must reveal a hidden row even when the
+                    // scaled window has room for only one model row.
+                    self.model_first = self.model_search.active_len;
+                } else self.model_first = @min(self.model_first, count -| 1);
                 self.model_selection_cleared = false;
                 self.button_count = 0;
             },
@@ -1631,7 +1636,7 @@ pub const App = struct {
             var hidden_rows: usize = 0;
             var active_rows: usize = 0;
             if (capacity == 1) {
-                if (selected_hidden or active_count == 0) hidden_rows = @min(hidden_count, 1) else active_rows = @min(active_count, 1);
+                if (expanded and hidden_count != 0 and (selected_hidden or active_count == 0)) hidden_rows = 1 else active_rows = 1;
             } else if (capacity > 1) {
                 hidden_rows = if (expanded) @min(hidden_count, @max(1, capacity / 3)) else 0;
                 active_rows = @min(if (active_count == 0) @as(usize, 1) else active_count, capacity - hidden_rows);
@@ -1667,7 +1672,7 @@ pub const App = struct {
             self.model_section_bounds[1] = .{ .x = x + 8, .y = disclosure_y + 32, .w = width - 16, .h = @as(f32, @floatFromInt(hidden_rows)) * 44 };
             if (self.runtime_snapshot) |snapshot| {
                 self.model_first = @min(self.model_first, count -| 1);
-                if (active_count == 0) try self.label(if (snapshot.models.len == 0) "No configured models" else if (hidden_count != 0) "No active models match" else "No matching models", x + 12, rows_y + 10, 13, colors.muted);
+                if (active_count == 0 and active_rows != 0) try self.label(if (snapshot.models.len == 0) "No configured models" else if (hidden_count != 0) "No active models match" else "No matching models", x + 12, rows_y + 10, 13, colors.muted);
                 try self.drawModelSection(snapshot.models, 0, 0, active_count, active_rows);
                 if (expanded) try self.drawModelSection(snapshot.models, 1, active_count, hidden_count, hidden_rows);
             } else try self.label("Start pi to discover models", x + 12, rows_y + 10, 13, colors.muted);
@@ -2940,11 +2945,20 @@ test "model search filters names IDs and providers without editing the draft" {
     try app.drawOverlays();
     try std.testing.expectEqual(@as(f32, 44), app.model_section_bounds[0].h);
     try std.testing.expectEqual(@as(f32, 0), app.model_section_bounds[1].h);
-    app.model_first = 3;
+    try app.act(.toggle_hidden_models);
+    try std.testing.expect(!app.model_hidden_expanded);
+    try app.act(.toggle_hidden_models);
+    try std.testing.expect(app.model_hidden_expanded);
+    try std.testing.expectEqual(app.model_search.active_len, app.model_first);
     app.button_count = 0;
     try app.drawOverlays();
     try std.testing.expectEqual(@as(f32, 0), app.model_section_bounds[0].h);
     try std.testing.expectEqual(@as(f32, 44), app.model_section_bounds[1].h);
+    var hidden_restore_visible = false;
+    for (app.buttons[0..app.button_count]) |button_value| {
+        if (button_value.action == .toggle_model_visibility and button_value.action.toggle_model_visibility == 2) hidden_restore_visible = true;
+    }
+    try std.testing.expect(hidden_restore_visible);
     app.composer_bounds.y = 440;
     app.button_count = 0;
     try app.drawOverlays();

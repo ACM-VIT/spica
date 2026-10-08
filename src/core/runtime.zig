@@ -216,6 +216,7 @@ pub const Runtime = struct {
     snapshot: ?Snapshot = null,
     state: Snapshot,
     model_policy: ?std.json.Parsed(Value) = null,
+    model_changes_inflight: usize = 0,
     availability_worker: *AvailabilityWorker = undefined,
     closing: bool = false,
     accepting: bool = true,
@@ -585,6 +586,7 @@ pub const Runtime = struct {
                     try self.outgoing.appendSlice(self.allocator, queued.data);
                     if (queued.stop) self.stop_requested = true;
                     if (queued.model_change) {
+                        self.model_changes_inflight += 1;
                         self.state.model_change_pending = true;
                         try self.publish();
                     }
@@ -935,6 +937,10 @@ pub const Runtime = struct {
             // new_session must never import the outgoing history into its successor.
             if ((std.mem.eql(u8, command_name, "get_state") or std.mem.eql(u8, command_name, "get_entries")) and integer(value, "id") != self.state.generation) return;
             try self.acknowledge(value);
+            if (std.mem.eql(u8, command_name, "set_model")) {
+                self.model_changes_inflight -|= 1;
+                self.state.model_change_pending = self.model_changes_inflight != 0;
+            }
             if (!boolean(value, "success")) {
                 if (std.mem.eql(u8, string(value, "command"), "bash")) self.state.bash_running = false;
                 if (std.mem.eql(u8, string(value, "command"), "get_entries")) {
@@ -953,7 +959,6 @@ pub const Runtime = struct {
                 const model = child(data, "model");
                 try self.replace(&self.state.model, string(model, "id"));
                 try self.replace(&self.state.provider, string(model, "provider"));
-                self.state.model_change_pending = false;
                 self.checkSelectedModel();
                 self.state.status = if (self.closing) .stopping else if (boolean(data, "isStreaming")) .streaming else .ready;
                 if (self.state.session_file.len > 0) {
@@ -1026,6 +1031,7 @@ pub const Runtime = struct {
             } else if (std.mem.eql(u8, command_name, "set_model")) {
                 try self.replace(&self.state.model, string(data, "id"));
                 try self.replace(&self.state.provider, string(data, "provider"));
+                self.checkSelectedModel();
                 self.clearThinkingLevels();
                 try self.requestState();
                 try self.queue(.{ .type = "get_available_thinking_levels" });
@@ -1456,4 +1462,33 @@ test "completed agents reconcile idle state while queued work remains streaming"
         try runtime.event(parsed.value, @splat(0));
         try std.testing.expectEqual(if (index == events.len - 1) Status.ready else Status.streaming, runtime.snapshot.?.status);
     }
+}
+
+test "failed model choices release the send guard while concurrent choices remain guarded" {
+    const allocator = std.testing.allocator;
+    const mutex = native.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer native.SDL_DestroyMutex(mutex);
+    var runtime: Runtime = .{
+        .allocator = allocator,
+        .io = undefined,
+        .options = .{ .database_path = "", .project_path = "", .wake_event = native.SDL_EVENT_USER },
+        .options_arena = undefined,
+        .mutex = mutex,
+        .wake = undefined,
+        .state = try copySnapshot(allocator, .{ .allocator = allocator, .model = "working", .provider = "openai", .model_change_pending = true }),
+        .model_changes_inflight = 2,
+    };
+    defer runtime.state.deinit();
+    defer if (runtime.snapshot) |*snapshot| snapshot.deinit();
+    const failed = try std.json.parseFromSlice(Value, allocator,
+        \\{"type":"response","command":"set_model","success":false,"error":"unavailable"}
+    , .{});
+    defer failed.deinit();
+    try runtime.event(failed.value, @splat(0));
+    try std.testing.expect(runtime.state.model_change_pending);
+    try std.testing.expectEqual(@as(usize, 1), runtime.model_changes_inflight);
+    try runtime.event(failed.value, @splat(0));
+    try std.testing.expect(!runtime.state.model_change_pending);
+    try std.testing.expectEqual(@as(usize, 0), runtime.model_changes_inflight);
+    try std.testing.expectEqualStrings("working", runtime.state.model);
 }
