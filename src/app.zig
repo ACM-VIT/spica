@@ -3,17 +3,17 @@ const builtin = @import("builtin");
 const c = @import("native/bindings.zig").c;
 const Clay = @import("ui/clay.zig").Layout;
 const theme_module = @import("ui/theme.zig");
-const transcript_view = @import("ui/transcript.zig");
+const transcript_view = @import("features/transcript/view.zig");
 const TranscriptView = transcript_view.View;
 const widgets = @import("ui/widgets.zig");
 const LabelCache = @import("ui/label_cache.zig").LabelCache;
 const label_cache = @import("ui/label_cache.zig");
 const HitTargets = @import("ui/hit_targets.zig").HitTargets;
 const EditorView = @import("ui/editor_view.zig").EditorView;
-const ModelPicker = @import("ui/model_picker.zig").Picker;
-const ThinkingMenu = @import("ui/thinking_menu.zig").Menu;
-const Settings = @import("ui/settings.zig");
-const Library = @import("ui/library.zig");
+const ModelPicker = @import("features/models/picker.zig").Picker;
+const ThinkingMenu = @import("features/models/thinking.zig").Menu;
+const Settings = @import("features/settings/settings.zig");
+const Library = @import("features/library/panel.zig");
 const Composer = @import("text/composer.zig").Composer;
 const utf8 = @import("text/utf8.zig");
 const ContentWorker = @import("content/worker.zig");
@@ -23,11 +23,11 @@ const SessionCatalog = @import("core/catalog.zig");
 const Options = @import("options.zig").Options;
 const Paths = @import("platform/paths.zig").Paths;
 const build_options = @import("build_options");
-const chat = @import("app/chat.zig");
-const processes = @import("app/processes.zig");
-const updates = @import("app/updates.zig");
-const workspace = @import("app/workspace.zig");
-const conversation = @import("app/conversation.zig");
+const chat = @import("features/chat/chat.zig");
+const processes = @import("features/chat/processes.zig");
+const updates = @import("features/chat/updates.zig");
+const workspace = @import("features/library/workspace.zig");
+const conversation = @import("features/transcript/conversation.zig");
 const input = @import("app/input.zig");
 const view = @import("app/view.zig");
 
@@ -146,6 +146,13 @@ pub const App = struct {
             return error.SDLInitialization;
         }
         errdefer c.SDL_Quit();
+        // The software renderer draws into the window's framebuffer surface. Linux and Windows
+        // provide one natively, and the hint keeps SDL from routing it through a GPU renderer.
+        // Cocoa has no native window framebuffer, so SDL emulates one with a GPU renderer; with
+        // the hint set to "0" that emulation is off and SDL_CreateRenderer fails ("Window
+        // framebuffer support not available"). macOS therefore skips the hint: the CPU still
+        // draws every frame, and Metal (built into macOS, nothing to install) only presents it.
+        // SDL's Wayland backend has no native framebuffer either, so Wayland skips it too.
         const video_driver = if (c.SDL_GetCurrentVideoDriver()) |name| std.mem.span(name) else "";
         const native_framebuffer = builtin.os.tag != .macos and !std.mem.eql(u8, video_driver, "wayland");
         if (options.renderer == .software and native_framebuffer) _ = c.SDL_SetHint(c.SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
@@ -417,7 +424,7 @@ test {
     _ = conversation;
     _ = input;
     _ = view;
-    _ = @import("app/sidebar.zig");
-    _ = @import("app/menus.zig");
+    _ = @import("features/library/sidebar.zig");
+    _ = @import("features/models/menus.zig");
     _ = @import("app/commands.zig");
 }

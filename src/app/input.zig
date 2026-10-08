@@ -4,12 +4,12 @@ const widgets = @import("../ui/widgets.zig");
 const clipboard = @import("../ui/clipboard.zig");
 const App = @import("../app.zig").App;
 const commands = @import("commands.zig");
-const chat = @import("chat.zig");
-const processes = @import("processes.zig");
-const workspace = @import("workspace.zig");
-const conversation = @import("conversation.zig");
-const sidebar = @import("sidebar.zig");
-const menus = @import("menus.zig");
+const chat = @import("../features/chat/chat.zig");
+const processes = @import("../features/chat/processes.zig");
+const workspace = @import("../features/library/workspace.zig");
+const conversation = @import("../features/transcript/conversation.zig");
+const sidebar = @import("../features/library/sidebar.zig");
+const menus = @import("../features/models/menus.zig");
 
 const act = commands.act;
 
@@ -273,6 +273,7 @@ fn editorKey(app: *App, event: *const c.SDL_Event, command: bool, shift: bool) !
             app.dirty = true;
         },
         c.SDLK_RETURN, c.SDLK_KP_ENTER => {
+            // A held Enter must not send: its repeats can outlive the menu that consumed the first press.
             if (app.runtime != null and !shift) {
                 if (!event.key.repeat) try chat.submit(app);
             } else {

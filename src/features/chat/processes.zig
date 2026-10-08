@@ -1,10 +1,10 @@
 const std = @import("std");
-const c = @import("../native/bindings.zig").c;
-const pi = @import("../core/runtime.zig");
-const App = @import("../app.zig").App;
+const c = @import("../../native/bindings.zig").c;
+const pi = @import("../../core/runtime.zig");
+const App = @import("../../app.zig").App;
 const chat = @import("chat.zig");
-const menus = @import("menus.zig");
-const workspace = @import("workspace.zig");
+const menus = @import("../models/menus.zig");
+const workspace = @import("../library/workspace.zig");
 const updates = @import("updates.zig");
 
 pub fn runtimeStatus(app: *const App) pi.Status {

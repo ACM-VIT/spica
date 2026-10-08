@@ -1,5 +1,5 @@
 const std = @import("std");
-const Theme = @import("theme.zig");
+const Theme = @import("../../ui/theme.zig");
 
 pub const Action = enum {
     close,

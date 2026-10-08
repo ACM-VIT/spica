@@ -1,8 +1,8 @@
 const std = @import("std");
-const c = @import("../native/bindings.zig").c;
-const pi = @import("../core/runtime.zig");
-const widgets = @import("../ui/widgets.zig");
-const App = @import("../app.zig").App;
+const c = @import("../../native/bindings.zig").c;
+const pi = @import("../../core/runtime.zig");
+const widgets = @import("../../ui/widgets.zig");
+const App = @import("../../app.zig").App;
 
 pub fn modelChoices(app: *const App) []const pi.Model {
     return if (app.runtime_snapshot) |snapshot| snapshot.models else &.{};
@@ -28,6 +28,8 @@ pub fn selectedModelIndex(app: *App) !?usize {
     return app.model_picker.selected(modelChoices(app), query(app));
 }
 
+// Called before releasing the old snapshot, so identity comparisons borrow
+// its strings and retain only an index into the incoming model list.
 pub fn updateModelSearch(app: *App, incoming: []const pi.Model) !void {
     if (app.runtime_snapshot) |old| if (pi.Model.listsEqual(old.models, incoming)) return;
     if (try app.model_picker.replaceModels(modelChoices(app), incoming, query(app))) app.buttons.clear();
@@ -37,6 +39,7 @@ pub fn toggleModelMenu(app: *App) void {
     if (app.model_picker.open) {
         closeModelMenu(app);
     } else {
+        // Mutually exclusive popups share the library's bounded query editor.
         app.library.resetQuery();
         app.model_picker.restart();
         app.model_picker.open = true;
@@ -224,10 +227,10 @@ pub fn drawThinkingMenu(app: *App) !void {
     }
 }
 
-const Composer = @import("../text/composer.zig").Composer;
-const Library = @import("../ui/library.zig");
-const input = @import("input.zig");
-const commands = @import("commands.zig");
+const Composer = @import("../../text/composer.zig").Composer;
+const Library = @import("../library/panel.zig");
+const input = @import("../../app/input.zig");
+const commands = @import("../../app/commands.zig");
 
 test "model search filters names IDs and providers without editing the draft" {
     const allocator = std.testing.allocator;
@@ -329,6 +332,7 @@ test "model search filters names IDs and providers without editing the draft" {
     try input.handle(&app, &event);
     try std.testing.expectEqual(@as(usize, 0), app.model_picker.first);
     try std.testing.expectEqualStrings("keep this message draft", app.editor.textBytes());
+    // Rejected input keeps the current results and leaves an error for the popup.
     event.type = c.SDL_EVENT_TEXT_INPUT;
     event.text.text = "x" ** 257;
     try input.handle(&app, &event);
@@ -340,7 +344,8 @@ test "model search filters names IDs and providers without editing the draft" {
     event.key.mod = 0;
     try input.handle(&app, &event);
     try std.testing.expect(app.library.input_err == null);
-    const p = @import("../platform/executables.zig").c;
+    // Exercise Enter through the existing set_model action without starting Pi.
+    const p = @import("../../platform/executables.zig").c;
     const mutex = c.SDL_CreateMutex() orelse return error.MutexCreation;
     defer c.SDL_DestroyMutex(mutex);
     var wake: [2]c_int = undefined;
@@ -439,6 +444,7 @@ test "model picker snapshot refresh preserves identity and clears disappeared se
     try std.testing.expectEqual(@as(usize, 0), app.model_picker.first);
     try std.testing.expectEqual(@as(?usize, 0), try selectedModelIndex(&app));
     try std.testing.expectEqualStrings("opus", app.library.queryBytes());
+    // Same ID from a different provider must not replace the disappeared choice.
     const removed = [_]pi.Model{original[1]};
     try updateModelSearch(&app, &removed);
     app.runtime_snapshot.?.models = @constCast(&removed);
@@ -448,6 +454,7 @@ test "model picker snapshot refresh preserves identity and clears disappeared se
     try updateModelSearch(&app, &restored);
     app.runtime_snapshot.?.models = @constCast(&restored);
     try std.testing.expect(try selectedModelIndex(&app) == null);
+    // A deliberate query edit re-enables selection.
     var event = std.mem.zeroes(c.SDL_Event);
     event.type = c.SDL_EVENT_TEXT_INPUT;
     event.text.text = " ";
@@ -502,7 +509,7 @@ test "thinking menu keys choose through Pi and held Enter never sends the draft"
     app.runtime_snapshot = .{ .allocator = allocator, .thinking_levels = &levels, .thinking_level = "low" };
     app.thinking_menu.highlightCurrent(&levels, "low");
 
-    const p = @import("../platform/executables.zig").c;
+    const p = @import("../../platform/executables.zig").c;
     const mutex = c.SDL_CreateMutex() orelse return error.MutexCreation;
     defer c.SDL_DestroyMutex(mutex);
     var wake: [2]c_int = undefined;
@@ -524,6 +531,7 @@ test "thinking menu keys choose through Pi and held Enter never sends the draft"
     }
     app.runtime = &runtime;
     app.runtime_retiring = false;
+    // Escape closes without choosing and leaves the draft and its selection alone.
     var event = std.mem.zeroes(c.SDL_Event);
     event.type = c.SDL_EVENT_KEY_DOWN;
     event.key.key = c.SDLK_ESCAPE;
@@ -532,6 +540,7 @@ test "thinking menu keys choose through Pi and held Enter never sends the draft"
     try std.testing.expectEqual(@as(usize, 0), runtime.inputs.items.len);
     try std.testing.expectEqualStrings("unfinished draft", app.editor.textBytes());
     try std.testing.expectEqual(draft_selection, app.editor.selection());
+    // Enter sends the highlighted level and closes the menu.
     try commands.act(&app, .thinking);
     try std.testing.expectEqual(@as(?usize, 1), app.thinking_menu.selected(thinkingLevels(&app)));
     event.key.key = c.SDLK_DOWN;
@@ -544,6 +553,7 @@ test "thinking menu keys choose through Pi and held Enter never sends the draft"
     defer command.deinit();
     try std.testing.expectEqualStrings("set_thinking_level", command.value.object.get("type").?.string);
     try std.testing.expectEqualStrings("medium", command.value.object.get("level").?.string);
+    // Repeats of that held Enter reach the focused editor but must not submit.
     event.key.repeat = true;
     try input.handle(&app, &event);
     event.key.mod = c.SDL_KMOD_CTRL;
@@ -552,6 +562,7 @@ test "thinking menu keys choose through Pi and held Enter never sends the draft"
     try std.testing.expectEqualStrings("unfinished draft", app.editor.textBytes());
     event.key.repeat = false;
     event.key.mod = 0;
+    // An empty level list leaves nothing to choose.
     app.thinking_menu.open = true;
     app.runtime_snapshot.?.thinking_levels = &.{};
     try input.handle(&app, &event);

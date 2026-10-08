@@ -1,6 +1,6 @@
-const c = @import("../native/bindings.zig").c;
-const Model = @import("../core/runtime.zig").Model;
-const Search = @import("model_search.zig").Search;
+const c = @import("../../native/bindings.zig").c;
+const Model = @import("../../core/runtime.zig").Model;
+const Search = @import("search.zig").Search;
 
 pub const Picker = struct {
     open: bool = false,

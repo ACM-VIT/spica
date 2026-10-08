@@ -1,13 +1,13 @@
 const c = @import("../native/bindings.zig").c;
-const Settings = @import("../ui/settings.zig");
+const Settings = @import("../features/settings/settings.zig");
 const app_module = @import("../app.zig");
 const App = app_module.App;
 const Action = app_module.Action;
-const chat = @import("chat.zig");
-const processes = @import("processes.zig");
-const workspace = @import("workspace.zig");
-const conversation = @import("conversation.zig");
-const menus = @import("menus.zig");
+const chat = @import("../features/chat/chat.zig");
+const processes = @import("../features/chat/processes.zig");
+const workspace = @import("../features/library/workspace.zig");
+const conversation = @import("../features/transcript/conversation.zig");
+const menus = @import("../features/models/menus.zig");
 
 pub fn act(app: *App, action: Action) !void {
     switch (action) {

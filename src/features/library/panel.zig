@@ -1,13 +1,13 @@
 const std = @import("std");
-const c = @import("../native/bindings.zig").c;
-const catalog = @import("../core/catalog.zig");
-const Composer = @import("../text/composer.zig").Composer;
-const GroupKind = @import("../text/composer.zig").GroupKind;
-const Color = @import("theme.zig").Color;
-const widgets = @import("widgets.zig");
-const utf8 = @import("../text/utf8.zig");
-const clipboard = @import("clipboard.zig");
-const HitTargets = @import("hit_targets.zig").HitTargets;
+const c = @import("../../native/bindings.zig").c;
+const catalog = @import("../../core/catalog.zig");
+const Composer = @import("../../text/composer.zig").Composer;
+const GroupKind = @import("../../text/composer.zig").GroupKind;
+const Color = @import("../../ui/theme.zig").Color;
+const widgets = @import("../../ui/widgets.zig");
+const utf8 = @import("../../text/utf8.zig");
+const clipboard = @import("../../ui/clipboard.zig");
+const HitTargets = @import("../../ui/hit_targets.zig").HitTargets;
 const contains = widgets.contains;
 const Clip = widgets.Clip;
 
@@ -477,7 +477,7 @@ pub const Panel = struct {
                     return false;
                 }
                 if (key == c.SDLK_LEFT or key == c.SDLK_RIGHT) {
-                    const direction: @import("../text/composer.zig").Direction = if (key == c.SDLK_LEFT) .backward else .forward;
+                    const direction: @import("../../text/composer.zig").Direction = if (key == c.SDLK_LEFT) .backward else .forward;
                     if (word) self.editor.moveWord(direction, shift) else self.editor.moveGrapheme(direction, shift);
                     return false;
                 }

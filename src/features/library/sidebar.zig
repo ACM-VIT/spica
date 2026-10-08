@@ -1,10 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const widgets = @import("../ui/widgets.zig");
-const app_module = @import("../app.zig");
+const widgets = @import("../../ui/widgets.zig");
+const app_module = @import("../../app.zig");
 const App = app_module.App;
 const Action = app_module.Action;
-const chat = @import("chat.zig");
+const chat = @import("../chat/chat.zig");
 
 const first_row_y = 158;
 const row_step = 38;
@@ -102,6 +102,7 @@ fn drawFolderRow(app: *App, path: []const u8, action: Action, browse: Action, ro
     const width = app.shell.sidebar.width;
     const active = std.mem.eql(u8, path, app.project_path);
     try widgets.icon(app.renderer, .folder, .{ .x = 20, .y = y + 10, .w = 14, .h = 14 }, if (active) colors.accent else colors.muted);
+    // Browsing only expands/collapses; the separate plus creates a thread.
     try app.hit(browse, .{ .x = 10, .y = y, .w = width - 52, .h = row_height });
     const name = std.fs.path.basename(path);
     try app.fitLabel(App.clipped(if (name.len == 0) path else name), 42, y + 9, width - 86, 13, colors.text);
@@ -161,6 +162,7 @@ pub fn draw(app: *App, height: f32) !void {
             row += 1;
         }
         const count = folder.row_count - 1;
+        // Decode/draw/hit-test only the visible slice, not every session.
         const first = @min(count, app.sidebar_first -| row);
         const end = @min(count, (app.sidebar_first + visible) -| row);
         for (catalog.rows[folder.first_row + 1 + first .. folder.first_row + 1 + end], first..) |item, offset| {

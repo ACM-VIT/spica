@@ -1,12 +1,12 @@
 const std = @import("std");
-const c = @import("../native/bindings.zig").c;
-const pi = @import("../core/runtime.zig");
-const SessionCatalog = @import("../core/catalog.zig");
-const Bounded = @import("../text/bounded.zig").Bounded;
-const App = @import("../app.zig").App;
+const c = @import("../../native/bindings.zig").c;
+const pi = @import("../../core/runtime.zig");
+const SessionCatalog = @import("../../core/catalog.zig");
+const Bounded = @import("../../text/bounded.zig").Bounded;
+const App = @import("../../app.zig").App;
 const processes = @import("processes.zig");
-const workspace = @import("workspace.zig");
-const menus = @import("menus.zig");
+const workspace = @import("../library/workspace.zig");
+const menus = @import("../models/menus.zig");
 
 pub const Title = Bounded(128);
 pub const ErrorText = Bounded(512);
@@ -60,6 +60,8 @@ pub const SnapshotChanges = struct {
     }
 };
 
+// Inactive chats retain only runtime metadata and bounded draft text. The single
+// viewport, text layouts, and composer undo storage stay with the active chat.
 pub const ParkedChat = struct {
     id: u64,
     runtime: ?*pi.Runtime,
@@ -184,6 +186,8 @@ pub fn resetViewport(app: *App) void {
 }
 
 pub fn activateParked(app: *App, index: usize) !void {
+    // Reserve before transferring ownership; a failed allocation leaves the
+    // active chat and every runtime intact.
     try parkCurrent(app);
     const chat = app.parked_chats.orderedRemove(index);
     defer app.allocator.free(chat.draft);
@@ -219,6 +223,8 @@ pub fn activateParked(app: *App, index: usize) !void {
     app.follow_bottom = false;
     resetViewport(app);
     if (chat.retiring) {
+        // Shutdown cannot be reversed. Keep ownership until exit before
+        // starting its replacement, so this session never has two writers.
         app.dirty = true;
     } else if (app.runtime == null or app.runtime.?.isFinished()) {
         try processes.beginRuntime(app);

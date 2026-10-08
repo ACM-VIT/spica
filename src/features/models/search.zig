@@ -1,6 +1,6 @@
 const std = @import("std");
-const c = @import("../native/bindings.zig").c;
-const Model = @import("../core/runtime.zig").Model;
+const c = @import("../../native/bindings.zig").c;
+const Model = @import("../../core/runtime.zig").Model;
 
 const Quality = struct { class: u8, score: f64 };
 const Match = struct { index: usize, quality: Quality };

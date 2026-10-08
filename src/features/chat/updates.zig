@@ -1,12 +1,12 @@
 const std = @import("std");
-const c = @import("../native/bindings.zig").c;
-const pi = @import("../core/runtime.zig");
-const composer = @import("../text/composer.zig");
-const App = @import("../app.zig").App;
+const c = @import("../../native/bindings.zig").c;
+const pi = @import("../../core/runtime.zig");
+const composer = @import("../../text/composer.zig");
+const App = @import("../../app.zig").App;
 const chat = @import("chat.zig");
 const processes = @import("processes.zig");
-const workspace = @import("workspace.zig");
-const menus = @import("menus.zig");
+const workspace = @import("../library/workspace.zig");
+const menus = @import("../models/menus.zig");
 
 pub fn consumeRuntime(app: *App) void {
     const runtime = app.runtime orelse return;
@@ -205,6 +205,8 @@ pub fn consumeParkedSnapshot(app: *App, parked: *chat.ParkedChat, incoming: pi.S
     };
     if (incoming.status == .needs_force_stop and previous_status != .needs_force_stop) app.force_dialog = true;
     if (incoming.status == .ready and (previous_status == .streaming or changes.canonical)) app.catalog_worker.refresh();
+    // The recovery revision, not its copied text, is needed for subsequent
+    // snapshots. The recovered text now belongs to this chat's draft.
     if (parked.snapshot) |*snapshot| {
         app.allocator.free(snapshot.pending_draft);
         snapshot.pending_draft = "";
@@ -214,6 +216,8 @@ pub fn consumeParkedSnapshot(app: *App, parked: *chat.ParkedChat, incoming: pi.S
 
 pub fn consumeParked(app: *App) void {
     var idle_count: usize = 0;
+    // Keep a small most-recent idle pool. Busy chats are never retired for
+    // resource pressure; compact drafts outlive an idle child process.
     var index = app.parked_chats.items.len;
     while (index != 0) {
         index -= 1;
@@ -254,7 +258,7 @@ pub fn consumeParked(app: *App) void {
     }
 }
 
-const Composer = @import("../text/composer.zig").Composer;
+const Composer = @import("../../text/composer.zig").Composer;
 
 test "background prompt acknowledgements clear only the submitted chat revision" {
     const allocator = std.testing.allocator;

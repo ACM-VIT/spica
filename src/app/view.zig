@@ -4,12 +4,12 @@ const c = @import("../native/bindings.zig").c;
 const theme_module = @import("../ui/theme.zig");
 const widgets = @import("../ui/widgets.zig");
 const editor_view = @import("../ui/editor_view.zig");
-const Settings = @import("../ui/settings.zig");
+const Settings = @import("../features/settings/settings.zig");
 const Composer = @import("../text/composer.zig").Composer;
 const App = @import("../app.zig").App;
-const processes = @import("processes.zig");
-const sidebar = @import("sidebar.zig");
-const menus = @import("menus.zig");
+const processes = @import("../features/chat/processes.zig");
+const sidebar = @import("../features/library/sidebar.zig");
+const menus = @import("../features/models/menus.zig");
 
 pub fn paint(app: *App) !void {
     app.buttons.clear();

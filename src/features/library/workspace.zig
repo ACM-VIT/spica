@@ -1,11 +1,11 @@
 const std = @import("std");
-const c = @import("../native/bindings.zig").c;
-const SessionCatalog = @import("../core/catalog.zig");
-const Library = @import("../ui/library.zig");
-const App = @import("../app.zig").App;
-const chat = @import("chat.zig");
-const processes = @import("processes.zig");
-const menus = @import("menus.zig");
+const c = @import("../../native/bindings.zig").c;
+const SessionCatalog = @import("../../core/catalog.zig");
+const Library = @import("panel.zig");
+const App = @import("../../app.zig").App;
+const chat = @import("../chat/chat.zig");
+const processes = @import("../chat/processes.zig");
+const menus = @import("../models/menus.zig");
 
 pub const max_projects = 64;
 

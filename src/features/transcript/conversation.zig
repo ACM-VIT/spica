@@ -1,8 +1,8 @@
 const std = @import("std");
-const fixture = @import("../diagnostics/fixture.zig");
-const store = @import("../core/store.zig");
-const ContentWorker = @import("../content/worker.zig");
-const App = @import("../app.zig").App;
+const fixture = @import("../../diagnostics/fixture.zig");
+const store = @import("../../core/store.zig");
+const ContentWorker = @import("../../content/worker.zig");
+const App = @import("../../app.zig").App;
 
 pub fn pump(app: *App) !void {
     if (app.content_pending or app.minimized) return;
