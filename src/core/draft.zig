@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("../native/bindings.zig").c;
 const allocator = std.heap.page_allocator;
+const ModelPreferences = @import("model_preferences.zig");
 
 pub const State = struct {
     draft: []const u8 = "",
@@ -9,6 +10,7 @@ pub const State = struct {
     ui_scale: u16 = 100,
     chat_width: u16 = 768,
     projects: []const []const u8 = &.{},
+    hidden_models: []const ModelPreferences.Identity = &.{},
 };
 
 const RawState = struct {
@@ -18,6 +20,7 @@ const RawState = struct {
     ui_scale: std.json.Value = .null,
     chat_width: std.json.Value = .null,
     projects: []const []const u8 = &.{},
+    hidden_models: []const ModelPreferences.Identity = &.{},
 };
 
 fn restoredNumber(comptime T: type, raw: std.json.Value, fallback: T, minimum: T, maximum: T) T {
@@ -43,6 +46,7 @@ pub const Restored = struct {
             .ui_scale = restoredNumber(u16, raw.ui_scale, 100, 75, 175),
             .chat_width = restoredNumber(u16, raw.chat_width, 768, 560, 1120),
             .projects = raw.projects,
+            .hidden_models = raw.hidden_models,
         };
     }
     pub fn deinit(self: *Restored) void {
@@ -50,7 +54,7 @@ pub const Restored = struct {
     }
 };
 pub fn restore(io: std.Io, path: []const u8) !Restored {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(512 * 1024)) catch |err| switch (err) {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
@@ -62,6 +66,7 @@ pub fn restore(io: std.Io, path: []const u8) !Restored {
     for (parsed.value.projects) |project| {
         if (project.len > 4096 or !std.unicode.utf8ValidateSlice(project)) return error.InvalidProjects;
     }
+    try ModelPreferences.validate(parsed.value.hidden_models);
     return .{ .parsed = parsed };
 }
 
@@ -158,3 +163,36 @@ pub const Writer = struct {
         }
     }
 };
+
+test "hidden model choices survive shutdown and reopen with independent identities" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try std.testing.expect(c.spica_image_install_sdl_allocator());
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/workspace.json", .{tmp.sub_path});
+    defer a.free(path);
+    var choices: ModelPreferences.Preferences = .{};
+    defer choices.deinit(a);
+    try choices.toggle(a, "google", "older-model");
+    try choices.toggle(a, "openrouter", "same-model");
+    const writer = try Writer.create(io, path, 0);
+    try writer.submit(.{ .draft = "keep draft", .hidden_models = choices.items.items });
+    writer.destroy();
+    var restored = try restore(io, path);
+    var reopened = try ModelPreferences.Preferences.restore(a, restored.value().hidden_models);
+    defer reopened.deinit(a);
+    try std.testing.expectEqualStrings("keep draft", restored.value().draft);
+    restored.deinit();
+    try std.testing.expect(reopened.hidden("google", "older-model"));
+    try std.testing.expect(!reopened.hidden("other", "older-model"));
+    try reopened.toggle(a, "google", "older-model");
+    try std.testing.expect(!reopened.hidden("google", "older-model"));
+    const second = try Writer.create(io, path, 0);
+    try second.submit(.{ .hidden_models = reopened.items.items });
+    second.destroy();
+    var final = try restore(io, path);
+    defer final.deinit();
+    try std.testing.expectEqual(@as(usize, 1), final.value().hidden_models.len);
+    try std.testing.expectEqualStrings("openrouter", final.value().hidden_models[0].provider);
+}

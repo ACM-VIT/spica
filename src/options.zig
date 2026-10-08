@@ -84,6 +84,8 @@ pub const help =
     \\Enter sends; Shift+Enter inserts a newline; Ctrl+Enter also sends.
     \\While running, input is a follow-up; click that control to choose steering instead.
     \\The composer only sends prompts, never direct shell commands. Ctrl+M opens configured models.
+    \\Hide moves a model into Hidden Models; search still finds it and Restore brings it back.
+    \\Ctrl+H toggles Hide/Restore; Ctrl+Shift+H expands/collapses Hidden Models. Choices persist.
     \\Thinking choices come from pi; each assistant's Reasoning disclosure keeps its answer visible.
     \\Prompts use bubbles; answers stay plain. Timestamps are source times in UTC, not estimated durations.
     \\File reads, changes and commands collapse into activity summaries; failed calls remain visible.

@@ -2,6 +2,7 @@ test {
     _ = @import("app.zig");
     _ = @import("platform/executables.zig");
     _ = @import("core/protocol_test.zig");
+    _ = @import("core/model_availability.zig");
     _ = @import("core/store_test.zig");
     _ = @import("core/catalog.zig");
     _ = @import("core/search.zig");

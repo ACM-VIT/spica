@@ -1,15 +1,17 @@
 const std = @import("std");
 const c = @import("../native/bindings.zig").c;
 const Model = @import("../core/runtime.zig").Model;
+const preferences = @import("../core/model_preferences.zig");
 
 const Quality = struct { class: u8, score: f64 };
-const Match = struct { index: usize, quality: Quality };
+const Match = struct { index: usize, quality: Quality, hidden: bool = false };
 const query_scalars = 256 * 3; // Maximum case-fold expansion per input byte.
 
-/// Ranked original indices, bounded by the runtime's 256-model display budget.
+/// Reusable ranked indices, bounded by the runtime's complete catalog budget.
 pub const Search = struct {
-    matches: [256]Match = undefined,
+    matches: [@import("../core/runtime.zig").model_limit]Match = undefined,
     len: usize = 0,
+    active_len: usize = 0,
     dirty: bool = true,
 
     pub fn invalidate(self: *Search) void {
@@ -22,10 +24,29 @@ pub const Search = struct {
     }
 
     pub fn rebuild(self: *Search, models: []const Model, query: []const u8) !void {
+        return self.rebuildVisible(models, query, &.{});
+    }
+
+    pub fn rebuildVisible(self: *Search, models: []const Model, query: []const u8, hidden: []const preferences.Identity) !void {
+        return self.build(models, query, hidden, false);
+    }
+
+    /// One bounded result buffer, active results first, independently ranked
+    /// within each section. Hidden results are retained even with no query.
+    pub fn rebuildGrouped(self: *Search, models: []const Model, query: []const u8, hidden: []const preferences.Identity) !void {
+        try self.build(models, query, hidden, true);
+    }
+
+    fn build(self: *Search, models: []const Model, query: []const u8, hidden: []const preferences.Identity, grouped: bool) !void {
         self.invalidate();
+        self.active_len = 0;
         if (models.len > self.matches.len) return error.ModelSearchBudget;
         if (query.len > 256 or !std.unicode.utf8ValidateSlice(query)) return error.InvalidSearchQuery;
-        for (models, 0..) |_, i| self.matches[i] = .{ .index = i, .quality = .{ .class = 2, .score = 0 } };
+        const browsing = std.mem.trim(u8, query, " \t\r\n").len == 0;
+        for (models, 0..) |model, i| self.matches[i] = .{ .index = i, .hidden = preferences.contains(hidden, model.provider, model.id), .quality = .{
+            .class = if (!grouped and browsing and preferences.contains(hidden, model.provider, model.id)) 0 else 2,
+            .score = 0,
+        } };
         var terms = std.mem.tokenizeAny(u8, query, " \t\r\n");
         while (terms.next()) |term| {
             var query_buffer: [query_scalars]u32 = undefined;
@@ -46,16 +67,58 @@ pub const Search = struct {
             if (match.quality.class == 0) continue;
             self.matches[self.len] = match;
             self.len += 1;
+            if (!match.hidden) self.active_len += 1;
         }
-        std.mem.sort(Match, self.matches[0..self.len], {}, better);
+        std.mem.sort(Match, self.matches[0..self.len], grouped, better);
         self.dirty = false;
     }
 };
 
-fn better(_: void, a: Match, b: Match) bool {
+fn better(grouped: bool, a: Match, b: Match) bool {
+    if (grouped and a.hidden != b.hidden) return !a.hidden;
     if (a.quality.class != b.quality.class) return a.quality.class > b.quality.class;
     if (a.quality.score != b.quality.score) return a.quality.score > b.quality.score;
     return a.index < b.index;
+}
+
+test "hidden models stay searchable and later providers survive large catalogs" {
+    const models = try std.testing.allocator.alloc(Model, 600);
+    defer std.testing.allocator.free(models);
+    for (models) |*model| model.* = .{ .provider = "router", .id = "common", .name = "Common" };
+    models[599] = .{ .provider = "google", .id = "gemini-example", .name = "Gemini example" };
+    const hidden = [_]preferences.Identity{.{ .provider = "google", .id = "gemini-example" }};
+    var search: Search = .{};
+    try search.rebuildVisible(models, "", &hidden);
+    try std.testing.expectEqual(@as(usize, 599), search.len);
+    try search.rebuildVisible(models, "   ", &hidden);
+    try std.testing.expectEqual(@as(usize, 599), search.len);
+    try search.rebuildVisible(models, "gemini", &hidden);
+    try std.testing.expectEqual(@as(usize, 1), search.len);
+    try std.testing.expectEqual(@as(?usize, 599), search.index(0));
+    // Identical IDs on another provider are separate user choices.
+    models[0] = .{ .provider = "other", .id = "gemini-example", .name = "Gemini example" };
+    try search.rebuildVisible(models, "", &hidden);
+    try std.testing.expectEqual(@as(?usize, 0), search.index(0));
+}
+
+test "grouped model results rank each section and move restored identities immediately" {
+    const models = [_]Model{
+        .{ .provider = "one", .id = "shared", .name = "Model B" },
+        .{ .provider = "two", .id = "shared", .name = "Model A" },
+        .{ .provider = "one", .id = "other", .name = "Model A" },
+    };
+    const hidden = [_]preferences.Identity{.{ .provider = "one", .id = "shared" }};
+    var search: Search = .{};
+    try search.rebuildGrouped(&models, "", &hidden);
+    try std.testing.expectEqual(@as(usize, 3), search.len);
+    try std.testing.expectEqual(@as(usize, 2), search.active_len);
+    try std.testing.expectEqual(@as(?usize, 1), search.index(0));
+    try std.testing.expectEqual(@as(?usize, 0), search.index(2));
+    try search.rebuildGrouped(&models, "model b", &hidden);
+    try std.testing.expectEqual(@as(usize, 1), search.len);
+    try std.testing.expectEqual(@as(usize, 0), search.active_len);
+    try search.rebuildGrouped(&models, "model b", &.{});
+    try std.testing.expectEqual(@as(usize, 1), search.active_len);
 }
 
 const FoldIterator = struct {

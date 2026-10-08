@@ -17,9 +17,15 @@ const SessionCatalog = @import("core/catalog.zig");
 const Settings = @import("ui/settings.zig");
 const Library = @import("ui/library.zig");
 const ModelSearch = @import("ui/model_search.zig").Search;
+const ModelPreferences = @import("core/model_preferences.zig").Preferences;
+
+fn providerModelLabel(buffer: []u8, provider: []const u8, name: []const u8) []const u8 {
+    if (provider.len == 0) return name;
+    return std.fmt.bufPrint(buffer, "{s} · {s}", .{ provider, name }) catch name;
+}
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
-const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
+const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, toggle_model_visibility: usize, toggle_hidden_models, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
 const ThreadTarget = struct { path: ?[:0]u8, cwd: [:0]u8, archived: bool = false };
 const SubmittedPrompt = struct { token: u64, draft_revision: u64 };
 const ChatView = enum { new_thread, opening, existing };
@@ -155,7 +161,11 @@ pub const App = struct {
     model_menu: bool = false,
     model_first: usize = 0,
     model_selection_cleared: bool = false,
+    model_hidden_expanded: bool = false,
+    model_scroll: [2]usize = .{ 0, 0 },
+    model_section_bounds: [2]c.SDL_FRect = .{ std.mem.zeroes(c.SDL_FRect), std.mem.zeroes(c.SDL_FRect) },
     model_search: ModelSearch = .{},
+    hidden_models: ModelPreferences = .{},
     thinking_menu: bool = false,
     thinking_highlight: usize = 0,
     sidebar_visible: bool = true,
@@ -295,6 +305,8 @@ pub const App = struct {
         const catalog_worker = try SessionCatalog.Worker.create(io, environ, legacy_sessions, paths.database, wake_event);
         errdefer catalog_worker.destroy();
         const saved = restored.value();
+        var hidden_models = try ModelPreferences.restore(allocator, saved.hidden_models);
+        errdefer hidden_models.deinit(allocator);
         const appearance = Settings.Values{ .font_size = saved.font_size, .ui_scale = saved.ui_scale, .chat_width = saved.chat_width, .light = options.light or saved.light };
         var projects: std.ArrayList([:0]u8) = .empty;
         errdefer {
@@ -326,6 +338,7 @@ pub const App = struct {
             .theme = .{ .light = theme.light, .dark = theme.dark, .metrics = Settings.metrics(theme.metrics, appearance) },
             .base_metrics = theme.metrics,
             .appearance = appearance,
+            .hidden_models = hidden_models,
             .projects = projects,
             .editor = editor,
             .copy_buffer = copy_buffer,
@@ -357,6 +370,7 @@ pub const App = struct {
         if (self.accepted_draft) |draft| self.allocator.free(draft);
         self.saveDraft() catch |err| std.log.err("final draft queue: {s}", .{@errorName(err)});
         self.draft_writer.destroy();
+        self.hidden_models.deinit(self.allocator);
         self.content.destroy();
         self.catalog_worker.destroy();
         if (self.catalog) |*catalog| catalog.deinit();
@@ -1132,6 +1146,7 @@ pub const App = struct {
     }
 
     fn submit(self: *App) !void {
+        if (self.runtime_snapshot) |snapshot| if (snapshot.model_unavailable) return error.ChooseAvailableModelBeforeSending;
         if (self.current_archived) return error.RestoreArchivedChatBeforeSending;
         if (self.enrollment_intent) return error.WorkspaceEnrollmentPending;
         if (self.pending_mutation) |mutation| if (!mutation.automatic or mutation.owner_id == self.chat_id) return error.WorkspaceEnrollmentPending;
@@ -1356,8 +1371,15 @@ pub const App = struct {
                     self.library.resetQuery();
                     self.model_search.invalidate();
                     self.model_first = 0;
+                    self.model_hidden_expanded = false;
+                    self.model_scroll = .{ 0, 0 };
                     self.model_selection_cleared = false;
                     self.model_menu = true;
+                    if (self.runtime_snapshot) |snapshot| {
+                        if (snapshot.status == .ready or snapshot.status == .streaming) {
+                            if (self.runtime) |runtime| runtime.refreshModels() catch |err| self.report("Refreshing model availability", err);
+                        }
+                    }
                     self.dragging = false;
                     self.preedit.clearRetainingCapacity();
                     self.editor_changed = true;
@@ -1390,6 +1412,29 @@ pub const App = struct {
                 const model = snapshot.models[index];
                 try (self.runtime orelse return error.PiNotReady).setModel(model.provider, model.id);
                 self.closeModelMenu();
+            },
+            .toggle_model_visibility => |index| {
+                const snapshot = self.runtime_snapshot orelse return error.PiNotReady;
+                if (index >= snapshot.models.len) return error.StaleModelChoice;
+                const model = snapshot.models[index];
+                try self.hidden_models.toggle(self.allocator, model.provider, model.id);
+                self.model_search.invalidate();
+                self.model_first = @min(self.model_first, (try self.modelCount()) -| 1);
+                // While searching, keep focus on the model that just moved.
+                if (std.mem.trim(u8, self.library.queryBytes(), " \t\r\n").len != 0) {
+                    for (self.model_search.matches[0..try self.modelCount()], 0..) |match, rank| {
+                        if (match.index == index) self.model_first = rank;
+                    }
+                }
+                self.model_selection_cleared = false;
+                self.button_count = 0;
+                try self.saveDraft();
+            },
+            .toggle_hidden_models => {
+                self.model_hidden_expanded = !self.model_hidden_expanded;
+                self.model_first = @min(self.model_first, (try self.modelCount()) -| 1);
+                self.model_selection_cleared = false;
+                self.button_count = 0;
             },
             .force_stop => {
                 try self.forceOwned();
@@ -1471,17 +1516,17 @@ pub const App = struct {
     fn refreshModelSearch(self: *App) !void {
         if (!self.model_search.dirty) return;
         const models = if (self.runtime_snapshot) |snapshot| snapshot.models else &.{};
-        try self.model_search.rebuild(models, self.library.queryBytes());
+        try self.model_search.rebuildGrouped(models, self.library.queryBytes(), self.hidden_models.items.items);
     }
 
     fn modelCount(self: *App) !usize {
         try self.refreshModelSearch();
-        return self.model_search.len;
+        return if (self.model_hidden_expanded) self.model_search.len else self.model_search.active_len;
     }
 
     fn modelIndex(self: *App, ranked_index: usize) !?usize {
         try self.refreshModelSearch();
-        return self.model_search.index(ranked_index);
+        return if (ranked_index < try self.modelCount()) self.model_search.index(ranked_index) else null;
     }
 
     fn selectedModelIndex(self: *App) !?usize {
@@ -1508,10 +1553,11 @@ pub const App = struct {
         if (!self.model_menu) return;
         self.button_count = 0;
         if (selected != null) self.model_selection_cleared = true;
-        try self.model_search.rebuild(models, self.library.queryBytes());
-        self.model_first = @min(self.model_first, self.model_search.len -| 1);
+        try self.model_search.rebuildGrouped(models, self.library.queryBytes(), self.hidden_models.items.items);
+        const count = try self.modelCount();
+        self.model_first = @min(self.model_first, count -| 1);
         if (retained) |index| {
-            for (self.model_search.matches[0..self.model_search.len], 0..) |match, rank| {
+            for (self.model_search.matches[0..count], 0..) |match, rank| {
                 if (match.index == index) {
                     self.model_first = rank;
                     self.model_selection_cleared = false;
@@ -1526,8 +1572,44 @@ pub const App = struct {
         if (try self.library.handleQuery(self, event)) {
             self.model_search.invalidate();
             self.model_first = 0;
+            self.model_scroll = .{ 0, 0 };
+            self.model_hidden_expanded = std.mem.trim(u8, self.library.queryBytes(), " \t\r\n").len != 0;
             self.model_selection_cleared = false;
             self.button_count = 0;
+        }
+    }
+
+    fn drawModelSection(self: *App, models: []const pi.Model, section: usize, base: usize, count: usize, rows: usize) !void {
+        if (count == 0 or rows == 0) return;
+        const bounds = self.model_section_bounds[section];
+        const colors = self.palette();
+        var first = @min(self.model_scroll[section], count -| rows);
+        if (!self.model_selection_cleared and self.model_first >= base and self.model_first < base + count) {
+            const selected = self.model_first - base;
+            if (selected < first) first = selected;
+            if (selected >= first + rows) first = selected + 1 - rows;
+        }
+        self.model_scroll[section] = first;
+        const end = @min(count, first + rows);
+        for (self.model_search.matches[base + first .. base + end], first..) |match, rank| {
+            const model = models[match.index];
+            const row_y = bounds.y + @as(f32, @floatFromInt(rank - first)) * 44;
+            if (!self.model_selection_cleared and self.model_first == base + rank) try self.rectangle(bounds.x, row_y, bounds.w, 42, 5, colors.raised);
+            const row_clip = c.SDL_Rect{ .x = @intFromFloat(bounds.x), .y = @intFromFloat(row_y), .w = @intFromFloat(bounds.w - 70), .h = 42 };
+            _ = c.SDL_SetRenderClipRect(self.renderer, &row_clip);
+            try self.hit(.{ .select_model = match.index }, .{ .x = bounds.x, .y = row_y, .w = bounds.w - 70, .h = 42 });
+            try self.label(clippedLabel(model.name), bounds.x + 4, row_y + 4, 13, if (section == 0) colors.text else colors.muted);
+            try self.label(clippedLabel(model.provider), bounds.x + 4, row_y + 24, 10, colors.muted);
+            _ = c.SDL_SetRenderClipRect(self.renderer, null);
+            const action_bounds = c.SDL_FRect{ .x = bounds.x + bounds.w - 66, .y = row_y + 3, .w = 62, .h = 36 };
+            try self.hit(.{ .toggle_model_visibility = match.index }, action_bounds);
+            try self.label(if (section == 0) "Hide" else "Restore", action_bounds.x + (if (section == 0) @as(f32, 24) else 6), row_y + 13, 12, colors.muted);
+        }
+        if (count > rows) {
+            const track = @as(f32, @floatFromInt(rows)) * 44;
+            const thumb = @max(12, track * @as(f32, @floatFromInt(rows)) / @as(f32, @floatFromInt(count)));
+            const offset = (track - thumb) * @as(f32, @floatFromInt(first)) / @as(f32, @floatFromInt(count - rows));
+            try self.rectangle(bounds.x + bounds.w - 2, bounds.y + offset, 2, thumb, 1, colors.border);
         }
     }
 
@@ -1535,42 +1617,46 @@ pub const App = struct {
         const colors = self.palette();
         if (self.model_menu) {
             const x = self.model_bounds.x;
-            const width: f32 = @min(360, self.composer_bounds.w - 16);
+            const width: f32 = @min(420, self.composer_bounds.w - 16);
             const error_height: f32 = if (self.library.input_err != null) 20 else 0;
-            const visible: usize = @intFromFloat(@max(1, @min(6, @floor((self.composer_bounds.y - 66 - error_height) / 40))));
-            const height = @as(f32, @floatFromInt(visible)) * 40 + 56 + error_height;
+            const count = try self.modelCount();
+            const active_count = self.model_search.active_len;
+            const hidden_count = self.model_search.len - active_count;
+            const expanded = self.model_hidden_expanded and hidden_count != 0;
+            const capacity: usize = @intFromFloat(@max(2, @min(8, @floor((self.composer_bounds.y - 130 - error_height) / 44))));
+            const hidden_rows: usize = if (expanded) @min(hidden_count, @max(1, capacity / 3)) else 0;
+            const active_rows = @min(@max(1, active_count), capacity - hidden_rows);
+            const height = @as(f32, @floatFromInt(active_rows + hidden_rows)) * 44 + 120 + error_height;
             const y = self.composer_bounds.y - height - 10;
             self.model_popup_bounds = .{ .x = x, .y = y, .w = width, .h = height };
             try self.rectangle(x, y, width, height, 8, colors.border);
             try self.rectangle(x + 1, y + 1, width - 2, height - 2, 7, colors.panel);
-            if (self.runtime_snapshot) |snapshot| {
-                const count = try self.modelCount();
-                if (count == 0) try self.label(if (snapshot.models.len == 0) "No configured models" else "No matching models", x + 12, y + 16, 13, colors.muted);
-                self.model_first = @min(self.model_first, count -| 1);
-                const end = @min(count, self.model_first + visible);
-                for (self.model_search.matches[self.model_first..end], self.model_first..) |match, filtered_index| {
-                    const index = match.index;
-                    const model = snapshot.models[index];
-                    const row_y = y + 8 + @as(f32, @floatFromInt(filtered_index - self.model_first)) * 40;
-                    if (!self.model_selection_cleared and filtered_index == self.model_first) try self.rectangle(x + 8, row_y, width - 16, 38, 5, colors.raised);
-                    const row_clip = c.SDL_Rect{ .x = @intFromFloat(x + 8), .y = @intFromFloat(row_y), .w = @intFromFloat(width - 16), .h = 38 };
-                    _ = c.SDL_SetRenderClipRect(self.renderer, &row_clip);
-                    try self.hit(.{ .select_model = index }, .{ .x = x + 8, .y = row_y, .w = width - 16, .h = 38 });
-                    try self.label(clippedLabel(model.name), x + 12, row_y + 3, 13, colors.text);
-                    try self.label(clippedLabel(model.provider), x + 12, row_y + 23, 10, colors.muted);
-                    _ = c.SDL_SetRenderClipRect(self.renderer, null);
-                }
-            } else try self.label("Start pi to discover models", x + 12, y + 16, 13, colors.muted);
-            const query_y = y + height - 42 - error_height;
-            try self.rectangle(x + 8, query_y - 5, width - 16, 1, 0, colors.border);
-            self.library.query_bounds = .{ .x = x + 8, .y = query_y, .w = width - 16, .h = 34 };
-            try self.rectangle(x + 8, query_y, width - 16, 34, 5, colors.raised);
+            self.library.query_bounds = .{ .x = x + 8, .y = y + 8, .w = width - 16, .h = 34 };
+            try self.rectangle(x + 8, y + 8, width - 16, 34, 5, colors.raised);
             try self.library.drawQuery(self, "Search models...");
             if (self.library.input_err) |err| {
                 var buffer: [128]u8 = undefined;
                 const message = try std.fmt.bufPrint(&buffer, "Error: {s}", .{@errorName(err)});
-                try self.fitLabel(message, x + 12, query_y + 36, width - 24, 12, colors.error_color);
+                try self.fitLabel(message, x + 12, y + 44, width - 24, 12, colors.error_color);
             }
+            const heading_y = y + 52 + error_height;
+            try self.rectangle(x + 1, heading_y - 4, width - 2, 1, 0, colors.border);
+            var heading: [64]u8 = undefined;
+            try self.label(try std.fmt.bufPrint(&heading, "ACTIVE MODELS ({d})", .{active_count}), x + 12, heading_y + 3, 11, colors.muted);
+            const rows_y = heading_y + 28;
+            self.model_section_bounds[0] = .{ .x = x + 8, .y = rows_y, .w = width - 16, .h = @as(f32, @floatFromInt(active_rows)) * 44 };
+            const disclosure_y = rows_y + self.model_section_bounds[0].h;
+            try self.rectangle(x + 1, disclosure_y, width - 2, 1, 0, colors.border);
+            if (hidden_count != 0) try self.hit(.toggle_hidden_models, .{ .x = x + 8, .y = disclosure_y + 1, .w = width - 16, .h = 32 });
+            try self.label(try std.fmt.bufPrint(&heading, "{s}  Hidden Models ({d})", .{ if (expanded) "−" else "+", hidden_count }), x + 12, disclosure_y + 10, 12, colors.muted);
+            if (hidden_count != 0) try self.label(if (expanded) "Collapse" else "Expand", x + width - 66, disclosure_y + 10, 11, colors.muted);
+            self.model_section_bounds[1] = .{ .x = x + 8, .y = disclosure_y + 32, .w = width - 16, .h = @as(f32, @floatFromInt(hidden_rows)) * 44 };
+            if (self.runtime_snapshot) |snapshot| {
+                self.model_first = @min(self.model_first, count -| 1);
+                if (active_count == 0) try self.label(if (snapshot.models.len == 0) "No configured models" else if (hidden_count != 0) "No active models match" else "No matching models", x + 12, rows_y + 10, 13, colors.muted);
+                try self.drawModelSection(snapshot.models, 0, 0, active_count, active_rows);
+                if (expanded) try self.drawModelSection(snapshot.models, 1, active_count, hidden_count, hidden_rows);
+            } else try self.label("Start pi to discover models", x + 12, rows_y + 10, 13, colors.muted);
         }
         if (self.thinking_menu) {
             if (self.runtime_snapshot) |snapshot| {
@@ -1732,7 +1818,7 @@ pub const App = struct {
         const bytes = self.editor.textBytes();
         var projects: [64][]const u8 = undefined;
         for (self.projects.items, 0..) |path, index| projects[index] = path;
-        try self.draft_writer.submit(.{ .draft = bytes, .light = self.light, .font_size = self.appearance.font_size, .ui_scale = self.appearance.ui_scale, .chat_width = self.appearance.chat_width, .projects = projects[0..self.projects.items.len] });
+        try self.draft_writer.submit(.{ .draft = bytes, .light = self.light, .font_size = self.appearance.font_size, .ui_scale = self.appearance.ui_scale, .chat_width = self.appearance.chat_width, .projects = projects[0..self.projects.items.len], .hidden_models = self.hidden_models.items.items });
         self.draft_due = null;
     }
 
@@ -2090,16 +2176,20 @@ pub const App = struct {
         try self.drawEditor();
         const controls_y = composer.y + composer.h - 40;
         var model_name: []const u8 = "Select model";
+        var model_provider: []const u8 = "";
         if (self.runtime_snapshot) |snapshot| {
             if (snapshot.model.len != 0) model_name = snapshot.model;
+            model_provider = snapshot.provider;
             for (snapshot.models) |model| if (std.mem.eql(u8, model.id, snapshot.model) and std.mem.eql(u8, model.provider, snapshot.provider)) {
                 model_name = model.name;
                 break;
             };
         }
-        const model_width = @min(@min(220, composer.w * 0.43), try self.labelWidth(clippedLabel(model_name), 13) + 34);
+        var model_label_buffer: [384]u8 = undefined;
+        const model_label = providerModelLabel(&model_label_buffer, model_provider, model_name);
+        const model_width = @min(@min(260, composer.w * 0.48), try self.labelWidth(clippedLabel(model_label), 13) + 34);
         self.model_bounds = .{ .x = composer.x + 8, .y = controls_y, .w = model_width, .h = 30 };
-        try self.flatButton(.models, model_name, self.model_bounds);
+        try self.flatButton(.models, model_label, self.model_bounds);
         try widgets.icon(self.renderer, .chevron_down, .{ .x = self.model_bounds.x + model_width - 19, .y = controls_y + 9, .w = 12, .h = 12 }, colors.muted);
         const thinking = if (self.runtime_snapshot) |snapshot| snapshot.thinking_level else "";
         self.thinking_bounds = .{ .x = self.model_bounds.x + model_width + 4, .y = controls_y, .w = 80, .h = 30 };
@@ -2127,7 +2217,9 @@ pub const App = struct {
         if (self.error_len != 0) {
             try self.fitLabel(clippedLabel(self.error_text[0..self.error_len]), composer.x, composer.y - 25, composer.w, 12, colors.error_color);
         } else if (self.runtime_snapshot) |snapshot| {
-            if (snapshot.attention.len != 0) {
+            if (snapshot.model_unavailable) {
+                try self.fitLabel("Selected model is unavailable for this account. Choose another model.", composer.x, composer.y - 25, composer.w, 12, colors.error_color);
+            } else if (snapshot.attention.len != 0) {
                 try self.fitLabel(clippedLabel(snapshot.attention), composer.x, composer.y - 25, composer.w, 12, colors.muted);
             } else if (snapshot.status == .streaming or self.bashRunning()) {
                 var buffer: [128]u8 = undefined;
@@ -2354,7 +2446,11 @@ pub const App = struct {
                 if (self.model_menu) {
                     const last = (try self.modelCount()) -| 1;
                     const direction = event.wheel.y * (if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) @as(f32, -1) else 1);
-                    self.model_first = if (direction > 0) self.model_first -| 1 else if (direction < 0) @min(last, self.model_first + 1) else self.model_first;
+                    const section: usize = if (self.model_hidden_expanded and contains(self.model_section_bounds[1], event.wheel.mouse_x, event.wheel.mouse_y)) 1 else 0;
+                    const base = if (section == 1) self.model_search.active_len else 0;
+                    const end = if (section == 1) last else self.model_search.active_len -| 1;
+                    const current = std.math.clamp(self.model_first, base, @max(base, end));
+                    self.model_first = if (direction > 0) @max(base, current -| 1) else if (direction < 0) @min(end, current + 1) else current;
                     if (direction != 0) self.model_selection_cleared = false;
                     self.button_count = 0;
                 } else if (!self.closing) {
@@ -2382,7 +2478,7 @@ pub const App = struct {
                     if (contains(self.model_popup_bounds, event.button.x, event.button.y)) {
                         if (event.button.button == c.SDL_BUTTON_LEFT) {
                             for (self.buttons[0..self.button_count]) |pressed| {
-                                if (pressed.action == .select_model and contains(pressed.bounds, event.button.x, event.button.y)) {
+                                if ((pressed.action == .select_model or pressed.action == .toggle_model_visibility or pressed.action == .toggle_hidden_models) and contains(pressed.bounds, event.button.x, event.button.y)) {
                                     try self.act(pressed.action);
                                     return;
                                 }
@@ -2496,6 +2592,14 @@ pub const App = struct {
                         self.focused_editor = true;
                         self.closeModelMenu();
                         self.dirty = true;
+                        return;
+                    }
+                    if ((event.key.mod & c.SDL_KMOD_CTRL) != 0 and event.key.key == c.SDLK_H) {
+                        if ((event.key.mod & c.SDL_KMOD_SHIFT) != 0) {
+                            if (!event.key.repeat) try self.act(.toggle_hidden_models);
+                            return;
+                        }
+                        if (!event.key.repeat) if (try self.selectedModelIndex()) |index| try self.act(.{ .toggle_model_visibility = index });
                         return;
                     }
                     if (event.key.key == c.SDLK_UP) {
@@ -2720,10 +2824,16 @@ test "model search filters names IDs and providers without editing the draft" {
     defer c.SDL_QuitSubSystem(c.SDL_INIT_VIDEO);
     app.window = c.SDL_CreateWindow("Model picker regression", 640, 480, c.SDL_WINDOW_HIDDEN) orelse return error.Window;
     defer c.SDL_DestroyWindow(app.window);
-    const surface = c.SDL_CreateSurface(640, 480, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
-    defer c.SDL_DestroySurface(surface);
-    app.renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    app.renderer = c.SDL_CreateRenderer(app.window, "software") orelse return error.Renderer;
     defer c.SDL_DestroyRenderer(app.renderer);
+    app.text = c.spica_text_create(app.renderer, build_options.font_directory ++ "/Inter.ttf") orelse return error.FontInitialization;
+    defer c.spica_text_destroy(app.text);
+    app.labels = [_]Label{.{}} ** 64;
+    app.label_clock = 0;
+    defer for (app.labels) |label_value| if (label_value.layout) |layout| c.spica_text_layout_release(layout);
+    const theme_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, build_options.asset_directory ++ "/theme.json", allocator, .limited(16384));
+    defer allocator.free(theme_bytes);
+    app.theme = try theme_module.parse(allocator, theme_bytes);
     app.wake_event = 0;
     app.closing = false;
     app.force_dialog = false;
@@ -2733,6 +2843,20 @@ test "model search filters names IDs and providers without editing the draft" {
     app.focused_editor = false;
     app.options = .{};
     app.model_search = .{};
+    app.model_hidden_expanded = false;
+    app.model_scroll = .{ 0, 0 };
+    app.hidden_models = .{};
+    defer app.hidden_models.deinit(allocator);
+    app.allocator = allocator;
+    app.light = false;
+    app.appearance = .{};
+    app.projects = .empty;
+    var preferences_tmp = std.testing.tmpDir(.{});
+    defer preferences_tmp.cleanup();
+    const preferences_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/workspace.json", .{preferences_tmp.sub_path});
+    defer allocator.free(preferences_path);
+    app.draft_writer = try Draft.Writer.create(std.testing.io, preferences_path, 0);
+    defer app.draft_writer.destroy();
     app.model_selection_cleared = false;
     app.library = try Library.Panel.init(allocator);
     defer app.library.deinit();
@@ -2751,6 +2875,95 @@ test "model search filters names IDs and providers without editing the draft" {
     app.button_count = 4;
     app.dirty = false;
     var event = std.mem.zeroes(c.SDL_Event);
+    // Render the popup, then click its generated Hide and Restore hit areas.
+    app.model_bounds = .{ .x = 20, .y = 420, .w = 40, .h = 20 };
+    app.composer_bounds = .{ .x = 10, .y = 440, .w = 600, .h = 40 };
+    app.model_first = 0;
+    app.button_count = 0;
+    try app.drawOverlays();
+    var hide_bounds: ?c.SDL_FRect = null;
+    for (app.buttons[0..app.button_count]) |button_value| {
+        if (button_value.action == .toggle_model_visibility and button_value.action.toggle_model_visibility == 2) hide_bounds = button_value.bounds;
+    }
+    const hide = hide_bounds orelse return error.MissingHideButton;
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    event.button.x = hide.x + hide.w / 2;
+    event.button.y = hide.y + hide.h / 2;
+    try app.handle(&event);
+    try std.testing.expect(app.model_menu);
+    try std.testing.expect(app.hidden_models.hidden("anthropic", "claude-haiku-4-5"));
+    try std.testing.expectEqual(@as(usize, 3), try app.modelCount());
+    try std.testing.expectEqual(@as(usize, 3), app.model_search.active_len);
+    try std.testing.expectEqual(@as(usize, 4), app.model_search.len);
+    app.button_count = 0;
+    try app.drawOverlays();
+    try std.testing.expect(app.library.query_bounds.y < app.model_section_bounds[0].y);
+    var disclosure_bounds: ?c.SDL_FRect = null;
+    for (app.buttons[0..app.button_count]) |button_value| {
+        if (button_value.action == .toggle_hidden_models) disclosure_bounds = button_value.bounds;
+        if (button_value.action == .select_model) try std.testing.expect(button_value.action.select_model != 2);
+    }
+    const disclosure = disclosure_bounds orelse return error.MissingHiddenDisclosure;
+    event.button.x = disclosure.x + disclosure.w / 2;
+    event.button.y = disclosure.y + disclosure.h / 2;
+    try app.handle(&event);
+    try std.testing.expect(app.model_hidden_expanded);
+    try std.testing.expectEqual(@as(usize, 4), try app.modelCount());
+    try std.testing.expectEqual(@as(?usize, 2), try app.modelIndex(3));
+    app.button_count = 0;
+    try app.drawOverlays();
+    try std.testing.expect(app.model_section_bounds[1].y > app.model_section_bounds[0].y);
+    // Keyboard selection crosses into hidden results; collapsing it brings
+    // selection back into the active section, never to an invisible row.
+    app.model_first = 2;
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_DOWN;
+    event.key.mod = 0;
+    try app.handle(&event);
+    try std.testing.expectEqual(@as(?usize, 2), try app.selectedModelIndex());
+    event.key.key = c.SDLK_H;
+    event.key.mod = c.SDL_KMOD_CTRL | c.SDL_KMOD_SHIFT;
+    try app.handle(&event);
+    try std.testing.expect(!app.model_hidden_expanded);
+    try std.testing.expectEqual(@as(usize, 3), try app.modelCount());
+    try std.testing.expectEqual(@as(?usize, 3), try app.selectedModelIndex());
+    event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_TEXT_INPUT;
+    event.text.text = "haiku";
+    try app.handle(&event);
+    try std.testing.expectEqual(@as(usize, 1), try app.modelCount());
+    try std.testing.expectEqual(@as(?usize, 2), try app.modelIndex(0));
+    try std.testing.expect(app.model_hidden_expanded);
+    try std.testing.expectEqual(@as(usize, 0), app.model_search.active_len);
+    app.button_count = 0;
+    try app.drawOverlays();
+    var show_bounds: ?c.SDL_FRect = null;
+    for (app.buttons[0..app.button_count]) |button_value| {
+        if (button_value.action == .toggle_model_visibility and button_value.action.toggle_model_visibility == 2) show_bounds = button_value.bounds;
+    }
+    const show = show_bounds orelse return error.MissingShowButton;
+    event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    event.button.x = show.x + show.w / 2;
+    event.button.y = show.y + show.h / 2;
+    try app.handle(&event);
+    try std.testing.expect(!app.hidden_models.hidden("anthropic", "claude-haiku-4-5"));
+    try std.testing.expectEqual(@as(usize, 1), try app.modelCount());
+    try std.testing.expectEqual(@as(usize, 1), app.model_search.active_len);
+    event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_H;
+    event.key.mod = c.SDL_KMOD_CTRL;
+    try app.handle(&event);
+    try std.testing.expect(app.hidden_models.hidden("anthropic", "claude-haiku-4-5"));
+    try std.testing.expectEqual(@as(usize, 1), try app.modelCount());
+    try app.handle(&event);
+    try std.testing.expect(!app.hidden_models.hidden("anthropic", "claude-haiku-4-5"));
+    app.library.resetQuery();
+    app.model_search.invalidate();
+    try std.testing.expectEqual(@as(usize, 4), try app.modelCount());
     event.type = c.SDL_EVENT_TEXT_INPUT;
     event.text.text = "OPUS";
     try app.handle(&event);
@@ -2884,9 +3097,31 @@ test "model search filters names IDs and providers without editing the draft" {
     try std.testing.expect(app.model_menu);
     try std.testing.expectEqual(@as(usize, 2), runtime.inputs.items.len);
 
+    // With all models hidden, the lower section still scrolls to every row.
+    app.runtime_snapshot.?.models = @constCast(&models);
+    app.library.resetQuery();
+    app.model_hidden_expanded = true;
+    for (models) |model| try app.hidden_models.toggle(allocator, model.provider, model.id);
+    app.model_search.invalidate();
+    app.model_first = 0;
+    app.button_count = 0;
+    try app.drawOverlays();
+    try std.testing.expectEqual(@as(usize, 0), app.model_search.active_len);
+    try std.testing.expectEqual(@as(usize, 4), try app.modelCount());
+    event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_MOUSE_WHEEL;
+    event.wheel.y = -1;
+    event.wheel.mouse_x = app.model_section_bounds[1].x + 10;
+    event.wheel.mouse_y = app.model_section_bounds[1].y + 10;
+    for (0..3) |_| try app.handle(&event);
+    try app.drawOverlays();
+    try std.testing.expectEqual(@as(?usize, 3), try app.selectedModelIndex());
+    try std.testing.expect(app.model_scroll[1] > 0);
+
     app.focused_editor = false;
     app.editor.setCaret(9, true);
     const draft_selection = app.editor.selection();
+    event.type = c.SDL_EVENT_KEY_DOWN;
     event.key.key = c.SDLK_ESCAPE;
     try app.handle(&event);
     try std.testing.expect(!app.model_menu);
@@ -2896,6 +3131,22 @@ test "model search filters names IDs and providers without editing the draft" {
     try std.testing.expectEqual(draft_selection, app.editor.selection());
 }
 
+test "composer model label identifies the credential provider" {
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("openrouter · OpenAI: GPT-5.4 Mini", providerModelLabel(&buffer, "openrouter", "OpenAI: GPT-5.4 Mini"));
+    try std.testing.expectEqualStrings("GPT-5.4 Mini", providerModelLabel(&buffer, "", "GPT-5.4 Mini"));
+}
+
+test "confirmed unavailable current models keep the user's draft and require a choice" {
+    var app: App = undefined;
+    app.runtime_snapshot = .{ .allocator = std.testing.allocator, .model_unavailable = true };
+    app.editor = try Composer.init(std.testing.allocator);
+    defer app.editor.deinit();
+    try app.editor.setText("keep this draft");
+    try std.testing.expectError(error.ChooseAvailableModelBeforeSending, app.submit());
+    try std.testing.expectEqualStrings("keep this draft", app.editor.textBytes());
+}
+
 test "model picker snapshot refresh preserves identity and clears disappeared selections" {
     const allocator = std.testing.allocator;
     var app: App = undefined;
@@ -2903,6 +3154,9 @@ test "model picker snapshot refresh preserves identity and clears disappeared se
     app.model_first = 1;
     app.model_selection_cleared = false;
     app.model_search = .{};
+    app.model_hidden_expanded = false;
+    app.model_scroll = .{ 0, 0 };
+    app.hidden_models = .{};
     app.button_count = 2;
     app.dirty = false;
     app.library = try Library.Panel.init(allocator);

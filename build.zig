@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "native_library_dir", b.path(b.fmt("{s}/lib", .{prefix})).getPath(b));
     options.addOption([]const u8, "asset_directory", b.path("assets").getPath(b));
     options.addOption([]const u8, "font_directory", b.path(".deps/install/fonts").getPath(b));
+    options.addOption([]const u8, "model_availability_helper", b.path("src/core/model_availability.mjs").getPath(b));
 
     // build/driver.py probes installed macOS SDKs and supplies SDKROOT/ZIG_LIBC
     // so native dependencies and Zig's bundled libc++ use a compatible SDK.
@@ -34,6 +35,8 @@ pub fn build(b: *std.Build) void {
     const bootstrap_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "build", "-p", "*_test.py" });
     bootstrap_tests.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     test_step.dependOn(&bootstrap_tests.step);
+    const availability_tests = b.addSystemCommand(&.{ "node", "--test", "src/core/model_availability.test.mjs" });
+    test_step.dependOn(&availability_tests.step);
 }
 
 fn nativeDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const u8) void {
