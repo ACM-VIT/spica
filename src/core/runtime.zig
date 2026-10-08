@@ -7,7 +7,9 @@ const storage = @import("store.zig");
 const protocol = @import("protocol.zig");
 const session = @import("session.zig");
 const Value = std.json.Value;
-const record_limit = 1024 * 1024;
+const attachments = @import("attachments.zig");
+const record_limit = attachments.max_command_bytes;
+const wire_budget = 2 * attachments.max_command_bytes;
 
 pub const Behavior = enum { prompt, steer, follow_up };
 pub const Status = enum { stopped, starting, ready, streaming, stopping, needs_force_stop, exited, failed };
@@ -154,6 +156,7 @@ pub const Runtime = struct {
     process: p.SpicaProcess = .{ .input = -1, .output = -1, .@"error" = -1, .exit_fd = -1, .pid = 0 },
     store: ?storage.Store = null,
     sink: Sink = undefined,
+    wire_bytes: usize = 0, // Protected by mutex; input queue + unwritten pipe bytes.
     next_id: u64 = 1,
     content_counter: u64 = 1,
     outgoing: std.ArrayList(u8) = .empty,
@@ -210,8 +213,16 @@ pub const Runtime = struct {
         try self.enqueue(.start);
     }
     pub fn sendPrompt(self: *Runtime, bytes: []const u8, behavior: Behavior) !u64 {
-        if (bytes.len == 0 or bytes.len > 65536) return error.InvalidPrompt;
-        return self.command(.{ .type = @tagName(behavior), .message = bytes }, bytes);
+        return self.sendAttachments(bytes, &.{}, behavior);
+    }
+    pub fn sendAttachments(self: *Runtime, bytes: []const u8, images: []const attachments.Image, behavior: Behavior) !u64 {
+        if (bytes.len == 0 or bytes.len > 128 * 1024 or images.len > attachments.max_count) return error.InvalidPrompt;
+        var size: usize = 0;
+        for (images) |image| {
+            if (image.data.len > attachments.max_draft_bytes - size) return error.ImageTooLarge;
+            size += image.data.len;
+        }
+        return self.command(.{ .type = @tagName(behavior), .message = bytes, .images = images }, bytes);
     }
     pub fn bash(self: *Runtime, bytes: []const u8) !void {
         _ = try self.command(.{ .type = "bash", .command = bytes }, null);
@@ -283,7 +294,10 @@ pub const Runtime = struct {
         defer native.SDL_UnlockMutex(self.mutex);
         if (self.worker_done or (!self.accepting and input != .force)) return error.RuntimeClosed;
         if (self.inputs.items.len >= 128) return error.CommandQueueFull;
+        const size = if (input == .bytes) input.bytes.data.len else 0;
+        if (size > wire_budget - self.wire_bytes) return error.OutgoingQueueFull;
         try self.inputs.append(self.allocator, input);
+        self.wire_bytes += size;
         if (input == .shutdown) self.accepting = false;
         p.spica_wake(self.wake[1]);
     }
@@ -300,7 +314,9 @@ pub const Runtime = struct {
         defer self.allocator.free(base);
         const line = try std.fmt.allocPrint(self.allocator, "{{\"id\":\"{s}\",{s}\n", .{ id, base[1..] });
         errdefer self.allocator.free(line);
-        if (line.len > 128 * 1024) return error.CommandTooLarge;
+        const command_limit: usize = if (@hasField(@TypeOf(value), "images")) attachments.max_command_bytes else 128 * 1024;
+        if (line.len > command_limit) return error.CommandTooLarge;
+        if (line.len > wire_budget - self.wire_bytes) return error.OutgoingQueueFull;
         try self.inputs.ensureUnusedCapacity(self.allocator, 1);
         if (draft) |text| {
             if (self.pending.items.len >= 128) return error.CommandQueueFull;
@@ -311,6 +327,7 @@ pub const Runtime = struct {
             self.pending.appendAssumeCapacity(.{ .id = pending_id, .draft = pending_draft });
         }
         self.inputs.appendAssumeCapacity(.{ .bytes = .{ .data = line, .command_id = token, .bash = std.mem.eql(u8, value.type, "bash") } });
+        self.wire_bytes += line.len;
         p.spica_wake(self.wake[1]);
         return token;
     }
@@ -432,9 +449,17 @@ pub const Runtime = struct {
             if (bits & 8 != 0) {
                 const n = p.spica_process_write(self.process.input, self.outgoing.items.ptr + self.write_offset, self.outgoing.items.len - self.write_offset);
                 if (n == -1) return error.ProcessInputClosed;
-                if (n > 0) self.write_offset += @intCast(n);
+                if (n > 0) {
+                    self.write_offset += @intCast(n);
+                    native.SDL_LockMutex(self.mutex);
+                    self.wire_bytes -|= @intCast(n);
+                    native.SDL_UnlockMutex(self.mutex);
+                }
                 if (self.write_offset == self.outgoing.items.len) {
-                    self.outgoing.clearRetainingCapacity();
+                    if (self.outgoing.capacity > 128 * 1024) {
+                        self.outgoing.deinit(self.allocator);
+                        self.outgoing = .empty;
+                    } else self.outgoing.clearRetainingCapacity();
                     self.write_offset = 0;
                 }
             }
@@ -478,11 +503,15 @@ pub const Runtime = struct {
             },
             .bytes => |queued| {
                 if (self.process.pid == 0 or self.process.input < 0) {
+                    native.SDL_LockMutex(self.mutex);
+                    self.wire_bytes -|= queued.data.len;
+                    native.SDL_UnlockMutex(self.mutex);
                     try self.replace(&self.state.error_message, "Pi is not accepting commands; unsent draft retained");
                     if (queued.command_id) |token| try self.rejectUnsent(token);
                     try self.publish();
                 } else {
-                    if (self.outgoing.items.len + queued.data.len > 2 * 1024 * 1024) return error.OutgoingQueueFull;
+                    self.compactOutgoing();
+                    if (self.outgoing.items.len + queued.data.len > wire_budget) return error.OutgoingQueueFull;
                     try self.outgoing.appendSlice(self.allocator, queued.data);
                     if (queued.stop) self.stop_requested = true;
                     if (queued.bash) {
@@ -529,11 +558,24 @@ pub const Runtime = struct {
     fn requestState(self: *Runtime) !void {
         try self.queue(.{ .type = "get_state", .id = self.state.generation });
     }
+    fn compactOutgoing(self: *Runtime) void {
+        if (self.write_offset == 0) return;
+        const remaining = self.outgoing.items.len - self.write_offset;
+        std.mem.copyForwards(u8, self.outgoing.items[0..remaining], self.outgoing.items[self.write_offset..]);
+        self.outgoing.items.len = remaining;
+        self.write_offset = 0;
+    }
     fn queue(self: *Runtime, value: anytype) !void {
         const bytes = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
         defer self.allocator.free(bytes);
-        try self.outgoing.appendSlice(self.allocator, bytes);
-        try self.outgoing.append(self.allocator, '\n');
+        self.compactOutgoing();
+        native.SDL_LockMutex(self.mutex);
+        defer native.SDL_UnlockMutex(self.mutex);
+        if (bytes.len + 1 > wire_budget - self.wire_bytes) return error.OutgoingQueueFull;
+        try self.outgoing.ensureUnusedCapacity(self.allocator, bytes.len + 1);
+        self.outgoing.appendSliceAssumeCapacity(bytes);
+        self.outgoing.appendAssumeCapacity('\n');
+        self.wire_bytes += bytes.len + 1;
     }
     fn readStdout(self: *Runtime, framer: *protocol.Framer(Sink)) !void {
         var b: [65536]u8 = undefined;
@@ -1266,4 +1308,53 @@ test "completed agents reconcile idle state while queued work remains streaming"
         try runtime.event(parsed.value, @splat(0));
         try std.testing.expectEqual(if (index == events.len - 1) Status.ready else Status.streaming, runtime.snapshot.?.status);
     }
+}
+
+test "RPC image payloads survive prompt steer follow-up and queue pressure rejects synchronously" {
+    const a = std.testing.allocator;
+    const mutex = native.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer native.SDL_DestroyMutex(mutex);
+    var wake: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), p.spica_wake_create(&wake));
+    defer p.spica_close(wake[0]);
+    defer p.spica_close(wake[1]);
+    var runtime: Runtime = .{
+        .allocator = a,
+        .io = undefined,
+        .options = undefined,
+        .options_arena = undefined,
+        .mutex = mutex,
+        .wake = wake,
+        .state = .{ .allocator = a },
+    };
+    defer {
+        for (runtime.inputs.items) |input| if (input == .bytes) a.free(input.bytes.data);
+        runtime.inputs.deinit(a);
+        for (runtime.pending.items) |item| {
+            a.free(item.id);
+            a.free(item.draft);
+        }
+        runtime.pending.deinit(a);
+    }
+    // Bigger than the previous 128 KiB command cap, without requiring a model.
+    const data = try a.alloc(u8, 256 * 1024);
+    defer a.free(data);
+    @memset(data, 'A');
+    const images = [_]attachments.Image{.{ .data = data, .mimeType = "image/png" }};
+    for ([_]Behavior{ .prompt, .steer, .follow_up }, 0..) |behavior, index| {
+        _ = try runtime.sendAttachments("inspect", &images, behavior);
+        const line = runtime.inputs.items[index].bytes.data;
+        var parsed = try std.json.parseFromSlice(Value, a, line, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(@tagName(behavior), parsed.value.object.get("type").?.string);
+        const image = parsed.value.object.get("images").?.array.items[0].object;
+        try std.testing.expectEqualStrings("image", image.get("type").?.string);
+        try std.testing.expectEqualStrings("image/png", image.get("mimeType").?.string);
+        try std.testing.expectEqualStrings(data, image.get("data").?.string);
+    }
+    runtime.wire_bytes = wire_budget;
+    try std.testing.expectError(error.OutgoingQueueFull, runtime.sendAttachments("inspect", &images, .prompt));
+    try std.testing.expectEqual(@as(usize, 3), runtime.inputs.items.len);
+    try std.testing.expectEqual(@as(usize, 3), runtime.pending.items.len);
+    try std.testing.expect(runtime.accepting and !runtime.worker_done);
 }

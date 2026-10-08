@@ -7,6 +7,8 @@ const TranscriptView = @import("ui/transcript.zig").View;
 const widgets = @import("ui/widgets.zig");
 const Composer = @import("text/composer.zig").Composer;
 const ContentWorker = @import("content/worker.zig");
+const Attachments = @import("core/attachments.zig");
+const AttachmentPlatform = @import("platform/attachments.zig");
 const Draft = @import("core/draft.zig");
 const pi = @import("core/runtime.zig");
 const Options = @import("options.zig").Options;
@@ -19,7 +21,7 @@ const Library = @import("ui/library.zig");
 const ModelSearch = @import("ui/model_search.zig").Search;
 
 const Label = struct { bytes: [128]u8 = undefined, len: usize = 0, size: c_uint = 0, layout: ?*c.SpicaTextLayout = null, used: u64 = 0 };
-const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
+const Action = union(enum) { start, new_thread, new_project_thread: usize, new_catalog_thread: usize, toggle_folder: usize, toggle_project_folder: usize, toggle_current_folder, add_project, settings, appearance: Settings.Action, sidebar, open_thread: usize, open_parked: usize, archive_thread: usize, open_library: SessionCatalog.Scope, library: Library.Action, restore_current, add_files, remove_attachment: usize, attachment_previous, attachment_next, send, stop, theme, behavior, latest, models, select_model: usize, thinking, select_thinking: usize, disclosure: @import("ui/transcript.zig").Toggle, force_stop, wait };
 const ThreadTarget = struct { path: ?[:0]u8, cwd: [:0]u8, archived: bool = false };
 const SubmittedPrompt = struct { token: u64, draft_revision: u64 };
 const ChatView = enum { new_thread, opening, existing };
@@ -45,6 +47,8 @@ const ParkedChat = struct {
     path: ?[:0]u8,
     trust: ?bool,
     model_restore: ?ModelRestore = null,
+    attachments: Attachments.List = .{},
+    cleared_attachments: Attachments.List = .{},
     draft: []u8,
     caret: usize,
     anchor: usize,
@@ -79,6 +83,8 @@ const ParkedChat = struct {
         if (self.snapshot) |*snapshot| snapshot.deinit();
         allocator.free(self.cwd);
         if (self.path) |path| allocator.free(path);
+        self.attachments.deinit(allocator);
+        self.cleared_attachments.deinit(allocator);
         allocator.free(self.draft);
         if (self.cleared_draft) |draft| allocator.free(draft);
         if (self.model_restore) |*settings| settings.deinit(allocator);
@@ -149,6 +155,11 @@ pub const App = struct {
     next_chat_id: u64 = 2,
     model_restore: ?ModelRestore = null,
     runtime_retiring: bool = false,
+    attachments: Attachments.List = .{},
+    accepted_attachments: Attachments.List = .{},
+    next_attachment_id: u64 = 1,
+    attachment_first: usize = 0,
+    file_picker_pending: bool = false,
     accepted_draft: ?[]u8 = null,
     closing: bool = false,
     force_dialog: bool = false,
@@ -356,6 +367,8 @@ pub const App = struct {
         if (self.model_restore) |*settings| settings.deinit(self.allocator);
         if (self.accepted_draft) |draft| self.allocator.free(draft);
         self.saveDraft() catch |err| std.log.err("final draft queue: {s}", .{@errorName(err)});
+        self.attachments.deinit(self.allocator);
+        self.accepted_attachments.deinit(self.allocator);
         self.draft_writer.destroy();
         self.content.destroy();
         self.catalog_worker.destroy();
@@ -576,6 +589,8 @@ pub const App = struct {
             .cwd = self.project_path,
             .path = path,
             .trust = self.options.trust_project,
+            .attachments = self.attachments,
+            .cleared_attachments = self.accepted_attachments,
             .draft = draft,
             .caret = self.editor.caret,
             .anchor = self.editor.anchor,
@@ -605,6 +620,8 @@ pub const App = struct {
         self.runtime_snapshot = null;
         self.resume_path = null;
         self.accepted_draft = null;
+        self.attachments = .{};
+        self.accepted_attachments = .{};
         self.model_restore = null;
         self.runtime_retiring = false;
     }
@@ -620,6 +637,7 @@ pub const App = struct {
         self.preedit.clearRetainingCapacity();
         _ = c.SDL_ClearComposition(self.window);
         self.dragging = false;
+        self.attachment_first = 0;
         self.editor_scroll = 0;
         self.editor_start = 0;
         self.editor_end = 0;
@@ -646,6 +664,8 @@ pub const App = struct {
         self.options.trust_project = chat.trust;
         self.model_restore = chat.model_restore;
         self.accepted_draft = chat.cleared_draft;
+        self.attachments = chat.attachments;
+        self.accepted_attachments = chat.cleared_attachments;
         self.runtime_retiring = chat.retiring;
         try self.editor.setText(chat.draft);
         self.editor.setCaret(chat.anchor, false);
@@ -808,6 +828,7 @@ pub const App = struct {
     }
 
     fn closeSettled(self: *const App) bool {
+        if (self.file_picker_pending) return false;
         if (!self.ownedRuntimesFinished() or self.pending_mutation != null or self.submitted_prompt != null or
             (self.enrollment_intent and !self.enrollment_failed)) return false;
         for (self.parked_chats.items) |chat| if (chat.submitted != null or (chat.enrollment_intent and !chat.enrollment_failed)) return false;
@@ -904,6 +925,9 @@ pub const App = struct {
                         };
                         if (self.accepted_draft) |old| self.allocator.free(old);
                         self.accepted_draft = saved;
+                        self.accepted_attachments.deinit(self.allocator);
+                        self.accepted_attachments = self.attachments;
+                        self.attachments = .{};
                         self.editor.selectAll();
                         self.editor.insert("", .paste) catch |err| {
                             self.report("Clearing accepted draft", err);
@@ -916,8 +940,12 @@ pub const App = struct {
                     self.submitted_prompt = null;
                 }
             }
-            if (recovery_changed and snapshot.pending_draft.len != 0 and self.editor.len == 0 and self.submitted_prompt == null) {
-                self.editor.insert(snapshot.pending_draft, .paste) catch |err| {
+            if (recovery_changed and snapshot.pending_draft.len != 0 and self.editor.len == 0 and self.attachments.items.items.len == 0 and self.submitted_prompt == null) {
+                const recovered = Attachments.recover(self.allocator, snapshot.pending_draft, self.accepted_draft, &self.accepted_attachments, &self.attachments) catch |err| {
+                    self.report("Recovering attachments", err);
+                    return;
+                };
+                self.editor.insert(recovered, .paste) catch |err| {
                     self.report("Recovering cancelled input; raw source retained", err);
                     return;
                 };
@@ -934,6 +962,10 @@ pub const App = struct {
                 self.options.resume_file = path;
             }
             if (changed_error and snapshot.visible_length == 0 and snapshot.status == .ready and self.run_started != null and self.accepted_clear_revision == self.draft_revision and self.editor.len == 0) {
+                if (self.attachments.items.items.len == 0) {
+                    self.attachments = self.accepted_attachments;
+                    self.accepted_attachments = .{};
+                }
                 if (self.editor.undo()) {
                     self.edited();
                 } else if (self.accepted_draft) |draft| {
@@ -1024,14 +1056,18 @@ pub const App = struct {
                     try self.replaceParkedDraft(chat, "");
                     if (chat.cleared_draft) |draft| self.allocator.free(draft);
                     chat.cleared_draft = cleared;
+                    chat.cleared_attachments.deinit(self.allocator);
+                    chat.cleared_attachments = chat.attachments;
+                    chat.attachments = .{};
                     chat.accepted_clear_revision = chat.draft_revision;
                 }
             } else if (std.mem.eql(u8, incoming.rejected_command_id, id) or chat.runtime.?.isFinished()) {
                 chat.submitted = null;
             }
         }
-        if (recovery_changed and incoming.pending_draft.len != 0 and chat.draft.len == 0 and chat.submitted == null) {
-            try self.replaceParkedDraft(chat, incoming.pending_draft);
+        if (recovery_changed and incoming.pending_draft.len != 0 and chat.draft.len == 0 and chat.attachments.items.items.len == 0 and chat.submitted == null) {
+            const recovered = try Attachments.recover(self.allocator, incoming.pending_draft, chat.cleared_draft, &chat.cleared_attachments, &chat.attachments);
+            try self.replaceParkedDraft(chat, recovered);
         }
         if (incoming.session_file.len != 0 and (chat.path == null or !std.mem.eql(u8, chat.path.?, incoming.session_file))) {
             const path = try self.allocator.dupeZ(u8, incoming.session_file);
@@ -1042,6 +1078,10 @@ pub const App = struct {
             chat.accepted_clear_revision == chat.draft_revision and chat.draft.len == 0)
         {
             if (chat.cleared_draft) |draft| try self.replaceParkedDraft(chat, draft);
+            if (chat.attachments.items.items.len == 0) {
+                chat.attachments = chat.cleared_attachments;
+                chat.cleared_attachments = .{};
+            }
         }
         if (chat.run_started) |started| {
             if (incoming.status == .ready and incoming.visible_revision > chat.run_base_revision and std.mem.eql(u8, incoming.content_status, "complete")) {
@@ -1140,7 +1180,8 @@ pub const App = struct {
         if (self.runtimeStatus() != .ready and self.runtimeStatus() != .streaming) return error.PiNotReady;
         if (self.bashRunning()) return error.PiBusy;
         const text = self.editor.textBytes();
-        if (text.len == 0) return;
+        if (text.len == 0 and self.attachments.items.items.len == 0) return;
+        if (!self.attachments.ready()) return error.AttachmentsNotReady;
         if (self.thread_title_len == 0) {
             const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
             const first = std.mem.trim(u8, clippedLabel(text[0..end]), " \t\r");
@@ -1154,7 +1195,15 @@ pub const App = struct {
         self.error_len = 0;
         if (self.submitted_prompt != null) return error.PromptAcknowledgementPending;
         const behavior: pi.Behavior = if (self.runtimeStatus() == .ready) .prompt else if (self.behavior == .prompt) .follow_up else self.behavior;
-        const token = try runtime.sendPrompt(text, behavior);
+        const message = try Attachments.message(self.allocator, text, self.attachments.items.items);
+        defer self.allocator.free(message);
+        var images: [Attachments.max_count]Attachments.Image = undefined;
+        var image_count: usize = 0;
+        for (self.attachments.items.items) |item| if (item.image) |image| {
+            images[image_count] = image;
+            image_count += 1;
+        };
+        const token = try runtime.sendAttachments(message, images[0..image_count], behavior);
         self.submitted_prompt = .{ .token = token, .draft_revision = self.draft_revision };
         self.follow_bottom = true;
         self.dirty = true;
@@ -1275,6 +1324,22 @@ pub const App = struct {
 
     fn act(self: *App, action: Action) !void {
         switch (action) {
+            .add_files => if (!self.file_picker_pending) {
+                try AttachmentPlatform.pick(self.window, self.wake_event, self.chat_id);
+                self.file_picker_pending = true;
+            },
+            .remove_attachment => |index| if (index < self.attachments.items.items.len) {
+                self.attachments.remove(self.allocator, index);
+                self.edited();
+            },
+            .attachment_previous => {
+                self.attachment_first -|= 1;
+                self.dirty = true;
+            },
+            .attachment_next => {
+                self.attachment_first += 1;
+                self.dirty = true;
+            },
             .start => try self.beginRuntime(),
             .new_thread => try self.newThreadIn(self.project_path),
             .open_parked => |index| {
@@ -1418,6 +1483,7 @@ pub const App = struct {
         try self.hit(action, bounds);
         const reserve: f32 = switch (action) {
             .models, .thinking => 28,
+            .attachment_previous, .attachment_next => 8,
             else => 16,
         };
         try self.fitLabel(clippedLabel(text), bounds.x + 8, bounds.y + 7, @max(0, bounds.w - reserve), 13, self.palette().muted);
@@ -1687,7 +1753,13 @@ pub const App = struct {
         if (self.draft_writer.takeError()) |err| self.report("Draft could not be saved", err);
         if (self.content.take()) |result_value| {
             var result = result_value;
+            if (result == .attachment) {
+                defer result.deinit();
+                self.acceptAttachment(&result.attachment) catch |err| self.report("Preparing attachment", err);
+                return;
+            }
             const generation = switch (result) {
+                .attachment => unreachable,
                 .ready => |value| value.generation,
                 .conversation => |value| value.generation,
                 .failure => |value| value.generation orelse self.generation,
@@ -1698,6 +1770,7 @@ pub const App = struct {
             }
             self.content_pending = false;
             switch (result) {
+                .attachment => unreachable,
                 .failure => |failure| {
                     if (self.pending_ordinal) |ordinal| self.transcript.fail(ordinal);
                     self.report("Loading conversation", failure.err);
@@ -1726,6 +1799,115 @@ pub const App = struct {
             }
             self.dirty = true;
         }
+    }
+
+    fn attachmentList(self: *App, chat_id: u64) ?*Attachments.List {
+        if (chat_id == self.chat_id) return &self.attachments;
+        for (self.parked_chats.items) |*chat| if (chat.id == chat_id) return &chat.attachments;
+        return null;
+    }
+
+    fn attachmentEdited(self: *App, chat_id: u64) void {
+        if (chat_id == self.chat_id) {
+            self.edited();
+        } else {
+            for (self.parked_chats.items) |*chat| if (chat.id == chat_id) {
+                chat.draft_revision += 1;
+            };
+        }
+        self.dirty = true;
+    }
+
+    fn queueAttachment(self: *App, chat_id: u64, path: ?[]const u8, clipboard: ?[]u8) !void {
+        const list = self.attachmentList(chat_id) orelse return error.ChatUnavailable;
+        if (list.items.items.len >= Attachments.max_count) return error.TooManyAttachments;
+        if (path) |value| if (!std.fs.path.isAbsolute(value) or value.len > 4096 or !std.unicode.utf8ValidateSlice(value)) return error.InvalidAttachmentPath;
+        var request: Attachments.Request = .{ .chat_id = chat_id, .id = self.next_attachment_id };
+        errdefer {
+            request.clipboard = null;
+            request.deinit();
+        }
+        if (path) |value| request.path = try std.heap.page_allocator.dupeZ(u8, value);
+        request.clipboard = clipboard;
+        var item: Attachments.Item = .{ .id = request.id, .name = try self.allocator.dupe(u8, if (path) |value| std.fs.path.basename(value) else "Pasted image") };
+        errdefer item.deinit(self.allocator);
+        if (path) |value| item.path = try self.allocator.dupeZ(u8, value);
+        try list.items.ensureUnusedCapacity(self.allocator, 1);
+        try self.content.attach(request);
+        list.items.appendAssumeCapacity(item);
+        self.next_attachment_id += 1;
+        self.attachmentEdited(chat_id);
+    }
+
+    fn retainedAttachmentBytes(self: *const App) usize {
+        var total = self.attachments.bytes() + self.accepted_attachments.bytes();
+        for (self.parked_chats.items) |chat| total += chat.attachments.bytes() + chat.cleared_attachments.bytes();
+        return total;
+    }
+
+    fn acceptAttachment(self: *App, prepared: *Attachments.Prepared) !void {
+        const list = self.attachmentList(prepared.chat_id) orelse return;
+        for (list.items.items) |*item| {
+            if (item.id != prepared.id) continue; // Removed/closed drafts discard late results.
+            item.loading = false;
+            item.failure = prepared.failure;
+            item.size = prepared.size;
+            self.dirty = true;
+            if (prepared.failure) |err| return err;
+            if (prepared.image) |image| {
+                if (image.data.len > Attachments.max_draft_bytes - list.bytes() or image.data.len > Attachments.max_retained_bytes - self.retainedAttachmentBytes()) {
+                    item.failure = error.AttachmentBudgetExceeded;
+                    return error.AttachmentBudgetExceeded;
+                }
+                const thumbnail = prepared.thumbnail;
+                const texture = c.SDL_CreateTexture(self.renderer, c.SDL_PIXELFORMAT_RGBA32, c.SDL_TEXTUREACCESS_STATIC, thumbnail.width, thumbnail.height) orelse {
+                    item.failure = error.ImageUpload;
+                    return error.ImageUpload;
+                };
+                errdefer c.SDL_DestroyTexture(texture);
+                if (!c.SDL_UpdateTexture(texture, null, thumbnail.pixels, thumbnail.stride) or !c.SDL_SetTextureBlendMode(texture, c.SDL_BLENDMODE_BLEND) or !c.SDL_SetTextureScaleMode(texture, c.SDL_SCALEMODE_LINEAR)) {
+                    item.failure = error.ImageUpload;
+                    return error.ImageUpload;
+                }
+                item.texture = texture;
+                item.width = @floatFromInt(thumbnail.width);
+                item.height = @floatFromInt(thumbnail.height);
+                item.image = image;
+                prepared.image = null;
+            }
+            return;
+        }
+    }
+
+    fn drawAttachments(self: *App, composer: c.SDL_FRect) !void {
+        const colors = self.palette();
+        const count = self.attachments.items.items.len;
+        const available = @max(1, composer.w - 60);
+        const visible: usize = @max(1, @as(usize, @intFromFloat(@floor(available / 144))));
+        self.attachment_first = @min(self.attachment_first, count -| visible);
+        const card_width = @min(136, available / @as(f32, @floatFromInt(@min(count, visible))) - 4);
+        const start_x = composer.x + 30;
+        const y = composer.y + 8;
+        if (self.attachment_first != 0) try self.flatButton(.attachment_previous, "<", .{ .x = composer.x + 4, .y = y + 18, .w = 24, .h = 28 });
+        const end = @min(count, self.attachment_first + visible);
+        for (self.attachments.items.items[self.attachment_first..end], self.attachment_first..) |item, index| {
+            const x = start_x + @as(f32, @floatFromInt(index - self.attachment_first)) * (card_width + 8);
+            try self.rectangle(x, y, card_width, 64, 8, colors.raised);
+            var text_x = x + 6;
+            if (item.texture) |texture| {
+                const scale = @min(48 / item.width, 44 / item.height);
+                const bounds = c.SDL_FRect{ .x = x + 5, .y = y + 10, .w = item.width * scale, .h = item.height * scale };
+                if (!c.SDL_RenderTexture(self.renderer, texture, null, &bounds)) return error.ImagePreview;
+                text_x = x + 58;
+            }
+            const label_width = @max(8, x + card_width - 6 - text_x);
+            try self.fitLabel(clippedLabel(item.name), text_x, y + 26, label_width, 11, colors.text);
+            var details: [48]u8 = undefined;
+            const detail = if (item.loading) "Loading..." else if (item.failure != null) "Failed" else if (item.size) |size| try std.fmt.bufPrint(&details, "{d} KiB", .{(size + 1023) / 1024}) else "File";
+            try self.fitLabel(detail, text_x, y + 43, label_width, 10, if (item.failure != null) colors.error_color else colors.muted);
+            try self.flatButton(.{ .remove_attachment = index }, "x", .{ .x = x + card_width - 24, .y = y, .w = 24, .h = 22 });
+        }
+        if (end < count) try self.flatButton(.attachment_next, ">", .{ .x = composer.x + composer.w - 28, .y = y + 18, .w = 24, .h = 28 });
     }
 
     fn saveDraft(self: *App) !void {
@@ -2026,7 +2208,7 @@ pub const App = struct {
         height = @intFromFloat(@as(f32, @floatFromInt(height)) / scale);
         self.layout.resize(@floatFromInt(width), @floatFromInt(height));
         const colors = self.palette();
-        self.shell = self.layout.shell(if (self.sidebar_visible) @min(268, @as(f32, @floatFromInt(width)) * 0.34) else 0, self.theme.metrics.header_height, @min(202, @as(f32, @floatFromInt(height)) * 0.4));
+        self.shell = self.layout.shell(if (self.sidebar_visible) @min(268, @as(f32, @floatFromInt(width)) * 0.34) else 0, self.theme.metrics.header_height, @min(if (self.attachments.items.items.len != 0) @as(f32, 282) else 202, @as(f32, @floatFromInt(height)) * (if (self.attachments.items.items.len != 0) @as(f32, 0.75) else 0.4)));
         const header = self.shell.header;
         const conversation = self.shell.conversation;
         const displayed_project = if (self.pending_thread) |target| target.cwd else self.project_path;
@@ -2077,7 +2259,8 @@ pub const App = struct {
             try self.fitLabel(description, content_x + 16, empty_y + 64, content_width - 32, 13, colors.muted);
         }
         if (!self.follow_bottom and self.transcript.height > viewport_height) try self.flatButton(.latest, "Jump to latest", .{ .x = content_x + content_width - 128, .y = conversation.y + conversation.height - 33, .w = 128, .h = 28 });
-        self.composer_bounds = .{ .x = content_x, .y = self.shell.composer.y + 8, .w = content_width, .h = @min(144, self.shell.composer.height - 44) };
+        const preview_height: f32 = if (self.attachments.items.items.len != 0) 76 else 0;
+        self.composer_bounds = .{ .x = content_x, .y = self.shell.composer.y + 8, .w = content_width, .h = @min(144 + preview_height, self.shell.composer.height - 44) };
         const composer = self.composer_bounds;
         const fill = theme_module.Color{
             .r = @intCast((@as(u16, colors.canvas.r) * 3 + colors.raised.r) / 4),
@@ -2086,7 +2269,8 @@ pub const App = struct {
         };
         try self.rectangle(composer.x, composer.y, composer.w, composer.h, 14, colors.border);
         try self.rectangle(composer.x + 1, composer.y + 1, composer.w - 2, composer.h - 2, 13, fill);
-        self.editor_bounds = .{ .x = composer.x + 4, .y = composer.y + 4, .w = composer.w - 8, .h = composer.h - 52 };
+        if (preview_height != 0) try self.drawAttachments(composer);
+        self.editor_bounds = .{ .x = composer.x + 4, .y = composer.y + 4 + preview_height, .w = composer.w - 8, .h = @max(24, composer.h - 52 - preview_height) };
         try self.drawEditor();
         const controls_y = composer.y + composer.h - 40;
         var model_name: []const u8 = "Select model";
@@ -2121,9 +2305,8 @@ pub const App = struct {
                 try self.iconButton(if (working) .stop else .send, if (working) .stop else .arrow_up, send_bounds, if (self.runtime == null) colors.muted else colors.text);
             }
         }
-        try widgets.icon(self.renderer, .folder, .{ .x = composer.x + 2, .y = composer.y + composer.h + 13, .w = 12, .h = 12 }, colors.muted);
-        try self.label("Local checkout", composer.x + 22, composer.y + composer.h + 13, 11, colors.muted);
-        try self.fitLabel(project, composer.x + 130, composer.y + composer.h + 13, @max(0, composer.w - 130), 11, colors.muted);
+        try self.flatButton(.add_files, "+ Add files", .{ .x = composer.x, .y = composer.y + composer.h + 6, .w = 94, .h = 28 });
+        try self.fitLabel(project, composer.x + 110, composer.y + composer.h + 13, @max(0, composer.w - 110), 11, colors.muted);
         if (self.error_len != 0) {
             try self.fitLabel(clippedLabel(self.error_text[0..self.error_len]), composer.x, composer.y - 25, composer.w, 12, colors.error_color);
         } else if (self.runtime_snapshot) |snapshot| {
@@ -2281,6 +2464,17 @@ pub const App = struct {
         if (!c.SDL_ConvertEventToRenderCoordinates(self.renderer, &logical)) return error.InputCoordinates;
         const event = &logical;
         if (event.type == self.wake_event) {
+            if (event.user.code == 3) {
+                self.file_picker_pending = false;
+                const selection: *AttachmentPlatform.Selection = @ptrCast(@alignCast(event.user.data1.?));
+                defer selection.destroy();
+                if (selection.failure) |err| return err;
+                if (!self.closing) {
+                    for (selection.paths) |path| if (path) |chosen| self.queueAttachment(selection.chat_id, chosen, null) catch |err| self.report("Adding file", err);
+                }
+                self.dirty = true;
+                return;
+            }
             if (event.user.code == 2) {
                 self.folder_pending = false;
                 return error.FolderPickerUnavailable;
@@ -2588,6 +2782,11 @@ pub const App = struct {
                             self.edited();
                         },
                         c.SDLK_V => {
+                            if (try AttachmentPlatform.clipboardImage()) |image| {
+                                errdefer std.heap.page_allocator.free(image);
+                                try self.queueAttachment(self.chat_id, null, image);
+                                return;
+                            }
                             const clipboard = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
                             defer c.SDL_free(clipboard);
                             try self.editor.insert(std.mem.span(clipboard), .paste);
@@ -3130,6 +3329,7 @@ test "background prompt acknowledgements clear only the submitted chat revision"
             .scroll = 0,
         };
         defer chat.deinit(allocator);
+        try chat.attachments.items.append(allocator, .{ .id = 12, .name = try allocator.dupe(u8, "pending-file"), .path = try allocator.dupeZ(u8, "/tmp/pending-file"), .loading = false });
         const snapshot = pi.Snapshot{
             .allocator = allocator,
             .status = .streaming,
@@ -3146,6 +3346,8 @@ test "background prompt acknowledgements clear only the submitted chat revision"
             try std.testing.expectEqual(chat.draft_revision, chat.accepted_clear_revision.?);
         }
         try std.testing.expectEqualStrings("active chat draft", app.editor.textBytes());
+        try std.testing.expectEqual(@as(usize, @intFromBool(edited_after_send)), chat.attachments.items.items.len);
+        try std.testing.expectEqual(@as(usize, @intFromBool(!edited_after_send)), chat.cleared_attachments.items.items.len);
         const recovery = pi.Snapshot{
             .allocator = allocator,
             .status = .streaming,
@@ -3156,6 +3358,37 @@ test "background prompt acknowledgements clear only the submitted chat revision"
         };
         try app.consumeParkedSnapshot(&chat, recovery);
         try std.testing.expectEqualStrings(if (edited_after_send) text else "recovered background input", chat.draft);
+        try std.testing.expectEqual(@as(usize, @intFromBool(edited_after_send)), chat.attachments.items.items.len);
         try std.testing.expectEqualStrings("active chat draft", app.editor.textBytes());
     }
+}
+
+test "asynchronous attachment results route to parked draft and removal discards late results" {
+    const a = std.testing.allocator;
+    var app: App = undefined;
+    app.allocator = a;
+    app.chat_id = 1;
+    app.attachments = .{};
+    defer app.attachments.deinit(a);
+    app.parked_chats = .empty;
+    defer app.parked_chats.deinit(a);
+    app.dirty = false;
+    var parked: ParkedChat = undefined;
+    parked.id = 7;
+    parked.attachments = .{};
+    try app.parked_chats.append(a, parked);
+    defer app.parked_chats.items[0].attachments.deinit(a);
+    try app.attachments.items.append(a, .{ .id = 10, .name = try a.dupe(u8, "active") });
+    try app.parked_chats.items[0].attachments.items.append(a, .{ .id = 11, .name = try a.dupe(u8, "parked") });
+    var result: Attachments.Prepared = .{ .chat_id = 7, .id = 11, .size = 321 };
+    try app.acceptAttachment(&result);
+    try std.testing.expect(app.attachments.items.items[0].loading);
+    try std.testing.expect(!app.parked_chats.items[0].attachments.items.items[0].loading);
+    try std.testing.expectEqual(@as(?u64, 321), app.parked_chats.items[0].attachments.items.items[0].size);
+    app.parked_chats.items[0].attachments.remove(a, 0);
+    try app.acceptAttachment(&result);
+    try std.testing.expectEqual(@as(usize, 0), app.parked_chats.items[0].attachments.items.items.len);
+    result.chat_id = 99;
+    try app.acceptAttachment(&result);
+    try std.testing.expectEqual(@as(usize, 1), app.attachments.items.items.len);
 }

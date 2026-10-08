@@ -57,6 +57,7 @@ fn nativeDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const 
         else => @panic("Process support requires Linux or macOS"),
     };
     module.addCSourceFile(.{ .file = b.path(process_backend), .flags = &.{ "-std=c11", "-O2" } });
+    module.addCSourceFile(.{ .file = b.path("src/platform/attachment_file.c"), .flags = &.{ "-std=c11", "-D_DEFAULT_SOURCE", "-O2" } });
     module.addCSourceFile(.{ .file = b.path("src/platform/database.c"), .flags = &.{ "-std=c11", "-D_DEFAULT_SOURCE", "-O2" } });
     module.addLibraryPath(b.path(b.fmt("{s}/lib", .{prefix})));
     module.addRPath(b.path(b.fmt("{s}/lib", .{prefix})));
@@ -71,6 +72,9 @@ fn nativeDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const 
     }
     // text.c finds fallback fonts through CoreText on macOS (fontconfig, loaded at runtime, on Linux).
     if (module.resolved_target.?.result.os.tag == .macos) {
+        module.addCSourceFile(.{ .file = b.path("src/platform/clipboard_macos.c"), .flags = &.{ "-std=c11", "-O2" } });
+        module.linkFramework("ImageIO", .{});
+        module.linkFramework("CoreGraphics", .{});
         module.linkFramework("CoreText", .{});
         module.linkFramework("CoreFoundation", .{});
     }

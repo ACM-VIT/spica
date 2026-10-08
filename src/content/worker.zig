@@ -5,6 +5,7 @@ const ContentId = @import("../core/store.zig").ContentId;
 const md = @import("markdown.zig");
 const fixture = @import("../diagnostics/fixture.zig");
 const allocator = std.heap.page_allocator;
+const Attachments = @import("../core/attachments.zig");
 
 pub const Role = enum { user, assistant, tool, bash, system };
 pub fn roleFor(role: []const u8, kind: []const u8) Role {
@@ -57,11 +58,13 @@ pub const Conversation = struct {
     }
 };
 pub const Result = union(enum) {
+    attachment: Attachments.Prepared,
     ready: Ready,
     conversation: Conversation,
     failure: struct { err: anyerror, generation: ?u64 },
     pub fn deinit(self: *Result) void {
         switch (self.*) {
+            .attachment => |*value| value.deinit(),
             .ready => |*value| value.deinit(),
             .conversation => |*value| value.deinit(),
             .failure => {},
@@ -80,6 +83,8 @@ pub const Worker = struct {
     fixture_mode: bool,
     wake_event: u32,
     closing: bool = false,
+    attachments: std.ArrayList(Attachments.Request) = .empty,
+    clipboard_bytes: usize = 0, // Includes the in-flight request, under mutex.
     pending: ?OwnedRequest = null,
     result: ?Result = null,
     latest_generation: u64 = 0,
@@ -104,6 +109,8 @@ pub const Worker = struct {
         c.SDL_BroadcastCondition(self.condition);
         c.SDL_UnlockMutex(self.mutex);
         if (self.thread) |thread| thread.join();
+        for (self.attachments.items) |*request_value| request_value.deinit();
+        self.attachments.deinit(allocator);
         if (self.pending) |*pending| pending.deinit();
         if (self.result) |*result| result.deinit();
         c.SDL_DestroyCondition(self.condition);
@@ -123,6 +130,20 @@ pub const Worker = struct {
         self.latest_generation = value.generation;
         if (self.pending) |*previous| previous.deinit();
         self.pending = owned;
+        c.SDL_SignalCondition(self.condition);
+    }
+
+    /// Consumes request ownership only on success. A bounded FIFO lets each
+    /// selected file complete without coalescing away another chat's files.
+    pub fn attach(self: *Worker, value: Attachments.Request) !void {
+        c.SDL_LockMutex(self.mutex);
+        defer c.SDL_UnlockMutex(self.mutex);
+        if (self.closing) return error.WorkerClosed;
+        if (self.attachments.items.len >= Attachments.max_count) return error.AttachmentQueueFull;
+        const bytes = if (value.clipboard) |data| data.len else 0;
+        if (bytes > Attachments.max_clipboard_queue_bytes - self.clipboard_bytes) return error.AttachmentQueueFull;
+        try self.attachments.append(allocator, value);
+        self.clipboard_bytes += bytes;
         c.SDL_SignalCondition(self.condition);
     }
 
@@ -176,10 +197,27 @@ pub const Worker = struct {
         defer if (reader) |*db| db.deinit();
         while (true) {
             c.SDL_LockMutex(self.mutex);
-            while (self.pending == null and !self.closing) c.SDL_WaitCondition(self.condition, self.mutex);
+            while (self.pending == null and self.attachments.items.len == 0 and !self.closing) c.SDL_WaitCondition(self.condition, self.mutex);
             if (self.closing) {
                 c.SDL_UnlockMutex(self.mutex);
                 return;
+            }
+            if (self.attachments.items.len != 0) {
+                var request_value = self.attachments.orderedRemove(0);
+                c.SDL_UnlockMutex(self.mutex);
+                defer {
+                    c.SDL_LockMutex(self.mutex);
+                    if (request_value.clipboard) |data| self.clipboard_bytes -= data.len;
+                    c.SDL_UnlockMutex(self.mutex);
+                    request_value.deinit();
+                }
+                const prepared = Attachments.prepare(self.io, request_value) catch |err| Attachments.Prepared{
+                    .chat_id = request_value.chat_id,
+                    .id = request_value.id,
+                    .failure = err,
+                };
+                self.publish(.{ .attachment = prepared }, null);
+                continue;
             }
             var owned = self.pending.?;
             self.pending = null;
