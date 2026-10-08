@@ -260,7 +260,7 @@ pub const Panel = struct {
 
     pub fn draw(self: *Panel, app: anytype) !void {
         if (!self.open) return;
-        app.button_count = 0;
+        app.buttons.clear();
         self.invalidateTargets();
         const colors = app.palette();
         const canvas_w = app.shell.sidebar.width + app.shell.conversation.width;

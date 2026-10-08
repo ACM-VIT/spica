@@ -14,6 +14,7 @@ test {
     _ = @import("text/utf8.zig");
     _ = @import("text/bounded.zig");
     _ = @import("ui/hit_targets.zig");
+    _ = @import("ui/thinking_menu.zig");
     _ = @import("native/markdown_test.zig");
     _ = @import("content/markdown_test.zig");
     _ = @import("native/images_test.zig");
