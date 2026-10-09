@@ -100,7 +100,7 @@ pub fn collectDrafts(app: *const App, drafts: *[Draft.max_drafts]Draft.Entry) Co
             if (index <= parked.len) shadowed += 1;
             continue;
         }
-        if (count == drafts.len) {
+        if (count == drafts.len or !entry.valid()) {
             dropped += 1;
             continue;
         }
@@ -125,7 +125,7 @@ pub fn saveDraft(app: *App) !void {
     });
     app.draft_due = null;
     // Unsaved drafts stay in memory; only the disk copy is bounded.
-    if (collected.dropped > app.draft_loss.dropped) app.report("Some drafts exceed the saved draft limit", error.DraftLimitReached);
+    if (collected.dropped > app.draft_loss.dropped) app.report("Some drafts could not be saved", error.DraftLimitReached);
     if (collected.shadowed > app.draft_loss.shadowed) app.report("Only one unsent draft per project is saved", error.DraftKeyShared);
     app.draft_loss = .{ .dropped = collected.dropped, .shadowed = collected.shadowed };
 }
@@ -574,4 +574,15 @@ test "stored drafts of deleted sessions are dropped and the oldest drafts are ev
     try std.testing.expect(draftIndex(buffer[0..collected.count], "", "/project-0") != null);
     const last = try std.fmt.bufPrint(&name, "/project-{d}", .{Draft.max_drafts - 1});
     try std.testing.expect(draftIndex(buffer[0..collected.count], "", last) == null);
+
+    freeDrafts(allocator, &app.stored_drafts);
+    app.stored_drafts = .empty;
+    const long_session = try allocator.alloc(u8, 4097);
+    defer allocator.free(long_session);
+    @memset(long_session, 'a');
+    app.options = .{ .resume_file = long_session };
+    app.current_member = true;
+    const rejected = collectDrafts(&app, &buffer);
+    try std.testing.expectEqual(@as(usize, 0), rejected.count);
+    try std.testing.expectEqual(@as(usize, 1), rejected.dropped);
 }

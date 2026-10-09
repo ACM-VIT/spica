@@ -23,7 +23,7 @@ pub const Entry = struct {
         return self.session.len == 0 and std.mem.eql(u8, self.cwd, cwd);
     }
 
-    fn valid(self: Entry) bool {
+    pub fn valid(self: Entry) bool {
         if (self.text.len == 0 or self.text.len > max_draft_bytes or !std.unicode.utf8ValidateSlice(self.text)) return false;
         if (self.session.len > max_path_bytes or self.cwd.len > max_path_bytes) return false;
         return self.session.len != 0 or self.cwd.len != 0;
