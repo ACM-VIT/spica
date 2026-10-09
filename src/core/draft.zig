@@ -85,22 +85,27 @@ pub const Restored = struct {
 };
 
 pub fn restore(io: std.Io, path: []const u8) !Restored {
-    return load(io, path) catch |err| switch (err) {
-        error.FileNotFound => .{},
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_state_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        error.StreamTooLong => return setAside(io, path, err),
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    return load(bytes) catch |err| switch (err) {
         error.OutOfMemory => err,
-        else => {
-            const backup = try std.fmt.allocPrint(allocator, "{s}.invalid", .{path});
-            defer allocator.free(backup);
-            // Without a preserved copy, starting would let the next write discard it.
-            std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), backup, io) catch return err;
-            return .{ .unreadable = err };
-        },
+        else => setAside(io, path, err),
     };
 }
 
-fn load(io: std.Io, path: []const u8) !Restored {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_state_bytes));
-    defer allocator.free(bytes);
+fn setAside(io: std.Io, path: []const u8, err: anyerror) !Restored {
+    const backup = try std.fmt.allocPrint(allocator, "{s}.invalid", .{path});
+    defer allocator.free(backup);
+    // Without a preserved copy, starting would let the next write discard it.
+    std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), backup, io) catch return err;
+    return .{ .unreadable = err };
+}
+
+fn load(bytes: []const u8) !Restored {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
     if (parsed.value != .object) return error.InvalidWorkspace;
@@ -359,6 +364,31 @@ test "an unreadable workspace is kept aside and defaults are used" {
     var next = try restore(io, path);
     defer next.deinit();
     try std.testing.expect(next.unreadable == null);
+}
+
+test "a workspace that cannot be opened stays in place" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "workspace.json", .data = "{\"font_size\":20}" });
+    const file = try tmp.dir.openFile(io, "workspace.json", .{});
+    defer file.close(io);
+    try file.setPermissions(io, .fromMode(0));
+    defer file.setPermissions(io, .fromMode(0o600)) catch {};
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "workspace.json" });
+    defer std.testing.allocator.free(path);
+
+    if (restore(io, path)) |opened| {
+        var restored = opened;
+        restored.deinit();
+        return error.SkipZigTest;
+    } else |_| {}
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "workspace.json.invalid", .{}));
+    try file.setPermissions(io, .fromMode(0o600));
+    (try tmp.dir.openFile(io, "workspace.json", .{})).close(io);
 }
 
 test "saved workspace files are private to the user" {
