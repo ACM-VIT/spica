@@ -89,10 +89,10 @@ pub fn collectDrafts(app: *const App, drafts: *[Draft.max_drafts]Draft.Entry) Co
     for (0..1 + parked.len + app.stored_drafts.items.len) |index| {
         const entry = if (index == 0)
             draftEntry(active_session, app.current_member or app.enrollment_intent, app.project_path, app.editor.textBytes())
-        else if (index <= parked.len)
-            draftEntry(parked[index - 1].session(), parked[index - 1].member or parked[index - 1].enrollment_intent, parked[index - 1].cwd, parked[index - 1].draft)
-        else
-            app.stored_drafts.items[index - 1 - parked.len];
+        else if (index <= parked.len) blk: {
+            const chat_state = &parked[parked.len - index];
+            break :blk draftEntry(chat_state.session(), chat_state.member or chat_state.enrollment_intent, chat_state.cwd, chat_state.draft);
+        } else app.stored_drafts.items[index - 1 - parked.len];
         if (entry.text.len == 0) continue;
         // Live chats come first, so an older stored copy never replaces them.
         // Two live unsent threads in one project share a key; only the first is kept.
@@ -585,4 +585,65 @@ test "stored drafts of deleted sessions are dropped and the oldest drafts are ev
     const rejected = collectDrafts(&app, &buffer);
     try std.testing.expectEqual(@as(usize, 0), rejected.count);
     try std.testing.expectEqual(@as(usize, 1), rejected.dropped);
+}
+
+fn testParked(allocator: std.mem.Allocator, cwd: []const u8, text: []const u8) !chat.ParkedChat {
+    const owned_cwd = try allocator.dupeZ(u8, cwd);
+    errdefer allocator.free(owned_cwd);
+    return .{
+        .id = 0,
+        .runtime = null,
+        .snapshot = null,
+        .cwd = owned_cwd,
+        .path = null,
+        .trust = false,
+        .draft = try allocator.dupe(u8, text),
+        .caret = 0,
+        .anchor = 0,
+        .draft_revision = 1,
+        .submitted = null,
+        .accepted_clear_revision = null,
+        .view = .new_thread,
+        .archived = false,
+        .member = false,
+        .enrollment_intent = false,
+        .accepted_enrollment = false,
+        .enrollment_failed = false,
+        .run_started = null,
+        .run_base_revision = 0,
+        .run_elapsed = null,
+        .behavior = .prompt,
+        .scroll = 0,
+    };
+}
+
+test "the most recently parked drafts are kept when drafts exceed the limit" {
+    const allocator = std.testing.allocator;
+    var app: App = undefined;
+    app.runtime_snapshot = null;
+    app.options = .{};
+    app.project_path = @constCast("/active");
+    app.current_member = false;
+    app.enrollment_intent = false;
+    app.stored_drafts = .empty;
+    app.editor = try Composer.init(allocator);
+    defer app.editor.deinit();
+    try app.editor.setText("active");
+    app.parked_chats = .empty;
+    defer {
+        for (app.parked_chats.items) |*parked| parked.deinit(allocator);
+        app.parked_chats.deinit(allocator);
+    }
+    var name: [32]u8 = undefined;
+    for (0..Draft.max_drafts) |index| {
+        var parked = try testParked(allocator, try std.fmt.bufPrint(&name, "/parked-{d}", .{index}), "parked");
+        errdefer parked.deinit(allocator);
+        try app.parked_chats.append(allocator, parked);
+    }
+    var buffer: [Draft.max_drafts]Draft.Entry = undefined;
+    const collected = collectDrafts(&app, &buffer);
+    try std.testing.expectEqual(@as(usize, 1), collected.dropped);
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "", "/active") != null);
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "", try std.fmt.bufPrint(&name, "/parked-{d}", .{Draft.max_drafts - 1})) != null);
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "", "/parked-0") == null);
 }
