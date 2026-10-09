@@ -1,10 +1,12 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("../native/bindings.zig").c;
 const allocator = std.heap.page_allocator;
 
 pub const max_drafts = 64;
 pub const max_draft_bytes = 64 * 1024;
 const max_path_bytes = 4096;
+pub const max_projects = 64;
 // JSON may escape each draft byte as six (\u00XX); the bound only limits reads.
 const max_state_bytes = 512 * 1024 + max_drafts * (max_draft_bytes + 2 * max_path_bytes) * 6;
 
@@ -36,17 +38,6 @@ pub const State = struct {
     projects: []const []const u8 = &.{},
 };
 
-const RawState = struct {
-    // Single draft written before drafts were keyed by chat.
-    draft: []const u8 = "",
-    drafts: []const Entry = &.{},
-    light: bool = false,
-    font_size: std.json.Value = .null,
-    ui_scale: std.json.Value = .null,
-    chat_width: std.json.Value = .null,
-    projects: []const []const u8 = &.{},
-};
-
 fn restoredNumber(comptime T: type, raw: std.json.Value, fallback: T, minimum: T, maximum: T) T {
     const number: f64 = switch (raw) {
         .integer => |value| @floatFromInt(value),
@@ -59,57 +50,108 @@ fn restoredNumber(comptime T: type, raw: std.json.Value, fallback: T, minimum: T
     if (number >= @as(f64, @floatFromInt(maximum))) return maximum;
     return @intFromFloat(number);
 }
+
+fn validPath(bytes: []const u8) bool {
+    return bytes.len != 0 and bytes.len <= max_path_bytes and std.unicode.utf8ValidateSlice(bytes);
+}
+
+// Absent fields default to empty; a present field of the wrong type rejects the entry.
+fn entryFrom(raw: std.json.Value) ?Entry {
+    if (raw != .object) return null;
+    var entry: Entry = .{};
+    inline for (.{ "session", "cwd", "text" }) |name| if (raw.object.get(name)) |field| {
+        if (field != .string) return null;
+        @field(entry, name) = field.string;
+    };
+    return if (entry.valid()) entry else null;
+}
+
 pub const Restored = struct {
-    parsed: ?std.json.Parsed(RawState) = null,
-    drafts: []const Entry = &.{},
+    parsed: ?std.json.Parsed(std.json.Value) = null,
+    state: State = .{},
     // The old single draft belongs to whichever chat opens at startup.
     legacy_draft: []const u8 = "",
-    // Invalid draft entries are skipped so settings and other drafts still load.
+    // Invalid draft and project entries are skipped so everything else still loads.
     skipped: usize = 0,
+    // The saved file could not be read. It was moved to `<path>.invalid` so the
+    // next write cannot replace it, and defaults were used instead.
+    unreadable: ?anyerror = null,
     pub fn value(self: Restored) State {
-        const raw = if (self.parsed) |parsed| parsed.value else return .{};
-        return .{
-            .drafts = self.drafts,
-            .light = raw.light,
-            .font_size = restoredNumber(u8, raw.font_size, 15, 12, 24),
-            .ui_scale = restoredNumber(u16, raw.ui_scale, 100, 75, 175),
-            .chat_width = restoredNumber(u16, raw.chat_width, 768, 560, 1120),
-            .projects = raw.projects,
-        };
+        return self.state;
     }
     pub fn deinit(self: *Restored) void {
         if (self.parsed) |parsed| parsed.deinit();
     }
 };
+
 pub fn restore(io: std.Io, path: []const u8) !Restored {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_state_bytes)) catch |err| switch (err) {
-        error.FileNotFound => return .{},
-        else => return err,
+    return load(io, path) catch |err| switch (err) {
+        error.FileNotFound => .{},
+        error.OutOfMemory => err,
+        else => {
+            const backup = try std.fmt.allocPrint(allocator, "{s}.invalid", .{path});
+            defer allocator.free(backup);
+            // Without a preserved copy, starting would let the next write discard it.
+            std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), backup, io) catch return err;
+            return .{ .unreadable = err };
+        },
     };
+}
+
+fn load(io: std.Io, path: []const u8) !Restored {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_state_bytes));
     defer allocator.free(bytes);
-    const parsed = try std.json.parseFromSlice(RawState, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
-    if (parsed.value.projects.len > 64) return error.InvalidProjects;
-    for (parsed.value.projects) |project| {
-        if (project.len > 4096 or !std.unicode.utf8ValidateSlice(project)) return error.InvalidProjects;
-    }
+    if (parsed.value != .object) return error.InvalidWorkspace;
+    const root = parsed.value.object;
+    const arena = parsed.arena.allocator();
     var restored: Restored = .{ .parsed = parsed };
-    const legacy = parsed.value.draft;
-    if (legacy.len <= max_draft_bytes and std.unicode.utf8ValidateSlice(legacy)) restored.legacy_draft = legacy else restored.skipped += 1;
-    const raw_drafts = parsed.value.drafts;
-    const drafts = try parsed.arena.allocator().alloc(Entry, @min(raw_drafts.len, max_drafts));
-    var kept: usize = 0;
-    for (raw_drafts) |entry| {
-        var duplicate = false;
-        for (drafts[0..kept]) |existing| duplicate = duplicate or existing.matches(entry.session, entry.cwd);
-        if (kept == drafts.len or duplicate or !entry.valid()) {
-            restored.skipped += 1;
-            continue;
+    const state = &restored.state;
+    if (root.get("light")) |raw| state.light = raw == .bool and raw.bool;
+    state.font_size = restoredNumber(u8, root.get("font_size") orelse .null, 15, 12, 24);
+    state.ui_scale = restoredNumber(u16, root.get("ui_scale") orelse .null, 100, 75, 175);
+    state.chat_width = restoredNumber(u16, root.get("chat_width") orelse .null, 768, 560, 1120);
+    if (root.get("projects")) |raw| if (raw == .array) {
+        const projects = try arena.alloc([]const u8, @min(raw.array.items.len, max_projects));
+        var kept: usize = 0;
+        for (raw.array.items) |item| {
+            if (kept == projects.len or item != .string or !validPath(item.string)) {
+                restored.skipped += 1;
+                continue;
+            }
+            projects[kept] = item.string;
+            kept += 1;
         }
-        drafts[kept] = entry;
-        kept += 1;
+        state.projects = projects[0..kept];
+    } else {
+        restored.skipped += 1;
+    };
+    // Single draft written before drafts were keyed by chat.
+    if (root.get("draft")) |raw| {
+        if (raw == .string and raw.string.len <= max_draft_bytes and std.unicode.utf8ValidateSlice(raw.string)) restored.legacy_draft = raw.string else restored.skipped += 1;
     }
-    restored.drafts = drafts[0..kept];
+    if (root.get("drafts")) |raw| if (raw == .array) {
+        const drafts = try arena.alloc(Entry, @min(raw.array.items.len, max_drafts));
+        var kept: usize = 0;
+        for (raw.array.items) |item| {
+            const entry = entryFrom(item) orelse {
+                restored.skipped += 1;
+                continue;
+            };
+            var duplicate = false;
+            for (drafts[0..kept]) |existing| duplicate = duplicate or existing.matches(entry.session, entry.cwd);
+            if (kept == drafts.len or duplicate) {
+                restored.skipped += 1;
+                continue;
+            }
+            drafts[kept] = entry;
+            kept += 1;
+        }
+        state.drafts = drafts[0..kept];
+    } else {
+        restored.skipped += 1;
+    };
     return restored;
 }
 
@@ -165,6 +207,8 @@ pub const Writer = struct {
         c.SDL_BroadcastCondition(self.condition);
         c.SDL_UnlockMutex(self.mutex);
         self.thread.?.join();
+        // Nothing can display an error once the application is closing.
+        if (self.last_error) |err| std.log.err("final workspace write: {s}", .{@errorName(err)});
         c.SDL_DestroyCondition(self.condition);
         c.SDL_DestroyMutex(self.mutex);
         allocator.free(self.path);
@@ -175,6 +219,8 @@ pub const Writer = struct {
     fn write(self: *Writer, bytes: []const u8) !void {
         const file = try std.Io.Dir.cwd().createFile(self.io, self.temporary_path, .{});
         defer file.close(self.io);
+        // Drafts can hold pasted secrets; also tightens a stale temporary file.
+        if (builtin.os.tag != .windows) try file.setPermissions(self.io, .fromMode(0o600));
         try file.writeStreamingAll(self.io, bytes);
         try file.sync(self.io);
         try std.Io.Dir.cwd().rename(self.temporary_path, std.Io.Dir.cwd(), self.path, self.io);
@@ -267,6 +313,68 @@ test "invalid draft entries are skipped without losing settings" {
     try std.testing.expectEqual(@as(usize, 1), restored.value().drafts.len);
     try std.testing.expectEqualStrings("kept", restored.value().drafts[0].text);
     try std.testing.expectEqual(@as(usize, 5), restored.skipped);
+}
+
+test "entries of the wrong type are skipped without losing settings" {
+    var restored = try restoreBytes(
+        \\{"light":"yes","font_size":"big","chat_width":900,
+        \\ "projects":["/p",7,"",{"x":1},"/q"],
+        \\ "draft":["legacy"],
+        \\ "drafts":[{"cwd":"/p","text":5},{"cwd":["/p"],"text":"a"},"text",{"session":"/s/a.jsonl","text":"kept","extra":true}]}
+    );
+    defer restored.deinit();
+    const value = restored.value();
+    try std.testing.expect(restored.unreadable == null);
+    try std.testing.expect(!value.light);
+    try std.testing.expectEqual(@as(u8, 15), value.font_size);
+    try std.testing.expectEqual(@as(u16, 900), value.chat_width);
+    try std.testing.expectEqual(@as(usize, 2), value.projects.len);
+    try std.testing.expectEqualStrings("/q", value.projects[1]);
+    try std.testing.expectEqual(@as(usize, 1), value.drafts.len);
+    try std.testing.expectEqualStrings("kept", value.drafts[0].text);
+    try std.testing.expectEqual(@as(usize, 7), restored.skipped);
+}
+
+test "an unreadable workspace is kept aside and defaults are used" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const corrupt = "{\"drafts\":[{\"cwd\":\"/p\",\"text\":\"unsaved";
+    try tmp.dir.writeFile(io, .{ .sub_path = "workspace.json", .data = corrupt });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "workspace.json" });
+    defer std.testing.allocator.free(path);
+
+    var restored = try restore(io, path);
+    defer restored.deinit();
+    try std.testing.expect(restored.unreadable != null);
+    try std.testing.expectEqual(@as(usize, 0), restored.value().drafts.len);
+    try std.testing.expectEqual(@as(u8, 15), restored.value().font_size);
+    const kept = try tmp.dir.readFileAlloc(io, "workspace.json.invalid", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings(corrupt, kept);
+
+    // The original is gone, so the next start is clean rather than unreadable again.
+    var next = try restore(io, path);
+    defer next.deinit();
+    try std.testing.expect(next.unreadable == null);
+}
+
+test "saved workspace files are private to the user" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "workspace.json" });
+    defer std.testing.allocator.free(path);
+    const writer = try Writer.create(io, path, 0);
+    try writer.submit(.{ .drafts = &.{.{ .cwd = "/p", .text = "secret" }} });
+    writer.destroy();
+    const stat = try tmp.dir.statFile(io, "workspace.json", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
 }
 
 test "a failed write is reported" {

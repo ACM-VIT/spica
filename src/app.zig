@@ -251,7 +251,9 @@ pub const App = struct {
             .quit_due = if (options.quit_after_ms) |ms| c.SDL_GetTicks() + ms else null,
             .stored_drafts = stored_drafts,
         };
-        if (restored.skipped != 0) app.report("Some saved drafts could not be restored", error.InvalidDraft);
+        if (restored.unreadable) |err| {
+            app.report("Saved drafts and settings were unreadable and kept as workspace.json.invalid", err);
+        } else if (restored.skipped != 0) app.report("Some saved drafts or projects could not be restored", error.InvalidWorkspaceEntry);
         return app;
     }
 

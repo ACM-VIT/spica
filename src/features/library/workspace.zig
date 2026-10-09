@@ -63,7 +63,7 @@ fn draftEntry(session: []const u8, durable: bool, cwd: []const u8, text: []const
     return .{ .session = if (durable) session else "", .cwd = cwd, .text = text };
 }
 
-pub const CollectedDrafts = struct { count: usize, dropped: usize };
+pub const CollectedDrafts = struct { count: usize, dropped: usize, shadowed: usize };
 
 pub fn collectDrafts(app: *const App, drafts: *[Draft.max_drafts]Draft.Entry) CollectedDrafts {
     const resumed = app.options.resume_file orelse "";
@@ -71,6 +71,7 @@ pub fn collectDrafts(app: *const App, drafts: *[Draft.max_drafts]Draft.Entry) Co
     const parked = app.parked_chats.items;
     var count: usize = 0;
     var dropped: usize = 0;
+    var shadowed: usize = 0;
     for (0..1 + parked.len + app.stored_drafts.items.len) |index| {
         const entry = if (index == 0)
             draftEntry(active_session, app.current_member or app.enrollment_intent, app.project_path, app.editor.textBytes())
@@ -78,8 +79,13 @@ pub fn collectDrafts(app: *const App, drafts: *[Draft.max_drafts]Draft.Entry) Co
             draftEntry(parked[index - 1].session(), parked[index - 1].member or parked[index - 1].enrollment_intent, parked[index - 1].cwd, parked[index - 1].draft)
         else
             app.stored_drafts.items[index - 1 - parked.len];
+        if (entry.text.len == 0) continue;
         // Live chats come first, so an older stored copy never replaces them.
-        if (entry.text.len == 0 or draftIndex(drafts[0..count], entry.session, entry.cwd) != null) continue;
+        // Two live unsent threads in one project share a key; only the first is kept.
+        if (draftIndex(drafts[0..count], entry.session, entry.cwd) != null) {
+            if (index <= parked.len) shadowed += 1;
+            continue;
+        }
         if (count == drafts.len) {
             dropped += 1;
             continue;
@@ -87,7 +93,7 @@ pub fn collectDrafts(app: *const App, drafts: *[Draft.max_drafts]Draft.Entry) Co
         drafts[count] = entry;
         count += 1;
     }
-    return .{ .count = count, .dropped = dropped };
+    return .{ .count = count, .dropped = dropped, .shadowed = shadowed };
 }
 
 pub fn saveDraft(app: *App) !void {
@@ -106,6 +112,7 @@ pub fn saveDraft(app: *App) !void {
     app.draft_due = null;
     // Unsaved drafts stay in memory; only the disk copy is bounded.
     if (collected.dropped != 0) app.report("Some drafts exceed the saved draft limit", error.DraftLimitReached);
+    if (collected.shadowed != 0) app.report("Only one unsent draft per project is saved", error.DraftKeyShared);
 }
 
 pub fn scheduleSave(app: *App) void {
@@ -484,4 +491,13 @@ test "drafts persist per chat and unsent threads stay unenrolled" {
     try std.testing.expectEqual(@as(usize, 3), collected.count);
     try std.testing.expect(draftIndex(buffer[0..collected.count], "/s/b.jsonl", "") == null);
     try std.testing.expect(draftIndex(buffer[0..collected.count], "/s/a.jsonl", "") != null);
+    try std.testing.expectEqual(@as(usize, 0), collected.shadowed);
+
+    // A second unsent thread in /q shares C's key. The active chat's draft wins,
+    // and the lost draft is counted so saveDraft can report it.
+    app.current_member = false;
+    app.project_path = @constCast("/q");
+    const shared = collectDrafts(&app, &buffer);
+    try std.testing.expectEqual(@as(usize, 1), shared.shadowed);
+    try std.testing.expectEqualStrings("draft A", buffer[draftIndex(buffer[0..shared.count], "", "/q").?].text);
 }
