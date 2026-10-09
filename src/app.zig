@@ -222,7 +222,7 @@ pub const App = struct {
                 try projects.append(allocator, owned);
             }
         }
-        return .{
+        var app: App = .{
             .window = window,
             .renderer = renderer,
             .layout = layout,
@@ -251,6 +251,8 @@ pub const App = struct {
             .quit_due = if (options.quit_after_ms) |ms| c.SDL_GetTicks() + ms else null,
             .stored_drafts = stored_drafts,
         };
+        if (restored.skipped != 0) app.report("Some saved drafts could not be restored", error.InvalidDraft);
+        return app;
     }
 
     pub fn deinit(self: *App) void {

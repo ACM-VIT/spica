@@ -104,6 +104,8 @@ pub fn saveDraft(app: *App) !void {
         .projects = projects[0..app.projects.items.len],
     });
     app.draft_due = null;
+    // Unsaved drafts stay in memory; only the disk copy is bounded.
+    if (collected.dropped != 0) app.report("Some drafts exceed the saved draft limit", error.DraftLimitReached);
 }
 
 pub fn scheduleSave(app: *App) void {
