@@ -35,6 +35,8 @@ pub const Action = union(enum) { start, new_thread, new_project_thread: usize, n
 
 const theme_path = build_options.asset_directory ++ "/theme.json";
 
+const Warning = struct { operation: []const u8, err: anyerror };
+
 pub const App = struct {
     window: *c.SDL_Window,
     renderer: *c.SDL_Renderer,
@@ -61,6 +63,7 @@ pub const App = struct {
     // draft into the editor; the rest are written back unchanged.
     stored_drafts: std.ArrayList(Draft.Entry) = .empty,
     draft_loss: workspace.DraftLoss = .{},
+    restore_warning: ?Warning = null,
     closing: bool = false,
     force_dialog: bool = false,
     model_picker: ModelPicker = .{},
@@ -224,7 +227,7 @@ pub const App = struct {
                 try projects.append(allocator, owned);
             }
         }
-        var app: App = .{
+        return .{
             .window = window,
             .renderer = renderer,
             .layout = layout,
@@ -252,11 +255,13 @@ pub const App = struct {
             .follow_bottom = true,
             .quit_due = if (options.quit_after_ms) |ms| c.SDL_GetTicks() + ms else null,
             .stored_drafts = stored_drafts,
+            .restore_warning = if (restored.unreadable) |err|
+                .{ .operation = "Saved drafts and settings were unreadable and kept beside workspace.json as .invalid", .err = err }
+            else if (restored.skipped != 0)
+                .{ .operation = "Some saved drafts or projects could not be restored", .err = error.InvalidWorkspaceEntry }
+            else
+                null,
         };
-        if (restored.unreadable) |err| {
-            app.report("Saved drafts and settings were unreadable and kept beside workspace.json as .invalid", err);
-        } else if (restored.skipped != 0) app.report("Some saved drafts or projects could not be restored", error.InvalidWorkspaceEntry);
-        return app;
     }
 
     pub fn deinit(self: *App) void {
@@ -397,9 +402,16 @@ pub const App = struct {
         conversation.consume(self);
     }
 
+    fn showRestoreWarning(self: *App) void {
+        const warning = self.restore_warning orelse return;
+        self.restore_warning = null;
+        if (self.error_text.slice().len == 0) self.report(warning.operation, warning.err);
+    }
+
     pub fn run(self: *App) !void {
         errdefer processes.retainOwnedProcessOnError(self);
         if (self.options.fixture) self.requestConversation() else processes.beginRuntime(self) catch |err| self.report("Starting pi", err);
+        self.showRestoreWarning();
         while (self.running) {
             self.consume();
             const now = c.SDL_GetTicks();
@@ -445,4 +457,17 @@ test {
     _ = @import("features/library/sidebar.zig");
     _ = @import("features/models/menus.zig");
     _ = @import("app/commands.zig");
+}
+
+test "a restore warning waits for startup and never replaces Pi's own startup error" {
+    var app: App = undefined;
+    app.error_text = .{};
+    app.dirty = false;
+    app.restore_warning = .{ .operation = "Some saved drafts or projects could not be restored", .err = error.InvalidWorkspaceEntry };
+    app.error_text.set("Starting pi: PiLaunchFailed");
+    app.showRestoreWarning();
+    try std.testing.expectEqualStrings("Starting pi: PiLaunchFailed", app.error_text.slice());
+    try std.testing.expect(app.restore_warning == null);
+    app.showRestoreWarning();
+    try std.testing.expectEqualStrings("Starting pi: PiLaunchFailed", app.error_text.slice());
 }
