@@ -63,6 +63,8 @@ fn draftEntry(session: []const u8, durable: bool, cwd: []const u8, text: []const
     return .{ .session = if (durable) session else "", .cwd = cwd, .text = text };
 }
 
+pub const DraftLoss = struct { dropped: usize = 0, shadowed: usize = 0 };
+
 pub const CollectedDrafts = struct { count: usize, dropped: usize, shadowed: usize };
 
 pub fn collectDrafts(app: *const App, drafts: *[Draft.max_drafts]Draft.Entry) CollectedDrafts {
@@ -111,8 +113,9 @@ pub fn saveDraft(app: *App) !void {
     });
     app.draft_due = null;
     // Unsaved drafts stay in memory; only the disk copy is bounded.
-    if (collected.dropped != 0) app.report("Some drafts exceed the saved draft limit", error.DraftLimitReached);
-    if (collected.shadowed != 0) app.report("Only one unsent draft per project is saved", error.DraftKeyShared);
+    if (collected.dropped > app.draft_loss.dropped) app.report("Some drafts exceed the saved draft limit", error.DraftLimitReached);
+    if (collected.shadowed > app.draft_loss.shadowed) app.report("Only one unsent draft per project is saved", error.DraftKeyShared);
+    app.draft_loss = .{ .dropped = collected.dropped, .shadowed = collected.shadowed };
 }
 
 pub fn scheduleSave(app: *App) void {
@@ -417,6 +420,7 @@ test "drafts persist per chat and unsent threads stay unenrolled" {
     app.projects = .empty;
     app.dirty = false;
     app.error_text = .{};
+    app.draft_loss = .{};
     app.editor = try Composer.init(allocator);
     defer app.editor.deinit();
     try app.editor.setText("draft A");
@@ -500,4 +504,11 @@ test "drafts persist per chat and unsent threads stay unenrolled" {
     const shared = collectDrafts(&app, &buffer);
     try std.testing.expectEqual(@as(usize, 1), shared.shadowed);
     try std.testing.expectEqualStrings("draft A", buffer[draftIndex(buffer[0..shared.count], "", "/q").?].text);
+
+    app.draft_writer = try Draft.Writer.create(io, path, 0);
+    defer app.draft_writer.destroy();
+    app.draft_loss = .{ .shadowed = 1 };
+    try saveDraft(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.error_text.slice().len);
+    try std.testing.expectEqual(@as(usize, 1), app.draft_loss.shadowed);
 }

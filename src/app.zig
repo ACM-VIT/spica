@@ -60,6 +60,7 @@ pub const App = struct {
     // Restored drafts for chats not opened since launch. Opening a chat moves its
     // draft into the editor; the rest are written back unchanged.
     stored_drafts: std.ArrayList(Draft.Entry) = .empty,
+    draft_loss: workspace.DraftLoss = .{},
     closing: bool = false,
     force_dialog: bool = false,
     model_picker: ModelPicker = .{},
