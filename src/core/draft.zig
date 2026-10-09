@@ -182,6 +182,7 @@ pub const Writer = struct {
     temporary_path: []u8,
     wake_event: u32,
     pending: ?[]u8 = null,
+    writing: ?[]const u8 = null,
     written: ?[]u8 = null,
     closing: bool = false,
     last_error: ?anyerror = null,
@@ -212,7 +213,7 @@ pub const Writer = struct {
         defer c.SDL_UnlockMutex(self.mutex);
         if (self.pending) |old| allocator.free(old);
         self.pending = null;
-        if (self.written) |written| if (std.mem.eql(u8, written, bytes)) {
+        if (self.writing orelse self.written) |newest| if (std.mem.eql(u8, newest, bytes)) {
             allocator.free(bytes);
             return;
         };
@@ -266,15 +267,18 @@ pub const Writer = struct {
                 return;
             };
             self.pending = null;
+            self.writing = bytes;
             c.SDL_UnlockMutex(self.mutex);
             if (self.write(bytes)) {
                 c.SDL_LockMutex(self.mutex);
+                self.writing = null;
                 if (self.written) |old| allocator.free(old);
                 self.written = bytes;
                 c.SDL_UnlockMutex(self.mutex);
             } else |err| {
-                allocator.free(bytes);
                 c.SDL_LockMutex(self.mutex);
+                self.writing = null;
+                allocator.free(bytes);
                 const notify = self.last_error == null;
                 self.last_error = err;
                 c.SDL_UnlockMutex(self.mutex);
@@ -555,6 +559,37 @@ test "a save that would not change the file is skipped" {
     try changed.submit(.{ .drafts = &.{.{ .cwd = "/p", .text = "changed" }} });
     changed.destroy();
     (try tmp.dir.openFile(io, "workspace.json", .{})).close(io);
+}
+
+test "a save matching the written file is kept while a different write is in flight" {
+    try std.testing.expect(c.spica_image_install_sdl_allocator());
+    const state_a = State{ .drafts = &.{.{ .cwd = "/p", .text = "A" }} };
+    const written = try std.json.Stringify.valueAlloc(allocator, state_a, .{});
+    var writer = Writer{
+        .mutex = c.SDL_CreateMutex() orelse return error.MutexCreation,
+        .condition = c.SDL_CreateCondition() orelse return error.ConditionCreation,
+        .io = std.testing.io,
+        .path = &.{},
+        .temporary_path = &.{},
+        .wake_event = 0,
+        .writing = "{\"draft\":\"B\"}",
+        .written = written,
+    };
+    defer {
+        if (writer.pending) |pending| allocator.free(pending);
+        allocator.free(written);
+        c.SDL_DestroyCondition(writer.condition);
+        c.SDL_DestroyMutex(writer.mutex);
+    }
+    try writer.submit(state_a);
+    try std.testing.expect(writer.pending != null);
+    try std.testing.expectEqualStrings(written, writer.pending.?);
+
+    writer.writing = writer.pending;
+    writer.pending = null;
+    try writer.submit(state_a);
+    try std.testing.expect(writer.pending == null);
+    writer.pending = @constCast(writer.writing.?);
 }
 
 test "a failed write is reported" {
