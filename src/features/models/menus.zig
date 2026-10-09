@@ -674,13 +674,17 @@ test "thinking menu keys choose through Pi and held Enter never sends the draft"
     var event = std.mem.zeroes(c.SDL_Event);
     event.type = c.SDL_EVENT_KEY_DOWN;
     event.key.key = c.SDLK_ESCAPE;
+    app.pending_hover = .{ 20, 60 };
     try input.handle(&app, &event);
     try std.testing.expect(!app.thinking_menu.open);
+    try std.testing.expect(app.pending_hover == null);
     try std.testing.expectEqual(@as(usize, 0), runtime.inputs.items.len);
     try std.testing.expectEqualStrings("unfinished draft", app.editor.textBytes());
     try std.testing.expectEqual(draft_selection, app.editor.selection());
     // Enter sends the highlighted level and closes the menu.
+    app.pending_hover = .{ 20, 60 };
     try commands.act(&app, .thinking);
+    try std.testing.expect(app.pending_hover == null);
     try std.testing.expectEqual(@as(?usize, 1), app.thinking_menu.selected(thinkingLevels(&app)));
     event.key.key = c.SDLK_DOWN;
     try input.handle(&app, &event);
