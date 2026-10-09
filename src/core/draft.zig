@@ -213,7 +213,7 @@ pub const Writer = struct {
         defer c.SDL_UnlockMutex(self.mutex);
         if (self.pending) |old| allocator.free(old);
         self.pending = null;
-        if (self.writing orelse self.written) |newest| if (std.mem.eql(u8, newest, bytes)) {
+        if (self.writing == null) if (self.written) |written| if (std.mem.eql(u8, written, bytes)) {
             allocator.free(bytes);
             return;
         };
@@ -561,7 +561,7 @@ test "a save that would not change the file is skipped" {
     (try tmp.dir.openFile(io, "workspace.json", .{})).close(io);
 }
 
-test "a save matching the written file is kept while a different write is in flight" {
+test "a save is skipped only when no write is in flight and it matches the written file" {
     try std.testing.expect(c.spica_image_install_sdl_allocator());
     const state_a = State{ .drafts = &.{.{ .cwd = "/p", .text = "A" }} };
     const written = try std.json.Stringify.valueAlloc(allocator, state_a, .{});
@@ -585,11 +585,18 @@ test "a save matching the written file is kept while a different write is in fli
     try std.testing.expect(writer.pending != null);
     try std.testing.expectEqualStrings(written, writer.pending.?);
 
-    writer.writing = writer.pending;
+    const queued = writer.pending.?;
+    writer.writing = queued;
+    writer.pending = null;
+    try writer.submit(state_a);
+    try std.testing.expect(writer.pending != null);
+    allocator.free(queued);
+
+    writer.writing = null;
+    allocator.free(writer.pending.?);
     writer.pending = null;
     try writer.submit(state_a);
     try std.testing.expect(writer.pending == null);
-    writer.pending = @constCast(writer.writing.?);
 }
 
 test "a failed write is reported" {
