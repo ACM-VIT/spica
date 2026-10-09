@@ -1,5 +1,6 @@
 const std = @import("std");
 const storage = @import("store.zig");
+const utf8 = @import("../text/utf8.zig");
 const Value = std.json.Value;
 const limit = 1024 * 1024;
 fn child(v: Value, key: []const u8) Value {
@@ -61,8 +62,7 @@ pub fn toolActivity(name: []const u8, args: Value) storage.Activity {
         const target = text(args, key);
         if (target.len > 0) {
             activity.append(" ");
-            var prefix_len = @min(target.len, activity.bytes.len);
-            while (prefix_len > 0 and prefix_len < target.len and (target[prefix_len] & 0xc0) == 0x80) prefix_len -= 1;
+            const prefix_len = utf8.prefix(target, activity.bytes.len).len;
             var start: usize = 0;
             var cursor: usize = 0;
             while (cursor < prefix_len and activity.len < activity.bytes.len) : (cursor += 1) {
