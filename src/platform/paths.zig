@@ -23,6 +23,8 @@ pub const Paths = struct {
         }
         try std.Io.Dir.cwd().createDirPath(io, roots[0]);
         try std.Io.Dir.cwd().createDirPath(io, roots[1]);
+        privateDirectory(io, roots[0]);
+        privateDirectory(io, roots[1]);
         const lock_path = try std.fs.path.join(allocator, &.{ roots[0], "instance.lock" });
         defer allocator.free(lock_path);
         const lock_file = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
@@ -56,6 +58,16 @@ pub const Paths = struct {
         self.allocator.free(self.state);
     }
 
+    // History, drafts, and caches can hold pasted secrets. Restricting the
+    // directories covers every file inside, including SQLite's sidecars.
+    // Failure only weakens privacy, so it is logged rather than fatal.
+    fn privateDirectory(io: std.Io, path: []const u8) void {
+        if (builtin.os.tag == .windows) return;
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| return std.log.warn("private directory {s}: {s}", .{ path, @errorName(err) });
+        defer dir.close(io);
+        dir.setPermissions(io, .fromMode(0o700)) catch |err| std.log.warn("private directory {s}: {s}", .{ path, @errorName(err) });
+    }
+
     fn variable(allocator: std.mem.Allocator, environ: std.process.Environ, key: []const u8) !?[]u8 {
         return environ.getAlloc(allocator, key) catch |err| switch (err) {
             error.EnvironmentVariableMissing => null,
@@ -87,3 +99,21 @@ pub const Paths = struct {
         return .{ data, try std.fs.path.join(allocator, &.{ cache_base, "spica" }) };
     }
 };
+
+test "data directories are private to the user, including existing ones" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "existing");
+    var existing = try tmp.dir.openDir(io, "existing", .{ .iterate = true });
+    defer existing.close(io);
+    try existing.setPermissions(io, .fromMode(0o755));
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "existing" });
+    defer std.testing.allocator.free(path);
+    Paths.privateDirectory(io, path);
+    const stat = try existing.stat(io);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), stat.permissions.toMode() & 0o777);
+}
