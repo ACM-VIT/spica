@@ -7,7 +7,7 @@ pub const max_drafts = 64;
 pub const max_draft_bytes = 64 * 1024;
 const max_path_bytes = 4096;
 pub const max_projects = 64;
-// JSON may escape each draft byte as six (\u00XX); the bound only limits reads.
+// JSON may escape each draft byte as six (\u00XX); writes that exceed the bound are refused.
 const max_state_bytes = 512 * 1024 + (max_draft_bytes + max_projects * max_path_bytes + max_drafts * (max_draft_bytes + 2 * max_path_bytes)) * 6;
 
 // A chat with a durable Pi session is keyed by that session file. An unsent new
@@ -74,8 +74,9 @@ pub const Restored = struct {
     legacy_draft: []const u8 = "",
     // Invalid draft and project entries are skipped so everything else still loads.
     skipped: usize = 0,
-    // The saved file could not be read. It was moved to `<path>.invalid` so the
-    // next write cannot replace it, and defaults were used instead.
+    // The saved file could not be read. It was moved to the first free
+    // `<path>.invalid` or `<path>.invalid.N` so the next write cannot replace it,
+    // and defaults were used instead.
     unreadable: ?anyerror = null,
     pub fn value(self: Restored) State {
         return self.state;
@@ -143,7 +144,7 @@ fn load(bytes: []const u8) !Restored {
     } else {
         restored.skipped += 1;
     };
-    // Single draft written before drafts were keyed by chat.
+    // Single draft from files written before drafts were keyed by chat.
     if (root.get("drafts") == null) if (root.get("draft")) |raw| {
         if (raw == .string and raw.string.len <= max_draft_bytes and std.unicode.utf8ValidateSlice(raw.string)) restored.legacy_draft = raw.string else restored.skipped += 1;
     };

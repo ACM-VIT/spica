@@ -103,7 +103,7 @@ pub fn collectDrafts(app: *const App, drafts: *[Draft.max_drafts]Draft.Entry) Co
         } else app.stored_drafts.items[index - 1 - parked.len];
         if (entry.text.len == 0) continue;
         // Live chats come first, so an older stored copy never replaces them.
-        // Two live unsent threads in one project share a key; only the first is kept.
+        // Two live unsent threads in one project share a key; only the most recently used is kept.
         if (draftIndex(drafts[0..count], entry.session, entry.cwd) != null) {
             if (index <= parked.len) shadowed += 1;
             continue;
