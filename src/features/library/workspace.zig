@@ -51,6 +51,14 @@ pub fn draftIndex(drafts: []const Draft.Entry, session: []const u8, cwd: []const
     return null;
 }
 
+pub fn resumedDraftIndex(allocator: std.mem.Allocator, io: std.Io, drafts: []const Draft.Entry, session: []const u8, cwd: []const u8) ?usize {
+    if (session.len != 0) if (std.Io.Dir.cwd().realPathFileAlloc(io, session, allocator)) |resolved| {
+        defer allocator.free(resolved);
+        if (draftIndex(drafts, resolved, cwd)) |index| return index;
+    } else |_| {};
+    return draftIndex(drafts, session, cwd);
+}
+
 pub fn dropMissingSessions(allocator: std.mem.Allocator, io: std.Io, drafts: *std.ArrayList(Draft.Entry)) void {
     var index: usize = 0;
     while (index < drafts.items.len) {
@@ -646,4 +654,37 @@ test "the most recently parked drafts are kept when drafts exceed the limit" {
     try std.testing.expect(draftIndex(buffer[0..collected.count], "", "/active") != null);
     try std.testing.expect(draftIndex(buffer[0..collected.count], "", try std.fmt.bufPrint(&name, "/parked-{d}", .{Draft.max_drafts - 1})) != null);
     try std.testing.expect(draftIndex(buffer[0..collected.count], "", "/parked-0") == null);
+}
+
+test "a resumed chat finds its draft through relative, dotted, and linked paths" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "sessions");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sessions/chat.jsonl", .data = "" });
+    try tmp.dir.symLink(io, "sessions/chat.jsonl", "link.jsonl", .{});
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const session = try std.fs.path.join(allocator, &.{ root, "sessions", "chat.jsonl" });
+    defer allocator.free(session);
+    const dotted = try std.fs.path.join(allocator, &.{ root, "sessions", "..", "sessions", "chat.jsonl" });
+    defer allocator.free(dotted);
+    const linked = try std.fs.path.join(allocator, &.{ root, "link.jsonl" });
+    defer allocator.free(linked);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(cwd);
+    const relative = try std.fs.path.relative(allocator, cwd, null, cwd, session);
+    defer allocator.free(relative);
+
+    const drafts = [_]Draft.Entry{
+        .{ .session = session, .cwd = root, .text = "resolved" },
+        .{ .session = "unresolvable.jsonl", .cwd = root, .text = "raw" },
+    };
+    for ([_][]const u8{ session, dotted, linked, relative }) |resume_file| {
+        try std.testing.expectEqual(@as(?usize, 0), resumedDraftIndex(allocator, io, &drafts, resume_file, root));
+    }
+    try std.testing.expectEqual(@as(?usize, 1), resumedDraftIndex(allocator, io, &drafts, "unresolvable.jsonl", root));
+    try std.testing.expect(resumedDraftIndex(allocator, io, &drafts, "", root) == null);
 }

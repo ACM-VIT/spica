@@ -146,7 +146,7 @@ pub const App = struct {
         try stored_drafts.ensureTotalCapacityPrecise(allocator, restored.value().drafts.len);
         for (restored.value().drafts) |entry| stored_drafts.appendAssumeCapacity(try workspace.dupeDraft(allocator, entry));
         workspace.dropMissingSessions(allocator, io, &stored_drafts);
-        const startup_draft = workspace.draftIndex(stored_drafts.items, options.resume_file orelse "", project_path);
+        const startup_draft = workspace.resumedDraftIndex(allocator, io, stored_drafts.items, options.resume_file orelse "", project_path);
         try editor.setText(if (startup_draft) |index| stored_drafts.items[index].text else restored.legacy_draft);
         if (startup_draft) |index| workspace.freeDraft(allocator, stored_drafts.orderedRemove(index));
         const copy_buffer = try allocator.alloc(u8, 65537);
