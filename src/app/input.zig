@@ -148,7 +148,9 @@ fn mouseMotion(app: *App, event: *const c.SDL_Event) !void {
         if (app.library.dragging) {
             try app.library.hitQuery(app, event.motion.x, event.motion.y, true);
             app.dirty = true;
-        }
+        } else menus.hoverMenu(app, event.motion.x, event.motion.y);
+    } else if (app.thinking_menu.open) {
+        menus.hoverMenu(app, event.motion.x, event.motion.y);
     } else if (app.dragging and !app.settings_open) {
         if (app.editor_view.offsetAt(event.motion.x, event.motion.y)) |offset| app.editor.setCaret(offset, true);
         app.dirty = true;

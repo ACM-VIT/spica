@@ -25,6 +25,12 @@ pub const Menu = struct {
         self.highlight = if (down) index + 1 else index -| 1;
         _ = self.selected(levels);
     }
+
+    pub fn hover(self: *Menu, index: usize) bool {
+        if (self.highlight == index) return false;
+        self.highlight = index;
+        return true;
+    }
 };
 
 test "thinking highlight follows the current level and clamps to the list" {

@@ -174,8 +174,7 @@ pub fn resetViewport(app: *App) void {
     app.content_pending = false;
     app.pending_ordinal = null;
     app.conversation_dirty = false;
-    menus.closeModelMenu(app);
-    app.thinking_menu.open = false;
+    menus.closeAll(app);
     app.preedit.clearRetainingCapacity();
     _ = c.SDL_ClearComposition(app.window);
     app.dragging = false;

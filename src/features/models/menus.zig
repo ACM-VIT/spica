@@ -32,7 +32,10 @@ pub fn selectedModelIndex(app: *App) !?usize {
 // its strings and retain only an index into the incoming model list.
 pub fn updateModelSearch(app: *App, incoming: []const pi.Model) !void {
     if (app.runtime_snapshot) |old| if (pi.Model.listsEqual(old.models, incoming)) return;
-    if (try app.model_picker.replaceModels(modelChoices(app), incoming, query(app))) app.buttons.clear();
+    if (try app.model_picker.replaceModels(modelChoices(app), incoming, query(app))) {
+        app.buttons.clear();
+        app.pending_hover = null;
+    }
 }
 
 pub fn toggleModelMenu(app: *App) void {
@@ -50,6 +53,7 @@ pub fn toggleModelMenu(app: *App) void {
         _ = c.SDL_StartTextInput(app.window);
     }
     app.buttons.clear();
+    app.pending_hover = null;
     app.thinking_menu.open = false;
 }
 
@@ -60,6 +64,7 @@ pub fn closeModelMenu(app: *App) void {
     app.library.layout_dirty = true;
     app.library.dragging = false;
     app.buttons.clear();
+    app.pending_hover = null;
     _ = c.SDL_ClearComposition(app.window);
     app.syncTextInput();
 }
@@ -67,13 +72,46 @@ pub fn closeModelMenu(app: *App) void {
 pub fn closeAll(app: *App) void {
     closeModelMenu(app);
     app.thinking_menu.open = false;
+    app.pending_hover = null;
 }
 
 pub fn editModelQuery(app: *App, event: *const c.SDL_Event) !void {
     if (try app.library.handleQuery(app, event)) {
         app.model_picker.restart();
+        app.pending_hover = null;
         app.buttons.clear();
     }
+}
+
+pub fn hoverMenu(app: *App, x: f32, y: f32) void {
+    if (app.closing or app.force_dialog) return;
+    if (app.buttons.len == 0) {
+        app.pending_hover = .{ x, y };
+        app.dirty = true;
+        return;
+    }
+    app.pending_hover = null;
+    if (app.model_picker.open) hoverModel(app, x, y) else if (app.thinking_menu.open) hoverThinking(app, x, y);
+}
+
+fn hoverThinking(app: *App, x: f32, y: f32) void {
+    for (app.buttons.slice()) |hovered| switch (hovered.action) {
+        .select_thinking => |index| if (widgets.contains(hovered.bounds, x, y)) {
+            if (app.thinking_menu.hover(index)) app.dirty = true;
+            return;
+        },
+        else => {},
+    };
+}
+
+fn hoverModel(app: *App, x: f32, y: f32) void {
+    for (app.buttons.slice()) |hovered| switch (hovered.action) {
+        .select_model => |index| if (widgets.contains(hovered.bounds, x, y)) {
+            if (app.model_picker.hover(index)) app.dirty = true;
+            return;
+        },
+        else => {},
+    };
 }
 
 pub fn selectModel(app: *App, index: usize) !void {
@@ -87,6 +125,7 @@ pub fn selectModel(app: *App, index: usize) !void {
 
 pub fn toggleThinkingMenu(app: *App) void {
     app.thinking_menu.open = !app.thinking_menu.open;
+    app.pending_hover = null;
     if (app.thinking_menu.open) {
         const current = if (app.runtime_snapshot) |snapshot| snapshot.thinking_level else "";
         app.thinking_menu.highlightCurrent(thinkingLevels(app), current);
@@ -100,6 +139,7 @@ pub fn selectThinking(app: *App, index: usize) !void {
     if (index >= snapshot.thinking_levels.len) return error.StaleThinkingChoice;
     try (app.runtime orelse return error.PiNotReady).setThinkingLevel(snapshot.thinking_levels[index]);
     app.thinking_menu.open = false;
+    app.pending_hover = null;
 }
 
 pub fn handleModelKey(app: *App, event: *const c.SDL_Event) !void {
@@ -110,14 +150,9 @@ pub fn handleModelKey(app: *App, event: *const c.SDL_Event) !void {
             closeModelMenu(app);
             app.dirty = true;
         },
-        c.SDLK_UP => {
-            app.model_picker.previous();
-            app.buttons.clear();
-            app.dirty = true;
-            try editModelQuery(app, event);
-        },
-        c.SDLK_DOWN => {
-            try app.model_picker.next(modelChoices(app), query(app));
+        c.SDLK_UP, c.SDLK_DOWN => {
+            try app.model_picker.move(modelChoices(app), query(app), event.key.key == c.SDLK_DOWN);
+            app.pending_hover = null;
             app.buttons.clear();
             app.dirty = true;
             try editModelQuery(app, event);
@@ -134,10 +169,12 @@ pub fn handleThinkingKey(app: *App, event: *const c.SDL_Event) !void {
     switch (event.key.key) {
         c.SDLK_ESCAPE => {
             app.thinking_menu.open = false;
+            app.pending_hover = null;
             app.dirty = true;
         },
         c.SDLK_UP, c.SDLK_DOWN => {
             app.thinking_menu.move(thinkingLevels(app), event.key.key == c.SDLK_DOWN);
+            app.pending_hover = null;
             app.dirty = true;
         },
         c.SDLK_RETURN, c.SDLK_KP_ENTER => if (app.thinking_menu.selected(thinkingLevels(app))) |index| {
@@ -186,12 +223,12 @@ pub fn drawModelMenu(app: *App) !void {
     if (app.runtime_snapshot) |snapshot| {
         const count = try modelCount(app);
         if (count == 0) try app.label(if (snapshot.models.len == 0) "No configured models" else "No matching models", x + 12, y + 16, 13, colors.muted);
-        picker.first = @min(picker.first, count -| 1);
+        picker.scrollToHighlight(count, visible);
         const end = @min(count, picker.first + visible);
         for (picker.search.matches[picker.first..end], picker.first..) |match, filtered_index| {
             const model = snapshot.models[match.index];
             const row = c.SDL_FRect{ .x = x + 8, .y = y + 8 + @as(f32, @floatFromInt(filtered_index - picker.first)) * 40, .w = width - 16, .h = 38 };
-            if (!picker.selection_cleared and filtered_index == picker.first) try app.rectangle(row.x, row.y, row.w, row.h, 5, colors.raised);
+            if (!picker.selection_cleared and filtered_index == picker.highlight) try app.rectangle(row.x, row.y, row.w, row.h, 5, colors.raised);
             var clip = widgets.Clip.push(app.renderer, row);
             defer clip.restore(app.renderer);
             try app.hit(.{ .select_model = match.index }, row);
@@ -268,6 +305,9 @@ test "model search filters names IDs and providers without editing the draft" {
     };
     app.runtime_snapshot = .{ .allocator = allocator, .models = @constCast(&models) };
     app.model_picker.first = 3;
+    app.model_picker.highlight = 3;
+    app.model_picker.visible = 6;
+    app.pending_hover = null;
     app.buttons = .{};
     app.buttons.len = 4;
     app.dirty = false;
@@ -277,6 +317,7 @@ test "model search filters names IDs and providers without editing the draft" {
     try input.handle(&app, &event);
     try std.testing.expect(app.dirty);
     try std.testing.expectEqual(@as(usize, 0), app.model_picker.first);
+    try std.testing.expectEqual(@as(usize, 0), app.model_picker.highlight);
     try std.testing.expectEqual(@as(usize, 0), app.buttons.len);
     try std.testing.expectEqual(@as(usize, 2), try modelCount(&app));
     try std.testing.expectEqual(@as(?usize, 1), try modelIndex(&app, 0));
@@ -325,12 +366,12 @@ test "model search filters names IDs and providers without editing the draft" {
     event.key.key = c.SDLK_DOWN;
     event.key.mod = 0;
     try input.handle(&app, &event);
-    try std.testing.expectEqual(@as(usize, 1), app.model_picker.first);
+    try std.testing.expectEqual(@as(usize, 1), app.model_picker.highlight);
     try std.testing.expect(!app.model_picker.search.dirty);
-    try std.testing.expectEqual(@as(?usize, 3), try modelIndex(&app, app.model_picker.first));
+    try std.testing.expectEqual(@as(?usize, 3), try modelIndex(&app, app.model_picker.highlight));
     event.key.key = c.SDLK_UP;
     try input.handle(&app, &event);
-    try std.testing.expectEqual(@as(usize, 0), app.model_picker.first);
+    try std.testing.expectEqual(@as(usize, 0), app.model_picker.highlight);
     try std.testing.expectEqualStrings("keep this message draft", app.editor.textBytes());
     // Rejected input keeps the current results and leaves an error for the popup.
     event.type = c.SDL_EVENT_TEXT_INPUT;
@@ -418,7 +459,7 @@ test "model search filters names IDs and providers without editing the draft" {
 test "model picker snapshot refresh preserves identity and clears disappeared selections" {
     const allocator = std.testing.allocator;
     var app: App = undefined;
-    app.model_picker = .{ .open = true, .first = 1 };
+    app.model_picker = .{ .open = true, .first = 0, .highlight = 1, .visible = 6 };
     app.buttons = .{};
     app.buttons.len = 2;
     app.dirty = false;
@@ -438,10 +479,12 @@ test "model picker snapshot refresh preserves identity and clears disappeared se
         original[0],
         original[1],
     };
+    app.pending_hover = .{ 20, 60 };
     try updateModelSearch(&app, &reordered);
     app.runtime_snapshot.?.models = @constCast(&reordered);
     try std.testing.expectEqual(@as(usize, 0), app.buttons.len);
-    try std.testing.expectEqual(@as(usize, 0), app.model_picker.first);
+    try std.testing.expect(app.pending_hover == null);
+    try std.testing.expectEqual(@as(usize, 0), app.model_picker.highlight);
     try std.testing.expectEqual(@as(?usize, 0), try selectedModelIndex(&app));
     try std.testing.expectEqualStrings("opus", app.library.queryBytes());
     // Same ID from a different provider must not replace the disappeared choice.
@@ -455,11 +498,13 @@ test "model picker snapshot refresh preserves identity and clears disappeared se
     app.runtime_snapshot.?.models = @constCast(&restored);
     try std.testing.expect(try selectedModelIndex(&app) == null);
     // A deliberate query edit re-enables selection.
+    app.pending_hover = .{ 20, 60 };
     var event = std.mem.zeroes(c.SDL_Event);
     event.type = c.SDL_EVENT_TEXT_INPUT;
     event.text.text = " ";
     try editModelQuery(&app, &event);
     try std.testing.expectEqual(@as(?usize, 0), try selectedModelIndex(&app));
+    try std.testing.expect(app.pending_hover == null);
     const renamed = [_]pi.Model{
         .{ .name = "Different", .id = "shared-id", .provider = "one" },
         reordered[0],
@@ -472,6 +517,100 @@ test "model picker snapshot refresh preserves identity and clears disappeared se
     app.runtime_snapshot.?.models = &.{};
     try std.testing.expectEqual(@as(usize, 0), try modelCount(&app));
     try std.testing.expect(try selectedModelIndex(&app) == null);
+}
+
+test "thinking menu hover moves the shared highlight only when the row changes" {
+    var app: App = undefined;
+    app.thinking_menu = .{ .open = true };
+    app.dirty = false;
+    app.buttons = .{};
+    try app.buttons.add(.thinking, .{ .x = 0, .y = 0, .w = 200, .h = 200 });
+    try app.buttons.add(.{ .select_thinking = 0 }, .{ .x = 4, .y = 8, .w = 122, .h = 30 });
+    try app.buttons.add(.{ .select_thinking = 1 }, .{ .x = 4, .y = 40, .w = 122, .h = 30 });
+
+    hoverThinking(&app, 20, 50);
+    try std.testing.expectEqual(@as(usize, 1), app.thinking_menu.highlight);
+    try std.testing.expect(app.dirty);
+
+    app.dirty = false;
+    hoverThinking(&app, 60, 55);
+    try std.testing.expect(!app.dirty);
+
+    hoverThinking(&app, 150, 150);
+    try std.testing.expectEqual(@as(usize, 1), app.thinking_menu.highlight);
+    try std.testing.expect(!app.dirty);
+
+    hoverThinking(&app, 20, 10);
+    try std.testing.expectEqual(@as(usize, 0), app.thinking_menu.highlight);
+    try std.testing.expect(app.dirty);
+}
+
+test "model menu hover highlights the row under the cursor without scrolling" {
+    const allocator = std.testing.allocator;
+    var app: App = undefined;
+    const models = [_]pi.Model{
+        .{ .name = "One", .id = "one", .provider = "local" },
+        .{ .name = "Two", .id = "two", .provider = "local" },
+        .{ .name = "Three", .id = "three", .provider = "local" },
+    };
+    app.library = try Library.Panel.init(allocator);
+    defer app.library.deinit();
+    app.library.resetQuery();
+    app.runtime_snapshot = .{ .allocator = allocator, .models = @constCast(&models) };
+    app.model_picker = .{ .open = true, .first = 1, .highlight = 1, .visible = 2 };
+    try app.model_picker.search.rebuild(&models, "");
+    app.thinking_menu = .{};
+    app.dirty = false;
+    app.buttons = .{};
+    try app.buttons.add(.{ .select_model = app.model_picker.search.index(1).? }, .{ .x = 8, .y = 8, .w = 200, .h = 38 });
+    try app.buttons.add(.{ .select_model = app.model_picker.search.index(2).? }, .{ .x = 8, .y = 48, .w = 200, .h = 38 });
+
+    hoverModel(&app, 20, 60);
+    try std.testing.expectEqual(@as(usize, 2), app.model_picker.highlight);
+    try std.testing.expectEqual(@as(usize, 1), app.model_picker.first);
+    try std.testing.expect(app.dirty);
+
+    app.dirty = false;
+    hoverModel(&app, 100, 70);
+    try std.testing.expect(!app.dirty);
+
+    hoverModel(&app, 300, 300);
+    try std.testing.expectEqual(@as(usize, 2), app.model_picker.highlight);
+    try std.testing.expect(!app.dirty);
+
+    app.closing = true;
+    app.force_dialog = false;
+    app.pending_hover = null;
+    hoverMenu(&app, 20, 20);
+    try std.testing.expectEqual(@as(usize, 2), app.model_picker.highlight);
+    app.closing = false;
+    const drawn = app.buttons;
+    app.buttons.clear();
+    hoverMenu(&app, 20, 20);
+    try std.testing.expect(app.pending_hover != null);
+    try std.testing.expectEqual(@as(usize, 2), app.model_picker.highlight);
+    app.buttons = drawn;
+    hoverMenu(&app, app.pending_hover.?[0], app.pending_hover.?[1]);
+    try std.testing.expect(app.pending_hover == null);
+    try std.testing.expectEqual(@as(usize, 1), app.model_picker.highlight);
+    app.buttons.clear();
+    hoverMenu(&app, 20, 60);
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_UP;
+    app.library.preedit_len = 0;
+    try handleModelKey(&app, &event);
+    try std.testing.expect(app.pending_hover == null);
+    try std.testing.expectEqual(@as(usize, 0), app.model_picker.highlight);
+    try std.testing.expectEqual(@as(usize, 1), app.model_picker.first);
+    app.model_picker.first = 1;
+    app.model_picker.highlight = 2;
+    app.buttons = drawn;
+
+    app.model_picker.selection_cleared = true;
+    hoverModel(&app, 20, 60);
+    try std.testing.expect(!app.model_picker.selection_cleared);
+    try std.testing.expect(app.dirty);
 }
 
 test "thinking menu keys choose through Pi and held Enter never sends the draft" {
@@ -535,13 +674,17 @@ test "thinking menu keys choose through Pi and held Enter never sends the draft"
     var event = std.mem.zeroes(c.SDL_Event);
     event.type = c.SDL_EVENT_KEY_DOWN;
     event.key.key = c.SDLK_ESCAPE;
+    app.pending_hover = .{ 20, 60 };
     try input.handle(&app, &event);
     try std.testing.expect(!app.thinking_menu.open);
+    try std.testing.expect(app.pending_hover == null);
     try std.testing.expectEqual(@as(usize, 0), runtime.inputs.items.len);
     try std.testing.expectEqualStrings("unfinished draft", app.editor.textBytes());
     try std.testing.expectEqual(draft_selection, app.editor.selection());
     // Enter sends the highlighted level and closes the menu.
+    app.pending_hover = .{ 20, 60 };
     try commands.act(&app, .thinking);
+    try std.testing.expect(app.pending_hover == null);
     try std.testing.expectEqual(@as(?usize, 1), app.thinking_menu.selected(thinkingLevels(&app)));
     event.key.key = c.SDLK_DOWN;
     try input.handle(&app, &event);

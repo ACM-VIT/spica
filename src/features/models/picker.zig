@@ -5,6 +5,8 @@ const Search = @import("search.zig").Search;
 pub const Picker = struct {
     open: bool = false,
     first: usize = 0,
+    highlight: usize = 0,
+    visible: usize = 1,
     selection_cleared: bool = false,
     search: Search = .{},
     popup_bounds: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -12,6 +14,7 @@ pub const Picker = struct {
     pub fn restart(self: *Picker) void {
         self.search.invalidate();
         self.first = 0;
+        self.highlight = 0;
         self.selection_cleared = false;
     }
 
@@ -32,23 +35,40 @@ pub const Picker = struct {
 
     pub fn selected(self: *Picker, models: []const Model, query: []const u8) !?usize {
         if (self.selection_cleared) return null;
-        return self.index(models, query, self.first);
+        return self.index(models, query, self.highlight);
     }
 
-    pub fn previous(self: *Picker) void {
-        self.first -|= 1;
-        self.selection_cleared = false;
-    }
-
-    pub fn next(self: *Picker, models: []const Model, query: []const u8) !void {
+    pub fn move(self: *Picker, models: []const Model, query: []const u8, down: bool) !void {
         const last = (try self.count(models, query)) -| 1;
-        self.first = if (self.selection_cleared) 0 else @min(last, self.first + 1);
+        self.highlight = if (self.selection_cleared) @min(last, self.first) else if (down) @min(last, self.highlight + 1) else self.highlight -| 1;
         self.selection_cleared = false;
+    }
+
+    pub fn hover(self: *Picker, model_index: usize) bool {
+        const end = @min(self.search.len, self.first + self.visible);
+        for (self.search.matches[self.first..end], self.first..) |match, rank| {
+            if (match.index != model_index) continue;
+            if (!self.selection_cleared and self.highlight == rank) return false;
+            self.highlight = rank;
+            self.selection_cleared = false;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn scrollToHighlight(self: *Picker, count_: usize, visible: usize) void {
+        self.visible = visible;
+        self.highlight = @min(self.highlight, count_ -| 1);
+        self.first = @min(self.first, count_ -| 1);
+        if (self.highlight < self.first) self.first = self.highlight;
+        if (self.highlight >= self.first + visible) self.first = self.highlight + 1 - visible;
     }
 
     pub fn scroll(self: *Picker, models: []const Model, query: []const u8, direction: f32) !void {
         const last = (try self.count(models, query)) -| 1;
+        const before = self.first;
         self.first = if (direction > 0) self.first -| 1 else if (direction < 0) @min(last, self.first + 1) else self.first;
+        self.highlight = if (self.selection_cleared) self.first else @min(last, (self.highlight + self.first) -| before);
         if (direction != 0) self.selection_cleared = false;
     }
 
@@ -71,13 +91,16 @@ pub const Picker = struct {
         if (retained) |kept| {
             for (self.search.matches[0..self.search.len], 0..) |match, rank| {
                 if (match.index == kept) {
-                    self.first = rank;
+                    self.highlight = rank;
                     self.selection_cleared = false;
                     break;
                 }
             }
         }
-        if (self.selection_cleared) self.first = 0;
+        if (self.selection_cleared) {
+            self.first = 0;
+            self.highlight = 0;
+        }
         return true;
     }
 };

@@ -28,6 +28,7 @@ const processes = @import("features/chat/processes.zig");
 const updates = @import("features/chat/updates.zig");
 const workspace = @import("features/library/workspace.zig");
 const conversation = @import("features/transcript/conversation.zig");
+const menus = @import("features/models/menus.zig");
 const input = @import("app/input.zig");
 const view = @import("app/view.zig");
 
@@ -61,6 +62,7 @@ pub const App = struct {
     force_dialog: bool = false,
     model_picker: ModelPicker = .{},
     thinking_menu: ThinkingMenu = .{},
+    pending_hover: ?[2]f32 = null,
     sidebar_visible: bool = true,
     model_bounds: c.SDL_FRect = undefined,
     thinking_bounds: c.SDL_FRect = undefined,
@@ -394,7 +396,14 @@ pub const App = struct {
                 workspace.saveDraft(self) catch |err| self.report("Saving draft", err);
                 self.draft_due = null;
             };
-            if (self.dirty and !self.minimized) try view.paint(self);
+            if (self.dirty and !self.minimized) {
+                try view.paint(self);
+                if (self.pending_hover) |point| {
+                    self.pending_hover = null;
+                    if (self.buttons.len != 0) menus.hoverMenu(self, point[0], point[1]);
+                    if (self.dirty) try view.paint(self);
+                }
+            }
             conversation.pump(self) catch |err| self.report("Loading viewport", err);
             var event: c.SDL_Event = undefined;
             const timeout = self.waitTimeout();
