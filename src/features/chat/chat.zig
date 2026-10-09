@@ -261,6 +261,7 @@ pub fn finishThreadSwitch(app: *App) !void {
     app.accepted_clear_revision = null;
     app.draft_revision = 0;
     try app.editor.setText("");
+    try workspace.takeStoredDraft(app, target.path orelse "", target.cwd);
     app.thread_title.clear();
     app.chat_view = if (target.path == null) .new_thread else .opening;
     app.run_started = null;

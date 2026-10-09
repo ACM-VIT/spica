@@ -57,6 +57,9 @@ pub const App = struct {
     model_restore: ?chat.ModelRestore = null,
     runtime_retiring: bool = false,
     accepted_draft: ?[]u8 = null,
+    // Restored drafts for chats not opened since launch. Opening a chat moves its
+    // draft into the editor; the rest are written back unchanged.
+    stored_drafts: std.ArrayList(Draft.Entry) = .empty,
     closing: bool = false,
     force_dialog: bool = false,
     model_picker: ModelPicker = .{},
@@ -137,7 +140,13 @@ pub const App = struct {
         errdefer editor.deinit();
         var library = try Library.Panel.init(allocator);
         errdefer library.deinit();
-        try editor.setText(restored.value().draft);
+        var stored_drafts: std.ArrayList(Draft.Entry) = .empty;
+        errdefer workspace.freeDrafts(allocator, &stored_drafts);
+        try stored_drafts.ensureTotalCapacityPrecise(allocator, restored.value().drafts.len);
+        for (restored.value().drafts) |entry| stored_drafts.appendAssumeCapacity(try workspace.dupeDraft(allocator, entry));
+        const startup_draft = workspace.draftIndex(stored_drafts.items, options.resume_file orelse "", project_path);
+        try editor.setText(if (startup_draft) |index| stored_drafts.items[index].text else restored.legacy_draft);
+        if (startup_draft) |index| workspace.freeDraft(allocator, stored_drafts.orderedRemove(index));
         const copy_buffer = try allocator.alloc(u8, 65537);
         errdefer allocator.free(copy_buffer);
         if (!c.spica_image_install_sdl_allocator()) return error.SDLAllocatorInstallation;
@@ -240,17 +249,20 @@ pub const App = struct {
             .light = options.light or saved.light,
             .follow_bottom = true,
             .quit_due = if (options.quit_after_ms) |ms| c.SDL_GetTicks() + ms else null,
+            .stored_drafts = stored_drafts,
         };
     }
 
     pub fn deinit(self: *App) void {
+        // Queue the final write while every parked chat still owns its draft.
+        workspace.saveDraft(self) catch |err| std.log.err("final draft queue: {s}", .{@errorName(err)});
         if (self.runtime) |runtime| runtime.destroy() catch |err| std.log.err("Runtime shutdown invariant: {s}", .{@errorName(err)});
         if (self.runtime_snapshot) |*snapshot| snapshot.deinit();
         for (self.parked_chats.items) |*parked| parked.deinit(self.allocator);
         self.parked_chats.deinit(self.allocator);
         if (self.model_restore) |*settings| settings.deinit(self.allocator);
         if (self.accepted_draft) |draft| self.allocator.free(draft);
-        workspace.saveDraft(self) catch |err| std.log.err("final draft queue: {s}", .{@errorName(err)});
+        workspace.freeDrafts(self.allocator, &self.stored_drafts);
         self.draft_writer.destroy();
         self.content.destroy();
         self.catalog_worker.destroy();

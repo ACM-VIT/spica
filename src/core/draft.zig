@@ -2,8 +2,33 @@ const std = @import("std");
 const c = @import("../native/bindings.zig").c;
 const allocator = std.heap.page_allocator;
 
+pub const max_drafts = 64;
+pub const max_draft_bytes = 64 * 1024;
+const max_path_bytes = 4096;
+// JSON may escape each draft byte as six (\u00XX); the bound only limits reads.
+const max_state_bytes = 512 * 1024 + max_drafts * (max_draft_bytes + 2 * max_path_bytes) * 6;
+
+// A chat with a durable Pi session is keyed by that session file. An unsent new
+// thread has no durable identity, so its draft is keyed by its project folder.
+pub const Entry = struct {
+    session: []const u8 = "",
+    cwd: []const u8 = "",
+    text: []const u8 = "",
+
+    pub fn matches(self: Entry, session: []const u8, cwd: []const u8) bool {
+        if (session.len != 0) return std.mem.eql(u8, self.session, session);
+        return self.session.len == 0 and std.mem.eql(u8, self.cwd, cwd);
+    }
+
+    fn valid(self: Entry) bool {
+        if (self.text.len == 0 or self.text.len > max_draft_bytes or !std.unicode.utf8ValidateSlice(self.text)) return false;
+        if (self.session.len > max_path_bytes or self.cwd.len > max_path_bytes) return false;
+        return self.session.len != 0 or self.cwd.len != 0;
+    }
+};
+
 pub const State = struct {
-    draft: []const u8 = "",
+    drafts: []const Entry = &.{},
     light: bool = false,
     font_size: u8 = 15,
     ui_scale: u16 = 100,
@@ -12,7 +37,9 @@ pub const State = struct {
 };
 
 const RawState = struct {
+    // Single draft written before drafts were keyed by chat.
     draft: []const u8 = "",
+    drafts: []const Entry = &.{},
     light: bool = false,
     font_size: std.json.Value = .null,
     ui_scale: std.json.Value = .null,
@@ -34,10 +61,15 @@ fn restoredNumber(comptime T: type, raw: std.json.Value, fallback: T, minimum: T
 }
 pub const Restored = struct {
     parsed: ?std.json.Parsed(RawState) = null,
+    drafts: []const Entry = &.{},
+    // The old single draft belongs to whichever chat opens at startup.
+    legacy_draft: []const u8 = "",
+    // Invalid draft entries are skipped so settings and other drafts still load.
+    skipped: usize = 0,
     pub fn value(self: Restored) State {
         const raw = if (self.parsed) |parsed| parsed.value else return .{};
         return .{
-            .draft = raw.draft,
+            .drafts = self.drafts,
             .light = raw.light,
             .font_size = restoredNumber(u8, raw.font_size, 15, 12, 24),
             .ui_scale = restoredNumber(u16, raw.ui_scale, 100, 75, 175),
@@ -50,19 +82,35 @@ pub const Restored = struct {
     }
 };
 pub fn restore(io: std.Io, path: []const u8) !Restored {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(512 * 1024)) catch |err| switch (err) {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_state_bytes)) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
     defer allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(RawState, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     errdefer parsed.deinit();
-    if (parsed.value.draft.len > 65536 or !std.unicode.utf8ValidateSlice(parsed.value.draft)) return error.InvalidDraft;
     if (parsed.value.projects.len > 64) return error.InvalidProjects;
     for (parsed.value.projects) |project| {
         if (project.len > 4096 or !std.unicode.utf8ValidateSlice(project)) return error.InvalidProjects;
     }
-    return .{ .parsed = parsed };
+    var restored: Restored = .{ .parsed = parsed };
+    const legacy = parsed.value.draft;
+    if (legacy.len <= max_draft_bytes and std.unicode.utf8ValidateSlice(legacy)) restored.legacy_draft = legacy else restored.skipped += 1;
+    const raw_drafts = parsed.value.drafts;
+    const drafts = try parsed.arena.allocator().alloc(Entry, @min(raw_drafts.len, max_drafts));
+    var kept: usize = 0;
+    for (raw_drafts) |entry| {
+        var duplicate = false;
+        for (drafts[0..kept]) |existing| duplicate = duplicate or existing.matches(entry.session, entry.cwd);
+        if (kept == drafts.len or duplicate or !entry.valid()) {
+            restored.skipped += 1;
+            continue;
+        }
+        drafts[kept] = entry;
+        kept += 1;
+    }
+    restored.drafts = drafts[0..kept];
+    return restored;
 }
 
 pub const Writer = struct {
@@ -158,3 +206,85 @@ pub const Writer = struct {
         }
     }
 };
+
+fn restoreBytes(bytes: []const u8) !Restored {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "workspace.json", .data = bytes });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "workspace.json" });
+    defer std.testing.allocator.free(path);
+    return restore(io, path);
+}
+
+test "keyed drafts round-trip with settings" {
+    const state = State{
+        .drafts = &.{ .{ .session = "/s/a.jsonl", .cwd = "/p", .text = "alpha" }, .{ .cwd = "/p", .text = "new thread ✓" } },
+        .light = true,
+        .font_size = 18,
+        .projects = &.{"/p"},
+    };
+    const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, state, .{});
+    defer std.testing.allocator.free(bytes);
+    var restored = try restoreBytes(bytes);
+    defer restored.deinit();
+    const value = restored.value();
+    try std.testing.expectEqual(@as(usize, 2), value.drafts.len);
+    try std.testing.expectEqualStrings("alpha", value.drafts[0].text);
+    try std.testing.expect(value.drafts[0].matches("/s/a.jsonl", "/other"));
+    try std.testing.expect(!value.drafts[0].matches("", "/p"));
+    try std.testing.expect(value.drafts[1].matches("", "/p"));
+    try std.testing.expect(!value.drafts[1].matches("/s/a.jsonl", "/p"));
+    try std.testing.expectEqualStrings("new thread ✓", value.drafts[1].text);
+    try std.testing.expect(value.light);
+    try std.testing.expectEqual(@as(u8, 18), value.font_size);
+    try std.testing.expectEqual(@as(usize, 0), restored.skipped);
+}
+
+test "the single draft of older workspaces is still restored" {
+    var restored = try restoreBytes("{\"draft\":\"legacy\",\"light\":true,\"projects\":[\"/p\"]}");
+    defer restored.deinit();
+    try std.testing.expectEqualStrings("legacy", restored.legacy_draft);
+    try std.testing.expectEqual(@as(usize, 0), restored.value().drafts.len);
+    try std.testing.expect(restored.value().light);
+    try std.testing.expectEqual(@as(usize, 1), restored.value().projects.len);
+}
+
+test "invalid draft entries are skipped without losing settings" {
+    var oversized: std.ArrayList(u8) = .empty;
+    defer oversized.deinit(std.testing.allocator);
+    try oversized.appendSlice(std.testing.allocator, "{\"font_size\":20,\"draft\":\"");
+    try oversized.appendNTimes(std.testing.allocator, 'x', max_draft_bytes + 1);
+    try oversized.appendSlice(std.testing.allocator, "\",\"drafts\":[{\"cwd\":\"/p\",\"text\":\"kept\"},{\"cwd\":\"/p\",\"text\":\"duplicate\"},{\"text\":\"no key\"},{\"cwd\":\"/q\",\"text\":\"\"},{\"cwd\":\"/q\",\"text\":\"");
+    try oversized.appendNTimes(std.testing.allocator, 'y', max_draft_bytes + 1);
+    try oversized.appendSlice(std.testing.allocator, "\"}]}");
+    var restored = try restoreBytes(oversized.items);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(u8, 20), restored.value().font_size);
+    try std.testing.expectEqualStrings("", restored.legacy_draft);
+    try std.testing.expectEqual(@as(usize, 1), restored.value().drafts.len);
+    try std.testing.expectEqualStrings("kept", restored.value().drafts[0].text);
+    try std.testing.expectEqual(@as(usize, 5), restored.skipped);
+}
+
+test "a failed write is reported" {
+    try std.testing.expect(c.spica_image_install_sdl_allocator());
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "missing", "workspace.json" });
+    defer std.testing.allocator.free(path);
+    const writer = try Writer.create(io, path, 0);
+    defer writer.destroy();
+    try writer.submit(.{ .drafts = &.{.{ .cwd = "/p", .text = "kept in memory" }} });
+    var waited: u32 = 0;
+    const err = while (waited < 500) : (waited += 1) {
+        if (writer.takeError()) |err| break err;
+        c.SDL_Delay(10);
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(error.FileNotFound, err);
+}
