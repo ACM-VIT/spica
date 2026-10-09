@@ -9,7 +9,7 @@ const max_path_bytes = 4096;
 pub const max_projects = 64;
 const max_backups = 10;
 // JSON may escape each draft byte as six (\u00XX); the bound only limits reads.
-const max_state_bytes = 512 * 1024 + max_drafts * (max_draft_bytes + 2 * max_path_bytes) * 6;
+const max_state_bytes = 512 * 1024 + (max_projects * max_path_bytes + max_drafts * (max_draft_bytes + 2 * max_path_bytes)) * 6;
 
 // A chat with a durable Pi session is keyed by that session file. An unsent new
 // thread has no durable identity, so its draft is keyed by its project folder.
@@ -201,6 +201,10 @@ pub const Writer = struct {
 
     pub fn submit(self: *Writer, state: State) !void {
         const bytes = try std.json.Stringify.valueAlloc(allocator, state, .{});
+        if (bytes.len >= max_state_bytes) {
+            allocator.free(bytes);
+            return error.WorkspaceTooLarge;
+        }
         c.SDL_LockMutex(self.mutex);
         defer c.SDL_UnlockMutex(self.mutex);
         if (self.pending) |old| allocator.free(old);
@@ -438,6 +442,23 @@ test "saved workspace files are private to the user" {
     writer.destroy();
     const stat = try tmp.dir.statFile(io, "workspace.json", .{});
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+}
+
+test "a workspace the reader would reject is never written" {
+    try std.testing.expect(c.spica_image_install_sdl_allocator());
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "workspace.json" });
+    defer std.testing.allocator.free(path);
+    const session = try std.testing.allocator.alloc(u8, max_state_bytes / 6 + 1);
+    defer std.testing.allocator.free(session);
+    @memset(session, 1);
+    const writer = try Writer.create(io, path, 0);
+    defer writer.destroy();
+    try std.testing.expectError(error.WorkspaceTooLarge, writer.submit(.{ .drafts = &.{.{ .session = session, .text = "draft" }} }));
 }
 
 test "a failed write is reported" {
