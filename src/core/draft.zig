@@ -151,6 +151,7 @@ fn load(bytes: []const u8) !Restored {
         const drafts = try arena.alloc(Entry, @min(raw.array.items.len, max_drafts));
         var kept: usize = 0;
         for (raw.array.items) |item| {
+            if (item == .object) if (item.object.get("text")) |text| if (text == .string and text.string.len == 0) continue;
             const entry = entryFrom(item) orelse {
                 restored.skipped += 1;
                 continue;
@@ -333,7 +334,7 @@ test "invalid draft entries are skipped without losing settings" {
     try std.testing.expectEqualStrings("", restored.legacy_draft);
     try std.testing.expectEqual(@as(usize, 1), restored.value().drafts.len);
     try std.testing.expectEqualStrings("kept", restored.value().drafts[0].text);
-    try std.testing.expectEqual(@as(usize, 5), restored.skipped);
+    try std.testing.expectEqual(@as(usize, 4), restored.skipped);
 }
 
 test "entries of the wrong type are skipped without losing settings" {
