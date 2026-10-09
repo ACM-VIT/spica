@@ -237,7 +237,8 @@ pub const Writer = struct {
     }
 
     fn write(self: *Writer, bytes: []const u8) !void {
-        const file = try std.Io.Dir.cwd().createFile(self.io, self.temporary_path, .{});
+        const permissions: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600);
+        const file = try std.Io.Dir.cwd().createFile(self.io, self.temporary_path, .{ .permissions = permissions });
         defer file.close(self.io);
         // Drafts can hold pasted secrets; also tightens a stale temporary file.
         if (builtin.os.tag != .windows) try file.setPermissions(self.io, .fromMode(0o600));
