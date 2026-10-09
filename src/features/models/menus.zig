@@ -53,6 +53,7 @@ pub fn toggleModelMenu(app: *App) void {
         _ = c.SDL_StartTextInput(app.window);
     }
     app.buttons.clear();
+    app.pending_hover = null;
     app.thinking_menu.open = false;
 }
 
@@ -63,6 +64,7 @@ pub fn closeModelMenu(app: *App) void {
     app.library.layout_dirty = true;
     app.library.dragging = false;
     app.buttons.clear();
+    app.pending_hover = null;
     _ = c.SDL_ClearComposition(app.window);
     app.syncTextInput();
 }
@@ -70,6 +72,7 @@ pub fn closeModelMenu(app: *App) void {
 pub fn closeAll(app: *App) void {
     closeModelMenu(app);
     app.thinking_menu.open = false;
+    app.pending_hover = null;
 }
 
 pub fn editModelQuery(app: *App, event: *const c.SDL_Event) !void {
@@ -122,6 +125,7 @@ pub fn selectModel(app: *App, index: usize) !void {
 
 pub fn toggleThinkingMenu(app: *App) void {
     app.thinking_menu.open = !app.thinking_menu.open;
+    app.pending_hover = null;
     if (app.thinking_menu.open) {
         const current = if (app.runtime_snapshot) |snapshot| snapshot.thinking_level else "";
         app.thinking_menu.highlightCurrent(thinkingLevels(app), current);
@@ -135,6 +139,7 @@ pub fn selectThinking(app: *App, index: usize) !void {
     if (index >= snapshot.thinking_levels.len) return error.StaleThinkingChoice;
     try (app.runtime orelse return error.PiNotReady).setThinkingLevel(snapshot.thinking_levels[index]);
     app.thinking_menu.open = false;
+    app.pending_hover = null;
 }
 
 pub fn handleModelKey(app: *App, event: *const c.SDL_Event) !void {
@@ -164,6 +169,7 @@ pub fn handleThinkingKey(app: *App, event: *const c.SDL_Event) !void {
     switch (event.key.key) {
         c.SDLK_ESCAPE => {
             app.thinking_menu.open = false;
+            app.pending_hover = null;
             app.dirty = true;
         },
         c.SDLK_UP, c.SDLK_DOWN => {
