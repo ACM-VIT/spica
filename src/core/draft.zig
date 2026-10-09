@@ -7,7 +7,6 @@ pub const max_drafts = 64;
 pub const max_draft_bytes = 64 * 1024;
 const max_path_bytes = 4096;
 pub const max_projects = 64;
-const max_backups = 10;
 // JSON may escape each draft byte as six (\u00XX); the bound only limits reads.
 const max_state_bytes = 512 * 1024 + (max_draft_bytes + max_projects * max_path_bytes + max_drafts * (max_draft_bytes + 2 * max_path_bytes)) * 6;
 
@@ -100,7 +99,8 @@ pub fn restore(io: std.Io, path: []const u8) !Restored {
 }
 
 fn setAside(io: std.Io, path: []const u8, err: anyerror) !Restored {
-    for (0..max_backups) |attempt| {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
         const backup = if (attempt == 0)
             try std.fmt.allocPrint(allocator, "{s}.invalid", .{path})
         else
@@ -108,13 +108,12 @@ fn setAside(io: std.Io, path: []const u8, err: anyerror) !Restored {
         defer allocator.free(backup);
         if (std.Io.Dir.cwd().openFile(io, backup, .{})) |existing| {
             existing.close(io);
-            if (attempt + 1 < max_backups) continue;
+            continue;
         } else |open_err| if (open_err != error.FileNotFound) return err;
         // Without a preserved copy, starting would let the next write discard it.
         std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), backup, io) catch return err;
         return .{ .unreadable = err };
     }
-    unreachable;
 }
 
 fn load(bytes: []const u8) !Restored {
@@ -446,7 +445,7 @@ test "an earlier unreadable workspace backup is never replaced" {
     }
 }
 
-test "an unreadable workspace still starts once every backup name is taken" {
+test "an unreadable workspace takes the next free backup name and never replaces one" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -455,21 +454,21 @@ test "an unreadable workspace still starts once every backup name is taken" {
     const path = try std.fs.path.join(std.testing.allocator, &.{ root, "workspace.json" });
     defer std.testing.allocator.free(path);
 
-    for (0..max_backups + 1) |round| {
-        var buffer: [16]u8 = undefined;
-        try tmp.dir.writeFile(io, .{ .sub_path = "workspace.json", .data = try std.fmt.bufPrint(&buffer, "{{broken {d}", .{round}) });
+    const rounds = 12;
+    var expected: [16]u8 = undefined;
+    for (0..rounds) |round| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "workspace.json", .data = try std.fmt.bufPrint(&expected, "{{broken {d}", .{round}) });
         var restored = try restore(io, path);
         defer restored.deinit();
         try std.testing.expect(restored.unreadable != null);
     }
-    const first = try tmp.dir.readFileAlloc(io, "workspace.json.invalid", std.testing.allocator, .limited(64));
-    defer std.testing.allocator.free(first);
-    try std.testing.expectEqualStrings("{broken 0", first);
-    var last_name: [32]u8 = undefined;
-    const last = try tmp.dir.readFileAlloc(io, try std.fmt.bufPrint(&last_name, "workspace.json.invalid.{d}", .{max_backups - 1}), std.testing.allocator, .limited(64));
-    defer std.testing.allocator.free(last);
-    var expected: [16]u8 = undefined;
-    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{{broken {d}", .{max_backups}), last);
+    var name: [32]u8 = undefined;
+    for (0..rounds) |round| {
+        const backup = if (round == 0) "workspace.json.invalid" else try std.fmt.bufPrint(&name, "workspace.json.invalid.{d}", .{round});
+        const kept = try tmp.dir.readFileAlloc(io, backup, std.testing.allocator, .limited(64));
+        defer std.testing.allocator.free(kept);
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{{broken {d}", .{round}), kept);
+    }
 }
 
 test "a workspace that cannot be opened stays in place" {
