@@ -124,6 +124,7 @@ pub fn saveDraft(app: *App) !void {
     var projects: [max_projects][]const u8 = undefined;
     for (app.projects.items, 0..) |path, index| projects[index] = path;
     try app.draft_writer.submit(.{
+        .draft = app.editor.textBytes(),
         .drafts = drafts[0..collected.count],
         .light = app.light,
         .font_size = app.appearance.font_size,

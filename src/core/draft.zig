@@ -9,7 +9,7 @@ const max_path_bytes = 4096;
 pub const max_projects = 64;
 const max_backups = 10;
 // JSON may escape each draft byte as six (\u00XX); the bound only limits reads.
-const max_state_bytes = 512 * 1024 + (max_projects * max_path_bytes + max_drafts * (max_draft_bytes + 2 * max_path_bytes)) * 6;
+const max_state_bytes = 512 * 1024 + (max_draft_bytes + max_projects * max_path_bytes + max_drafts * (max_draft_bytes + 2 * max_path_bytes)) * 6;
 
 // A chat with a durable Pi session is keyed by that session file. An unsent new
 // thread has no durable identity, so its draft is keyed by its project folder.
@@ -31,6 +31,7 @@ pub const Entry = struct {
 };
 
 pub const State = struct {
+    draft: []const u8 = "",
     drafts: []const Entry = &.{},
     light: bool = false,
     font_size: u8 = 15,
@@ -144,9 +145,9 @@ fn load(bytes: []const u8) !Restored {
         restored.skipped += 1;
     };
     // Single draft written before drafts were keyed by chat.
-    if (root.get("draft")) |raw| {
+    if (root.get("drafts") == null) if (root.get("draft")) |raw| {
         if (raw == .string and raw.string.len <= max_draft_bytes and std.unicode.utf8ValidateSlice(raw.string)) restored.legacy_draft = raw.string else restored.skipped += 1;
-    }
+    };
     if (root.get("drafts")) |raw| if (raw == .array) {
         const drafts = try arena.alloc(Entry, @min(raw.array.items.len, max_drafts));
         var kept: usize = 0;
@@ -323,6 +324,30 @@ test "keyed drafts round-trip with settings" {
     try std.testing.expectEqual(@as(usize, 0), restored.skipped);
 }
 
+test "older builds can read the active draft while newer builds ignore it" {
+    const state = State{ .draft = "active", .drafts = &.{.{ .cwd = "/p", .text = "active" }} };
+    const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, state, .{});
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"draft\":\"active\"") != null);
+    var restored = try restoreBytes(bytes);
+    defer restored.deinit();
+    try std.testing.expectEqualStrings("", restored.legacy_draft);
+    try std.testing.expectEqual(@as(usize, 1), restored.value().drafts.len);
+}
+
+test "an oversized draft in an older workspace is skipped" {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(std.testing.allocator);
+    try bytes.appendSlice(std.testing.allocator, "{\"font_size\":20,\"draft\":\"");
+    try bytes.appendNTimes(std.testing.allocator, 'x', max_draft_bytes + 1);
+    try bytes.appendSlice(std.testing.allocator, "\"}");
+    var restored = try restoreBytes(bytes.items);
+    defer restored.deinit();
+    try std.testing.expectEqualStrings("", restored.legacy_draft);
+    try std.testing.expectEqual(@as(usize, 1), restored.skipped);
+    try std.testing.expectEqual(@as(u8, 20), restored.value().font_size);
+}
+
 test "the single draft of older workspaces is still restored" {
     var restored = try restoreBytes("{\"draft\":\"legacy\",\"light\":true,\"projects\":[\"/p\"]}");
     defer restored.deinit();
@@ -346,7 +371,7 @@ test "invalid draft entries are skipped without losing settings" {
     try std.testing.expectEqualStrings("", restored.legacy_draft);
     try std.testing.expectEqual(@as(usize, 1), restored.value().drafts.len);
     try std.testing.expectEqualStrings("kept", restored.value().drafts[0].text);
-    try std.testing.expectEqual(@as(usize, 4), restored.skipped);
+    try std.testing.expectEqual(@as(usize, 3), restored.skipped);
 }
 
 test "entries of the wrong type are skipped without losing settings" {
@@ -366,7 +391,7 @@ test "entries of the wrong type are skipped without losing settings" {
     try std.testing.expectEqualStrings("/q", value.projects[1]);
     try std.testing.expectEqual(@as(usize, 1), value.drafts.len);
     try std.testing.expectEqualStrings("kept", value.drafts[0].text);
-    try std.testing.expectEqual(@as(usize, 7), restored.skipped);
+    try std.testing.expectEqual(@as(usize, 6), restored.skipped);
 }
 
 test "an unreadable workspace is kept aside and defaults are used" {
