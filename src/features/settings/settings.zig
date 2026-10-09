@@ -1,6 +1,6 @@
 const std = @import("std");
-const Theme = @import("theme.zig");
-const c = @import("../native/bindings.zig").c;
+const Theme = @import("../../ui/theme.zig");
+const c = @import("../../native/bindings.zig").c;
 
 const min_font_size: u8 = 12;
 const max_font_size: u8 = 24;

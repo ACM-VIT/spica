@@ -1,9 +1,9 @@
 const std = @import("std");
-const c = @import("../native/bindings.zig").c;
-const md = @import("../content/markdown.zig");
-const Theme = @import("theme.zig");
-const Highlight = @import("../content/worker.zig").Highlight;
-const Edit = @import("../text/edit.zig");
+const c = @import("../../native/bindings.zig").c;
+const md = @import("../../content/markdown.zig");
+const Theme = @import("../../ui/theme.zig");
+const Highlight = @import("../../content/worker.zig").Highlight;
+const Edit = @import("../../text/edit.zig");
 
 const Box = struct {
     block: u32,

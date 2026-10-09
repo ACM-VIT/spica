@@ -1,10 +1,10 @@
 const std = @import("std");
-const c = @import("../native/bindings.zig").c;
-const storage = @import("../core/store.zig");
-const content = @import("../content/worker.zig");
+const c = @import("../../native/bindings.zig").c;
+const storage = @import("../../core/store.zig");
+const content = @import("../../content/worker.zig");
 const DocumentView = @import("document.zig").View;
-const theme = @import("theme.zig");
-const widgets = @import("widgets.zig");
+const theme = @import("../../ui/theme.zig");
+const widgets = @import("../../ui/widgets.zig");
 const resident_slots = 256;
 const decoded_cache_bytes = 16 * 1024 * 1024;
 const body_padding: f32 = 16;
@@ -653,7 +653,7 @@ test "removing expanded reasoning preserves the answer across conversation updat
     const theme_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "assets/theme.json", alloc, .limited(16384));
     defer alloc.free(theme_bytes);
     const appearance = try theme.parse(alloc, theme_bytes);
-    const md = @import("../content/markdown.zig");
+    const md = @import("../../content/markdown.zig");
     const answer = "The answer is retained.";
     const thought = "Earlier reasoning.";
     const answer_id: storage.ContentId = @splat(1);
