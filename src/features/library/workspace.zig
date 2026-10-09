@@ -51,6 +51,18 @@ pub fn draftIndex(drafts: []const Draft.Entry, session: []const u8, cwd: []const
     return null;
 }
 
+pub fn dropMissingSessions(allocator: std.mem.Allocator, io: std.Io, drafts: *std.ArrayList(Draft.Entry)) void {
+    var index: usize = 0;
+    while (index < drafts.items.len) {
+        const session = drafts.items[index].session;
+        if (session.len != 0) if (std.Io.Dir.cwd().access(io, session, .{})) {} else |err| if (err == error.FileNotFound) {
+            freeDraft(allocator, drafts.orderedRemove(index));
+            continue;
+        };
+        index += 1;
+    }
+}
+
 pub fn takeStoredDraft(app: *App, session: []const u8, cwd: []const u8) !void {
     const index = draftIndex(app.stored_drafts.items, session, cwd) orelse return;
     try app.editor.setText(app.stored_drafts.items[index].text);
@@ -511,4 +523,55 @@ test "drafts persist per chat and unsent threads stay unenrolled" {
     try saveDraft(&app);
     try std.testing.expectEqual(@as(usize, 0), app.error_text.slice().len);
     try std.testing.expectEqual(@as(usize, 1), app.draft_loss.shadowed);
+}
+
+test "stored drafts of deleted sessions are dropped and the oldest drafts are evicted first" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "kept.jsonl", .data = "" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const kept = try std.fs.path.join(allocator, &.{ root, "kept.jsonl" });
+    defer allocator.free(kept);
+    const deleted = try std.fs.path.join(allocator, &.{ root, "deleted.jsonl" });
+    defer allocator.free(deleted);
+
+    var drafts: std.ArrayList(Draft.Entry) = .empty;
+    defer freeDrafts(allocator, &drafts);
+    try drafts.append(allocator, try dupeDraft(allocator, .{ .session = deleted, .cwd = root, .text = "gone" }));
+    try drafts.append(allocator, try dupeDraft(allocator, .{ .session = kept, .cwd = root, .text = "kept" }));
+    try drafts.append(allocator, try dupeDraft(allocator, .{ .cwd = "/missing-folder", .text = "folder" }));
+    dropMissingSessions(allocator, io, &drafts);
+    try std.testing.expectEqual(@as(usize, 2), drafts.items.len);
+    try std.testing.expect(draftIndex(drafts.items, deleted, "") == null);
+    try std.testing.expect(draftIndex(drafts.items, kept, "") != null);
+    try std.testing.expect(draftIndex(drafts.items, "", "/missing-folder") != null);
+
+    var app: App = undefined;
+    app.runtime_snapshot = null;
+    app.options = .{};
+    app.project_path = @constCast("/active");
+    app.current_member = false;
+    app.enrollment_intent = false;
+    app.parked_chats = .empty;
+    app.editor = try Composer.init(allocator);
+    defer app.editor.deinit();
+    app.stored_drafts = .empty;
+    defer freeDrafts(allocator, &app.stored_drafts);
+    var name: [32]u8 = undefined;
+    for (0..Draft.max_drafts) |index| {
+        const cwd = try std.fmt.bufPrint(&name, "/project-{d}", .{index});
+        try app.stored_drafts.append(allocator, try dupeDraft(allocator, .{ .cwd = cwd, .text = "stored" }));
+    }
+    try app.editor.setText("active");
+    var buffer: [Draft.max_drafts]Draft.Entry = undefined;
+    const collected = collectDrafts(&app, &buffer);
+    try std.testing.expectEqual(@as(usize, Draft.max_drafts), collected.count);
+    try std.testing.expectEqual(@as(usize, 1), collected.dropped);
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "", "/active") != null);
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "", "/project-0") != null);
+    const last = try std.fmt.bufPrint(&name, "/project-{d}", .{Draft.max_drafts - 1});
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "", last) == null);
 }
