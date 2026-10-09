@@ -181,6 +181,7 @@ pub const Writer = struct {
     temporary_path: []u8,
     wake_event: u32,
     pending: ?[]u8 = null,
+    written: ?[]u8 = null,
     closing: bool = false,
     last_error: ?anyerror = null,
 
@@ -209,6 +210,11 @@ pub const Writer = struct {
         c.SDL_LockMutex(self.mutex);
         defer c.SDL_UnlockMutex(self.mutex);
         if (self.pending) |old| allocator.free(old);
+        self.pending = null;
+        if (self.written) |written| if (std.mem.eql(u8, written, bytes)) {
+            allocator.free(bytes);
+            return;
+        };
         self.pending = bytes;
         c.SDL_SignalCondition(self.condition);
     }
@@ -232,6 +238,7 @@ pub const Writer = struct {
         if (self.last_error) |err| std.log.err("final workspace write: {s}", .{@errorName(err)});
         c.SDL_DestroyCondition(self.condition);
         c.SDL_DestroyMutex(self.mutex);
+        if (self.written) |written| allocator.free(written);
         allocator.free(self.path);
         allocator.free(self.temporary_path);
         allocator.destroy(self);
@@ -259,8 +266,13 @@ pub const Writer = struct {
             };
             self.pending = null;
             c.SDL_UnlockMutex(self.mutex);
-            defer allocator.free(bytes);
-            self.write(bytes) catch |err| {
+            if (self.write(bytes)) {
+                c.SDL_LockMutex(self.mutex);
+                if (self.written) |old| allocator.free(old);
+                self.written = bytes;
+                c.SDL_UnlockMutex(self.mutex);
+            } else |err| {
+                allocator.free(bytes);
                 c.SDL_LockMutex(self.mutex);
                 const notify = self.last_error == null;
                 self.last_error = err;
@@ -270,7 +282,7 @@ pub const Writer = struct {
                     event.type = self.wake_event;
                     _ = c.SDL_PushEvent(&event);
                 }
-            };
+            }
         }
     }
 };
@@ -487,6 +499,37 @@ test "a workspace the reader would reject is never written" {
     const writer = try Writer.create(io, path, 0);
     defer writer.destroy();
     try std.testing.expectError(error.WorkspaceTooLarge, writer.submit(.{ .drafts = &.{.{ .session = session, .text = "draft" }} }));
+}
+
+test "a save that would not change the file is skipped" {
+    try std.testing.expect(c.spica_image_install_sdl_allocator());
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "workspace.json" });
+    defer std.testing.allocator.free(path);
+    const writer = try Writer.create(io, path, 0);
+    const first = State{ .drafts = &.{.{ .cwd = "/p", .text = "same" }} };
+    try writer.submit(first);
+    var waited: u32 = 0;
+    while (waited < 500) : (waited += 1) {
+        c.SDL_LockMutex(writer.mutex);
+        const done = writer.written != null;
+        c.SDL_UnlockMutex(writer.mutex);
+        if (done) break;
+        c.SDL_Delay(10);
+    } else return error.TestUnexpectedResult;
+    try tmp.dir.deleteFile(io, "workspace.json");
+    try writer.submit(first);
+    writer.destroy();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "workspace.json", .{}));
+
+    const changed = try Writer.create(io, path, 0);
+    try changed.submit(.{ .drafts = &.{.{ .cwd = "/p", .text = "changed" }} });
+    changed.destroy();
+    (try tmp.dir.openFile(io, "workspace.json", .{})).close(io);
 }
 
 test "a failed write is reported" {
