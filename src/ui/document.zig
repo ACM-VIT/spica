@@ -4,6 +4,7 @@ const md = @import("../content/markdown.zig");
 const Theme = @import("theme.zig");
 const Highlight = @import("../content/worker.zig").Highlight;
 const Edit = @import("../text/edit.zig");
+pub const Range = struct { start: usize, end: usize };
 
 const Box = struct {
     block: u32,
@@ -23,6 +24,8 @@ pub const View = struct {
     allocator: std.mem.Allocator,
     boxes: std.ArrayList(Box) = .empty,
     color_scratch: std.ArrayList(c.SpicaTextColorSpan) = .empty,
+    selection_scratch: std.ArrayList(c.SDL_FRect) = .empty,
+    selection: ?Range = null,
     width: f32 = 0,
     height: f32 = 0,
 
@@ -33,6 +36,7 @@ pub const View = struct {
         self.clear();
         self.boxes.deinit(self.allocator);
         self.color_scratch.deinit(self.allocator);
+        self.selection_scratch.deinit(self.allocator);
     }
     pub fn clear(self: *View) void {
         for (self.boxes.items) |box| if (box.layout) |layout| c.spica_text_layout_release(layout);
@@ -221,6 +225,119 @@ pub const View = struct {
         return changed;
     }
 
+    fn textOrigin(box: Box, document: *const md.Document) struct { x: f32, y: f32 } {
+        const kind = document.blocks.items[box.block].kind;
+        const mono = kind == .code or kind == .html;
+        return .{ .x = box.x + (if (mono) @as(f32, 12) else 0), .y = box.y + (if (mono) (if (box.first) @as(f32, 12) else 0) else 4) };
+    }
+
+    /// Only inspect retained shapes; selecting never shapes offscreen history.
+    pub fn hitText(self: *const View, document: *const md.Document, x: f32, y: f32) ?usize {
+        var nearest: ?usize = null;
+        var distance: f32 = std.math.inf(f32);
+        for (self.boxes.items) |box| {
+            const layout = box.layout orelse continue;
+            const origin = textOrigin(box, document);
+            const dy = @max(0, @max(origin.y - y, y - origin.y - c.spica_text_layout_height(layout)));
+            const dx = @max(0, @max(box.x - x, x - box.x - box.width));
+            const d = dy * dy + dx * dx;
+            if (d < distance) {
+                distance = d;
+                nearest = box.text_start + c.spica_text_layout_hit_test(layout, x - origin.x, y - origin.y);
+            }
+        }
+        return nearest;
+    }
+
+    pub fn caretRect(self: *const View, document: *const md.Document, offset: usize) ?c.SDL_FRect {
+        for (self.boxes.items) |box| {
+            if (offset < box.text_start or offset > box.text_end or (offset == box.text_end and offset != document.text.items.len)) continue;
+            const layout = box.layout orelse continue;
+            var rect: c.SDL_FRect = undefined;
+            const end = box.text_end - @as(u32, if (box.text_end > box.text_start and document.text.items[box.text_end - 1] == '\n') 1 else 0);
+            if (!c.spica_text_layout_caret(layout, @min(offset, end) - box.text_start, &rect)) continue;
+            const origin = textOrigin(box, document);
+            rect.x += origin.x;
+            rect.y += origin.y;
+            return rect;
+        }
+        return null;
+    }
+
+    pub fn offsetY(self: *const View, document: *const md.Document, offset: usize) f32 {
+        if (self.caretRect(document, offset)) |rect| return rect.y;
+        for (self.boxes.items) |box| {
+            if (offset >= box.text_start and offset <= box.text_end) return box.y;
+        }
+        return 0;
+    }
+
+    pub fn lineEdge(self: *const View, document: *const md.Document, offset: usize, end: bool) usize {
+        const caret = self.caretRect(document, offset) orelse return offset;
+        for (self.boxes.items) |box| {
+            if (offset < box.text_start or offset > box.text_end) continue;
+            const layout = box.layout orelse continue;
+            const origin = textOrigin(box, document);
+            if (caret.y < origin.y or caret.y >= origin.y + c.spica_text_layout_height(layout)) continue;
+            return box.text_start + c.spica_text_layout_hit_test(layout, if (end) 1000000 else 0, caret.y - origin.y + caret.h / 2);
+        }
+        return offset;
+    }
+
+    pub fn moveVertical(self: *const View, document: *const md.Document, offset: usize, x: f32, down: bool) usize {
+        const caret = self.caretRect(document, offset) orelse return offset;
+        for (self.boxes.items, 0..) |box, index| {
+            if (offset < box.text_start or offset > box.text_end) continue;
+            const layout = box.layout orelse continue;
+            const origin = textOrigin(box, document);
+            const line_count = c.spica_text_layout_line_count(layout);
+            for (0..line_count) |line_index| {
+                var line: c.SpicaTextLine = undefined;
+                if (!c.spica_text_layout_line(layout, line_index, &line)) continue;
+                if (@abs(line.y + origin.y - caret.y) > 0.5) continue;
+                if ((down and line_index + 1 < line_count) or (!down and line_index > 0)) {
+                    _ = c.spica_text_layout_line(layout, if (down) line_index + 1 else line_index - 1, &line);
+                    return box.text_start + c.spica_text_layout_hit_test(layout, x - origin.x, line.y + line.height * 0.5);
+                }
+                if ((down and index + 1 < self.boxes.items.len) or (!down and index > 0)) {
+                    const next = self.boxes.items[if (down) index + 1 else index - 1];
+                    if (next.layout) |next_layout| {
+                        const next_origin = textOrigin(next, document);
+                        return next.text_start + c.spica_text_layout_hit_test(next_layout, x - next_origin.x, if (down) 0 else c.spica_text_layout_height(next_layout));
+                    }
+                    return if (down) next.text_start else next.text_end;
+                }
+                return if (down) document.text.items.len else 0;
+            }
+        }
+        return offset;
+    }
+
+    /// Analyze at most one bounded text segment per keypress, including for
+    /// offscreen carets. Offsets refer to rendered UTF-8, not Markdown source.
+    pub fn moveHorizontal(self: *const View, document: *const md.Document, offset: usize, forward: bool, word: bool) usize {
+        const text = document.text.items;
+        for (self.boxes.items) |box| {
+            if (if (forward) offset < box.text_start or offset >= box.text_end else offset <= box.text_start or offset > box.text_end) continue;
+            var graphemes: [32768]u8 = undefined;
+            var words: [32768]u8 = undefined;
+            const bytes = text[box.text_start..box.text_end];
+            Edit.analyzeValidUtf8(bytes, &graphemes, &words);
+            const breaks = if (word) words[0..bytes.len] else graphemes[0..bytes.len];
+            const local = offset - box.text_start;
+            return box.text_start + (if (forward) Edit.nextBoundary(breaks, local) else Edit.previousBoundary(breaks, local));
+        }
+        // Gaps between rendered blocks consist of separators (newlines/tabs).
+        if (forward) {
+            var end = @min(offset + 1, text.len);
+            while (end < text.len and text[end] & 0xc0 == 0x80) end += 1;
+            return end;
+        }
+        var start = offset -| 1;
+        while (start > 0 and text[start] & 0xc0 == 0x80) start -= 1;
+        return start;
+    }
+
     pub fn draw(self: *View, engine: *c.SpicaText, renderer: *c.SDL_Renderer, document: *const md.Document, highlights: []const Highlight, x: f32, y: f32, palette: Theme.Palette, light: bool) !void {
         const color = c.SDL_Color{ .r = palette.text.r, .g = palette.text.g, .b = palette.text.b, .a = 255 };
         for (self.boxes.items) |box| {
@@ -232,6 +349,25 @@ pub const View = struct {
                 _ = c.SDL_SetRenderDrawColor(renderer, shade.r, shade.g, shade.b, 255);
                 _ = c.SDL_RenderFillRect(renderer, &c.SDL_FRect{ .x = x + box.x, .y = y + box.y, .w = box.width + (if (block.kind == .table_cell) @as(f32, 16) else 0), .h = box.height });
             }
+            const origin = textOrigin(box, document);
+            if (self.selection) |range| {
+                const start = @max(range.start, box.text_start);
+                const end = @min(range.end, box.text_end);
+                if (start < end) {
+                    // A native layout has at most 8192 codepoints. Use reusable
+                    // scratch so bidi selections cannot silently lose rectangles.
+                    const count = c.spica_text_layout_selection_rects(layout, start - box.text_start, end - box.text_start, null, 0);
+                    try self.selection_scratch.resize(self.allocator, count);
+                    const rects = self.selection_scratch.items;
+                    _ = c.spica_text_layout_selection_rects(layout, start - box.text_start, end - box.text_start, rects.ptr, rects.len);
+                    _ = c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_BLEND);
+                    _ = c.SDL_SetRenderDrawColor(renderer, palette.accent.r, palette.accent.g, palette.accent.b, 90);
+                    for (rects) |rect| {
+                        const screen = c.SDL_FRect{ .x = x + origin.x + rect.x, .y = y + origin.y + rect.y, .w = rect.w, .h = rect.h };
+                        if (!c.SDL_RenderFillRect(renderer, &screen)) return error.SelectionDraw;
+                    }
+                }
+            }
             self.color_scratch.clearRetainingCapacity();
             if (block.kind == .code) {
                 for (highlights) |span| {
@@ -241,7 +377,17 @@ pub const View = struct {
                     try self.color_scratch.append(self.allocator, .{ .byte_start = start - box.text_start, .byte_end = end - box.text_start, .rgba = tokenColor(span.token_class, light) });
                 }
             }
-            if (!c.spica_text_layout_draw_colors(engine, layout, x + box.x + (if (mono) @as(f32, 12) else 0), y + box.y + (if (mono) (if (box.first) @as(f32, 12) else 0) else 4), color, self.color_scratch.items.ptr, self.color_scratch.items.len)) return error.TextDraw;
+            if (!c.spica_text_layout_draw_colors(engine, layout, x + origin.x, y + origin.y, color, self.color_scratch.items.ptr, self.color_scratch.items.len)) return error.TextDraw;
+            if (self.selection) |range| if (range.start == range.end and range.start >= box.text_start and range.start <= box.text_end) {
+                var caret: c.SDL_FRect = undefined;
+                if (c.spica_text_layout_caret(layout, range.start - box.text_start, &caret)) {
+                    caret.x += x + origin.x;
+                    caret.y += y + origin.y;
+                    caret.w = 1;
+                    _ = c.SDL_SetRenderDrawColor(renderer, palette.accent.r, palette.accent.g, palette.accent.b, 255);
+                    _ = c.SDL_RenderFillRect(renderer, &caret);
+                }
+            };
             if (block.parent) |parent| {
                 const ancestor = document.blocks.items[parent];
                 if (ancestor.kind == .item and box.first) {
@@ -273,6 +419,23 @@ pub const View = struct {
     }
 };
 
+test "selection arrows preserve combining characters flags and joined emoji" {
+    const allocator = std.testing.allocator;
+    const text = "e\u{301}🇺🇸👩‍💻";
+    var document = try md.parse(allocator, @splat(90), text);
+    defer document.deinit();
+    var view = View.init(allocator);
+    defer view.deinit();
+    try view.rebuild(&document, 300);
+    const after_accent = view.moveHorizontal(&document, 0, true, false);
+    try std.testing.expectEqual(@as(usize, "e\u{301}".len), after_accent);
+    const after_flag = view.moveHorizontal(&document, after_accent, true, false);
+    try std.testing.expectEqual(@as(usize, "e\u{301}🇺🇸".len), after_flag);
+    try std.testing.expectEqual(text.len, view.moveHorizontal(&document, after_flag, true, false));
+    try std.testing.expectEqual(after_flag, view.moveHorizontal(&document, text.len, false, false));
+    try std.testing.expectEqual(after_accent, view.moveHorizontal(&document, after_flag, false, false));
+}
+
 test "large single-line Unicode paragraphs retain late text within native visible layouts" {
     const allocator = std.testing.allocator;
     var source: std.ArrayList(u8) = .empty;
@@ -293,6 +456,11 @@ test "large single-line Unicode paragraphs retain late text within native visibl
         end = box.text_end;
     }
     try std.testing.expectEqual(document.text.items.len, end);
+    for (view.boxes.items[1..]) |box| {
+        const previous = view.moveHorizontal(&document, box.text_start, false, false);
+        try std.testing.expect(previous < box.text_start);
+        try std.testing.expectEqual(@as(usize, box.text_start), view.moveHorizontal(&document, previous, true, false));
+    }
     const sentinel_offset = std.mem.indexOf(u8, document.text.items, "late-visible-sentinel") orelse return error.LateTextMissing;
     try std.testing.expect(sentinel_offset > 65536);
     if (!c.spica_image_install_sdl_allocator()) return error.SDLAllocatorInstallation;

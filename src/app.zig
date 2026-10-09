@@ -2372,6 +2372,7 @@ pub const App = struct {
                 self.dirty = true;
             },
             c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
+                if (event.button.button != c.SDL_BUTTON_LEFT) return;
                 if (self.model_menu and !self.closing and !self.force_dialog) {
                     if (contains(self.library.query_bounds, event.button.x, event.button.y)) {
                         if (event.button.button == c.SDL_BUTTON_LEFT) {
@@ -2413,15 +2414,25 @@ pub const App = struct {
                 const inside = contains(self.editor_bounds, event.button.x, event.button.y);
                 self.focused_editor = inside;
                 if (inside) {
+                    self.transcript.selection = null;
                     self.preferred_caret_x = null;
                     _ = c.SDL_StartTextInput(self.window);
                     if (self.editor_layout) |layout| self.editor.setCaret(self.editor_start + c.spica_text_layout_hit_test(layout, event.button.x - self.editor_bounds.x - 12, event.button.y - self.editor_bounds.y - 10 + self.editor_scroll), (c.SDL_GetModState() & c.SDL_KMOD_SHIFT) != 0);
                     self.dragging = true;
-                } else _ = c.SDL_StopTextInput(self.window);
+                } else {
+                    _ = c.SDL_StopTextInput(self.window);
+                    if (self.transcript.selectAt(event.button.x, event.button.y, (c.SDL_GetModState() & c.SDL_KMOD_SHIFT) != 0)) {
+                        self.follow_bottom = false;
+                        _ = c.SDL_CaptureMouse(true);
+                    }
+                }
                 self.dirty = true;
             },
             c.SDL_EVENT_MOUSE_BUTTON_UP => {
+                if (event.button.button != c.SDL_BUTTON_LEFT) return;
                 self.dragging = false;
+                self.transcript.endSelectionDrag();
+                _ = c.SDL_CaptureMouse(false);
                 if (self.model_menu) self.library.dragging = false;
             },
             c.SDL_EVENT_MOUSE_MOTION => if (self.model_menu) {
@@ -2429,6 +2440,9 @@ pub const App = struct {
                     try self.library.hitQuery(self, event.motion.x, event.motion.y, true);
                     self.dirty = true;
                 }
+            } else if (!self.settings_open and self.transcript.selection != null and self.transcript.selection.?.dragging) {
+                self.transcript.dragSelection(event.motion.x, event.motion.y);
+                self.dirty = true;
             } else if (self.dragging and !self.settings_open) {
                 if (self.editor_layout) |layout| self.editor.setCaret(self.editor_start + c.spica_text_layout_hit_test(layout, event.motion.x - self.editor_bounds.x - 12, event.motion.y - self.editor_bounds.y - 10 + self.editor_scroll), true);
                 self.dirty = true;
@@ -2542,7 +2556,7 @@ pub const App = struct {
                     self.dirty = true;
                     return;
                 }
-                if (command and !self.focused_editor and (event.key.key == c.SDLK_HOME or event.key.key == c.SDLK_END)) {
+                if (command and !self.focused_editor and self.transcript.selection == null and (event.key.key == c.SDLK_HOME or event.key.key == c.SDLK_END)) {
                     self.follow_bottom = event.key.key == c.SDLK_END;
                     self.scroll = if (self.follow_bottom) @max(0, self.transcript.height - self.transcript.viewport_height) else 0;
                     self.dirty = true;
@@ -2560,7 +2574,37 @@ pub const App = struct {
                     self.catalog_worker.refresh();
                     return;
                 }
-                if (!self.focused_editor) return;
+                if (!self.focused_editor) {
+                    if (self.transcript.selectedIndex() != null) {
+                        if (command and event.key.key == c.SDLK_C) {
+                            if (self.transcript.selectedText()) |bytes| {
+                                const terminated = try self.allocator.dupeZ(u8, bytes);
+                                defer self.allocator.free(terminated);
+                                if (!c.SDL_SetClipboardText(terminated.ptr)) return error.ClipboardWrite;
+                            }
+                            return;
+                        }
+                        if (command and event.key.key == c.SDLK_V) {
+                            const clipboard = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+                            defer c.SDL_free(clipboard);
+                            try self.editor.insert(std.mem.span(clipboard), .paste);
+                            self.transcript.selection = null;
+                            self.focused_editor = true;
+                            _ = c.SDL_StartTextInput(self.window);
+                            self.edited();
+                            return;
+                        }
+                        const mac_line = builtin.os.tag == .macos and (event.key.mod & c.SDL_KMOD_GUI) != 0 and
+                            (event.key.key == c.SDLK_LEFT or event.key.key == c.SDLK_RIGHT);
+                        const key = if (mac_line) (if (event.key.key == c.SDLK_LEFT) @as(c.SDL_Keycode, c.SDLK_HOME) else c.SDLK_END) else event.key.key;
+                        if (self.transcript.selectionKey(key, command and !mac_line, shift, command or (event.key.mod & c.SDL_KMOD_ALT) != 0)) {
+                            if (!(command and key == c.SDLK_A)) self.transcript.revealSelection(&self.scroll);
+                            self.follow_bottom = false;
+                            self.dirty = true;
+                        }
+                    }
+                    return;
+                }
                 if (event.key.key == c.SDLK_ESCAPE) {
                     self.preedit.clearRetainingCapacity();
                     _ = c.SDL_ClearComposition(self.window);
@@ -2670,11 +2714,175 @@ pub const App = struct {
                 try self.preedit.appendSlice(self.allocator, bytes);
                 self.dirty = true;
             },
-            c.SDL_EVENT_WINDOW_FOCUS_LOST => if (self.model_menu) try self.editModelQuery(event),
+            c.SDL_EVENT_WINDOW_FOCUS_LOST => {
+                self.dragging = false;
+                self.transcript.endSelectionDrag();
+                _ = c.SDL_CaptureMouse(false);
+                if (self.model_menu) try self.editModelQuery(event);
+            },
             else => {},
         }
     }
 };
+
+test "transcript mouse and keyboard selection copies rendered Unicode and pastes only into composer" {
+    const allocator = std.testing.allocator;
+    var app: App = undefined;
+    try std.testing.expect(c.spica_image_install_sdl_allocator());
+    try std.testing.expect(c.SDL_SetHint(c.SDL_HINT_VIDEO_DRIVER, "dummy"));
+    defer _ = c.SDL_ResetHint(c.SDL_HINT_VIDEO_DRIVER);
+    try std.testing.expect(c.SDL_InitSubSystem(c.SDL_INIT_VIDEO));
+    defer c.SDL_QuitSubSystem(c.SDL_INIT_VIDEO);
+    app.window = c.SDL_CreateWindow("Transcript selection regression", 640, 480, c.SDL_WINDOW_HIDDEN) orelse return error.Window;
+    defer c.SDL_DestroyWindow(app.window);
+    app.renderer = c.SDL_CreateRenderer(app.window, "software") orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(app.renderer);
+    app.text = c.spica_text_create(app.renderer, build_options.font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(app.text);
+    try std.testing.expect(c.spica_text_set_monospace(app.text, build_options.font_directory ++ "/JetBrainsMono-Regular.ttf"));
+    const theme_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, build_options.asset_directory ++ "/theme.json", allocator, .limited(16384));
+    defer allocator.free(theme_bytes);
+    app.theme = try theme_module.parse(allocator, theme_bytes);
+    app.allocator = allocator;
+    app.wake_event = 0;
+    app.closing = false;
+    app.force_dialog = false;
+    app.settings_open = false;
+    app.model_menu = false;
+    app.thinking_menu = false;
+    app.focused_editor = true;
+    app.button_count = 0;
+    app.follow_bottom = false;
+    app.scroll = 0;
+    app.dragging = false;
+    app.preedit = .empty;
+    app.draft_revision = 0;
+    app.editor_layout = null;
+    app.editor_bounds = .{ .x = 20, .y = 420, .w = 580, .h = 50 };
+    app.library = try Library.Panel.init(allocator);
+    defer app.library.deinit();
+    app.editor = try Composer.init(allocator);
+    defer app.editor.deinit();
+    app.copy_buffer = try allocator.alloc(u8, 65537);
+    defer allocator.free(app.copy_buffer);
+    app.transcript = TranscriptView.init(allocator);
+    defer app.transcript.deinit();
+    const md = @import("content/markdown.zig");
+    const source = "Cafe\u{301} and a long paragraph that wraps across several lines to test selection.\n\n```zig\nconst answer = 42;\nreturn answer;\n```\n";
+    const id: md.ContentId = @splat(71);
+    var entry = [_]@import("core/store.zig").ConversationEntry{.{ .ordinal = 7, .role = .assistant, .content_id = id, .length = source.len }};
+    try app.transcript.update(&entry);
+    try app.transcript.accept(app.renderer, .{ .generation = 1, .ordinal = 7, .document = try md.parse(allocator, id, source) });
+    const clip = c.SDL_Rect{ .x = 20, .y = 20, .w = 260, .h = 390 };
+    try std.testing.expect(c.SDL_SetRenderClipRect(app.renderer, &clip));
+    try app.transcript.draw(app.text, app.renderer, 20, 20, 260, 390, &app.scroll, false, app.theme.metrics, app.theme.dark, false);
+    const loaded = app.transcript.items.items[0].loaded.?;
+    const text = loaded.ready.document.text.items;
+    const first = loaded.view.caretRect(&loaded.ready.document, 0).?;
+    const after_combining = loaded.view.caretRect(&loaded.ready.document, "Cafe\u{301}".len).?;
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    event.button.x = 20 + first.x;
+    event.button.y = 24 + first.y + first.h / 2;
+    try app.handle(&event);
+    try std.testing.expect(!app.focused_editor);
+    event.type = c.SDL_EVENT_MOUSE_MOTION;
+    event.motion.x = 20 + after_combining.x;
+    event.motion.y = 24 + after_combining.y + after_combining.h / 2;
+    try app.handle(&event);
+    try std.testing.expectEqualStrings("Cafe\u{301}", app.transcript.selectedText().?);
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_UP;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    try app.handle(&event);
+    try std.testing.expect(!app.transcript.selection.?.dragging);
+    event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_LEFT;
+    event.key.mod = c.SDL_KMOD_SHIFT;
+    try app.handle(&event);
+    try std.testing.expectEqualStrings("Caf", app.transcript.selectedText().?);
+    event.key.key = c.SDLK_DOWN;
+    try app.handle(&event);
+    try std.testing.expect(app.transcript.selection.?.caret > "Cafe\u{301}".len);
+    // Shift-click extends across wrapped prose into a code block.
+    const code_end = std.mem.indexOf(u8, text, "42;").? + 3;
+    const code_caret = loaded.view.caretRect(&loaded.ready.document, code_end).?;
+    c.SDL_SetModState(c.SDL_KMOD_SHIFT);
+    defer c.SDL_SetModState(0);
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    event.button.x = 20 + code_caret.x;
+    event.button.y = 24 + code_caret.y + code_caret.h / 2;
+    try app.handle(&event);
+    try std.testing.expectEqualStrings(text[0..code_end], app.transcript.selectedText().?);
+    c.SDL_SetModState(0);
+    const code_start = std.mem.indexOf(u8, text, "const answer").?;
+    try std.testing.expectEqual(code_start, loaded.view.lineEdge(&loaded.ready.document, code_end, false));
+    try std.testing.expectEqual(code_end, loaded.view.lineEdge(&loaded.ready.document, code_start, true));
+    try app.transcript.draw(app.text, app.renderer, 20, 20, 260, 390, &app.scroll, false, app.theme.metrics, app.theme.dark, false);
+    try std.testing.expect(loaded.view.selection_scratch.items.len > 0);
+    event.type = c.SDL_EVENT_WINDOW_FOCUS_LOST;
+    try app.handle(&event);
+    try std.testing.expect(!app.transcript.selection.?.dragging);
+    // Both modifier families select and copy the rendered text, without fences.
+    inline for (.{ c.SDL_KMOD_CTRL, c.SDL_KMOD_GUI }) |modifier| {
+        event = std.mem.zeroes(c.SDL_Event);
+        event.type = c.SDL_EVENT_KEY_DOWN;
+        event.key.mod = modifier;
+        event.key.key = c.SDLK_A;
+        try app.handle(&event);
+        try std.testing.expectEqualStrings(text, app.transcript.selectedText().?);
+        event.key.key = c.SDLK_C;
+        try app.handle(&event);
+        const clipboard = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+        defer c.SDL_free(clipboard);
+        try std.testing.expectEqualStrings(text, std.mem.span(clipboard));
+    }
+    event.key.key = c.SDLK_V;
+    try app.handle(&event);
+    var draft: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings(text, try app.editor.materialize(&draft));
+    try std.testing.expect(app.focused_editor);
+    try std.testing.expect(app.transcript.selection == null);
+    // Composer shortcuts still own focus after paste.
+    event.key.key = c.SDLK_A;
+    try app.handle(&event);
+    try std.testing.expectEqual(text.len, app.editor.selection().end);
+    event.key.key = c.SDLK_C;
+    try app.handle(&event);
+    // A refresh of the same message keeps selection; changed text clears it.
+    try std.testing.expect(app.transcript.selectAt(20 + first.x, 24 + first.y + first.h / 2, false));
+    try app.transcript.update(&entry);
+    try std.testing.expect(app.transcript.selection != null);
+    entry[0].length += 1;
+    try app.transcript.update(&entry);
+    try std.testing.expect(app.transcript.selection == null);
+    // Copy is not truncated to the composer's 64 KiB limit. A refused paste
+    // must preserve both the existing draft and the transcript selection.
+    const large = try allocator.alloc(u8, 70000);
+    defer allocator.free(large);
+    @memset(large, 'a');
+    entry[0].length = large.len;
+    try app.transcript.update(&entry);
+    try app.transcript.accept(app.renderer, .{ .generation = 2, .ordinal = 7, .document = try md.parse(allocator, id, large) });
+    const full = app.transcript.items.items[0].loaded.?.ready.document.text.items;
+    app.transcript.selection = .{ .ordinal = 7, .content_id = id, .source_length = large.len, .anchor = full.len, .caret = 0 };
+    app.focused_editor = false;
+    event.key.key = c.SDLK_C;
+    try app.handle(&event);
+    const large_clipboard = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+    defer c.SDL_free(large_clipboard);
+    try std.testing.expectEqualStrings(full, std.mem.span(large_clipboard));
+    const draft_before = try allocator.dupe(u8, try app.editor.materialize(&draft));
+    defer allocator.free(draft_before);
+    event.key.key = c.SDLK_V;
+    try std.testing.expectError(error.TextTooLarge, app.handle(&event));
+    try std.testing.expectEqualStrings(draft_before, try app.editor.materialize(&draft));
+    try std.testing.expectEqualStrings(full, app.transcript.selectedText().?);
+    try app.transcript.update(&.{});
+    try std.testing.expect(app.transcript.selection == null);
+}
 
 test "new chat reveal expands only its project and archived current never makes a transient row" {
     const allocator = std.testing.allocator;

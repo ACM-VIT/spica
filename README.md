@@ -49,6 +49,8 @@ Terminal launches normally pick up nvm/fnm through `PATH`. Finder launches may n
   --pi-entry "$(pnpm ls -g --parseable @earendil-works/pi-coding-agent | tail -1)/dist/bundle/cli.js"
 ```
 
+Conversation text supports click-drag selection within a message, including wrapped prose and code blocks. Shift-click or Shift+arrow keys extend the selection; Cmd/Ctrl+A selects the focused message and Cmd/Ctrl+C copies its rendered text. Home/End move within a line, and Cmd/Ctrl+Home/End move to the message boundaries. On macOS, Cmd+Left/Right move to line edges and Option+Left/Right move by word. Cmd/Ctrl+V pastes into the composer, where normal editing shortcuts remain available. Escape clears message selection. Selection is cleared when the selected message changes or leaves the decoded cache.
+
 ## Development
 
 Read [CONTRIBUTING.md](./CONTRIBUTING.md) before making changes. It lists required tools,

@@ -21,7 +21,7 @@ fn readyBytes(ready: *const content.Ready) usize {
         arrayBytes(&ready.document.text) + arrayBytes(&ready.document.metadata) + arrayBytes(&ready.highlights);
 }
 fn viewBytes(view: *const DocumentView) usize {
-    return arrayBytes(&view.boxes) + arrayBytes(&view.color_scratch);
+    return arrayBytes(&view.boxes) + arrayBytes(&view.color_scratch) + arrayBytes(&view.selection_scratch);
 }
 
 const Reasoning = struct {
@@ -73,6 +73,19 @@ const Item = struct {
 };
 pub const Toggle = struct { ordinal: usize, kind: enum { reasoning, activity, output } };
 pub const Disclosure = struct { toggle: Toggle, bounds: c.SDL_FRect };
+pub const Selection = struct {
+    ordinal: usize,
+    content_id: storage.ContentId,
+    source_length: u64,
+    anchor: usize,
+    caret: usize,
+    dragging: bool = false,
+    preferred_x: ?f32 = null,
+
+    fn range(self: Selection) @import("document.zig").Range {
+        return .{ .start = @min(self.anchor, self.caret), .end = @max(self.anchor, self.caret) };
+    }
+};
 const Caption = struct {
     bytes: [256]u8 = undefined,
     len: usize = 0,
@@ -97,6 +110,9 @@ pub const View = struct {
     disclosures: [32]Disclosure = undefined,
     disclosure_count: usize = 0,
     draw_top: f32 = 0,
+    draw_x: f32 = 0,
+    draw_width: f32 = 0,
+    selection: ?Selection = null,
 
     pub fn init(allocator: std.mem.Allocator) View {
         return .{ .allocator = allocator };
@@ -107,6 +123,7 @@ pub const View = struct {
         for (&self.captions) |*cached| if (cached.layout) |layout| c.spica_text_layout_release(layout);
     }
     pub fn clear(self: *View) void {
+        self.selection = null;
         for (self.resident) |slot| if (slot) |index| self.items.items[index].loaded.?.destroy(self.allocator);
         self.items.clearRetainingCapacity();
         self.resident = [_]?usize{null} ** resident_slots;
@@ -199,6 +216,16 @@ pub const View = struct {
         }
     }
     pub fn update(self: *View, entries: []const storage.ConversationEntry) !void {
+        if (self.selection) |selected| {
+            var valid = false;
+            for (entries) |entry| if (entry.ordinal == selected.ordinal and
+                std.meta.eql(entry.content_id, selected.content_id) and entry.length == selected.source_length)
+            {
+                valid = true;
+                break;
+            };
+            if (!valid) self.selection = null;
+        }
         if (self.items.items.len == entries.len) {
             var same_order = true;
             for (self.items.items, entries) |item, entry| if (item.entry.ordinal != entry.ordinal) {
@@ -281,6 +308,9 @@ pub const View = struct {
     }
     fn evict(self: *View, slot: usize) void {
         const item = &self.items.items[self.resident[slot].?];
+        if (self.selection) |selected| if (selected.ordinal == item.entry.ordinal) {
+            self.selection = null;
+        };
         item.loaded.?.destroy(self.allocator);
         item.loaded = null;
         self.resident[slot] = null;
@@ -386,6 +416,7 @@ pub const View = struct {
         self.resident[free.?] = index;
     }
     pub fn toggle(self: *View, target: Toggle) void {
+        self.selection = null;
         for (self.items.items) |*item| if (item.entry.ordinal == target.ordinal) {
             switch (target.kind) {
                 .reasoning => if (item.entry.reasoning != null) {
@@ -437,12 +468,124 @@ pub const View = struct {
         self.disclosure_count += 1;
     }
 
+    fn bodyX(self: *const View, item: *const Item) f32 {
+        return self.draw_x + (if (item.entry.role == .user) self.draw_width * 0.2 + body_padding else if (isTool(item)) @as(f32, 28) else 0);
+    }
+
+    pub fn selectedIndex(self: *const View) ?usize {
+        const selected = self.selection orelse return null;
+        for (self.resident) |slot| if (slot) |index| {
+            const item = &self.items.items[index];
+            if (item.entry.ordinal == selected.ordinal and current(item) and self.bodyVisible(index) and
+                std.meta.eql(item.entry.content_id, selected.content_id) and item.entry.length == selected.source_length) return index;
+        };
+        return null;
+    }
+
+    pub fn selectAt(self: *View, x: f32, y: f32, extend: bool) bool {
+        if (y < self.draw_top or y >= self.draw_top + self.viewport_height) {
+            if (!extend) self.selection = null;
+            return false;
+        }
+        var index = self.firstVisible(self.viewport_scroll);
+        while (index < self.items.items.len and self.items.items[index].top <= self.viewport_scroll + self.viewport_height) : (index = self.nextVisible(index)) {
+            const item = &self.items.items[index];
+            if (!self.bodyVisible(index) or !current(item)) continue;
+            const loaded = item.loaded.?;
+            const top = self.draw_top + item.top - self.viewport_scroll + self.bodyTop(index);
+            const left = self.bodyX(item);
+            if (x < left or x > left + bodyWidth(item, self.draw_width) or y < top or y >= top + loaded.view.height) continue;
+            const offset = loaded.view.hitText(&loaded.ready.document, x - left, y - top) orelse continue;
+            const anchor = if (extend and self.selectedIndex() == index) self.selection.?.anchor else offset;
+            self.selection = .{ .ordinal = item.entry.ordinal, .content_id = item.entry.content_id, .source_length = item.entry.length, .anchor = anchor, .caret = offset, .dragging = true };
+            return true;
+        }
+        if (!extend) self.selection = null;
+        return false;
+    }
+
+    pub fn dragSelection(self: *View, x: f32, y: f32) void {
+        const index = self.selectedIndex() orelse return;
+        if (!self.selection.?.dragging) return;
+        const item = &self.items.items[index];
+        const loaded = item.loaded.?;
+        const local_y = y - self.draw_top - item.top + self.viewport_scroll - self.bodyTop(index);
+        const offset = if (local_y < 0) 0 else if (local_y >= loaded.view.height) loaded.ready.document.text.items.len else loaded.view.hitText(&loaded.ready.document, x - self.bodyX(item), local_y) orelse return;
+        self.selection.?.caret = offset;
+        self.selection.?.preferred_x = null;
+    }
+
+    pub fn endSelectionDrag(self: *View) void {
+        if (self.selection) |*selected| selected.dragging = false;
+    }
+
+    pub fn selectedText(self: *const View) ?[]const u8 {
+        const index = self.selectedIndex() orelse return null;
+        const text = self.items.items[index].loaded.?.ready.document.text.items;
+        const range = self.selection.?.range();
+        if (range.end > text.len or range.start == range.end) return null;
+        return text[range.start..range.end];
+    }
+
+    pub fn revealSelection(self: *const View, scroll: *f32) void {
+        const index = self.selectedIndex() orelse return;
+        const item = &self.items.items[index];
+        const loaded = item.loaded.?;
+        const y = item.top + self.bodyTop(index) + loaded.view.offsetY(&loaded.ready.document, self.selection.?.caret);
+        if (y < scroll.*) scroll.* = y;
+        if (y + 28 > scroll.* + self.viewport_height) scroll.* = @max(0, y + 28 - self.viewport_height);
+    }
+
+    pub fn selectionKey(self: *View, key: c.SDL_Keycode, command: bool, shift: bool, word: bool) bool {
+        const index = self.selectedIndex() orelse return false;
+        const loaded = self.items.items[index].loaded.?;
+        const document = &loaded.ready.document;
+        const selected = &self.selection.?;
+        var next = selected.caret;
+        if (command and key == c.SDLK_A) {
+            selected.anchor = 0;
+            selected.caret = document.text.items.len;
+            return true;
+        }
+        if (key == c.SDLK_ESCAPE) {
+            self.selection = null;
+            return true;
+        }
+        switch (key) {
+            c.SDLK_LEFT, c.SDLK_RIGHT => {
+                const forward = key == c.SDLK_RIGHT;
+                if (!shift and selected.anchor != selected.caret) {
+                    const range = selected.range();
+                    next = if (forward) range.end else range.start;
+                } else next = loaded.view.moveHorizontal(document, next, forward, word);
+                selected.preferred_x = null;
+            },
+            c.SDLK_HOME, c.SDLK_END, c.SDLK_UP, c.SDLK_DOWN => {
+                const end = key == c.SDLK_END or key == c.SDLK_DOWN;
+                if (command) {
+                    next = if (end) document.text.items.len else 0;
+                } else if (loaded.view.caretRect(document, next)) |rect| {
+                    const vertical = key == c.SDLK_UP or key == c.SDLK_DOWN;
+                    const x = if (vertical) selected.preferred_x orelse rect.x else if (end) @as(f32, 1000000) else 0;
+                    next = if (vertical) loaded.view.moveVertical(document, next, x, end) else loaded.view.lineEdge(document, next, end);
+                    selected.preferred_x = if (vertical) x else null;
+                }
+            },
+            else => return false,
+        }
+        selected.caret = next;
+        if (!shift) selected.anchor = next;
+        return true;
+    }
+
     pub fn draw(self: *View, engine: *c.SpicaText, renderer: *c.SDL_Renderer, x: f32, y: f32, viewport_width: f32, viewport_height: f32, scroll: *f32, follow_bottom: bool, metrics: theme.Metrics, palette: theme.Palette, light: bool) !void {
         const width = @max(1, viewport_width - scrollbar_gutter);
         self.wanted = null;
         self.wanted_reasoning = false;
         self.disclosure_count = 0;
         self.draw_top = y;
+        self.draw_x = x;
+        self.draw_width = width;
         self.viewport_height = viewport_height;
         scroll.* = if (follow_bottom) @max(0, self.height - viewport_height) else @min(scroll.*, @max(0, self.height - viewport_height));
         for (self.resident) |slot| if (slot) |index| {
@@ -569,6 +712,7 @@ pub const View = struct {
                 if (visible_body) {
                     const body_y = top + self.bodyTop(index);
                     if (loaded.ready.document.state == .rich) {
+                        loaded.view.selection = if (self.selectedIndex() == index) self.selection.?.range() else null;
                         try loaded.view.draw(engine, renderer, &loaded.ready.document, loaded.ready.highlights.items, body_x, body_y, palette, light);
                         if (loaded.texture) |texture| {
                             const scale = @min(1, body_width / loaded.image_width);
