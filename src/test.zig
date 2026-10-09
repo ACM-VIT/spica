@@ -1,8 +1,10 @@
 test {
     _ = @import("app.zig");
     _ = @import("platform/executables.zig");
+    _ = @import("platform/paths.zig");
     _ = @import("core/protocol_test.zig");
     _ = @import("core/store_test.zig");
+    _ = @import("core/draft.zig");
     _ = @import("core/catalog.zig");
     _ = @import("core/search.zig");
     _ = @import("core/search_source.zig");

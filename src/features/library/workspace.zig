@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("../../native/bindings.zig").c;
 const SessionCatalog = @import("../../core/catalog.zig");
+const Draft = @import("../../core/draft.zig");
 const Library = @import("panel.zig");
 const App = @import("../../app.zig").App;
 const chat = @import("../chat/chat.zig");
@@ -26,11 +27,105 @@ pub const PendingMutation = struct {
     }
 };
 
+pub fn dupeDraft(allocator: std.mem.Allocator, entry: Draft.Entry) !Draft.Entry {
+    const session = try allocator.dupe(u8, entry.session);
+    errdefer allocator.free(session);
+    const cwd = try allocator.dupe(u8, entry.cwd);
+    errdefer allocator.free(cwd);
+    return .{ .session = session, .cwd = cwd, .text = try allocator.dupe(u8, entry.text) };
+}
+
+pub fn freeDraft(allocator: std.mem.Allocator, entry: Draft.Entry) void {
+    allocator.free(entry.session);
+    allocator.free(entry.cwd);
+    allocator.free(entry.text);
+}
+
+pub fn freeDrafts(allocator: std.mem.Allocator, drafts: *std.ArrayList(Draft.Entry)) void {
+    for (drafts.items) |entry| freeDraft(allocator, entry);
+    drafts.deinit(allocator);
+}
+
+pub fn draftIndex(drafts: []const Draft.Entry, session: []const u8, cwd: []const u8) ?usize {
+    for (drafts, 0..) |entry, index| if (entry.matches(session, cwd)) return index;
+    return null;
+}
+
+pub fn resumedDraftIndex(allocator: std.mem.Allocator, io: std.Io, drafts: []const Draft.Entry, session: []const u8, cwd: []const u8) ?usize {
+    if (session.len != 0) if (std.Io.Dir.cwd().realPathFileAlloc(io, session, allocator)) |resolved| {
+        defer allocator.free(resolved);
+        if (draftIndex(drafts, resolved, cwd)) |index| return index;
+    } else |_| {};
+    return draftIndex(drafts, session, cwd);
+}
+
+pub fn dropMissingSessions(allocator: std.mem.Allocator, io: std.Io, drafts: *std.ArrayList(Draft.Entry)) void {
+    var index: usize = 0;
+    while (index < drafts.items.len) {
+        const session = drafts.items[index].session;
+        if (session.len != 0) if (std.Io.Dir.cwd().access(io, session, .{})) {} else |err| if (err == error.FileNotFound) {
+            freeDraft(allocator, drafts.orderedRemove(index));
+            continue;
+        };
+        index += 1;
+    }
+}
+
+pub fn takeStoredDraft(app: *App, session: []const u8, cwd: []const u8) !void {
+    const index = draftIndex(app.stored_drafts.items, session, cwd) orelse return;
+    try app.editor.setText(app.stored_drafts.items[index].text);
+    freeDraft(app.allocator, app.stored_drafts.orderedRemove(index));
+}
+
+// A chat keeps its draft under its Pi session only once it is a workspace
+// member or enrolling; Pi names a session file before the first prompt.
+fn draftEntry(session: []const u8, durable: bool, cwd: []const u8, text: []const u8) Draft.Entry {
+    return .{ .session = if (durable) session else "", .cwd = cwd, .text = text };
+}
+
+pub const DraftLoss = struct { dropped: usize = 0, shadowed: usize = 0 };
+
+pub const CollectedDrafts = struct { count: usize, dropped: usize, shadowed: usize };
+
+pub fn collectDrafts(app: *const App, drafts: *[Draft.max_drafts]Draft.Entry) CollectedDrafts {
+    const resumed = app.options.resume_file orelse "";
+    const active_session = if (app.runtime_snapshot) |snapshot| if (snapshot.session_file.len != 0) snapshot.session_file else resumed else resumed;
+    const parked = app.parked_chats.items;
+    var count: usize = 0;
+    var dropped: usize = 0;
+    var shadowed: usize = 0;
+    for (0..1 + parked.len + app.stored_drafts.items.len) |index| {
+        const entry = if (index == 0)
+            draftEntry(active_session, app.current_member or app.enrollment_intent, app.project_path, app.editor.textBytes())
+        else if (index <= parked.len) blk: {
+            const chat_state = &parked[parked.len - index];
+            break :blk draftEntry(chat_state.session(), chat_state.member or chat_state.enrollment_intent, chat_state.cwd, chat_state.draft);
+        } else app.stored_drafts.items[index - 1 - parked.len];
+        if (entry.text.len == 0) continue;
+        // Live chats come first, so an older stored copy never replaces them.
+        // Two live unsent threads in one project share a key; only the most recently used is kept.
+        if (draftIndex(drafts[0..count], entry.session, entry.cwd) != null) {
+            if (index <= parked.len) shadowed += 1;
+            continue;
+        }
+        if (count == drafts.len or !entry.valid()) {
+            dropped += 1;
+            continue;
+        }
+        drafts[count] = entry;
+        count += 1;
+    }
+    return .{ .count = count, .dropped = dropped, .shadowed = shadowed };
+}
+
 pub fn saveDraft(app: *App) !void {
+    var drafts: [Draft.max_drafts]Draft.Entry = undefined;
+    const collected = collectDrafts(app, &drafts);
     var projects: [max_projects][]const u8 = undefined;
     for (app.projects.items, 0..) |path, index| projects[index] = path;
     try app.draft_writer.submit(.{
         .draft = app.editor.textBytes(),
+        .drafts = drafts[0..collected.count],
         .light = app.light,
         .font_size = app.appearance.font_size,
         .ui_scale = app.appearance.ui_scale,
@@ -38,6 +133,10 @@ pub fn saveDraft(app: *App) !void {
         .projects = projects[0..app.projects.items.len],
     });
     app.draft_due = null;
+    // Unsaved drafts stay in memory; only the disk copy is bounded.
+    if (collected.dropped > app.draft_loss.dropped) app.report("Some drafts could not be saved", error.DraftLimitReached);
+    if (collected.shadowed > app.draft_loss.shadowed) app.report("Only one unsent draft per project is saved", error.DraftKeyShared);
+    app.draft_loss = .{ .dropped = collected.dropped, .shadowed = collected.shadowed };
 }
 
 pub fn scheduleSave(app: *App) void {
@@ -315,4 +414,278 @@ fn applyMutation(app: *App, result: SessionCatalog.MutationResult) void {
         };
         closeLibrary(app);
     } else if (app.library.open) queryLibrary(app) catch |err| app.report("Refreshing chat search", err);
+}
+
+const Composer = @import("../../text/composer.zig").Composer;
+
+test "drafts persist per chat and unsent threads stay unenrolled" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(c.spica_image_install_sdl_allocator());
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "workspace.json" });
+    defer allocator.free(path);
+
+    var app: App = undefined;
+    app.allocator = allocator;
+    app.runtime_snapshot = null;
+    app.options = .{ .resume_file = "/s/a.jsonl" };
+    app.project_path = @constCast("/p");
+    app.current_member = true;
+    app.enrollment_intent = false;
+    app.light = false;
+    app.appearance = .{};
+    app.projects = .empty;
+    app.dirty = false;
+    app.error_text = .{};
+    app.draft_loss = .{};
+    app.editor = try Composer.init(allocator);
+    defer app.editor.deinit();
+    try app.editor.setText("draft A");
+    app.stored_drafts = .empty;
+    defer freeDrafts(allocator, &app.stored_drafts);
+    try app.stored_drafts.append(allocator, try dupeDraft(allocator, .{ .session = "/s/a.jsonl", .cwd = "/p", .text = "stale A" }));
+    try app.stored_drafts.append(allocator, try dupeDraft(allocator, .{ .session = "/s/d.jsonl", .cwd = "/p", .text = "never opened" }));
+    app.parked_chats = .empty;
+    defer {
+        for (app.parked_chats.items) |*parked| parked.deinit(allocator);
+        app.parked_chats.deinit(allocator);
+    }
+    for ([_]struct { path: []const u8, cwd: []const u8, draft: []const u8, member: bool }{
+        .{ .path = "/s/b.jsonl", .cwd = "/p", .draft = "draft B", .member = true },
+        .{ .path = "/s/c.jsonl", .cwd = "/q", .draft = "unsent C", .member = false },
+        .{ .path = "/s/e.jsonl", .cwd = "/p", .draft = "", .member = true },
+    }, 0..) |spec, id| {
+        const cwd = try allocator.dupeZ(u8, spec.cwd);
+        errdefer allocator.free(cwd);
+        const session = try allocator.dupeZ(u8, spec.path);
+        errdefer allocator.free(session);
+        const draft = try allocator.dupe(u8, spec.draft);
+        errdefer allocator.free(draft);
+        try app.parked_chats.append(allocator, .{
+            .id = id + 2,
+            .runtime = null,
+            .snapshot = null,
+            .cwd = cwd,
+            .path = session,
+            .trust = false,
+            .draft = draft,
+            .caret = 0,
+            .anchor = 0,
+            .draft_revision = 1,
+            .submitted = null,
+            .accepted_clear_revision = null,
+            .view = .existing,
+            .archived = false,
+            .member = spec.member,
+            .enrollment_intent = false,
+            .accepted_enrollment = false,
+            .enrollment_failed = false,
+            .run_started = null,
+            .run_base_revision = 0,
+            .run_elapsed = null,
+            .behavior = .prompt,
+            .scroll = 0,
+        });
+    }
+
+    app.draft_writer = try Draft.Writer.create(io, path, 0);
+    try saveDraft(&app);
+    app.draft_writer.destroy();
+    try std.testing.expectEqual(@as(usize, 0), app.error_text.slice().len);
+    try std.testing.expect(!app.parked_chats.items[1].member and !app.parked_chats.items[1].enrollment_intent);
+
+    var restored = try Draft.restore(io, path);
+    defer restored.deinit();
+    const drafts = restored.value().drafts;
+    try std.testing.expectEqual(@as(usize, 4), drafts.len);
+    try std.testing.expectEqualStrings("draft A", drafts[draftIndex(drafts, "/s/a.jsonl", "").?].text);
+    try std.testing.expectEqualStrings("draft B", drafts[draftIndex(drafts, "/s/b.jsonl", "").?].text);
+    try std.testing.expectEqualStrings("unsent C", drafts[draftIndex(drafts, "", "/q").?].text);
+    try std.testing.expect(draftIndex(drafts, "/s/c.jsonl", "/q") == null);
+    try std.testing.expectEqualStrings("never opened", drafts[draftIndex(drafts, "/s/d.jsonl", "").?].text);
+    try std.testing.expect(draftIndex(drafts, "/s/e.jsonl", "") == null);
+
+    var buffer: [Draft.max_drafts]Draft.Entry = undefined;
+    allocator.free(app.parked_chats.items[0].draft);
+    app.parked_chats.items[0].draft = try allocator.dupe(u8, "");
+    const collected = collectDrafts(&app, &buffer);
+    try std.testing.expectEqual(@as(usize, 3), collected.count);
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "/s/b.jsonl", "") == null);
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "/s/a.jsonl", "") != null);
+    try std.testing.expectEqual(@as(usize, 0), collected.shadowed);
+
+    // A second unsent thread in /q shares C's key. The active chat's draft wins,
+    // and the lost draft is counted so saveDraft can report it.
+    app.current_member = false;
+    app.project_path = @constCast("/q");
+    const shared = collectDrafts(&app, &buffer);
+    try std.testing.expectEqual(@as(usize, 1), shared.shadowed);
+    try std.testing.expectEqualStrings("draft A", buffer[draftIndex(buffer[0..shared.count], "", "/q").?].text);
+
+    app.draft_writer = try Draft.Writer.create(io, path, 0);
+    defer app.draft_writer.destroy();
+    app.draft_loss = .{ .shadowed = 1 };
+    try saveDraft(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.error_text.slice().len);
+    try std.testing.expectEqual(@as(usize, 1), app.draft_loss.shadowed);
+}
+
+test "stored drafts of deleted sessions are dropped and the oldest drafts are evicted first" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "kept.jsonl", .data = "" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const kept = try std.fs.path.join(allocator, &.{ root, "kept.jsonl" });
+    defer allocator.free(kept);
+    const deleted = try std.fs.path.join(allocator, &.{ root, "deleted.jsonl" });
+    defer allocator.free(deleted);
+
+    var drafts: std.ArrayList(Draft.Entry) = .empty;
+    defer freeDrafts(allocator, &drafts);
+    try drafts.append(allocator, try dupeDraft(allocator, .{ .session = deleted, .cwd = root, .text = "gone" }));
+    try drafts.append(allocator, try dupeDraft(allocator, .{ .session = kept, .cwd = root, .text = "kept" }));
+    try drafts.append(allocator, try dupeDraft(allocator, .{ .cwd = "/missing-folder", .text = "folder" }));
+    dropMissingSessions(allocator, io, &drafts);
+    try std.testing.expectEqual(@as(usize, 2), drafts.items.len);
+    try std.testing.expect(draftIndex(drafts.items, deleted, "") == null);
+    try std.testing.expect(draftIndex(drafts.items, kept, "") != null);
+    try std.testing.expect(draftIndex(drafts.items, "", "/missing-folder") != null);
+
+    var app: App = undefined;
+    app.runtime_snapshot = null;
+    app.options = .{};
+    app.project_path = @constCast("/active");
+    app.current_member = false;
+    app.enrollment_intent = false;
+    app.parked_chats = .empty;
+    app.editor = try Composer.init(allocator);
+    defer app.editor.deinit();
+    app.stored_drafts = .empty;
+    defer freeDrafts(allocator, &app.stored_drafts);
+    var name: [32]u8 = undefined;
+    for (0..Draft.max_drafts) |index| {
+        const cwd = try std.fmt.bufPrint(&name, "/project-{d}", .{index});
+        try app.stored_drafts.append(allocator, try dupeDraft(allocator, .{ .cwd = cwd, .text = "stored" }));
+    }
+    try app.editor.setText("active");
+    var buffer: [Draft.max_drafts]Draft.Entry = undefined;
+    const collected = collectDrafts(&app, &buffer);
+    try std.testing.expectEqual(@as(usize, Draft.max_drafts), collected.count);
+    try std.testing.expectEqual(@as(usize, 1), collected.dropped);
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "", "/active") != null);
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "", "/project-0") != null);
+    const last = try std.fmt.bufPrint(&name, "/project-{d}", .{Draft.max_drafts - 1});
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "", last) == null);
+
+    freeDrafts(allocator, &app.stored_drafts);
+    app.stored_drafts = .empty;
+    const long_session = try allocator.alloc(u8, 4097);
+    defer allocator.free(long_session);
+    @memset(long_session, 'a');
+    app.options = .{ .resume_file = long_session };
+    app.current_member = true;
+    const rejected = collectDrafts(&app, &buffer);
+    try std.testing.expectEqual(@as(usize, 0), rejected.count);
+    try std.testing.expectEqual(@as(usize, 1), rejected.dropped);
+}
+
+fn testParked(allocator: std.mem.Allocator, cwd: []const u8, text: []const u8) !chat.ParkedChat {
+    const owned_cwd = try allocator.dupeZ(u8, cwd);
+    errdefer allocator.free(owned_cwd);
+    return .{
+        .id = 0,
+        .runtime = null,
+        .snapshot = null,
+        .cwd = owned_cwd,
+        .path = null,
+        .trust = false,
+        .draft = try allocator.dupe(u8, text),
+        .caret = 0,
+        .anchor = 0,
+        .draft_revision = 1,
+        .submitted = null,
+        .accepted_clear_revision = null,
+        .view = .new_thread,
+        .archived = false,
+        .member = false,
+        .enrollment_intent = false,
+        .accepted_enrollment = false,
+        .enrollment_failed = false,
+        .run_started = null,
+        .run_base_revision = 0,
+        .run_elapsed = null,
+        .behavior = .prompt,
+        .scroll = 0,
+    };
+}
+
+test "the most recently parked drafts are kept when drafts exceed the limit" {
+    const allocator = std.testing.allocator;
+    var app: App = undefined;
+    app.runtime_snapshot = null;
+    app.options = .{};
+    app.project_path = @constCast("/active");
+    app.current_member = false;
+    app.enrollment_intent = false;
+    app.stored_drafts = .empty;
+    app.editor = try Composer.init(allocator);
+    defer app.editor.deinit();
+    try app.editor.setText("active");
+    app.parked_chats = .empty;
+    defer {
+        for (app.parked_chats.items) |*parked| parked.deinit(allocator);
+        app.parked_chats.deinit(allocator);
+    }
+    var name: [32]u8 = undefined;
+    for (0..Draft.max_drafts) |index| {
+        var parked = try testParked(allocator, try std.fmt.bufPrint(&name, "/parked-{d}", .{index}), "parked");
+        errdefer parked.deinit(allocator);
+        try app.parked_chats.append(allocator, parked);
+    }
+    var buffer: [Draft.max_drafts]Draft.Entry = undefined;
+    const collected = collectDrafts(&app, &buffer);
+    try std.testing.expectEqual(@as(usize, 1), collected.dropped);
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "", "/active") != null);
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "", try std.fmt.bufPrint(&name, "/parked-{d}", .{Draft.max_drafts - 1})) != null);
+    try std.testing.expect(draftIndex(buffer[0..collected.count], "", "/parked-0") == null);
+}
+
+test "a resumed chat finds its draft through relative, dotted, and linked paths" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "sessions");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sessions/chat.jsonl", .data = "" });
+    try tmp.dir.symLink(io, "sessions/chat.jsonl", "link.jsonl", .{});
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const session = try std.fs.path.join(allocator, &.{ root, "sessions", "chat.jsonl" });
+    defer allocator.free(session);
+    const dotted = try std.fs.path.join(allocator, &.{ root, "sessions", "..", "sessions", "chat.jsonl" });
+    defer allocator.free(dotted);
+    const linked = try std.fs.path.join(allocator, &.{ root, "link.jsonl" });
+    defer allocator.free(linked);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(cwd);
+    const relative = try std.fs.path.relative(allocator, cwd, null, cwd, session);
+    defer allocator.free(relative);
+
+    const drafts = [_]Draft.Entry{
+        .{ .session = session, .cwd = root, .text = "resolved" },
+        .{ .session = "unresolvable.jsonl", .cwd = root, .text = "raw" },
+    };
+    for ([_][]const u8{ session, dotted, linked, relative }) |resume_file| {
+        try std.testing.expectEqual(@as(?usize, 0), resumedDraftIndex(allocator, io, &drafts, resume_file, root));
+    }
+    try std.testing.expectEqual(@as(?usize, 1), resumedDraftIndex(allocator, io, &drafts, "unresolvable.jsonl", root));
+    try std.testing.expect(resumedDraftIndex(allocator, io, &drafts, "", root) == null);
 }

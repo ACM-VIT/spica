@@ -139,6 +139,7 @@ fn replaceParkedDraft(app: *App, parked: *chat.ParkedChat, text: []const u8) !vo
     parked.caret = text.len;
     parked.anchor = text.len;
     parked.draft_revision += 1;
+    workspace.scheduleSave(app);
 }
 
 pub fn consumeParkedSnapshot(app: *App, parked: *chat.ParkedChat, incoming: pi.Snapshot) !void {
@@ -304,8 +305,10 @@ test "background prompt acknowledgements clear only the submitted chat revision"
             .role = try allocator.dupe(u8, "assistant"),
             .kind = try allocator.dupe(u8, "message"),
         };
+        app.draft_due = null;
         try consumeParkedSnapshot(&app, &parked, snapshot);
         try std.testing.expect(parked.submitted == null);
+        try std.testing.expectEqual(!edited_after_send, app.draft_due != null);
         try std.testing.expect(parked.enrollment_intent and parked.accepted_enrollment);
         try std.testing.expectEqualStrings(if (edited_after_send) text else "", parked.draft);
         if (!edited_after_send) {
