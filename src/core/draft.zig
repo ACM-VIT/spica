@@ -7,6 +7,7 @@ pub const max_drafts = 64;
 pub const max_draft_bytes = 64 * 1024;
 const max_path_bytes = 4096;
 pub const max_projects = 64;
+const max_backups = 10;
 // JSON may escape each draft byte as six (\u00XX); the bound only limits reads.
 const max_state_bytes = 512 * 1024 + max_drafts * (max_draft_bytes + 2 * max_path_bytes) * 6;
 
@@ -98,11 +99,21 @@ pub fn restore(io: std.Io, path: []const u8) !Restored {
 }
 
 fn setAside(io: std.Io, path: []const u8, err: anyerror) !Restored {
-    const backup = try std.fmt.allocPrint(allocator, "{s}.invalid", .{path});
-    defer allocator.free(backup);
-    // Without a preserved copy, starting would let the next write discard it.
-    std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), backup, io) catch return err;
-    return .{ .unreadable = err };
+    for (0..max_backups) |attempt| {
+        const backup = if (attempt == 0)
+            try std.fmt.allocPrint(allocator, "{s}.invalid", .{path})
+        else
+            try std.fmt.allocPrint(allocator, "{s}.invalid.{d}", .{ path, attempt });
+        defer allocator.free(backup);
+        if (std.Io.Dir.cwd().openFile(io, backup, .{})) |existing| {
+            existing.close(io);
+            continue;
+        } else |open_err| if (open_err != error.FileNotFound) return err;
+        // Without a preserved copy, starting would let the next write discard it.
+        std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), backup, io) catch return err;
+        return .{ .unreadable = err };
+    }
+    return err;
 }
 
 fn load(bytes: []const u8) !Restored {
@@ -364,6 +375,28 @@ test "an unreadable workspace is kept aside and defaults are used" {
     var next = try restore(io, path);
     defer next.deinit();
     try std.testing.expect(next.unreadable == null);
+}
+
+test "an earlier unreadable workspace backup is never replaced" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "workspace.json" });
+    defer std.testing.allocator.free(path);
+
+    for ([_][]const u8{ "{first", "{second" }) |corrupt| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "workspace.json", .data = corrupt });
+        var restored = try restore(io, path);
+        defer restored.deinit();
+        try std.testing.expect(restored.unreadable != null);
+    }
+    for ([_][2][]const u8{ .{ "workspace.json.invalid", "{first" }, .{ "workspace.json.invalid.1", "{second" } }) |backup| {
+        const kept = try tmp.dir.readFileAlloc(io, backup[0], std.testing.allocator, .limited(1024));
+        defer std.testing.allocator.free(kept);
+        try std.testing.expectEqualStrings(backup[1], kept);
+    }
 }
 
 test "a workspace that cannot be opened stays in place" {

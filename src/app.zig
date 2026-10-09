@@ -252,7 +252,7 @@ pub const App = struct {
             .stored_drafts = stored_drafts,
         };
         if (restored.unreadable) |err| {
-            app.report("Saved drafts and settings were unreadable and kept as workspace.json.invalid", err);
+            app.report("Saved drafts and settings were unreadable and kept beside workspace.json as .invalid", err);
         } else if (restored.skipped != 0) app.report("Some saved drafts or projects could not be restored", error.InvalidWorkspaceEntry);
         return app;
     }
