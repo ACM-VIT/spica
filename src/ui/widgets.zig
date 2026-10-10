@@ -81,7 +81,7 @@ pub fn panel(renderer: *c.SDL_Renderer, rect: c.SDL_FRect, radius_value: f32, co
     if (!c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_BLEND) or !c.SDL_RenderGeometry(renderer, null, &vertices, vertices.len, &indices, indices.len)) return error.RoundedRectangleDraw;
 }
 
-pub const Icon = enum { sidebar, plus, folder, layers, archive, arrow_up, stop, chevron_down, theme };
+pub const Icon = enum { sidebar, plus, folder, layers, archive, arrow_up, stop, chevron_down, theme, copy };
 
 fn line(renderer: *c.SDL_Renderer, x1: f32, y1: f32, x2: f32, y2: f32) !void {
     if (!c.SDL_RenderLine(renderer, x1, y1, x2, y2)) return error.IconDraw;
@@ -93,6 +93,14 @@ pub fn icon(renderer: *c.SDL_Renderer, kind: Icon, bounds: c.SDL_FRect, color: C
     const y = bounds.y;
     const s = bounds.w / 16;
     switch (kind) {
+        .copy => {
+            const front = c.SDL_FRect{ .x = x + 6 * s, .y = y + 5 * s, .w = 8 * s, .h = 9 * s };
+            try line(renderer, x + 4 * s, y + 11 * s, x + 2 * s, y + 11 * s);
+            try line(renderer, x + 2 * s, y + 11 * s, x + 2 * s, y + 2 * s);
+            try line(renderer, x + 2 * s, y + 2 * s, x + 10 * s, y + 2 * s);
+            try line(renderer, x + 10 * s, y + 2 * s, x + 10 * s, y + 3 * s);
+            if (!c.SDL_RenderRect(renderer, &front)) return error.IconDraw;
+        },
         .sidebar => {
             const border = c.SDL_FRect{ .x = x + 2 * s, .y = y + 2 * s, .w = 12 * s, .h = 12 * s };
             if (!c.SDL_RenderRect(renderer, &border)) return error.IconDraw;

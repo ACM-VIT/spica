@@ -75,6 +75,59 @@ pub const Document = struct {
     text: std.ArrayList(u8) = .empty,
     metadata: std.ArrayList(u8) = .empty,
 
+    /// Copy the readable projection, including list markers drawn separately by
+    /// the UI. Source Markdown and inert metadata never enter the clipboard.
+    pub fn clipboardText(self: *const Document, allocator: std.mem.Allocator) ![:0]u8 {
+        if (self.state != .rich) return error.FormattingUnavailable;
+        if (!std.unicode.utf8ValidateSlice(self.text.items)) return error.InvalidUtf8;
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
+        var offset: usize = 0;
+        for (self.blocks.items) |block| {
+            switch (block.kind) {
+                .item, .paragraph, .heading, .code, .html, .rule, .table_row => {},
+                else => continue,
+            }
+            try result.appendSlice(allocator, self.text.items[offset..block.text_start]);
+            var indent: usize = 0;
+            var parent = block.parent;
+            while (parent) |index| {
+                const ancestor = self.blocks.items[index];
+                if (ancestor.kind == .item) indent += 2;
+                parent = ancestor.parent;
+            }
+            if (block.kind != .item) {
+                // Each child block keeps its list depth, including continuation
+                // lines. Prefix the projection without touching code's own spaces.
+                var start: usize = block.text_start;
+                while (start < block.text_end) {
+                    if (result.items.len == 0 or result.items[result.items.len - 1] == '\n')
+                        try result.appendNTimes(allocator, ' ', indent);
+                    const end = if (std.mem.indexOfScalarPos(u8, self.text.items[0..block.text_end], start, '\n')) |newline| newline + 1 else block.text_end;
+                    try result.appendSlice(allocator, self.text.items[start..end]);
+                    start = end;
+                }
+                offset = block.text_end;
+                continue;
+            }
+            if (result.items.len != 0 and result.items[result.items.len - 1] != '\n') try result.append(allocator, '\n');
+            try result.appendNTimes(allocator, ' ', indent);
+            const list = self.blocks.items[block.parent.?];
+            if (list.ordered) {
+                var buffer: [32]u8 = undefined;
+                try result.appendSlice(allocator, try std.fmt.bufPrint(&buffer, "{d}{s} ", .{ block.number, if (list.paren_delimiter) ")" else "." }));
+            } else try result.appendSlice(allocator, "• ");
+            switch (block.task) {
+                .checked => try result.appendSlice(allocator, "[x] "),
+                .unchecked => try result.appendSlice(allocator, "[ ] "),
+                .none => {},
+            }
+            offset = block.text_start;
+        }
+        try result.appendSlice(allocator, self.text.items[offset..]);
+        return result.toOwnedSliceSentinel(allocator, 0);
+    }
+
     pub fn deinit(self: *Document) void {
         self.blocks.deinit(self.allocator);
         self.runs.deinit(self.allocator);

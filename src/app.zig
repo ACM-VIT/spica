@@ -385,6 +385,7 @@ pub const App = struct {
         while (self.running) {
             self.consume();
             const now = c.SDL_GetTicks();
+            if (self.transcript.expireCopyFeedback(now)) self.dirty = true;
             if (self.quit_due) |due| if (now >= due) {
                 self.quit_due = null;
                 try processes.requestClose(self);
@@ -408,7 +409,7 @@ pub const App = struct {
 
     fn waitTimeout(self: *const App) c_int {
         var timeout: c_int = -1;
-        for ([_]?u64{ self.quit_due, self.draft_due }) |deadline| if (deadline) |due| {
+        for ([_]?u64{ self.quit_due, self.draft_due, self.transcript.copyDeadline() }) |deadline| if (deadline) |due| {
             const remaining: c_int = @intCast(@min(2147483647, due -| c.SDL_GetTicks()));
             timeout = if (timeout == -1) remaining else @min(timeout, remaining);
         };
@@ -423,6 +424,7 @@ test {
     _ = workspace;
     _ = conversation;
     _ = input;
+    _ = @import("app/copy_test.zig");
     _ = view;
     _ = @import("features/library/sidebar.zig");
     _ = @import("features/models/menus.zig");

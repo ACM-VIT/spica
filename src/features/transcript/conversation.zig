@@ -1,4 +1,5 @@
 const std = @import("std");
+const c = @import("../../native/bindings.zig").c;
 const fixture = @import("../../diagnostics/fixture.zig");
 const store = @import("../../core/store.zig");
 const ContentWorker = @import("../../content/worker.zig");
@@ -95,15 +96,29 @@ pub fn requestLatest(app: *App) void {
 
 pub fn scrollBy(app: *App, delta: f32, follow_at_end: bool) void {
     app.follow_bottom = false;
+    app.transcript.draw_width = 0;
     app.scroll = @max(0, app.scroll + delta);
     if (follow_at_end and app.scroll >= maxScroll(app)) app.follow_bottom = true;
 }
 
 pub fn scrollToEdge(app: *App, bottom: bool) void {
+    app.transcript.draw_width = 0;
     app.follow_bottom = bottom;
     app.scroll = if (bottom) maxScroll(app) else 0;
 }
 
 fn maxScroll(app: *const App) f32 {
     return @max(0, app.transcript.height - app.transcript.viewport_height);
+}
+
+pub fn copyResponse(app: *App, ordinal: usize) !void {
+    var success = false;
+    defer {
+        app.transcript.copied(ordinal, success, c.SDL_GetTicks());
+        app.dirty = true;
+    }
+    const bytes = try app.transcript.copyText(ordinal);
+    defer app.allocator.free(bytes);
+    if (!c.SDL_SetClipboardText(bytes.ptr)) return error.ClipboardWrite;
+    success = true;
 }

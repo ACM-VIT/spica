@@ -39,6 +39,7 @@ pub fn handle(app: *App, incoming: *const c.SDL_Event) !void {
         c.SDL_EVENT_WINDOW_EXPOSED => app.dirty = true,
         c.SDL_EVENT_WINDOW_RESIZED, c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED => {
             app.buttons.clear();
+            app.transcript.draw_width = 0;
             app.library.invalidateTargets();
             app.dirty = true;
         },
@@ -131,6 +132,12 @@ fn mouseDown(app: *App, event: *const c.SDL_Event) !void {
         menus.closeAll(app);
         app.dirty = true;
         return;
+    }
+    if (event.button.button == c.SDL_BUTTON_LEFT) {
+        if (app.transcript.copyAt(event.button.x, event.button.y)) |ordinal| {
+            try conversation.copyResponse(app, ordinal);
+            return;
+        }
     }
     const inside = widgets.contains(app.editor_view.bounds, event.button.x, event.button.y);
     app.focused_editor = inside;
