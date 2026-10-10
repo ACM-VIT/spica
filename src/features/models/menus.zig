@@ -48,6 +48,7 @@ pub fn toggleModelMenu(app: *App) void {
         app.editor_view.changed = true;
         _ = c.SDL_ClearComposition(app.window);
         _ = c.SDL_StartTextInput(app.window);
+        if (app.runtime) |runtime| runtime.refreshModels() catch |err| app.report("Refreshing model availability", err);
     }
     app.buttons.clear();
     app.thinking_menu.open = false;
