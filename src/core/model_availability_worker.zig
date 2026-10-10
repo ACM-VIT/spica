@@ -40,6 +40,7 @@ pub const Worker = struct {
     pub fn destroy(self: *Worker) void {
         c.SDL_LockMutex(self.mutex);
         self.stopping = true;
+        self.requested = false;
         c.SDL_SignalCondition(self.condition);
         c.SDL_UnlockMutex(self.mutex);
         self.thread.join();

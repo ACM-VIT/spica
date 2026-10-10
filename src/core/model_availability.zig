@@ -115,10 +115,11 @@ fn listedSlugs(allocator: std.mem.Allocator, result: std.json.Value) !?[][]const
     const models = result.object.get("models") orelse return null;
     if (models != .array) return null;
     var ids: std.ArrayList([]const u8) = .empty;
-    errdefer {
+    var owns_ids = true;
+    defer if (owns_ids) {
         for (ids.items) |id| allocator.free(id);
         ids.deinit(allocator);
-    }
+    };
     for (models.array.items) |model| {
         const slug = stringField(model, "slug") orelse return null;
         const visibility = stringField(model, "visibility") orelse return null;
@@ -130,7 +131,9 @@ fn listedSlugs(allocator: std.mem.Allocator, result: std.json.Value) !?[][]const
         if (boolField(model, "supported_in_api")) |supported| if (!supported) continue;
         try ids.append(allocator, try allocator.dupe(u8, slug));
     }
-    return try ids.toOwnedSlice(allocator);
+    const owned = try ids.toOwnedSlice(allocator);
+    owns_ids = false;
+    return owned;
 }
 
 const ProviderResult = struct {
@@ -163,14 +166,30 @@ fn fetchJson(
     const body = try allocator.alloc(u8, 2 * 1024 * 1024);
     defer allocator.free(body);
     var writer = std.Io.Writer.fixed(body);
-    const response = try client.fetch(.{
-        .location = .{ .url = url },
+    const uri = try std.Uri.parse(url);
+    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.UnsupportedUriScheme;
+    const timeout: std.Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .{ .nanoseconds = 5 * std.time.ns_per_s } } };
+    const connection = try client.connectTcpOptions(.{
+        .host = try std.Io.net.HostName.init(uri.host.?.raw),
+        .port = uri.port orelse if (protocol == .tls) 443 else 80,
+        .protocol = protocol,
+        .timeout = timeout,
+    });
+    var request = try client.request(.GET, uri, .{
+        .connection = connection,
         .redirect_behavior = .not_allowed,
         .headers = .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = "identity" } },
         .extra_headers = extra[0..extra_len],
-        .response_writer = &writer,
     });
-    if (response.status != .ok) return error.AvailabilityRequestFailed;
+    defer request.deinit();
+    try request.sendBodiless();
+    var response = try request.receiveHead(&.{});
+    if (response.head.status != .ok) return error.AvailabilityRequestFailed;
+    const reader = response.reader(&.{});
+    _ = reader.streamRemaining(&writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr().?,
+        else => return err,
+    };
     return std.json.parseFromSlice(std.json.Value, allocator, body[0..writer.end], .{ .allocate = .alloc_always, .max_value_len = 2 * 1024 * 1024 });
 }
 
@@ -233,4 +252,12 @@ test "malformed catalogs are unknown instead of empty entitlements" {
     , .{});
     defer parsed.deinit();
     try std.testing.expect(keep(parsed.value, model));
+}
+
+test "malformed catalog after a valid entry releases partial IDs" {
+    const source = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"models":[{"slug":"valid","visibility":"list"},{"slug":42,"visibility":"list"}]}
+    , .{});
+    defer source.deinit();
+    try std.testing.expect(try listedSlugs(std.testing.allocator, source.value) == null);
 }

@@ -1,3 +1,4 @@
+const std = @import("std");
 const c = @import("../../native/bindings.zig").c;
 const Model = @import("../../core/runtime.zig").Model;
 const Search = @import("search.zig").Search;
@@ -81,3 +82,14 @@ pub const Picker = struct {
         return true;
     }
 };
+
+test "model refresh with retained snapshot preserves keyboard selection" {
+    var picker: Picker = .{ .open = true };
+    const models = [_]Model{
+        .{ .provider = "openai-codex", .id = "one", .name = "One" },
+        .{ .provider = "anthropic", .id = "two", .name = "Two" },
+    };
+    try std.testing.expectEqual(@as(?usize, 0), try picker.selected(&models, ""));
+    try std.testing.expect(try picker.replaceModels(&models, &models, ""));
+    try std.testing.expectEqual(@as(?usize, 0), try picker.selected(&models, ""));
+}

@@ -61,6 +61,45 @@ test "the model list exposed to the picker excludes models absent from the accou
     try std.testing.expectEqualStrings("included", runtime.state.models[0].id);
 }
 
+test "availability refresh retains the visible model snapshot and selection state" {
+    const a = std.testing.allocator;
+    var runtime: Runtime = .{
+        .allocator = a,
+        .io = undefined,
+        .options = .{ .database_path = "", .project_path = "", .wake_event = 0 },
+        .options_arena = undefined,
+        .mutex = undefined,
+        .wake = undefined,
+        .state = .{ .allocator = a, .models = try a.alloc(Model, 1), .provider = try a.dupe(u8, ""), .model = try a.dupe(u8, ""), .session_file = try a.dupe(u8, ""), .session_id = try a.dupe(u8, ""), .session_name = try a.dupe(u8, ""), .thinking_level = try a.dupe(u8, ""), .error_message = try a.dupe(u8, ""), .attention = try a.dupe(u8, ""), .pending_draft = try a.dupe(u8, ""), .rejected_command_id = try a.dupe(u8, ""), .accepted_command_id = try a.dupe(u8, ""), .role = try a.dupe(u8, "assistant"), .kind = try a.dupe(u8, "message"), .content_status = try a.dupe(u8, "") },
+        .availability_enabled = true,
+    };
+    runtime.state.models[0] = .{ .provider = try a.dupe(u8, "openai-codex"), .id = try a.dupe(u8, "existing"), .name = try a.dupe(u8, "Existing") };
+    defer {
+        runtime.clearVisibleModels();
+        runtime.state.deinit();
+    }
+    runtime.model_availability_pending = true;
+    try std.testing.expectEqual(@as(usize, 1), runtime.state.models.len);
+    try std.testing.expectEqualStrings("existing", runtime.state.models[0].id);
+}
+
+test "a pending Codex catalog lookup does not block other providers" {
+    const a = std.testing.allocator;
+    var runtime: Runtime = .{
+        .allocator = a,
+        .io = undefined,
+        .options = .{ .database_path = "", .project_path = "", .wake_event = 0 },
+        .options_arena = undefined,
+        .mutex = undefined,
+        .wake = undefined,
+        .state = .{ .allocator = a, .provider = try a.dupe(u8, "anthropic"), .model = try a.dupe(u8, ""), .session_file = try a.dupe(u8, ""), .session_id = try a.dupe(u8, ""), .session_name = try a.dupe(u8, ""), .thinking_level = try a.dupe(u8, ""), .error_message = try a.dupe(u8, ""), .attention = try a.dupe(u8, ""), .pending_draft = try a.dupe(u8, ""), .rejected_command_id = try a.dupe(u8, ""), .accepted_command_id = try a.dupe(u8, ""), .role = try a.dupe(u8, "assistant"), .kind = try a.dupe(u8, "message"), .content_status = try a.dupe(u8, "") },
+        .availability_enabled = true,
+        .model_availability_pending = true,
+    };
+    defer runtime.state.deinit();
+    try std.testing.expect(!(std.mem.eql(u8, runtime.state.provider, "openai-codex") and (runtime.model_availability_pending or runtime.state.model_unavailable)));
+}
+
 pub const PromptOutcome = enum { pending, accepted, rejected };
 
 pub fn commandId(buffer: *[32]u8, token: u64) []const u8 {
@@ -588,7 +627,7 @@ pub const Runtime = struct {
                     try self.replace(&self.state.error_message, "Pi is not accepting commands; unsent draft retained");
                     if (queued.command_id) |token| try self.rejectUnsent(token);
                     try self.publish();
-                } else if (queued.prompt and (self.model_availability_pending or self.state.model_unavailable)) {
+                } else if (queued.prompt and std.mem.eql(u8, self.state.provider, "openai-codex") and (self.model_availability_pending or self.state.model_unavailable)) {
                     try self.replace(&self.state.error_message, if (self.model_availability_pending)
                         "Model access is still refreshing; draft retained"
                     else
@@ -727,7 +766,6 @@ pub const Runtime = struct {
         if (!self.availability_enabled) return;
         self.model_availability_pending = true;
         self.state.model_unavailable = false;
-        self.clearVisibleModels();
         try self.availability_worker.request();
         try self.publish();
     }
@@ -1030,9 +1068,7 @@ pub const Runtime = struct {
                 }
                 self.releaseRawModels();
                 self.raw_models = try next_models.toOwnedSlice(self.allocator);
-                if (self.availability_enabled and self.model_availability_pending) {
-                    self.clearVisibleModels();
-                } else if (self.availability_enabled) {
+                if (self.availability_enabled and !self.model_availability_pending) {
                     try self.filterVisibleModels();
                     self.checkSelectedModel();
                 } else {
@@ -1063,6 +1099,7 @@ pub const Runtime = struct {
             } else if (std.mem.eql(u8, command_name, "set_model")) {
                 try self.replace(&self.state.model, string(data, "id"));
                 try self.replace(&self.state.provider, string(data, "provider"));
+                self.checkSelectedModel();
                 self.clearThinkingLevels();
                 try self.requestState();
                 try self.queue(.{ .type = "get_available_thinking_levels" });
