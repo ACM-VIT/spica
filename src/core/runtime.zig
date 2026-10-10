@@ -61,7 +61,7 @@ test "the model list exposed to the picker excludes models absent from the accou
     try std.testing.expectEqualStrings("included", runtime.state.models[0].id);
 }
 
-test "availability refresh retains the visible model snapshot and selection state" {
+test "availability refresh transition retains the visible model snapshot" {
     const a = std.testing.allocator;
     var runtime: Runtime = .{
         .allocator = a,
@@ -78,26 +78,31 @@ test "availability refresh retains the visible model snapshot and selection stat
         runtime.clearVisibleModels();
         runtime.state.deinit();
     }
-    runtime.model_availability_pending = true;
+    runtime.markModelAvailabilityPending();
     try std.testing.expectEqual(@as(usize, 1), runtime.state.models.len);
     try std.testing.expectEqualStrings("existing", runtime.state.models[0].id);
 }
 
-test "a pending Codex catalog lookup does not block other providers" {
+test "processInputs sends Anthropic prompts while Codex availability is pending" {
     const a = std.testing.allocator;
+    const mutex = native.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer native.SDL_DestroyMutex(mutex);
     var runtime: Runtime = .{
         .allocator = a,
         .io = undefined,
         .options = .{ .database_path = "", .project_path = "", .wake_event = 0 },
         .options_arena = undefined,
-        .mutex = undefined,
+        .mutex = mutex,
         .wake = undefined,
-        .state = .{ .allocator = a, .provider = try a.dupe(u8, "anthropic"), .model = try a.dupe(u8, ""), .session_file = try a.dupe(u8, ""), .session_id = try a.dupe(u8, ""), .session_name = try a.dupe(u8, ""), .thinking_level = try a.dupe(u8, ""), .error_message = try a.dupe(u8, ""), .attention = try a.dupe(u8, ""), .pending_draft = try a.dupe(u8, ""), .rejected_command_id = try a.dupe(u8, ""), .accepted_command_id = try a.dupe(u8, ""), .role = try a.dupe(u8, "assistant"), .kind = try a.dupe(u8, "message"), .content_status = try a.dupe(u8, "") },
+        .state = .{ .allocator = a, .provider = "anthropic" },
+        .process = .{ .input = 0, .output = -1, .@"error" = -1, .exit_fd = -1, .pid = 1 },
         .availability_enabled = true,
         .model_availability_pending = true,
     };
-    defer runtime.state.deinit();
-    try std.testing.expect(!(std.mem.eql(u8, runtime.state.provider, "openai-codex") and (runtime.model_availability_pending or runtime.state.model_unavailable)));
+    defer runtime.outgoing.deinit(a);
+    try runtime.inputs.append(a, .{ .bytes = .{ .data = try a.dupe(u8, "{\"type\":\"prompt\",\"message\":\"hello\"}\n"), .prompt = true } });
+    try runtime.processInputs();
+    try std.testing.expectEqualStrings("{\"type\":\"prompt\",\"message\":\"hello\"}\n", runtime.outgoing.items);
 }
 
 pub const PromptOutcome = enum { pending, accepted, rejected };
@@ -764,10 +769,14 @@ pub const Runtime = struct {
 
     fn scheduleModelAvailability(self: *Runtime) !void {
         if (!self.availability_enabled) return;
-        self.model_availability_pending = true;
-        self.state.model_unavailable = false;
+        self.markModelAvailabilityPending();
         try self.availability_worker.request();
         try self.publish();
+    }
+
+    fn markModelAvailabilityPending(self: *Runtime) void {
+        self.model_availability_pending = true;
+        self.state.model_unavailable = false;
     }
 
     fn consumeModelAvailability(self: *Runtime) !void {
