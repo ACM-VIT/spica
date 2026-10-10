@@ -6,6 +6,8 @@ const p = executables.c;
 const storage = @import("store.zig");
 const protocol = @import("protocol.zig");
 const session = @import("session.zig");
+const availability = @import("model_availability.zig");
+const AvailabilityWorker = @import("model_availability_worker.zig").Worker;
 const utf8 = @import("../text/utf8.zig");
 const Value = std.json.Value;
 const record_limit = 1024 * 1024;
@@ -29,6 +31,36 @@ pub const Model = struct {
         return true;
     }
 };
+
+test "the model list exposed to the picker excludes models absent from the account catalog" {
+    const a = std.testing.allocator;
+    const policy = try std.json.parseFromSlice(Value, a,
+        \\{"providers":[{"provider":"openai-codex","availableIds":["included"]}]}
+    , .{});
+    var runtime: Runtime = .{
+        .allocator = a,
+        .io = undefined,
+        .options = .{ .database_path = "", .project_path = "", .wake_event = 0 },
+        .options_arena = undefined,
+        .mutex = undefined,
+        .wake = undefined,
+        .state = .{ .allocator = a },
+        .raw_models = try a.alloc(Model, 2),
+        .model_policy = policy,
+        .availability_enabled = true,
+    };
+    runtime.raw_models[0] = .{ .provider = try a.dupe(u8, "openai-codex"), .id = try a.dupe(u8, "included"), .name = try a.dupe(u8, "Included") };
+    runtime.raw_models[1] = .{ .provider = try a.dupe(u8, "openai-codex"), .id = try a.dupe(u8, "not-in-plan"), .name = try a.dupe(u8, "Not in plan") };
+    defer {
+        runtime.clearVisibleModels();
+        runtime.releaseRawModels();
+        if (runtime.model_policy) |*owned| owned.deinit();
+    }
+    try runtime.filterVisibleModels();
+    try std.testing.expectEqual(@as(usize, 1), runtime.state.models.len);
+    try std.testing.expectEqualStrings("included", runtime.state.models[0].id);
+}
+
 pub const PromptOutcome = enum { pending, accepted, rejected };
 
 pub fn commandId(buffer: *[32]u8, token: u64) []const u8 {
@@ -67,6 +99,7 @@ pub const Snapshot = struct {
     rejected_command_id: []const u8 = "",
     accepted_command_id: []const u8 = "",
     models: []Model = &.{},
+    model_unavailable: bool = false,
     thinking_levels: [][]const u8 = &.{},
     visible_content_ref: ?storage.ContentId = null,
     visible_revision: u64 = 0,
@@ -151,8 +184,8 @@ fn copySnapshot(a: std.mem.Allocator, original: Snapshot) !Snapshot {
     }
     return result;
 }
-const QueuedBytes = struct { data: []u8, command_id: ?u64 = null, bash: bool = false, stop: bool = false };
-const Input = union(enum) { start, bytes: QueuedBytes, shutdown, force };
+const QueuedBytes = struct { data: []u8, command_id: ?u64 = null, prompt: bool = false, bash: bool = false, stop: bool = false };
+const Input = union(enum) { start, refresh_models, bytes: QueuedBytes, shutdown, force };
 const Pending = struct { id: []u8, draft: []u8 };
 const Block = struct { index: i64, id: storage.ContentId, length: u64 = 0 };
 const Tool = struct {
@@ -188,6 +221,11 @@ pub const Runtime = struct {
     inputs: std.ArrayList(Input) = .empty,
     snapshot: ?Snapshot = null,
     state: Snapshot,
+    raw_models: []Model = &.{},
+    model_policy: ?std.json.Parsed(Value) = null,
+    availability_enabled: bool = false,
+    model_availability_pending: bool = false,
+    availability_worker: *AvailabilityWorker = undefined,
     closing: bool = false,
     accepting: bool = true,
     worker_done: bool = false,
@@ -242,7 +280,22 @@ pub const Runtime = struct {
         const last_prompt = try a.dupe(u8, "");
         errdefer a.free(last_prompt);
         if (state.runtime_id == 0) return error.RuntimeIdentityUnavailable;
-        self.* = .{ .allocator = a, .io = io, .options = owned, .options_arena = arena, .mutex = mutex, .wake = wake, .state = state, .last_entry_id = last_entry, .leaf_id = leaf, .last_prompt = last_prompt };
+        const availability_worker = try AvailabilityWorker.create(a, io, wake[1]);
+        errdefer availability_worker.destroy();
+        self.* = .{
+            .allocator = a,
+            .io = io,
+            .options = owned,
+            .options_arena = arena,
+            .mutex = mutex,
+            .wake = wake,
+            .state = state,
+            .availability_enabled = true,
+            .availability_worker = availability_worker,
+            .last_entry_id = last_entry,
+            .leaf_id = leaf,
+            .last_prompt = last_prompt,
+        };
         self.thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, run, .{self});
         return self;
     }
@@ -258,6 +311,10 @@ pub const Runtime = struct {
     }
     pub fn setModel(self: *Runtime, provider: []const u8, id: []const u8) !void {
         _ = try self.command(.{ .type = "set_model", .provider = provider, .modelId = id }, null);
+    }
+    pub fn refreshModels(self: *Runtime) !void {
+        if (!self.availability_enabled) return;
+        try self.enqueue(.refresh_models);
     }
     pub fn newSession(self: *Runtime) !void {
         _ = try self.command(.{ .type = "new_session" }, null);
@@ -298,6 +355,8 @@ pub const Runtime = struct {
         self.inputs.deinit(self.allocator);
         if (self.snapshot) |*snap| snap.deinit();
         self.state.deinit();
+        self.releaseRawModels();
+        if (self.model_policy) |*policy| policy.deinit();
         self.options_arena.deinit();
         self.allocator.free(self.last_entry_id);
         self.allocator.free(self.leaf_id);
@@ -350,7 +409,12 @@ pub const Runtime = struct {
             const pending_draft = try self.allocator.dupe(u8, text);
             self.pending.appendAssumeCapacity(.{ .id = pending_id, .draft = pending_draft });
         }
-        self.inputs.appendAssumeCapacity(.{ .bytes = .{ .data = line, .command_id = token, .bash = std.mem.eql(u8, value.type, "bash") } });
+        self.inputs.appendAssumeCapacity(.{ .bytes = .{
+            .data = line,
+            .command_id = token,
+            .prompt = draft != null,
+            .bash = std.mem.eql(u8, value.type, "bash"),
+        } });
         p.spica_wake(self.wake[1]);
         return token;
     }
@@ -383,6 +447,7 @@ pub const Runtime = struct {
     fn run(self: *Runtime) void {
         defer native.SDL_CleanupTLS();
         defer {
+            if (self.availability_enabled) self.availability_worker.destroy();
             native.SDL_LockMutex(self.mutex);
             self.accepting = false;
             self.worker_done = true;
@@ -452,6 +517,7 @@ pub const Runtime = struct {
     }
     fn loop(self: *Runtime, framer: *protocol.Framer(Sink)) !void {
         while (true) {
+            try self.consumeModelAvailability();
             try self.processInputs();
             if (self.closing and self.process.pid == 0) {
                 self.state.status = .exited;
@@ -516,9 +582,17 @@ pub const Runtime = struct {
             .start => if (self.process.pid == 0 and self.state.status == .stopped) {
                 try self.launch();
             },
+            .refresh_models => try self.scheduleModelAvailability(),
             .bytes => |queued| {
                 if (self.process.pid == 0 or self.process.input < 0) {
                     try self.replace(&self.state.error_message, "Pi is not accepting commands; unsent draft retained");
+                    if (queued.command_id) |token| try self.rejectUnsent(token);
+                    try self.publish();
+                } else if (queued.prompt and (self.model_availability_pending or self.state.model_unavailable)) {
+                    try self.replace(&self.state.error_message, if (self.model_availability_pending)
+                        "Model access is still refreshing; draft retained"
+                    else
+                        "Selected model is unavailable for this account; draft retained");
                     if (queued.command_id) |token| try self.rejectUnsent(token);
                     try self.publish();
                 } else {
@@ -562,12 +636,121 @@ pub const Runtime = struct {
         const resume_path = if (self.options.resume_file) |file| try std.Io.Dir.cwd().realPathFileAlloc(self.io, file, self.allocator) else null;
         defer if (resume_path) |file| self.allocator.free(file);
         if (p.spica_process_spawn(&self.process, node, entry, cwd, if (resume_path) |r| r.ptr else null, @intFromBool(self.options.trust_project)) != 0) return error.PiLaunchFailed;
+        try self.scheduleModelAvailability();
         try self.requestState();
         try self.queue(.{ .type = "get_available_models" });
         try self.queue(.{ .type = "get_available_thinking_levels" });
     }
     fn requestState(self: *Runtime) !void {
         try self.queue(.{ .type = "get_state", .id = self.state.generation });
+    }
+
+    fn releaseModels(self: *Runtime, models: *[]Model) void {
+        for (models.*) |model| {
+            self.allocator.free(model.provider);
+            self.allocator.free(model.id);
+            self.allocator.free(model.name);
+        }
+        self.allocator.free(models.*);
+        models.* = &.{};
+    }
+
+    fn releaseRawModels(self: *Runtime) void {
+        self.releaseModels(&self.raw_models);
+    }
+
+    fn clearVisibleModels(self: *Runtime) void {
+        self.releaseModels(&self.state.models);
+    }
+
+    fn copyVisibleModels(self: *Runtime, source: []const Model) !void {
+        var next: std.ArrayList(Model) = .empty;
+        errdefer {
+            for (next.items) |model| {
+                self.allocator.free(model.provider);
+                self.allocator.free(model.id);
+                self.allocator.free(model.name);
+            }
+            next.deinit(self.allocator);
+        }
+        for (source[0..@min(source.len, 4096)]) |model| {
+            const provider = try self.allocator.dupe(u8, model.provider);
+            errdefer self.allocator.free(provider);
+            const id = try self.allocator.dupe(u8, model.id);
+            errdefer self.allocator.free(id);
+            const name = try self.allocator.dupe(u8, model.name);
+            errdefer self.allocator.free(name);
+            try next.append(self.allocator, .{ .provider = provider, .id = id, .name = name });
+        }
+        self.clearVisibleModels();
+        self.state.models = try next.toOwnedSlice(self.allocator);
+    }
+
+    fn filterVisibleModels(self: *Runtime) !void {
+        if (self.model_policy == null) {
+            try self.copyVisibleModels(self.raw_models);
+            return;
+        }
+        var next: std.ArrayList(Model) = .empty;
+        errdefer {
+            for (next.items) |model| {
+                self.allocator.free(model.provider);
+                self.allocator.free(model.id);
+                self.allocator.free(model.name);
+            }
+            next.deinit(self.allocator);
+        }
+        const policy = self.model_policy.?.value;
+        for (self.raw_models) |model| {
+            if (!availability.keep(policy, model)) continue;
+            const provider = try self.allocator.dupe(u8, model.provider);
+            errdefer self.allocator.free(provider);
+            const id = try self.allocator.dupe(u8, model.id);
+            errdefer self.allocator.free(id);
+            const name = try self.allocator.dupe(u8, model.name);
+            errdefer self.allocator.free(name);
+            try next.append(self.allocator, .{ .provider = provider, .id = id, .name = name });
+            if (next.items.len == 4096) break;
+        }
+        self.clearVisibleModels();
+        self.state.models = try next.toOwnedSlice(self.allocator);
+    }
+
+    fn checkSelectedModel(self: *Runtime) void {
+        self.state.model_unavailable = if (self.model_policy) |policy|
+            availability.status(policy.value, self.state.provider, self.state.model) == .unavailable
+        else
+            false;
+    }
+
+    fn scheduleModelAvailability(self: *Runtime) !void {
+        if (!self.availability_enabled) return;
+        self.model_availability_pending = true;
+        self.state.model_unavailable = false;
+        self.clearVisibleModels();
+        try self.availability_worker.request();
+        try self.publish();
+    }
+
+    fn consumeModelAvailability(self: *Runtime) !void {
+        if (!self.availability_enabled) return;
+        const bytes = self.availability_worker.take() orelse return;
+        defer self.allocator.free(bytes);
+        const parsed = std.json.parseFromSlice(Value, self.allocator, bytes, .{ .allocate = .alloc_always, .max_value_len = 2 * 1024 * 1024 }) catch {
+            self.model_availability_pending = false;
+            if (self.model_policy) |*old| old.deinit();
+            self.model_policy = null;
+            try self.filterVisibleModels();
+            self.checkSelectedModel();
+            try self.publish();
+            return;
+        };
+        if (self.model_policy) |*old| old.deinit();
+        self.model_policy = parsed;
+        self.model_availability_pending = false;
+        try self.filterVisibleModels();
+        self.checkSelectedModel();
+        try self.publish();
     }
     fn queue(self: *Runtime, value: anytype) !void {
         const bytes = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
@@ -816,6 +999,7 @@ pub const Runtime = struct {
                 const model = child(data, "model");
                 try self.replace(&self.state.model, string(model, "id"));
                 try self.replace(&self.state.provider, string(model, "provider"));
+                self.checkSelectedModel();
                 self.state.status = if (self.closing) .stopping else if (boolean(data, "isStreaming")) .streaming else .ready;
                 if (self.state.session_file.len > 0) {
                     try self.persistSession();
@@ -834,7 +1018,8 @@ pub const Runtime = struct {
                     }
                     next_models.deinit(self.allocator);
                 }
-                if (models == .array) for (models.array.items[0..@min(models.array.items.len, 256)]) |model| {
+                if (models != .array) return;
+                for (models.array.items[0..@min(models.array.items.len, 4096)]) |model| {
                     const provider = try self.allocator.dupe(u8, string(model, "provider"));
                     errdefer self.allocator.free(provider);
                     const id = try self.allocator.dupe(u8, string(model, "id"));
@@ -842,16 +1027,18 @@ pub const Runtime = struct {
                     const name = try self.allocator.dupe(u8, string(model, "name"));
                     errdefer self.allocator.free(name);
                     try next_models.append(self.allocator, .{ .provider = provider, .id = id, .name = name });
-                };
-                const owned_models = try next_models.toOwnedSlice(self.allocator);
-                for (self.state.models) |m| {
-                    self.allocator.free(m.provider);
-                    self.allocator.free(m.id);
-                    self.allocator.free(m.name);
                 }
-                self.allocator.free(self.state.models);
-                self.state.models = owned_models;
-                if (models == .array and models.array.items.len > 256) {
+                self.releaseRawModels();
+                self.raw_models = try next_models.toOwnedSlice(self.allocator);
+                if (self.availability_enabled and self.model_availability_pending) {
+                    self.clearVisibleModels();
+                } else if (self.availability_enabled) {
+                    try self.filterVisibleModels();
+                    self.checkSelectedModel();
+                } else {
+                    try self.copyVisibleModels(self.raw_models);
+                }
+                if (models.array.items.len > 4096) {
                     try self.inspect(raw, "model_display_budget", "Available model list exceeds first-pass display budget; complete list retained");
                     try self.replace(&self.state.attention, "Available model list exceeds first-pass display budget");
                 }
