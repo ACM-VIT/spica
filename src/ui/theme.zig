@@ -61,6 +61,12 @@ fn palette(raw: RawPalette) !Palette {
     };
 }
 
+pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Theme {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16384));
+    defer allocator.free(bytes);
+    return parse(allocator, bytes);
+}
+
 pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Theme {
     const parsed = try std.json.parseFromSlice(RawTheme, allocator, source, .{
         .allocate = .alloc_always,

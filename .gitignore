@@ -4,3 +4,4 @@ zig-out/
 dist/
 .tokensave/
 build/__pycache__/
+CLAUDE.local.md
