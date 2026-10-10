@@ -82,7 +82,7 @@ Hooks can be bypassed, so contributors remain responsible for passing checks.
 The build compiles the native C/C++ sources as well. There is no separate typechecker command or configured clang-tidy/static-analysis pass.
 Passing these checks does not replace exercising the behavior changed by your contribution.
 For UI changes, launch the app and inspect the actual interaction; report platform and verification details in your pull request.
-For assistant-response clipboard changes, follow [CLIPBOARD_TESTING.md](CLIPBOARD_TESTING.md) for native delivery checks and the macOS test procedure.
+See [clipboard.md](clipboard.md) for copy button tests.
 
 ## Formatting
 
