@@ -206,7 +206,7 @@ static void capture_stdout(SpicaProcess *p, char *out, size_t capacity, size_t *
     }
 }
 static int capture(SpicaProcess *p, const char *node, char *const argv[], int timeout_ms, char *out,
-                   size_t capacity, size_t *length) {
+                   size_t capacity, size_t *length, int *wait_status) {
     *length = 0;
     if (spawn(p, node, argv, "/"))
         return SPICA_PROCESS_SPAWN_FAILED;
@@ -243,6 +243,8 @@ static int capture(SpicaProcess *p, const char *node, char *const argv[], int ti
             }
             if (reaped == 1) {
                 capture_stdout(p, out, capacity, &n, &overflow);
+                if (wait_status)
+                    *wait_status = status;
                 result = !(WIFEXITED(status) && WEXITSTATUS(status) == 0) ? SPICA_PROCESS_EXIT_FAILED
                          : overflow                                       ? SPICA_PROCESS_OUTPUT_OVERFLOW
                                                                           : SPICA_PROCESS_OK;
@@ -257,16 +259,20 @@ static int capture(SpicaProcess *p, const char *node, char *const argv[], int ti
     return result;
 }
 int spica_process_version(SpicaProcess *p, const char *node, const char *entry, int timeout_ms,
-                          char *version, size_t capacity, size_t *length) {
+                          SpicaVersionCheck *check) {
     char *argv[] = {(char *)node, (char *)entry, "--version", 0};
-    char out[256];
-    size_t n = 0;
-    *length = 0;
-    int result = capture(p, node, argv, timeout_ms, out, sizeof out, &n);
-    size_t copy = n < capacity ? n : capacity;
-    if (version && copy)
-        memcpy(version, out, copy);
-    *length = version ? copy : 0;
+    char *out = check->output;
+    int status = -1;
+    check->output_length = 0;
+    check->exit_code = -1;
+    check->signal = 0;
+    int result = capture(p, node, argv, timeout_ms, out, sizeof check->output, &check->output_length,
+                         &status);
+    size_t n = check->output_length;
+    if (status != -1 && WIFEXITED(status))
+        check->exit_code = WEXITSTATUS(status);
+    if (status != -1 && WIFSIGNALED(status))
+        check->signal = WTERMSIG(status);
     if (result)
         return result;
     size_t v = sizeof SPICA_PI_VERSION - 1;
@@ -279,5 +285,5 @@ int spica_process_npm_root(SpicaProcess *p, const char *node, const char *npm, c
                            size_t capacity, size_t *length) {
     /* npm is its resolved JS entry, not a shell command; Finder need not expose node on PATH. */
     char *argv[] = {(char *)node, (char *)npm, "root", "-g", "--loglevel=error", 0};
-    return capture(p, node, argv, 5000, output, capacity, length);
+    return capture(p, node, argv, 5000, output, capacity, length, 0);
 }

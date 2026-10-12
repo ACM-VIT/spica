@@ -562,10 +562,9 @@ pub const Runtime = struct {
         defer paths.deinit(self.allocator);
         const node = paths.node;
         const entry = paths.entry;
-        var version: [64]u8 = undefined;
-        var version_length: usize = 0;
-        executables.verify(&self.process, node, entry, self.verify_timeout_ms, &version, &version_length) catch |err|
-            return self.explain(err, .{ .node = node, .entry = entry, .version = version[0..version_length], .timeout_ms = self.verify_timeout_ms });
+        var check: p.SpicaVersionCheck = undefined;
+        executables.verify(&self.process, node, entry, self.verify_timeout_ms, &check) catch |err|
+            return self.explain(err, executables.failureOf(node, entry, self.verify_timeout_ms, &check));
         const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.options.project_path, self.allocator);
         defer self.allocator.free(cwd);
         self.options.project_path = try self.options_arena.allocator().dupeZ(u8, cwd);
@@ -1359,7 +1358,7 @@ test "pi startup verification failures never spawn rpc and a timed-out verifier 
     const Case = struct { version: []const u8, expected: ?anyerror, mention: []const u8 };
     const cases = [_]Case{
         .{ .version = "printf '0.9.0\\n'", .expected = error.PiVersionMismatch, .mention = "found 0.9.0" },
-        .{ .version = "printf '1.0.0\\n'; exit 7", .expected = error.PiVerifierFailed, .mention = "exited with an error" },
+        .{ .version = "printf '1.0.0\\n'; exit 7", .expected = error.PiVerifierFailed, .mention = "exited with status 7" },
         .{ .version = "sleep 30 & printf '%s' $! > \"$SLEEPER\"; wait", .expected = error.PiVerifierTimedOut, .mention = "timed out after 300 ms" },
         .{ .version = "printf '1.0.0\\n'", .expected = null, .mention = "" },
     };

@@ -7,6 +7,11 @@ typedef struct {
 } SpicaProcess;
 #define SPICA_PI_VERSION "1.0.0"
 #define SPICA_PI_VERIFY_TIMEOUT_MS 5000
+typedef struct {
+    char output[256];
+    size_t output_length;
+    int exit_code, signal;
+} SpicaVersionCheck;
 enum {
     SPICA_PROCESS_OK = 0,
     SPICA_PROCESS_SPAWN_FAILED = -1,
@@ -23,7 +28,7 @@ int spica_process_spawn(SpicaProcess *p, const char *node, const char *entry, co
                         const char *resume, int trust);
 /* A verifier that fails while still alive remains owned in p for explicit shutdown. */
 int spica_process_version(SpicaProcess *p, const char *node, const char *entry, int timeout_ms,
-                          char *version, size_t capacity, size_t *length);
+                          SpicaVersionCheck *check);
 /* Bounded, five-second global npm lookup, run with the resolved Node executable.
  * A failed lookup still alive remains owned in p, just like the version verifier. */
 int spica_process_npm_root(SpicaProcess *p, const char *node, const char *npm, char *output,
