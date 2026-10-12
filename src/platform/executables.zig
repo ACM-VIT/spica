@@ -144,6 +144,55 @@ fn find(allocator: std.mem.Allocator, io: std.Io, name: []const u8, path: ?[]con
     return null;
 }
 
+pub const Failure = struct {
+    node: []const u8 = "",
+    entry: []const u8 = "",
+    version: []const u8 = "",
+};
+
+const Shown = struct {
+    bytes: []const u8,
+
+    pub fn format(self: Shown, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const limit = 240;
+        var index: usize = 0;
+        while (index < self.bytes.len and index < limit) {
+            const byte = self.bytes[index];
+            if (byte >= 0x80) {
+                const length = std.unicode.utf8ByteSequenceLength(byte) catch 0;
+                if (length > 0 and index + length <= self.bytes.len and std.unicode.utf8ValidateSlice(self.bytes[index .. index + length])) {
+                    try writer.writeAll(self.bytes[index .. index + length]);
+                    index += length;
+                    continue;
+                }
+            }
+            try writer.writeByte(if (byte < 0x20 or byte == 0x7f or byte >= 0x80) '?' else byte);
+            index += 1;
+        }
+        if (index < self.bytes.len) try writer.writeAll("...");
+    }
+};
+
+fn shown(bytes: []const u8) Shown {
+    return .{ .bytes = bytes };
+}
+
+pub fn describe(allocator: std.mem.Allocator, err: anyerror, failure: Failure) !?[]u8 {
+    const version = std.mem.trim(u8, failure.version, " \t\r\n");
+    return switch (err) {
+        error.InvalidNodePath => try std.fmt.allocPrint(allocator, "--node {f} is not an executable file. Pass --node /path/to/node.", .{shown(failure.node)}),
+        error.InvalidPiEntryPath => try std.fmt.allocPrint(allocator, "--pi-entry {f} is not a readable file. Pass --pi-entry /path/to/cli.js.", .{shown(failure.entry)}),
+        error.PiVersionMismatch => if (version.len == 0)
+            try std.fmt.allocPrint(allocator, "Pi 1.0.0 required; {f} printed no version. Pass --pi-entry /path/to/cli.js. Node: {f}", .{ shown(failure.entry), shown(failure.node) })
+        else
+            try std.fmt.allocPrint(allocator, "Pi 1.0.0 required, found {f} at {f}. Pass --pi-entry /path/to/cli.js. Node: {f}", .{ shown(version), shown(failure.entry), shown(failure.node) }),
+        error.PiVerifierLaunchFailed => try std.fmt.allocPrint(allocator, "Could not run Node at {f} to check Pi. Pass --node /path/to/node. Pi entry: {f}", .{ shown(failure.node), shown(failure.entry) }),
+        error.PiVerifierFailed => try std.fmt.allocPrint(allocator, "Pi version check exited with an error. Check --node {f} and --pi-entry {f}.", .{ shown(failure.node), shown(failure.entry) }),
+        error.PiVerifierTimedOut => try std.fmt.allocPrint(allocator, "Pi version check timed out after 5s; Force stop it, then check --node {f} and --pi-entry {f}.", .{ shown(failure.node), shown(failure.entry) }),
+        else => null,
+    };
+}
+
 pub fn errorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.NodeNotFound => "Node was not found. Install Node or pass --node /path/to/node. Finder may not see nvm/fnm; launch Spica from your terminal or use explicit paths.",

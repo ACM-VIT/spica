@@ -211,6 +211,7 @@ pub const Runtime = struct {
     stop_requested: bool = false,
     entries_inflight: bool = false,
     entries_again: bool = false,
+    failure_detail: ?[]u8 = null,
 
     pub fn create(a: std.mem.Allocator, io: std.Io, options: Options) !*Runtime {
         if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedRuntimeTarget;
@@ -311,6 +312,7 @@ pub const Runtime = struct {
             self.allocator.free(item.draft);
         }
         self.pending.deinit(self.allocator);
+        if (self.failure_detail) |detail| self.allocator.free(detail);
         p.spica_close(self.wake[0]);
         p.spica_close(self.wake[1]);
         native.SDL_DestroyMutex(self.mutex);
@@ -375,7 +377,10 @@ pub const Runtime = struct {
         }
     }
     fn fail(self: *Runtime, err: anyerror) void {
-        self.replace(&self.state.error_message, executables.errorMessage(err) orelse @errorName(err)) catch {};
+        const detail = self.failure_detail;
+        self.failure_detail = null;
+        defer if (detail) |bytes| self.allocator.free(bytes);
+        self.replace(&self.state.error_message, detail orelse executables.errorMessage(err) orelse @errorName(err)) catch {};
         self.recoverDrafts() catch {};
         self.state.status = .failed;
         self.publish() catch {};
@@ -551,13 +556,15 @@ pub const Runtime = struct {
     fn launch(self: *Runtime) !void {
         self.state.status = .starting;
         try self.publish();
-        const paths = try executables.resolve(self.allocator, self.io, &self.process, self.options.node_path, self.options.pi_entrypoint);
+        const paths = executables.resolve(self.allocator, self.io, &self.process, self.options.node_path, self.options.pi_entrypoint) catch |err|
+            return self.explain(err, .{ .node = self.options.node_path orelse "", .entry = self.options.pi_entrypoint orelse "" });
         defer paths.deinit(self.allocator);
         const node = paths.node;
         const entry = paths.entry;
         var version: [64]u8 = undefined;
         var version_length: usize = 0;
-        try executables.verify(&self.process, node, entry, &version, &version_length);
+        executables.verify(&self.process, node, entry, &version, &version_length) catch |err|
+            return self.explain(err, .{ .node = node, .entry = entry, .version = version[0..version_length] });
         const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.options.project_path, self.allocator);
         defer self.allocator.free(cwd);
         self.options.project_path = try self.options_arena.allocator().dupeZ(u8, cwd);
@@ -567,6 +574,11 @@ pub const Runtime = struct {
         try self.requestState();
         try self.queue(.{ .type = "get_available_models" });
         try self.queue(.{ .type = "get_available_thinking_levels" });
+    }
+    fn explain(self: *Runtime, err: anyerror, failure: executables.Failure) anyerror {
+        if (self.failure_detail) |detail| self.allocator.free(detail);
+        self.failure_detail = executables.describe(self.allocator, err, failure) catch null;
+        return err;
     }
     fn requestState(self: *Runtime) !void {
         try self.queue(.{ .type = "get_state", .id = self.state.generation });
