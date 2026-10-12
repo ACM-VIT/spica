@@ -31,6 +31,17 @@ pub fn resolve(allocator: std.mem.Allocator, io: std.Io, process: *c.SpicaProces
     return discover(allocator, io, process, node, entry, path, fallbackDirectories(builtin.os.tag));
 }
 
+pub fn verify(process: *c.SpicaProcess, node: [:0]const u8, entry: [:0]const u8, version: []u8, length: *usize) !void {
+    length.* = 0;
+    return switch (c.spica_process_version(process, node.ptr, entry.ptr, version.ptr, version.len, length)) {
+        c.SPICA_PROCESS_OK => {},
+        c.SPICA_PROCESS_VERSION_MISMATCH, c.SPICA_PROCESS_OUTPUT_OVERFLOW => error.PiVersionMismatch,
+        c.SPICA_PROCESS_SPAWN_FAILED => error.PiVerifierLaunchFailed,
+        c.SPICA_PROCESS_TIMED_OUT => error.PiVerifierTimedOut,
+        else => error.PiVerifierFailed,
+    };
+}
+
 fn discover(allocator: std.mem.Allocator, io: std.Io, process: *c.SpicaProcess, node_override: ?[]const u8, entry_override: ?[]const u8, path: ?[]const u8, fallbacks: []const []const u8) !Executables {
     const node = if (node_override) |value|
         (try candidate(allocator, io, value, false)) orelse return error.InvalidNodePath
@@ -140,6 +151,10 @@ pub fn errorMessage(err: anyerror) ?[]const u8 {
         error.InvalidPiEntryPath => "The --pi-entry path is not a readable file. Pass --pi-entry /path/to/cli.js.",
         error.PiEntryNotFound => "Pi's JavaScript entry was not found. Install Pi 1.0.0 or pass --pi-entry /path/to/cli.js (and --node /path/to/node if needed). Unrecognized shell wrappers require an explicit JS entry.",
         error.NpmGlobalLookupFailed => "npm root -g failed or timed out. Pass --pi-entry /path/to/cli.js and, if needed, --node /path/to/node.",
+        error.PiVersionMismatch => "Pi 1.0.0 is required but a different version was found. Install Pi 1.0.0 or pass --pi-entry /path/to/cli.js.",
+        error.PiVerifierLaunchFailed => "Node could not be started to check Pi's version. Pass --node /path/to/node.",
+        error.PiVerifierFailed => "Pi's version check failed. Pass --pi-entry /path/to/cli.js and, if needed, --node /path/to/node.",
+        error.PiVerifierTimedOut => "Pi's version check did not finish within 5 seconds; it is still owned and can be force stopped. Check --node and --pi-entry.",
         else => null,
     };
 }

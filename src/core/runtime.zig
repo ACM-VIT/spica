@@ -555,8 +555,9 @@ pub const Runtime = struct {
         defer paths.deinit(self.allocator);
         const node = paths.node;
         const entry = paths.entry;
+        var version: [64]u8 = undefined;
         var version_length: usize = 0;
-        if (p.spica_process_version(&self.process, node, entry, null, 0, &version_length) != p.SPICA_PROCESS_OK) return error.PiVersionMismatchOrVerificationFailed;
+        try executables.verify(&self.process, node, entry, &version, &version_length);
         const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.options.project_path, self.allocator);
         defer self.allocator.free(cwd);
         self.options.project_path = try self.options_arena.allocator().dupeZ(u8, cwd);
