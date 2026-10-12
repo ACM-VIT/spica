@@ -205,7 +205,8 @@ static void capture_stdout(SpicaProcess *p, char *out, size_t capacity, size_t *
         *n += add;
     }
 }
-static void capture_stderr(SpicaProcess *p, char *tail, size_t capacity, size_t *n, int *truncated) {
+static void capture_stderr(SpicaProcess *p, char *tail, size_t capacity, size_t *n,
+                           int *truncated) {
     for (int i = 0; i < 64; i++) {
         char b[1024];
         long r = spica_process_read(p->error, b, sizeof b);
@@ -269,9 +270,10 @@ static int capture(SpicaProcess *p, const char *node, char *const argv[], int ti
                 capture_stderr(p, tail, tail_capacity, tail_length, tail_truncated);
                 if (wait_status)
                     *wait_status = status;
-                result = !(WIFEXITED(status) && WEXITSTATUS(status) == 0) ? SPICA_PROCESS_EXIT_FAILED
-                         : overflow                                       ? SPICA_PROCESS_OUTPUT_OVERFLOW
-                                                                          : SPICA_PROCESS_OK;
+                result = !(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+                             ? SPICA_PROCESS_EXIT_FAILED
+                         : overflow ? SPICA_PROCESS_OUTPUT_OVERFLOW
+                                    : SPICA_PROCESS_OK;
                 break;
             }
         }
@@ -292,9 +294,10 @@ int spica_process_version(SpicaProcess *p, const char *node, const char *entry, 
     check->stderr_truncated = 0;
     check->exit_code = -1;
     check->signal = 0;
-    int result = capture(p, node, argv, timeout_ms, out, sizeof check->output, &check->output_length,
-                         &status, check->stderr_tail, sizeof check->stderr_tail,
-                         &check->stderr_length, &check->stderr_truncated);
+    int result =
+        capture(p, node, argv, timeout_ms, out, sizeof check->output, &check->output_length,
+                &status, check->stderr_tail, sizeof check->stderr_tail, &check->stderr_length,
+                &check->stderr_truncated);
     size_t n = check->output_length;
     if (status != -1 && WIFEXITED(status))
         check->exit_code = WEXITSTATUS(status);
@@ -303,7 +306,8 @@ int spica_process_version(SpicaProcess *p, const char *node, const char *entry, 
     if (result)
         return result;
     size_t v = sizeof SPICA_PI_VERSION - 1;
-    return ((n == v + 1 && out[v] == '\n') || (n == v + 2 && out[v] == '\r' && out[v + 1] == '\n')) &&
+    return ((n == v + 1 && out[v] == '\n') ||
+            (n == v + 2 && out[v] == '\r' && out[v + 1] == '\n')) &&
                    !memcmp(out, SPICA_PI_VERSION, v)
                ? SPICA_PROCESS_OK
                : SPICA_PROCESS_VERSION_MISMATCH;
