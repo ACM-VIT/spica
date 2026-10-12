@@ -1360,7 +1360,7 @@ test "pi startup verification failures never spawn rpc and a timed-out verifier 
     const cases = [_]Case{
         .{ .version = "printf '0.9.0\\n'", .expected = error.PiVersionMismatch, .mention = "found 0.9.0" },
         .{ .version = "printf '1.0.0\\n'; exit 7", .expected = error.PiVerifierFailed, .mention = "exited with an error" },
-        .{ .version = "sleep 30 & printf '%s' $! > \"$SLEEPER\"; wait", .expected = error.PiVerifierTimedOut, .mention = "timed out" },
+        .{ .version = "sleep 30 & printf '%s' $! > \"$SLEEPER\"; wait", .expected = error.PiVerifierTimedOut, .mention = "timed out after 300 ms" },
         .{ .version = "printf '1.0.0\\n'", .expected = null, .mention = "" },
     };
     for (cases) |case| {
@@ -1376,6 +1376,7 @@ test "pi startup verification failures never spawn rpc and a timed-out verifier 
             .mutex = mutex,
             .wake = undefined,
             .state = try copySnapshot(allocator, .{ .allocator = allocator }),
+            .verify_timeout_ms = 300,
         };
         defer {
             if (runtime.process.pid > 0) {

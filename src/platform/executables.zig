@@ -419,6 +419,21 @@ test "version verifier separates mismatch, failure and launch errors and rejects
     }
     const entry = try tmp.dir.realPathFileAlloc(io, "cli.js", a);
     defer a.free(entry);
+    try testFile(tmp.dir, "cli.js", "printf '1.0.'\nexec sleep 30\n", false);
+    try std.testing.expectError(error.PiVerifierTimedOut, verify(&process, node, entry, 200, &version, &length));
+    try std.testing.expectEqualStrings("1.0.", version[0..length]);
+    try std.testing.expect(process.pid > 0);
+    try std.testing.expectEqual(@as(c_int, 0), c.spica_process_force(&process));
+    var reaped: c_int = 0;
+    for (0..200) |_| {
+        var status: c_int = 0;
+        reaped = c.spica_process_reap(&process, &status);
+        if (reaped == 1) break;
+        var exit_only: c.SpicaProcess = .{ .input = -1, .output = -1, .@"error" = -1, .exit_fd = process.exit_fd, .pid = process.pid };
+        _ = c.spica_process_poll(&exit_only, -1, 0, 10);
+    }
+    try std.testing.expectEqual(@as(c_int, 1), reaped);
+    c.spica_process_dispose(&process);
     try std.testing.expectError(error.PiVerifierLaunchFailed, verify(&process, "/nonexistent/spica-node", entry, verify_timeout_ms, &version, &length));
     try std.testing.expectEqual(@as(usize, 0), length);
     try std.testing.expectEqual(@as(c_int, 0), process.pid);
@@ -443,7 +458,7 @@ test "startup diagnostics name paths, versions and overrides without control byt
         .{ .err = error.PiVersionMismatch, .failure = .{ .node = "/opt/node", .entry = "/opt/pi/cli.js" }, .needles = &.{ "/opt/pi/cli.js printed no version", "--pi-entry" } },
         .{ .err = error.PiVerifierLaunchFailed, .failure = failure, .needles = &.{ "/opt/node", "/opt/pi/cli.js", "--node" } },
         .{ .err = error.PiVerifierFailed, .failure = failure, .needles = &.{ "exited with an error", "--node /opt/node", "--pi-entry /opt/pi/cli.js" } },
-        .{ .err = error.PiVerifierTimedOut, .failure = failure, .needles = &.{ "timed out", "Force", "--node /opt/node", "--pi-entry /opt/pi/cli.js" } },
+        .{ .err = error.PiVerifierTimedOut, .failure = .{ .node = "/opt/node", .entry = "/opt/pi/cli.js", .timeout_ms = 750 }, .needles = &.{ "timed out after 750 ms", "Force", "--node /opt/node", "--pi-entry /opt/pi/cli.js" } },
         .{ .err = error.InvalidNodePath, .failure = .{ .node = "/bad\x1b[2J\nnode" }, .needles = &.{ "--node /bad?[2J?node is not", "--node /path/to/node" } },
         .{ .err = error.InvalidPiEntryPath, .failure = .{ .entry = "/pi/\xff/cli.js" }, .needles = &.{ "--pi-entry /pi/?/cli.js is not", "--pi-entry /path/to/cli.js" } },
         .{ .err = error.InvalidPiEntryPath, .failure = .{ .entry = "/Users/\xc3\xa5sa/cli.js" }, .needles = &.{"/Users/\xc3\xa5sa/cli.js"} },
