@@ -211,6 +211,8 @@ pub const Runtime = struct {
     stop_requested: bool = false,
     entries_inflight: bool = false,
     entries_again: bool = false,
+    failure_detail: ?[]u8 = null,
+    verify_timeout_ms: c_int = executables.verify_timeout_ms,
 
     pub fn create(a: std.mem.Allocator, io: std.Io, options: Options) !*Runtime {
         if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedRuntimeTarget;
@@ -311,6 +313,7 @@ pub const Runtime = struct {
             self.allocator.free(item.draft);
         }
         self.pending.deinit(self.allocator);
+        if (self.failure_detail) |detail| self.allocator.free(detail);
         p.spica_close(self.wake[0]);
         p.spica_close(self.wake[1]);
         native.SDL_DestroyMutex(self.mutex);
@@ -375,7 +378,10 @@ pub const Runtime = struct {
         }
     }
     fn fail(self: *Runtime, err: anyerror) void {
-        self.replace(&self.state.error_message, executables.errorMessage(err) orelse @errorName(err)) catch {};
+        const detail = self.failure_detail;
+        self.failure_detail = null;
+        defer if (detail) |bytes| self.allocator.free(bytes);
+        self.replace(&self.state.error_message, detail orelse executables.errorMessage(err) orelse @errorName(err)) catch {};
         self.recoverDrafts() catch {};
         self.state.status = .failed;
         self.publish() catch {};
@@ -551,11 +557,14 @@ pub const Runtime = struct {
     fn launch(self: *Runtime) !void {
         self.state.status = .starting;
         try self.publish();
-        const paths = try executables.resolve(self.allocator, self.io, &self.process, self.options.node_path, self.options.pi_entrypoint);
+        const paths = executables.resolve(self.allocator, self.io, &self.process, self.options.node_path, self.options.pi_entrypoint) catch |err|
+            return self.explain(err, .{ .node = self.options.node_path orelse "", .entry = self.options.pi_entrypoint orelse "" });
         defer paths.deinit(self.allocator);
         const node = paths.node;
         const entry = paths.entry;
-        if (p.spica_process_version(&self.process, node, entry) != 0) return error.PiVersionMismatchOrVerificationFailed;
+        var check: p.SpicaVersionCheck = undefined;
+        executables.verify(&self.process, node, entry, self.verify_timeout_ms, &check) catch |err|
+            return self.explain(err, executables.failureOf(node, entry, self.verify_timeout_ms, &check));
         const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.options.project_path, self.allocator);
         defer self.allocator.free(cwd);
         self.options.project_path = try self.options_arena.allocator().dupeZ(u8, cwd);
@@ -565,6 +574,11 @@ pub const Runtime = struct {
         try self.requestState();
         try self.queue(.{ .type = "get_available_models" });
         try self.queue(.{ .type = "get_available_thinking_levels" });
+    }
+    fn explain(self: *Runtime, err: anyerror, failure: executables.Failure) anyerror {
+        if (self.failure_detail) |detail| self.allocator.free(detail);
+        self.failure_detail = executables.describe(self.allocator, err, failure) catch null;
+        return err;
     }
     fn requestState(self: *Runtime) !void {
         try self.queue(.{ .type = "get_state", .id = self.state.generation });
@@ -1305,5 +1319,117 @@ test "completed agents reconcile idle state while queued work remains streaming"
         defer parsed.deinit();
         try runtime.event(parsed.value, @splat(0));
         try std.testing.expectEqual(if (index == events.len - 1) Status.ready else Status.streaming, runtime.snapshot.?.status);
+    }
+}
+
+fn reapLaunchTestChild(process: *p.SpicaProcess) !void {
+    var attempts: usize = 0;
+    while (process.pid > 0) : (attempts += 1) {
+        if (attempts == 200) return error.TestChildNotReaped;
+        var status: c_int = 0;
+        if (p.spica_process_reap(process, &status) == 1) break;
+        var polling = process.*;
+        polling.input = -1;
+        polling.output = -1;
+        polling.@"error" = -1;
+        _ = p.spica_process_poll(&polling, -1, 0, 50);
+    }
+}
+
+test "pi startup verification failures never spawn rpc and a timed-out verifier stays owned until forced" {
+    const signal = @cImport(@cInclude("signal.h"));
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const mutex = native.SDL_CreateMutex() orelse return error.MutexCreation;
+    defer native.SDL_DestroyMutex(mutex);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "node", .data = "#!/bin/sh\nexec /bin/sh \"$@\"\n", .flags = .{ .permissions = .fromMode(0o755) } });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const node = try std.fs.path.join(allocator, &.{ root, "node" });
+    defer allocator.free(node);
+    const entry = try std.fs.path.join(allocator, &.{ root, "cli.js" });
+    defer allocator.free(entry);
+    const marker = try std.fs.path.join(allocator, &.{ root, "rpc-started" });
+    defer allocator.free(marker);
+    const sleeper = try std.fs.path.join(allocator, &.{ root, "sleeper" });
+    defer allocator.free(sleeper);
+    const Case = struct { version: []const u8, expected: ?anyerror, mention: []const u8 };
+    const cases = [_]Case{
+        .{ .version = "printf '0.9.0\\n'", .expected = error.PiVersionMismatch, .mention = "found 0.9.0" },
+        .{ .version = "printf '1.0.0\\n'; echo 'Error: broken install' >&2; exit 7", .expected = error.PiVerifierFailed, .mention = "exited with status 7 (Error: broken install)" },
+        .{ .version = "sleep 30 & printf '%s' $! > \"$SLEEPER\"; wait", .expected = error.PiVerifierTimedOut, .mention = "timed out after 300 ms" },
+        .{ .version = "printf '1.0.0\\n'", .expected = null, .mention = "" },
+    };
+    for (cases) |case| {
+        const script = try std.fmt.allocPrint(allocator, "SLEEPER=\"{s}\"\nif [ \"$1\" = --version ]; then {s}; exit 0; fi\n: > \"{s}\"\n", .{ sleeper, case.version, marker });
+        defer allocator.free(script);
+        try tmp.dir.writeFile(io, .{ .sub_path = "cli.js", .data = script });
+        tmp.dir.deleteFile(io, "rpc-started") catch {};
+        var runtime: Runtime = .{
+            .allocator = allocator,
+            .io = io,
+            .options = .{ .database_path = "", .project_path = root, .node_path = node, .pi_entrypoint = entry, .wake_event = native.SDL_EVENT_USER },
+            .options_arena = .init(allocator),
+            .mutex = mutex,
+            .wake = undefined,
+            .state = try copySnapshot(allocator, .{ .allocator = allocator }),
+            .verify_timeout_ms = 300,
+        };
+        defer {
+            if (runtime.process.pid > 0) {
+                _ = p.spica_process_force(&runtime.process);
+                reapLaunchTestChild(&runtime.process) catch {};
+            }
+            p.spica_process_dispose(&runtime.process);
+            if (runtime.failure_detail) |detail| allocator.free(detail);
+            runtime.inputs.deinit(allocator);
+            runtime.outgoing.deinit(allocator);
+            if (runtime.snapshot) |*snapshot| snapshot.deinit();
+            runtime.state.deinit();
+            runtime.options_arena.deinit();
+        }
+        const expected = case.expected orelse {
+            try runtime.launch();
+            try std.testing.expect(runtime.process.pid > 0);
+            try std.testing.expect(runtime.failure_detail == null);
+            try reapLaunchTestChild(&runtime.process);
+            _ = try tmp.dir.statFile(io, "rpc-started", .{});
+            continue;
+        };
+        const err = runtime.launch();
+        try std.testing.expectError(expected, err);
+        const detail = runtime.failure_detail.?;
+        for ([_][]const u8{ case.mention, node, entry }) |needle| try std.testing.expect(std.mem.indexOf(u8, detail, needle) != null);
+        runtime.fail(expected);
+        try std.testing.expectEqual(Status.failed, runtime.state.status);
+        try std.testing.expect(runtime.failure_detail == null);
+        try std.testing.expect(std.mem.indexOf(u8, runtime.state.error_message, case.mention) != null);
+        if (expected == error.PiVerifierTimedOut) {
+            const owned = runtime.process.pid;
+            try std.testing.expect(owned > 0);
+            runtime.state.status = .stopped;
+            try runtime.inputs.append(allocator, .start);
+            try runtime.processInputs();
+            try std.testing.expectEqual(owned, runtime.process.pid);
+            try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "rpc-started", .{}));
+            var pid_bytes: [32]u8 = undefined;
+            const sleeper_pid = try std.fmt.parseInt(c_int, try tmp.dir.readFile(io, "sleeper", &pid_bytes), 10);
+            try std.testing.expectEqual(@as(c_int, 0), p.spica_process_force(&runtime.process));
+            try reapLaunchTestChild(&runtime.process);
+            var attempts: usize = 0;
+            while (signal.kill(sleeper_pid, 0) == 0) : (attempts += 1) {
+                if (attempts == 200) return error.TestVerifierDescendantLeaked;
+                var idle: p.SpicaProcess = .{ .input = -1, .output = -1, .@"error" = -1, .exit_fd = -1, .pid = 0 };
+                _ = p.spica_process_poll(&idle, -1, 0, 10);
+            }
+        } else {
+            try std.testing.expectEqual(@as(c_int, 0), runtime.process.pid);
+            try runtime.inputs.append(allocator, .start);
+            try runtime.processInputs();
+        }
+        try std.testing.expectEqual(@as(c_int, 0), runtime.process.pid);
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "rpc-started", .{}));
     }
 }
