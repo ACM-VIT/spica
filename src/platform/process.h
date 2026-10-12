@@ -5,13 +5,23 @@
 typedef struct {
     int input, output, error, exit_fd, pid;
 } SpicaProcess;
+enum {
+    SPICA_PROCESS_OK = 0,
+    SPICA_PROCESS_SPAWN_FAILED = -1,
+    SPICA_PROCESS_EXIT_FAILED = -2,
+    SPICA_PROCESS_TIMED_OUT = -3,
+    SPICA_PROCESS_OUTPUT_OVERFLOW = -4,
+    SPICA_PROCESS_WAIT_FAILED = -5,
+    SPICA_PROCESS_VERSION_MISMATCH = -6,
+};
 int spica_wake_create(int fds[2]);
 void spica_wake(int fd);
 void spica_close(int fd);
 int spica_process_spawn(SpicaProcess *p, const char *node, const char *entry, const char *cwd,
                         const char *resume, int trust);
 /* A verifier that fails while still alive remains owned in p for explicit shutdown. */
-int spica_process_version(SpicaProcess *p, const char *node, const char *entry);
+int spica_process_version(SpicaProcess *p, const char *node, const char *entry, char *version,
+                          size_t capacity, size_t *length);
 /* Bounded, five-second global npm lookup, run with the resolved Node executable.
  * A failed lookup still alive remains owned in p, just like the version verifier. */
 int spica_process_npm_root(SpicaProcess *p, const char *node, const char *npm, char *output,

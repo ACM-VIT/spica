@@ -245,6 +245,7 @@ test "automatic discovery skips project-controlled empty and relative PATH entri
     defer std.debug.assert(posix.chdir(original_cwd) == 0);
     var process = testProcess();
     defer c.spica_process_dispose(&process);
+    var version_length: usize = 0;
     for ([_][]const u8{ "", ".", "bin", "./bin", "../project/bin", ":.", ".:", "::" }) |unsafe_path| {
         inline for (.{ "node", "pi", "npm" }) |name| {
             const js = !std.mem.eql(u8, name, "node");
@@ -263,7 +264,7 @@ test "automatic discovery skips project-controlled empty and relative PATH entri
         defer found.deinit(a);
         try std.testing.expect(std.mem.endsWith(u8, found.node, "/installed/node"));
         try std.testing.expect(std.mem.endsWith(u8, found.entry, "/installed/cli.js"));
-        try std.testing.expectEqual(@as(c_int, 0), c.spica_process_version(&process, found.node, found.entry));
+        try std.testing.expectEqual(@as(c_int, c.SPICA_PROCESS_OK), c.spica_process_version(&process, found.node, found.entry, null, 0, &version_length));
     }
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "project/executed", .{}));
     // Project-local tools remain available when explicitly selected by the user.
@@ -292,11 +293,12 @@ test "npm fallback uses resolved Node, global lookup and bounded output without 
     defer a.free(bin);
     var process = testProcess();
     defer c.spica_process_dispose(&process);
+    var version_length: usize = 0;
     const found = try discover(a, io, &process, null, null, null, &.{bin});
     defer found.deinit(a);
     try std.testing.expect(std.mem.endsWith(u8, found.entry, "/global packages /" ++ pi_suffix));
     try std.testing.expectEqual(@as(c_int, 0), process.pid);
-    try std.testing.expectEqual(@as(c_int, 0), c.spica_process_version(&process, found.node, found.entry));
+    try std.testing.expectEqual(@as(c_int, c.SPICA_PROCESS_OK), c.spica_process_version(&process, found.node, found.entry, null, 0, &version_length));
     try testFile(tmp.dir, "bin/npm-cli.js", "printf 'relative/package/path\\n'\n", false);
     try std.testing.expectError(error.NpmGlobalLookupFailed, discover(a, io, &process, null, null, bin, &.{}));
     try testFile(tmp.dir, "bin/npm-cli.js", "i=0; while [ $i -lt 5000 ]; do printf x; i=$((i+1)); done\n", false);
