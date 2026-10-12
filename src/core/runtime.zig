@@ -1358,7 +1358,7 @@ test "pi startup verification failures never spawn rpc and a timed-out verifier 
     const Case = struct { version: []const u8, expected: ?anyerror, mention: []const u8 };
     const cases = [_]Case{
         .{ .version = "printf '0.9.0\\n'", .expected = error.PiVersionMismatch, .mention = "found 0.9.0" },
-        .{ .version = "printf '1.0.0\\n'; exit 7", .expected = error.PiVerifierFailed, .mention = "exited with status 7" },
+        .{ .version = "printf '1.0.0\\n'; echo 'Error: broken install' >&2; exit 7", .expected = error.PiVerifierFailed, .mention = "exited with status 7 (Error: broken install)" },
         .{ .version = "sleep 30 & printf '%s' $! > \"$SLEEPER\"; wait", .expected = error.PiVerifierTimedOut, .mention = "timed out after 300 ms" },
         .{ .version = "printf '1.0.0\\n'", .expected = null, .mention = "" },
     };

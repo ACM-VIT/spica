@@ -469,10 +469,24 @@ test "version verifier separates mismatch, failure and launch errors and rejects
         try std.testing.expectEqualStrings(case.version, check.output[0..check.output_length]);
         try std.testing.expectEqual(case.exit_code, check.exit_code);
         try std.testing.expectEqual(case.signal, check.signal);
+        try std.testing.expectEqual(@as(usize, 0), check.stderr_length);
         try std.testing.expectEqual(@as(c_int, 0), process.pid);
     }
     const entry = try tmp.dir.realPathFileAlloc(io, "cli.js", a);
     defer a.free(entry);
+    try testFile(tmp.dir, "cli.js", "printf '/x/cli.js:1\\nclass E extends Error {}\\n\\nError: Cannot find module \\047y\\047\\n    at load\\n' >&2; exit 1\n", false);
+    try std.testing.expectError(error.PiVerifierFailed, verify(&process, node, entry, verify_timeout_ms, &check));
+    try std.testing.expectEqual(@as(c_int, 1), check.exit_code);
+    try std.testing.expectEqual(@as(c_int, 0), check.stderr_truncated);
+    try std.testing.expectEqualStrings("Error: Cannot find module 'y'", stderrSummary(check.stderr_tail[0..check.stderr_length], false));
+    try testFile(tmp.dir, "cli.js", "i=0; while [ $i -lt 9000 ]; do printf x >&2; i=$((i+1)); done; printf '\\nTypeError: late failure\\n' >&2; exit 2\n", false);
+    try std.testing.expectError(error.PiVerifierFailed, verify(&process, node, entry, verify_timeout_ms, &check));
+    try std.testing.expectEqual(@as(c_int, 1), check.stderr_truncated);
+    try std.testing.expectEqual(check.stderr_tail.len, check.stderr_length);
+    try std.testing.expect(std.mem.endsWith(u8, check.stderr_tail[0..check.stderr_length], "xx\nTypeError: late failure\n"));
+    const failed = failureOf(node, entry, verify_timeout_ms, &check);
+    try std.testing.expectEqualStrings("TypeError: late failure", stderrSummary(failed.stderr, failed.stderr_truncated));
+    try std.testing.expectEqual(@as(c_int, 0), process.pid);
     try testFile(tmp.dir, "cli.js", "printf '1.0.'\nexec sleep 30\n", false);
     try std.testing.expectError(error.PiVerifierTimedOut, verify(&process, node, entry, 200, &check));
     try std.testing.expectEqualStrings("1.0.", check.output[0..check.output_length]);
@@ -504,6 +518,20 @@ fn expectMentions(message: []const u8, needles: []const []const u8) !void {
     for (message) |byte| try std.testing.expect(byte >= 0x20 and byte != 0x7f);
 }
 
+test "stderr summaries prefer error lines over minified source and partial lines" {
+    const Case = struct { bytes: []const u8, truncated: bool = false, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .bytes = "/p/cli.js:1\nvar a=class extends Error{};throw new TypeError: x\n ^\n\nTypeError: bad argument\n    at f (/p/cli.js:1:9)\n", .expected = "TypeError: bad argument" },
+        .{ .bytes = "node:internal/modules/cjs/loader:1228\n  throw err;\n\nError [ERR_MODULE_NOT_FOUND]: Cannot find package 'x'\n", .expected = "Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'x'" },
+        .{ .bytes = "\r\n  node: bad option: --version\r\n", .expected = "node: bad option: --version" },
+        .{ .bytes = "Error: cut off\nstill going\n", .truncated = true, .expected = "still going" },
+        .{ .bytes = "Errors happen: not a name\nMyError:x\n", .expected = "MyError:x" },
+        .{ .bytes = "", .expected = "" },
+        .{ .bytes = "\n \n", .expected = "" },
+    };
+    for (cases) |case| try std.testing.expectEqualStrings(case.expected, stderrSummary(case.bytes, case.truncated));
+}
+
 test "startup diagnostics name paths, versions and overrides without control bytes" {
     const a = std.testing.allocator;
     const failure: Failure = .{ .node = "/opt/node", .entry = "/opt/pi/cli.js", .version = "0.9.0\n" };
@@ -515,6 +543,7 @@ test "startup diagnostics name paths, versions and overrides without control byt
         .{ .err = error.PiVerifierFailed, .failure = failure, .needles = &.{ "exited with status -1", "--node /opt/node", "--pi-entry /opt/pi/cli.js" } },
         .{ .err = error.PiVerifierFailed, .failure = .{ .node = "/opt/node", .entry = "/opt/pi/cli.js", .exit_code = 3 }, .needles = &.{"exited with status 3"} },
         .{ .err = error.PiVerifierFailed, .failure = .{ .node = "/opt/node", .entry = "/opt/pi/cli.js", .signal = 9 }, .needles = &.{"killed by signal 9"} },
+        .{ .err = error.PiVerifierFailed, .failure = .{ .node = "/opt/node", .entry = "/opt/pi/cli.js", .exit_code = 1, .stderr = "x\nError: no \x1b[31mred\n" }, .needles = &.{ "exited with status 1 (Error: no ?[31mred)", "--pi-entry /opt/pi/cli.js" } },
         .{ .err = error.PiVerifierWaitFailed, .failure = failure, .needles = &.{ "could not be completed", "Force", "--node /opt/node", "--pi-entry /opt/pi/cli.js" } },
         .{ .err = error.PiVerifierTimedOut, .failure = .{ .node = "/opt/node", .entry = "/opt/pi/cli.js", .timeout_ms = 750 }, .needles = &.{ "timed out after 750 ms", "Force", "--node /opt/node", "--pi-entry /opt/pi/cli.js" } },
         .{ .err = error.InvalidNodePath, .failure = .{ .node = "/bad\x1b[2J\nnode" }, .needles = &.{ "--node /bad?[2J?node is not", "--node /path/to/node" } },
