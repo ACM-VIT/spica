@@ -35,6 +35,8 @@ pub fn resolve(allocator: std.mem.Allocator, io: std.Io, process: *c.SpicaProces
 
 pub fn verify(process: *c.SpicaProcess, node: [:0]const u8, entry: [:0]const u8, timeout_ms: c_int, check: *c.SpicaVersionCheck) !void {
     check.output_length = 0;
+    check.stderr_length = 0;
+    check.stderr_truncated = 0;
     check.exit_code = -1;
     check.signal = 0;
     return switch (c.spica_process_version(process, node.ptr, entry.ptr, timeout_ms, check)) {
@@ -156,6 +158,8 @@ pub const Failure = struct {
     timeout_ms: c_int = verify_timeout_ms,
     exit_code: c_int = -1,
     signal: c_int = 0,
+    stderr: []const u8 = "",
+    stderr_truncated: bool = false,
 };
 
 pub fn failureOf(node: []const u8, entry: []const u8, timeout_ms: c_int, check: *const c.SpicaVersionCheck) Failure {
@@ -166,7 +170,33 @@ pub fn failureOf(node: []const u8, entry: []const u8, timeout_ms: c_int, check: 
         .timeout_ms = timeout_ms,
         .exit_code = check.exit_code,
         .signal = check.signal,
+        .stderr = check.stderr_tail[0..@min(check.stderr_length, check.stderr_tail.len)],
+        .stderr_truncated = check.stderr_truncated != 0,
     };
+}
+
+fn errorName(line: []const u8) bool {
+    var end: usize = 0;
+    while (end < line.len and (std.ascii.isAlphanumeric(line[end]) or line[end] == '_' or line[end] == '$')) end += 1;
+    if (!std.mem.endsWith(u8, line[0..end], "Error")) return false;
+    const rest = line[end..];
+    return std.mem.startsWith(u8, rest, ":") or std.mem.startsWith(u8, rest, " [");
+}
+
+pub fn stderrSummary(bytes: []const u8, truncated: bool) []const u8 {
+    var fallback: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var first = true;
+    while (lines.next()) |raw| {
+        const partial = first and truncated;
+        first = false;
+        if (partial) continue;
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (errorName(line)) return line;
+        if (fallback.len == 0) fallback = line;
+    }
+    return fallback;
 }
 
 const Shown = struct {
@@ -208,6 +238,8 @@ pub fn describe(allocator: std.mem.Allocator, err: anyerror, failure: Failure) !
         error.PiVerifierLaunchFailed => try std.fmt.allocPrint(allocator, "Could not run Node at {f} to check Pi. Pass --node /path/to/node. Pi entry: {f}", .{ shown(failure.node), shown(failure.entry) }),
         error.PiVerifierFailed => if (failure.signal > 0)
             try std.fmt.allocPrint(allocator, "Pi version check was killed by signal {d}. Check --node {f} and --pi-entry {f}.", .{ failure.signal, shown(failure.node), shown(failure.entry) })
+        else if (stderrSummary(failure.stderr, failure.stderr_truncated).len > 0)
+            try std.fmt.allocPrint(allocator, "Pi version check exited with status {d} ({f}). Check --node {f} and --pi-entry {f}.", .{ failure.exit_code, shown(stderrSummary(failure.stderr, failure.stderr_truncated)), shown(failure.node), shown(failure.entry) })
         else
             try std.fmt.allocPrint(allocator, "Pi version check exited with status {d}. Check --node {f} and --pi-entry {f}.", .{ failure.exit_code, shown(failure.node), shown(failure.entry) }),
         error.PiVerifierWaitFailed => try std.fmt.allocPrint(allocator, "Pi version check could not be completed; Force stop it if it is still running, then check --node {f} and --pi-entry {f}.", .{ shown(failure.node), shown(failure.entry) }),

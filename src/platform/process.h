@@ -10,6 +10,9 @@ typedef struct {
 typedef struct {
     char output[256];
     size_t output_length;
+    char stderr_tail[4096];
+    size_t stderr_length;
+    int stderr_truncated;
     int exit_code, signal;
 } SpicaVersionCheck;
 enum {

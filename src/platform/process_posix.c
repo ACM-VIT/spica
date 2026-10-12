@@ -205,8 +205,34 @@ static void capture_stdout(SpicaProcess *p, char *out, size_t capacity, size_t *
         *n += add;
     }
 }
+static void capture_stderr(SpicaProcess *p, char *tail, size_t capacity, size_t *n, int *truncated) {
+    for (int i = 0; i < 64; i++) {
+        char b[1024];
+        long r = spica_process_read(p->error, b, sizeof b);
+        if (r <= 0)
+            break;
+        if (!tail || !capacity)
+            continue;
+        size_t add = (size_t)r;
+        const char *from = b;
+        if (add >= capacity) {
+            from += add - capacity;
+            add = capacity;
+            *n = 0;
+            *truncated = 1;
+        } else if (add > capacity - *n) {
+            size_t drop = add - (capacity - *n);
+            memmove(tail, tail + drop, *n - drop);
+            *n -= drop;
+            *truncated = 1;
+        }
+        memcpy(tail + *n, from, add);
+        *n += add;
+    }
+}
 static int capture(SpicaProcess *p, const char *node, char *const argv[], int timeout_ms, char *out,
-                   size_t capacity, size_t *length, int *wait_status) {
+                   size_t capacity, size_t *length, int *wait_status, char *tail,
+                   size_t tail_capacity, size_t *tail_length, int *tail_truncated) {
     *length = 0;
     if (spawn(p, node, argv, "/"))
         return SPICA_PROCESS_SPAWN_FAILED;
@@ -230,11 +256,8 @@ static int capture(SpicaProcess *p, const char *node, char *const argv[], int ti
             break;
         if (f[0].revents)
             capture_stdout(p, out, capacity, &n, &overflow);
-        if (f[1].revents) {
-            char b[1024];
-            for (int i = 0; i < 64 && spica_process_read(p->error, b, sizeof b) > 0; i++) {
-            }
-        }
+        if (f[1].revents)
+            capture_stderr(p, tail, tail_capacity, tail_length, tail_truncated);
         if (f[2].revents) {
             int reaped = spica_process_reap(p, &status);
             if (reaped < 0) {
@@ -243,6 +266,7 @@ static int capture(SpicaProcess *p, const char *node, char *const argv[], int ti
             }
             if (reaped == 1) {
                 capture_stdout(p, out, capacity, &n, &overflow);
+                capture_stderr(p, tail, tail_capacity, tail_length, tail_truncated);
                 if (wait_status)
                     *wait_status = status;
                 result = !(WIFEXITED(status) && WEXITSTATUS(status) == 0) ? SPICA_PROCESS_EXIT_FAILED
@@ -264,10 +288,13 @@ int spica_process_version(SpicaProcess *p, const char *node, const char *entry, 
     char *out = check->output;
     int status = -1;
     check->output_length = 0;
+    check->stderr_length = 0;
+    check->stderr_truncated = 0;
     check->exit_code = -1;
     check->signal = 0;
     int result = capture(p, node, argv, timeout_ms, out, sizeof check->output, &check->output_length,
-                         &status);
+                         &status, check->stderr_tail, sizeof check->stderr_tail,
+                         &check->stderr_length, &check->stderr_truncated);
     size_t n = check->output_length;
     if (status != -1 && WIFEXITED(status))
         check->exit_code = WEXITSTATUS(status);
@@ -285,5 +312,8 @@ int spica_process_npm_root(SpicaProcess *p, const char *node, const char *npm, c
                            size_t capacity, size_t *length) {
     /* npm is its resolved JS entry, not a shell command; Finder need not expose node on PATH. */
     char *argv[] = {(char *)node, (char *)npm, "root", "-g", "--loglevel=error", 0};
-    return capture(p, node, argv, 5000, output, capacity, length, 0);
+    size_t ignored_length = 0;
+    int ignored_truncated = 0;
+    return capture(p, node, argv, 5000, output, capacity, length, 0, 0, 0, &ignored_length,
+                   &ignored_truncated);
 }
