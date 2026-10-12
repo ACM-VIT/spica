@@ -269,8 +269,9 @@ int spica_process_version(SpicaProcess *p, const char *node, const char *entry, 
     *length = version ? copy : 0;
     if (result)
         return result;
-    return ((n == 6 && out[5] == '\n') || (n == 7 && out[5] == '\r' && out[6] == '\n')) &&
-                   !memcmp(out, "1.0.0", 5)
+    size_t v = sizeof SPICA_PI_VERSION - 1;
+    return ((n == v + 1 && out[v] == '\n') || (n == v + 2 && out[v] == '\r' && out[v + 1] == '\n')) &&
+                   !memcmp(out, SPICA_PI_VERSION, v)
                ? SPICA_PROCESS_OK
                : SPICA_PROCESS_VERSION_MISMATCH;
 }

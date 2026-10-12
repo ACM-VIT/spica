@@ -5,6 +5,7 @@
 typedef struct {
     int input, output, error, exit_fd, pid;
 } SpicaProcess;
+#define SPICA_PI_VERSION "1.0.0"
 enum {
     SPICA_PROCESS_OK = 0,
     SPICA_PROCESS_SPAWN_FAILED = -1,

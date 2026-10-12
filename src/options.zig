@@ -1,4 +1,5 @@
 const std = @import("std");
+const pi_version = @import("platform/executables.zig").pi_version;
 
 pub const Options = struct {
     data_dir: ?[]const u8 = null,
@@ -50,7 +51,8 @@ pub const help =
     \\
     \\Software is the lower-residency default. Neither backend has passed the 32 MiB gate.
     \\Pi starts automatically. Project resources are disabled unless --trust-project is given.
-    \\The real-process application runs on Linux and macOS, pinned to Pi 1.0.0.
+    \\The real-process application runs on Linux and macOS, pinned to Pi
+++ " " ++ pi_version ++ ".\n" ++
     \\Node and Pi are discovered through PATH, platform bin directories, then npm root -g.
     \\--node and --pi-entry override discovery; the README shows manual examples.
     \\--resume is explicit, not replay.

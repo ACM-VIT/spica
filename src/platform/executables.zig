@@ -5,6 +5,7 @@ pub const c = @cImport({
     @cInclude("stdlib.h");
 });
 
+pub const pi_version: []const u8 = c.SPICA_PI_VERSION;
 const pi_suffix = "@earendil-works/pi-coding-agent/dist/bundle/cli.js";
 
 pub const Executables = struct {
@@ -183,9 +184,9 @@ pub fn describe(allocator: std.mem.Allocator, err: anyerror, failure: Failure) !
         error.InvalidNodePath => try std.fmt.allocPrint(allocator, "--node {f} is not an executable file. Pass --node /path/to/node.", .{shown(failure.node)}),
         error.InvalidPiEntryPath => try std.fmt.allocPrint(allocator, "--pi-entry {f} is not a readable file. Pass --pi-entry /path/to/cli.js.", .{shown(failure.entry)}),
         error.PiVersionMismatch => if (version.len == 0)
-            try std.fmt.allocPrint(allocator, "Pi 1.0.0 required; {f} printed no version. Pass --pi-entry /path/to/cli.js. Node: {f}", .{ shown(failure.entry), shown(failure.node) })
+            try std.fmt.allocPrint(allocator, "Pi " ++ pi_version ++ " required; {f} printed no version. Pass --pi-entry /path/to/cli.js. Node: {f}", .{ shown(failure.entry), shown(failure.node) })
         else
-            try std.fmt.allocPrint(allocator, "Pi 1.0.0 required, found {f} at {f}. Pass --pi-entry /path/to/cli.js. Node: {f}", .{ shown(version), shown(failure.entry), shown(failure.node) }),
+            try std.fmt.allocPrint(allocator, "Pi " ++ pi_version ++ " required, found {f} at {f}. Pass --pi-entry /path/to/cli.js. Node: {f}", .{ shown(version), shown(failure.entry), shown(failure.node) }),
         error.PiVerifierLaunchFailed => try std.fmt.allocPrint(allocator, "Could not run Node at {f} to check Pi. Pass --node /path/to/node. Pi entry: {f}", .{ shown(failure.node), shown(failure.entry) }),
         error.PiVerifierFailed => try std.fmt.allocPrint(allocator, "Pi version check exited with an error. Check --node {f} and --pi-entry {f}.", .{ shown(failure.node), shown(failure.entry) }),
         error.PiVerifierTimedOut => try std.fmt.allocPrint(allocator, "Pi version check timed out after 5s; Force stop it, then check --node {f} and --pi-entry {f}.", .{ shown(failure.node), shown(failure.entry) }),
@@ -198,9 +199,9 @@ pub fn errorMessage(err: anyerror) ?[]const u8 {
         error.NodeNotFound => "Node was not found. Install Node or pass --node /path/to/node. Finder may not see nvm/fnm; launch Spica from your terminal or use explicit paths.",
         error.InvalidNodePath => "The --node path is not an executable file. Pass --node /path/to/node.",
         error.InvalidPiEntryPath => "The --pi-entry path is not a readable file. Pass --pi-entry /path/to/cli.js.",
-        error.PiEntryNotFound => "Pi's JavaScript entry was not found. Install Pi 1.0.0 or pass --pi-entry /path/to/cli.js (and --node /path/to/node if needed). Unrecognized shell wrappers require an explicit JS entry.",
+        error.PiEntryNotFound => "Pi's JavaScript entry was not found. Install Pi " ++ pi_version ++ " or pass --pi-entry /path/to/cli.js (and --node /path/to/node if needed). Unrecognized shell wrappers require an explicit JS entry.",
         error.NpmGlobalLookupFailed => "npm root -g failed or timed out. Pass --pi-entry /path/to/cli.js and, if needed, --node /path/to/node.",
-        error.PiVersionMismatch => "Pi 1.0.0 is required but a different version was found. Install Pi 1.0.0 or pass --pi-entry /path/to/cli.js.",
+        error.PiVersionMismatch => "Pi " ++ pi_version ++ " is required but a different version was found. Install Pi " ++ pi_version ++ " or pass --pi-entry /path/to/cli.js.",
         error.PiVerifierLaunchFailed => "Node could not be started to check Pi's version. Pass --node /path/to/node.",
         error.PiVerifierFailed => "Pi's version check failed. Pass --pi-entry /path/to/cli.js and, if needed, --node /path/to/node.",
         error.PiVerifierTimedOut => "Pi's version check did not finish within 5 seconds; it is still owned and can be force stopped. Check --node and --pi-entry.",
