@@ -6,6 +6,7 @@ pub const c = @cImport({
 });
 
 pub const pi_version: []const u8 = c.SPICA_PI_VERSION;
+pub const verify_timeout_ms: c_int = c.SPICA_PI_VERIFY_TIMEOUT_MS;
 const pi_suffix = "@earendil-works/pi-coding-agent/dist/bundle/cli.js";
 
 pub const Executables = struct {
@@ -32,9 +33,9 @@ pub fn resolve(allocator: std.mem.Allocator, io: std.Io, process: *c.SpicaProces
     return discover(allocator, io, process, node, entry, path, fallbackDirectories(builtin.os.tag));
 }
 
-pub fn verify(process: *c.SpicaProcess, node: [:0]const u8, entry: [:0]const u8, version: []u8, length: *usize) !void {
+pub fn verify(process: *c.SpicaProcess, node: [:0]const u8, entry: [:0]const u8, timeout_ms: c_int, version: []u8, length: *usize) !void {
     length.* = 0;
-    return switch (c.spica_process_version(process, node.ptr, entry.ptr, version.ptr, version.len, length)) {
+    return switch (c.spica_process_version(process, node.ptr, entry.ptr, timeout_ms, version.ptr, version.len, length)) {
         c.SPICA_PROCESS_OK => {},
         c.SPICA_PROCESS_VERSION_MISMATCH, c.SPICA_PROCESS_OUTPUT_OVERFLOW => error.PiVersionMismatch,
         c.SPICA_PROCESS_SPAWN_FAILED => error.PiVerifierLaunchFailed,
@@ -149,6 +150,7 @@ pub const Failure = struct {
     node: []const u8 = "",
     entry: []const u8 = "",
     version: []const u8 = "",
+    timeout_ms: c_int = verify_timeout_ms,
 };
 
 const Shown = struct {
@@ -189,7 +191,7 @@ pub fn describe(allocator: std.mem.Allocator, err: anyerror, failure: Failure) !
             try std.fmt.allocPrint(allocator, "Pi " ++ pi_version ++ " required, found {f} at {f}. Pass --pi-entry /path/to/cli.js. Node: {f}", .{ shown(version), shown(failure.entry), shown(failure.node) }),
         error.PiVerifierLaunchFailed => try std.fmt.allocPrint(allocator, "Could not run Node at {f} to check Pi. Pass --node /path/to/node. Pi entry: {f}", .{ shown(failure.node), shown(failure.entry) }),
         error.PiVerifierFailed => try std.fmt.allocPrint(allocator, "Pi version check exited with an error. Check --node {f} and --pi-entry {f}.", .{ shown(failure.node), shown(failure.entry) }),
-        error.PiVerifierTimedOut => try std.fmt.allocPrint(allocator, "Pi version check timed out after 5s; Force stop it, then check --node {f} and --pi-entry {f}.", .{ shown(failure.node), shown(failure.entry) }),
+        error.PiVerifierTimedOut => try std.fmt.allocPrint(allocator, "Pi version check timed out after {d} ms; Force stop it, then check --node {f} and --pi-entry {f}.", .{ failure.timeout_ms, shown(failure.node), shown(failure.entry) }),
         else => null,
     };
 }
@@ -204,7 +206,7 @@ pub fn errorMessage(err: anyerror) ?[]const u8 {
         error.PiVersionMismatch => "Pi " ++ pi_version ++ " is required but a different version was found. Install Pi " ++ pi_version ++ " or pass --pi-entry /path/to/cli.js.",
         error.PiVerifierLaunchFailed => "Node could not be started to check Pi's version. Pass --node /path/to/node.",
         error.PiVerifierFailed => "Pi's version check failed. Pass --pi-entry /path/to/cli.js and, if needed, --node /path/to/node.",
-        error.PiVerifierTimedOut => "Pi's version check did not finish within 5 seconds; it is still owned and can be force stopped. Check --node and --pi-entry.",
+        error.PiVerifierTimedOut => "Pi's version check did not finish in time; it is still owned and can be force stopped. Check --node and --pi-entry.",
         else => null,
     };
 }
@@ -329,7 +331,7 @@ test "automatic discovery skips project-controlled empty and relative PATH entri
         defer found.deinit(a);
         try std.testing.expect(std.mem.endsWith(u8, found.node, "/installed/node"));
         try std.testing.expect(std.mem.endsWith(u8, found.entry, "/installed/cli.js"));
-        try std.testing.expectEqual(@as(c_int, c.SPICA_PROCESS_OK), c.spica_process_version(&process, found.node, found.entry, null, 0, &version_length));
+        try std.testing.expectEqual(@as(c_int, c.SPICA_PROCESS_OK), c.spica_process_version(&process, found.node, found.entry, verify_timeout_ms, null, 0, &version_length));
     }
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "project/executed", .{}));
     // Project-local tools remain available when explicitly selected by the user.
@@ -363,7 +365,7 @@ test "npm fallback uses resolved Node, global lookup and bounded output without 
     defer found.deinit(a);
     try std.testing.expect(std.mem.endsWith(u8, found.entry, "/global packages /" ++ pi_suffix));
     try std.testing.expectEqual(@as(c_int, 0), process.pid);
-    try std.testing.expectEqual(@as(c_int, c.SPICA_PROCESS_OK), c.spica_process_version(&process, found.node, found.entry, null, 0, &version_length));
+    try std.testing.expectEqual(@as(c_int, c.SPICA_PROCESS_OK), c.spica_process_version(&process, found.node, found.entry, verify_timeout_ms, null, 0, &version_length));
     try testFile(tmp.dir, "bin/npm-cli.js", "printf 'relative/package/path\\n'\n", false);
     try std.testing.expectError(error.NpmGlobalLookupFailed, discover(a, io, &process, null, null, bin, &.{}));
     try testFile(tmp.dir, "bin/npm-cli.js", "i=0; while [ $i -lt 5000 ]; do printf x; i=$((i+1)); done\n", false);
@@ -410,14 +412,14 @@ test "version verifier separates mismatch, failure and launch errors and rejects
         const entry = try tmp.dir.realPathFileAlloc(io, "cli.js", a);
         defer a.free(entry);
         if (case.expected) |expected| {
-            try std.testing.expectError(expected, verify(&process, node, entry, &version, &length));
-        } else try verify(&process, node, entry, &version, &length);
+            try std.testing.expectError(expected, verify(&process, node, entry, verify_timeout_ms, &version, &length));
+        } else try verify(&process, node, entry, verify_timeout_ms, &version, &length);
         try std.testing.expectEqualStrings(case.version, version[0..length]);
         try std.testing.expectEqual(@as(c_int, 0), process.pid);
     }
     const entry = try tmp.dir.realPathFileAlloc(io, "cli.js", a);
     defer a.free(entry);
-    try std.testing.expectError(error.PiVerifierLaunchFailed, verify(&process, "/nonexistent/spica-node", entry, &version, &length));
+    try std.testing.expectError(error.PiVerifierLaunchFailed, verify(&process, "/nonexistent/spica-node", entry, verify_timeout_ms, &version, &length));
     try std.testing.expectEqual(@as(usize, 0), length);
     try std.testing.expectEqual(@as(c_int, 0), process.pid);
 }

@@ -205,7 +205,7 @@ static void capture_stdout(SpicaProcess *p, char *out, size_t capacity, size_t *
         *n += add;
     }
 }
-static int capture(SpicaProcess *p, const char *node, char *const argv[], char *out,
+static int capture(SpicaProcess *p, const char *node, char *const argv[], int timeout_ms, char *out,
                    size_t capacity, size_t *length) {
     *length = 0;
     if (spawn(p, node, argv, "/"))
@@ -214,7 +214,7 @@ static int capture(SpicaProcess *p, const char *node, char *const argv[], char *
     p->input = -1;
     size_t n = 0;
     int result = SPICA_PROCESS_TIMED_OUT, status = 0, overflow = 0;
-    long long deadline = ms() + 5000;
+    long long deadline = ms() + timeout_ms;
     for (;;) {
         struct pollfd f[3] = {
             {p->output, POLLIN, 0}, {p->error, POLLIN, 0}, {p->exit_fd, POLLIN, 0}};
@@ -256,13 +256,13 @@ static int capture(SpicaProcess *p, const char *node, char *const argv[], char *
     *length = n;
     return result;
 }
-int spica_process_version(SpicaProcess *p, const char *node, const char *entry, char *version,
-                          size_t capacity, size_t *length) {
+int spica_process_version(SpicaProcess *p, const char *node, const char *entry, int timeout_ms,
+                          char *version, size_t capacity, size_t *length) {
     char *argv[] = {(char *)node, (char *)entry, "--version", 0};
     char out[256];
     size_t n = 0;
     *length = 0;
-    int result = capture(p, node, argv, out, sizeof out, &n);
+    int result = capture(p, node, argv, timeout_ms, out, sizeof out, &n);
     size_t copy = n < capacity ? n : capacity;
     if (version && copy)
         memcpy(version, out, copy);
@@ -279,5 +279,5 @@ int spica_process_npm_root(SpicaProcess *p, const char *node, const char *npm, c
                            size_t capacity, size_t *length) {
     /* npm is its resolved JS entry, not a shell command; Finder need not expose node on PATH. */
     char *argv[] = {(char *)node, (char *)npm, "root", "-g", "--loglevel=error", 0};
-    return capture(p, node, argv, output, capacity, length);
+    return capture(p, node, argv, 5000, output, capacity, length);
 }

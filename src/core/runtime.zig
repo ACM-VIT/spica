@@ -212,6 +212,7 @@ pub const Runtime = struct {
     entries_inflight: bool = false,
     entries_again: bool = false,
     failure_detail: ?[]u8 = null,
+    verify_timeout_ms: c_int = executables.verify_timeout_ms,
 
     pub fn create(a: std.mem.Allocator, io: std.Io, options: Options) !*Runtime {
         if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedRuntimeTarget;
@@ -563,8 +564,8 @@ pub const Runtime = struct {
         const entry = paths.entry;
         var version: [64]u8 = undefined;
         var version_length: usize = 0;
-        executables.verify(&self.process, node, entry, &version, &version_length) catch |err|
-            return self.explain(err, .{ .node = node, .entry = entry, .version = version[0..version_length] });
+        executables.verify(&self.process, node, entry, self.verify_timeout_ms, &version, &version_length) catch |err|
+            return self.explain(err, .{ .node = node, .entry = entry, .version = version[0..version_length], .timeout_ms = self.verify_timeout_ms });
         const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.options.project_path, self.allocator);
         defer self.allocator.free(cwd);
         self.options.project_path = try self.options_arena.allocator().dupeZ(u8, cwd);
