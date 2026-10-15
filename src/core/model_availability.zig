@@ -166,22 +166,19 @@ fn fetchJson(
     const body = try allocator.alloc(u8, 2 * 1024 * 1024);
     defer allocator.free(body);
     var writer = std.Io.Writer.fixed(body);
-    const uri = try std.Uri.parse(url);
-    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.UnsupportedUriScheme;
-    const timeout: std.Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .{ .nanoseconds = 5 * std.time.ns_per_s } } };
-    const connection = try client.connectTcpOptions(.{
-        .host = try std.Io.net.HostName.init(uri.host.?.raw),
-        .port = uri.port orelse if (protocol == .tls) 443 else 80,
-        .protocol = protocol,
-        .timeout = timeout,
-    });
-    var request = try client.request(.GET, uri, .{
-        .connection = connection,
+    // Let request initialize the certificate bundle and decode the URI host
+    // before opening TLS. The worker bounds and cancels the entire lookup.
+    var request = try client.request(.GET, try std.Uri.parse(url), .{
         .redirect_behavior = .not_allowed,
         .headers = .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = "identity" } },
         .extra_headers = extra[0..extra_len],
     });
-    defer request.deinit();
+    defer {
+        // One catalog request per client; never drain an error body during
+        // cleanup, where it could delay cancellation or shutdown.
+        if (request.connection) |connection| connection.closing = true;
+        request.deinit();
+    }
     try request.sendBodiless();
     var response = try request.receiveHead(&.{});
     if (response.head.status != .ok) return error.AvailabilityRequestFailed;

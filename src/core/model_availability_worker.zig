@@ -17,6 +17,7 @@ pub const Worker = struct {
     requested: bool = false,
     result_ready: bool = false,
     result: ?[]u8 = null,
+    active_event: ?*std.Io.Event = null,
 
     pub fn create(allocator: std.mem.Allocator, io: std.Io, wake_fd: c_int) !*Worker {
         const self = try allocator.create(Worker);
@@ -41,6 +42,7 @@ pub const Worker = struct {
         c.SDL_LockMutex(self.mutex);
         self.stopping = true;
         self.requested = false;
+        if (self.active_event) |event| event.set(self.io);
         c.SDL_SignalCondition(self.condition);
         c.SDL_UnlockMutex(self.mutex);
         self.thread.join();
@@ -83,7 +85,7 @@ pub const Worker = struct {
             self.requested = false;
             c.SDL_UnlockMutex(self.mutex);
 
-            const bytes = availability.resolve(self.allocator, self.io) catch self.allocator.dupe(u8, "{\"providers\":[]}") catch null;
+            const bytes = self.lookup(availability.resolve, .fromSeconds(5)) catch self.allocator.dupe(u8, "{\"providers\":[]}") catch null;
 
             c.SDL_LockMutex(self.mutex);
             if (self.stopping) {
@@ -101,5 +103,39 @@ pub const Worker = struct {
             c.SDL_UnlockMutex(self.mutex);
             p.spica_wake(self.wake_fd);
         }
+    }
+
+    const Lookup = struct {
+        worker: *Worker,
+        resolve: *const fn (std.mem.Allocator, std.Io) anyerror![]u8,
+        done: std.Io.Event = .unset,
+        result: ?[]u8 = null,
+
+        fn run(job: *Lookup) void {
+            job.result = job.resolve(job.worker.allocator, job.worker.io) catch null;
+            job.done.set(job.worker.io);
+        }
+    };
+
+    fn lookup(self: *Worker, resolve: *const fn (std.mem.Allocator, std.Io) anyerror![]u8, timeout: std.Io.Duration) ![]u8 {
+        var job: Lookup = .{ .worker = self, .resolve = resolve };
+        c.SDL_LockMutex(self.mutex);
+        if (self.stopping) {
+            c.SDL_UnlockMutex(self.mutex);
+            return error.WorkerStopped;
+        }
+        self.active_event = &job.done;
+        c.SDL_UnlockMutex(self.mutex);
+        defer {
+            c.SDL_LockMutex(self.mutex);
+            self.active_event = null;
+            c.SDL_UnlockMutex(self.mutex);
+        }
+        var task = try self.io.concurrent(Lookup.run, .{&job});
+        job.done.waitTimeout(self.io, .{ .duration = .{ .clock = .awake, .raw = timeout } }) catch {};
+        // Cancellation interrupts DNS, connect, TLS, headers and body I/O.
+        // Await cancellation before releasing the stack job or its result.
+        task.cancel(self.io);
+        return job.result orelse self.allocator.dupe(u8, "{\"providers\":[]}");
     }
 };
