@@ -48,6 +48,7 @@ pub fn toggleModelMenu(app: *App) void {
         app.editor_view.changed = true;
         _ = c.SDL_ClearComposition(app.window);
         _ = c.SDL_StartTextInput(app.window);
+        if (app.runtime) |runtime| runtime.refreshModels() catch |err| app.report("Refreshing model availability", err);
     }
     app.buttons.clear();
     app.thinking_menu.open = false;
@@ -174,6 +175,12 @@ pub fn drawModelMenu(app: *App) !void {
     const colors = app.palette();
     const picker = &app.model_picker;
     const composer = app.composer_bounds;
+    const count = if (app.runtime_snapshot != null) modelCount(app) catch |err| failed: {
+        // Discovery/search failures belong in the popup, not in App.run's
+        // fatal render path. Leave the composer draft available for recovery.
+        app.library.input_err = err;
+        break :failed @as(usize, 0);
+    } else 0;
     const x = app.model_bounds.x;
     const width: f32 = @min(360, composer.w - 16);
     const error_height: f32 = if (app.library.input_err != null) 20 else 0;
@@ -184,7 +191,6 @@ pub fn drawModelMenu(app: *App) !void {
     try app.rectangle(x, y, width, height, 8, colors.border);
     try app.rectangle(x + 1, y + 1, width - 2, height - 2, 7, colors.panel);
     if (app.runtime_snapshot) |snapshot| {
-        const count = try modelCount(app);
         if (count == 0) try app.label(if (snapshot.models.len == 0) "No configured models" else "No matching models", x + 12, y + 16, 13, colors.muted);
         picker.first = @min(picker.first, count -| 1);
         const end = @min(count, picker.first + visible);
