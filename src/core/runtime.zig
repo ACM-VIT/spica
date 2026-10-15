@@ -14,6 +14,7 @@ const record_limit = 1024 * 1024;
 
 pub const Behavior = enum { prompt, steer, follow_up };
 pub const Status = enum { stopped, starting, ready, streaming, stopping, needs_force_stop, exited, failed };
+pub const model_display_limit: usize = 4096;
 pub const Model = struct {
     provider: []const u8,
     id: []const u8,
@@ -717,7 +718,7 @@ pub const Runtime = struct {
             }
             next.deinit(self.allocator);
         }
-        for (source[0..@min(source.len, 4096)]) |model| {
+        for (source[0..@min(source.len, model_display_limit)]) |model| {
             const provider = try self.allocator.dupe(u8, model.provider);
             errdefer self.allocator.free(provider);
             const id = try self.allocator.dupe(u8, model.id);
@@ -754,7 +755,7 @@ pub const Runtime = struct {
             const name = try self.allocator.dupe(u8, model.name);
             errdefer self.allocator.free(name);
             try next.append(self.allocator, .{ .provider = provider, .id = id, .name = name });
-            if (next.items.len == 4096) break;
+            if (next.items.len == model_display_limit) break;
         }
         self.clearVisibleModels();
         self.state.models = try next.toOwnedSlice(self.allocator);
@@ -1066,7 +1067,7 @@ pub const Runtime = struct {
                     next_models.deinit(self.allocator);
                 }
                 if (models != .array) return;
-                for (models.array.items[0..@min(models.array.items.len, 4096)]) |model| {
+                for (models.array.items[0..@min(models.array.items.len, model_display_limit)]) |model| {
                     const provider = try self.allocator.dupe(u8, string(model, "provider"));
                     errdefer self.allocator.free(provider);
                     const id = try self.allocator.dupe(u8, string(model, "id"));
@@ -1083,7 +1084,7 @@ pub const Runtime = struct {
                 } else {
                     try self.copyVisibleModels(self.raw_models);
                 }
-                if (models.array.items.len > 4096) {
+                if (models.array.items.len > model_display_limit) {
                     try self.inspect(raw, "model_display_budget", "Available model list exceeds first-pass display budget; complete list retained");
                     try self.replace(&self.state.attention, "Available model list exceeds first-pass display budget");
                 }

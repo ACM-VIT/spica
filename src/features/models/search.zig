@@ -1,14 +1,15 @@
 const std = @import("std");
 const c = @import("../../native/bindings.zig").c;
 const Model = @import("../../core/runtime.zig").Model;
+const model_display_limit = @import("../../core/runtime.zig").model_display_limit;
 
 const Quality = struct { class: u8, score: f64 };
 const Match = struct { index: usize, quality: Quality };
 const query_scalars = 256 * 3; // Maximum case-fold expansion per input byte.
 
-/// Ranked original indices, bounded by the runtime's 256-model display budget.
+/// Ranked original indices, bounded by the same display budget as the runtime.
 pub const Search = struct {
-    matches: [256]Match = undefined,
+    matches: [model_display_limit]Match = undefined,
     len: usize = 0,
     dirty: bool = true,
 
