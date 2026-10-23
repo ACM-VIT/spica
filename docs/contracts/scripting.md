@@ -83,3 +83,33 @@ worker stack and interpreter C stack. The implementation rejects caps above
 errors and instruction exhaustion return bounded errors and preserve last-good
 output; failed script evaluation does not roll back arbitrary Lua module-local
 mutations in the current VM. Domain-owned accepted work outlives all scripts.
+
+## Native proof consumer
+
+The native App selects a module explicitly with `--lua-module PATH`; F5 stages
+that file again, and F9 switches between the installed custom composition and
+the default. Neither operation replaces Host. Initial module failure leaves the
+default usable; reload failure preserves the installed generation, root and
+renderer while reporting the error. A successful later reload clears that error.
+While staging, snapshot refresh cannot supersede the staging result.
+
+Root descriptors drive a bounded preorder layout in the existing Clay arena.
+Composer and transcript nodes reuse retained native primitives; omitting the
+composer also disables hidden composer text/keyboard admission. The minimal
+example's plain renderer consumes copied UTF-8 from the bounded retained visible
+transcript, not a new history query or borrowed projection storage. This proof
+does not establish arbitrary rich custom-renderer or large-history behavior.
+
+Native admission captures thread/run/approval/digest/workspace identities,
+relevant revisions, draft revision, installed generation, root-switch epoch and
+stable command ID before queuing an explicit action. Delivery rejects changed
+contexts, obsolete generations and root-switch epochs before touching Host.
+Default native approval/cancel controls remain available in the reused composer.
+Shutdown consumes reserved action results while Host and wake storage still
+exist, then joins Lua, presentation and Host before destroying SDL.
+
+Actual native input/reload/restart evidence is
+`.artifacts/ui005/lua-native-custom/manifest.json`, source checkpoint
+`d5698fd11399723059fe3052c13362f8d081792e` (shared `fe6a0ff`).
+This is frontend proof, unlike the earlier standalone consumers; milestone
+acceptance still requires the assembled checks, measurements and Main review.
