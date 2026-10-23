@@ -1,4 +1,6 @@
 test {
+    _ = @import("runtime/adapter.zig");
+    _ = @import("runtime/transport.zig");
     _ = @import("runtime/fake_test.zig");
     _ = @import("domain.zig");
     _ = @import("script_test.zig");

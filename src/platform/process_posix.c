@@ -35,8 +35,8 @@ void spica_close(int fd) {
     if (fd >= 0)
         close(fd);
 }
-int spica_process_spawn(SpicaProcess *p, const char *executable, char *const argv[],
-                        const char *cwd) {
+int spica_process_spawn_env(SpicaProcess *p, const char *executable, char *const argv[],
+                            const char *cwd, char *const environment[]) {
     int in[2] = {-1, -1}, out[2] = {-1, -1}, err[2] = {-1, -1};
     if (spica_process_pipe(in) || spica_process_pipe(out) || spica_process_pipe(err))
         goto fail;
@@ -55,7 +55,7 @@ int spica_process_spawn(SpicaProcess *p, const char *executable, char *const arg
     sigaddset(&defs, SIGPIPE);
     posix_spawnattr_setsigdefault(&attr, &defs);
     pid_t pid = 0;
-    int rc = posix_spawn(&pid, executable, &acts, &attr, argv, environ);
+    int rc = posix_spawn(&pid, executable, &acts, &attr, argv, environment ? environment : environ);
     posix_spawn_file_actions_destroy(&acts);
     posix_spawnattr_destroy(&attr);
     if (rc) {
@@ -93,6 +93,10 @@ fail:
         spica_close(err[i]);
     }
     return -1;
+}
+int spica_process_spawn(SpicaProcess *p, const char *executable, char *const argv[],
+                        const char *cwd) {
+    return spica_process_spawn_env(p, executable, argv, cwd, NULL);
 }
 long spica_process_read(int fd, void *b, size_t n) {
     ssize_t r;

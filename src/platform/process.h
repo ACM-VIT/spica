@@ -14,6 +14,9 @@ void spica_close(int fd);
  * Failure may still leave an owned child in p; inspect pid before cleanup. */
 int spica_process_spawn(SpicaProcess *p, const char *executable, char *const argv[],
                         const char *cwd);
+/* Explicit per-child environment; NULL inherits. Never mutates parent environment. */
+int spica_process_spawn_env(SpicaProcess *p, const char *executable, char *const argv[],
+                            const char *cwd, char *const environment[]);
 /* bits: wake=1 stdout=2 stderr=4 writable=8 exited=16 */
 int spica_process_poll(SpicaProcess *p, int wake, int want_write, int timeout_ms);
 long spica_process_read(int fd, void *bytes, size_t size);
