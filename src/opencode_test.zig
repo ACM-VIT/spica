@@ -26,7 +26,7 @@ fn consume(runtime: *Runtime, a: std.mem.Allocator, bytes: []const u8) !?c.Obser
     return runtime.consume(a, parsed.value);
 }
 fn ready(runtime: *Runtime, a: std.mem.Allocator) !void {
-    try runtime.init(std.testing.allocator, .{}, .{ .selection = selection, .instance = .{ .value = "test-instance" }, .account = .{ .reference = "isolated", .readiness = .unknown } });
+    try runtime.init(std.testing.allocator, .{}, .{ .selection = selection, .cwd = "/tmp/spica", .instance = .{ .value = "test-instance" }, .account = .{ .reference = "isolated", .readiness = .unknown } });
     _ = try consume(runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentInfo\":{\"version\":\"2.1.4\"},\"agentCapabilities\":{\"sessionCapabilities\":{\"resume\":{}}}}}");
     _ = try runtime.asAdapter().dispatch(a, .{ .open = .{ .create = .{ .session = correlation.session, .effect = correlation.effect.?, .selection = selection } } });
     _ = try consume(runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"ses_upstream\"}}");
@@ -98,7 +98,7 @@ test "ACP exact model and version mismatches are explicit" {
     defer arena.deinit();
     const a = arena.allocator();
     var runtime: Runtime = undefined;
-    try runtime.init(std.testing.allocator, .{}, .{ .selection = selection, .instance = .{ .value = "test-instance" }, .account = .{ .reference = "isolated", .readiness = .unknown } });
+    try runtime.init(std.testing.allocator, .{}, .{ .selection = selection, .cwd = "/tmp/spica", .instance = .{ .value = "test-instance" }, .account = .{ .reference = "isolated", .readiness = .unknown } });
     defer runtime.shutdown();
     try std.testing.expectError(error.RuntimeVersionMismatch, consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentInfo\":{\"version\":\"1.0\"}}}"));
 }
@@ -187,4 +187,79 @@ test "ACP large tool result streams exact canonical content then one terminal ev
     try std.testing.expectEqualStrings("", current.body.tool_completed.result);
     try std.testing.expect((try runtime.poll(a)) == null);
     try std.testing.expectEqual(@as(usize, 1), runtime.transport.polls);
+}
+
+test "ACP opaque workspace identity stays separate from explicit cwd" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var runtime: Runtime = undefined;
+    var requested = selection;
+    requested.workspace = .{ .value = "workspace-opaque-db-id" };
+    try runtime.init(std.testing.allocator, .{}, .{ .selection = selection, .cwd = "/tmp/explicit-process-root", .instance = .{ .value = "test-instance" }, .account = .{ .reference = "isolated", .readiness = .unknown } });
+    defer runtime.shutdown();
+    _ = try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentInfo\":{\"version\":\"2.1.4\"},\"agentCapabilities\":{\"sessionCapabilities\":{\"resume\":{}}}}}");
+    _ = try runtime.dispatch(a, .{ .open = .{ .create = .{ .session = correlation.session, .effect = correlation.effect.?, .selection = requested } } });
+    try std.testing.expect(std.mem.indexOf(u8, runtime.transport.sent[0..runtime.transport.len], "\"cwd\":\"/tmp/explicit-process-root\"") != null);
+    try std.testing.expectEqualStrings("workspace-opaque-db-id", runtime.selection.workspace.value);
+    try std.testing.expectEqual(c.Readiness.unknown, runtime.resolveSelection(requested).readiness);
+    _ = try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"ses_upstream\"}}");
+    _ = try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"configOptions\":[{\"id\":\"model\",\"currentValue\":\"opencode/big-pickle\"}]}}");
+    try std.testing.expect(c.equal(requested, runtime.resolveSelection(requested).effective.?));
+}
+
+test "ACP bridge registration persists through create and resume until shutdown" {
+    const helper = @import("runtime/opencode_bridge.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try helper.serialize(std.testing.allocator, .{ .url = "http://127.0.0.1:4321/mcp/app-session", .token = "per-session-token" });
+    defer std.testing.allocator.free(json);
+    for ([_]bool{ false, true }) |is_resume| {
+        var runtime: Runtime = undefined;
+        try runtime.init(std.testing.allocator, .{}, .{ .selection = selection, .cwd = "/tmp/spica", .instance = .{ .value = "test-instance" }, .account = .{ .reference = "isolated", .readiness = .unknown }, .mcp_servers = json });
+        defer runtime.shutdown();
+        try std.testing.expect(!runtime.asAdapter().ready());
+        _ = try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentInfo\":{\"version\":\"2.1.4\"},\"agentCapabilities\":{\"sessionCapabilities\":{\"resume\":{}}}}}");
+        try std.testing.expect(runtime.asAdapter().ready());
+        const open: c.Open = if (is_resume)
+            .{ .existing = .{ .session = .{ .id = correlation.session, .instance = .{ .value = "old-instance" }, .upstream = .{ .value = "existing-upstream" } } } }
+        else
+            .{ .create = .{ .session = correlation.session, .effect = correlation.effect.?, .selection = selection } };
+        _ = try runtime.dispatch(a, .{ .open = open });
+        const sent = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, runtime.transport.sent[0..runtime.transport.len], .{});
+        defer sent.deinit();
+        try std.testing.expectEqualStrings(if (is_resume) "session/resume" else "session/new", sent.value.object.get("method").?.string);
+        const registered = try std.json.Stringify.valueAlloc(std.testing.allocator, sent.value.object.get("params").?.object.get("mcpServers").?, .{});
+        defer std.testing.allocator.free(registered);
+        try std.testing.expectEqualStrings(json, registered);
+        runtime.shutdown();
+        try std.testing.expect(runtime.asAdapter().ready());
+        try std.testing.expectEqualStrings(json, runtime.config.mcp_servers);
+    }
+}
+
+test "ACP bridge malformed registration fails before initialization" {
+    var runtime: Runtime = undefined;
+    try std.testing.expectError(error.InvalidMcpServers, runtime.init(std.testing.allocator, .{}, .{ .selection = selection, .cwd = "/tmp/spica", .instance = .{ .value = "test-instance" }, .account = .{ .reference = "isolated", .readiness = .unknown }, .mcp_servers = "{}" }));
+    try std.testing.expectError(error.UnexpectedEndOfInput, runtime.init(std.testing.allocator, .{}, .{ .selection = selection, .cwd = "/tmp/spica", .instance = .{ .value = "test-instance" }, .account = .{ .reference = "isolated", .readiness = .unknown }, .mcp_servers = "[" }));
+}
+
+test "ACP initialization error and version mismatch end readiness wait" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_]bool{ false, true }) |wrong_version| {
+        var runtime: Runtime = undefined;
+        try runtime.init(std.testing.allocator, .{}, .{ .selection = selection, .cwd = "/tmp/spica", .instance = .{ .value = "test-instance" }, .account = .{ .reference = "isolated", .readiness = .unknown } });
+        defer runtime.shutdown();
+        try std.testing.expect(!runtime.asAdapter().ready());
+        if (wrong_version) {
+            try std.testing.expectError(error.RuntimeVersionMismatch, consume(&runtime, arena.allocator(), "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentInfo\":{\"version\":\"wrong\"}}}"));
+        } else {
+            const failed = (try consume(&runtime, arena.allocator(), "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"initialization refused\"}}")).?;
+            try std.testing.expect(failed.body == .failure);
+        }
+        try std.testing.expect(runtime.asAdapter().ready());
+        try std.testing.expectError(error.NotReady, runtime.dispatch(arena.allocator(), .{ .open = .{ .create = .{ .session = correlation.session, .effect = correlation.effect.?, .selection = selection } } }));
+    }
 }

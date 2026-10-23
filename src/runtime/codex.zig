@@ -258,8 +258,9 @@ pub fn RuntimeFor(comptime T: type) type { return struct {
             try self.wire.send(reply_json);
         }
     }
-    pub fn asAdapter(self: *Self) adapter.Adapter { return .{ .context = self, .vtable = &.{ .discover = discoverAny, .accountStatus = accountAny, .resolveSelection = selectionAny, .dispatch = dispatchAny, .pump = pumpAny, .poll = pollAny, .shutdown = shutdownAny, .pollTool = pollToolAny, .respondTool = respondToolAny } }; }
+    pub fn asAdapter(self: *Self) adapter.Adapter { return .{ .context = self, .vtable = &.{ .discover = discoverAny, .accountStatus = accountAny, .resolveSelection = selectionAny, .dispatch = dispatchAny, .pump = pumpAny, .poll = pollAny, .shutdown = shutdownAny, .pollTool = pollToolAny, .respondTool = respondToolAny, .ready = readyAny } }; }
     fn ptr(context: *anyopaque) *Self { return @ptrCast(@alignCast(context)); }
+    fn readyAny(context: *anyopaque) bool { const self = ptr(context); return self.disconnected or self.diagnostic.len != 0 or (self.initialized and self.pending == null); }
     fn discoverAny(context: *anyopaque) c.Discovery { return ptr(context).discover(); }
     fn accountAny(context: *anyopaque) c.Account { return ptr(context).accountStatus(); }
     fn selectionAny(context: *anyopaque, selection: c.Selection) c.SelectionResult { return ptr(context).resolveSelection(selection); }

@@ -16,7 +16,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const selection: c.Selection = .{ .runtime_kind = "opencode", .required_runtime_version = "2.1.4", .model_provider = "opencode", .model_id = "big-pickle", .effort = "default", .account_ref = "disposable-unsigned-in", .workspace = .{ .value = workspace } };
     var runtime: provider.Runtime = undefined;
     var process = try transport.Transport.init(a, .{ .argv = &.{ executable, "acp" }, .cwd = workspace });
-    runtime.init(a, process, .{ .selection = selection, .instance = .{ .value = "disposable-smoke-instance" }, .account = .{ .reference = selection.account_ref, .readiness = .unknown } }) catch |err| {
+    runtime.init(a, process, .{ .selection = selection, .cwd = workspace, .instance = .{ .value = "disposable-smoke-instance" }, .account = .{ .reference = selection.account_ref, .readiness = .unknown } }) catch |err| {
         process.deinit();
         return err;
     };

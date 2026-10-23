@@ -7,6 +7,8 @@ pub const Runtime = RuntimeFor(@import("transport.zig").Transport);
 
 pub const Config = struct {
     selection: c.Selection,
+    /// Absolute provider process workspace; never the durable opaque workspace ID.
+    cwd: []const u8,
     instance: c.RuntimeInstanceId,
     /// Reference names isolated runtime-owned state; never an OMP credential.
     account: c.Account,
@@ -73,7 +75,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
         pub fn init(self: *Self, allocator: std.mem.Allocator, transport: Transport, config: Config) !void {
             if (!eq(config.selection.runtime_kind, "opencode") or
                 !eq(config.selection.required_runtime_version, "2.1.4") or
-                !std.fs.path.isAbsolute(config.selection.workspace.value) or
+                !std.fs.path.isAbsolute(config.cwd) or
                 !eq(config.selection.account_ref, config.account.reference)) return error.SelectionUnavailable;
             const mcp = try std.json.parseFromSlice(Value, allocator, config.mcp_servers, .{});
             defer mcp.deinit();
@@ -143,6 +145,12 @@ pub fn RuntimeFor(comptime Transport: type) type {
                         cast(p).shutdown();
                     }
                 }.call,
+                .ready = struct {
+                    fn call(p: *anyopaque) bool {
+                        const phase = cast(p).phase;
+                        return phase != .cold and phase != .initializing;
+                    }
+                }.call,
             } };
         }
         fn cast(p: *anyopaque) *Self {
@@ -150,6 +158,11 @@ pub fn RuntimeFor(comptime Transport: type) type {
         }
         pub fn resolveSelection(self: *const Self, requested: c.Selection) c.SelectionResult {
             return .{ .requested = requested, .effective = if (self.effective and c.equal(requested, self.selection)) self.selection else null, .readiness = self.accountStatus().readiness };
+        }
+        fn compatibleSelection(self: *const Self, requested: c.Selection) bool {
+            var expected = self.selection;
+            if (self.session == null) expected.workspace = requested.workspace;
+            return c.equal(requested, expected);
         }
         fn send(self: *Self, value: anytype) !void {
             const bytes = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
@@ -167,9 +180,9 @@ pub fn RuntimeFor(comptime Transport: type) type {
             const parsed = try std.json.parseFromSlice(Value, self.allocator, self.config.mcp_servers, .{});
             defer parsed.deinit();
             if (upstream) |id| {
-                try self.rpc(method, .{ .sessionId = id, .cwd = self.selection.workspace.value, .mcpServers = parsed.value });
+                try self.rpc(method, .{ .sessionId = id, .cwd = self.config.cwd, .mcpServers = parsed.value });
             } else {
-                try self.rpc(method, .{ .cwd = self.selection.workspace.value, .mcpServers = parsed.value });
+                try self.rpc(method, .{ .cwd = self.config.cwd, .mcpServers = parsed.value });
             }
         }
         pub fn dispatch(self: *Self, allocator: std.mem.Allocator, request: c.Request) !c.Receipt {
@@ -180,7 +193,8 @@ pub fn RuntimeFor(comptime Transport: type) type {
                     self.turn.reset();
                     switch (open) {
                         .create => |r| {
-                            if (!c.equal(r.selection, self.selection)) return error.SelectionUnavailable;
+                            if (!self.compatibleSelection(r.selection)) return error.SelectionUnavailable;
+                            self.selection.workspace = try clone(self.retained.allocator(), r.selection.workspace);
                             self.correlation = try clone(self.turn.allocator(), c.Correlation{ .session = r.session, .effect = r.effect });
                             try self.sessionParams("session/new", null);
                         },
@@ -324,7 +338,10 @@ pub fn RuntimeFor(comptime Transport: type) type {
                     .initializing => {
                         const version = field(result, "protocolVersion");
                         const info = field(result, "agentInfo");
-                        if (version != .integer or version.integer != 1 or !eq(text(field(info, "version")), self.selection.required_runtime_version)) return error.RuntimeVersionMismatch;
+                        if (version != .integer or version.integer != 1 or !eq(text(field(info, "version")), self.selection.required_runtime_version)) {
+                            self.phase = .failed;
+                            return error.RuntimeVersionMismatch;
+                        }
                         self.runtime_version = try self.retained.allocator().dupe(u8, text(field(info, "version")));
                         const caps = field(result, "agentCapabilities");
                         const load = field(caps, "loadSession");

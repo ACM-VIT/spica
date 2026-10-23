@@ -4,7 +4,7 @@
 
 ## Selection and lifecycle
 
-The application supplies absolute workspace, exact runtime version, provider/model, effort, and runtime-owned account reference. Runtime version and protocol are negotiated, model selection is applied through `session/set_config_option` and checked against returned `configOptions`. No effective selection is claimed before successful configuration. A model listing does not establish account readiness. Readiness is supplied explicitly by the runtime-account owner; unsigned-in disposable smoke reports unknown. No OMP credentials or existing histories are read.
+The application supplies `Config.cwd` as an absolute process workspace separately from `Selection.workspace`, which is the opaque durable database workspace ID. Before open the configured selection may carry a placeholder workspace; create compares every other selection field and adopts the actual requested opaque ID. It never treats that ID as a filesystem path. The Host binds its configured workspace root to the durable workspace's canonical root before dispatch. Exact runtime version, provider/model, effort and runtime-owned account reference remain explicit. Runtime version/protocol are negotiated; model selection is applied through `session/set_config_option` and checked against returned `configOptions`. No effective selection is claimed before successful configuration. A model listing does not establish account readiness. Unsigned-in disposable smoke reports unknown even if the explicit free model responds; explicit attempts with unknown readiness do not claim authentication or entitlement. No OMP credentials or existing histories are read.
 
 Open/create acknowledgement precedes asynchronous session observation. Start is forbidden until that observation. Resume requires negotiated `sessionCapabilities.resume`, preserves upstream ID and exact workspace, and never falls back to create. Cursor replay, inspection, mid-turn messaging and usage normalization are unsupported. `session/update` text uses UTF-8 byte offsets; tool events retain upstream tool IDs. Unknown notifications are ignored, unknown client requests get method-not-found; malformed/cross-session messages and mismatched replies fail closed. Errors are failures, not completion. Cancellation acknowledgement is not completion: only the upstream cancelled stop reason emits cancellation, with tools-stopped unproven. Process exit emits disconnect with unknown continuity; it never triggers automatic replay.
 
@@ -17,6 +17,33 @@ Tool result pieces use ordinary chunk observations with correlation.tool/upstrea
 `session/request_permission` carries JSON-RPC request ID, session, tool call and offered options. The adapter hashes the complete request, binds approval to session/run/tool/digest, uses only the actual offered `allow_once`/`reject_once` option IDs, rejects stale/duplicate responses, and never selects `allow_always`. Scope comes from the upstream title; no upstream expiry is invented. The domain's fail-closed handling of absent expiry remains applicable.
 
 OpenCode accepts stdio or HTTP `mcpServers` in `session/new` and `session/resume`. `Config.mcp_servers` accepts the serialized ACP array from the actual application MCP owner. This is NOT an ACP tool-call response channel: OpenCode does not support MCP-over-ACP. HTTP registration forwards explicit headers; integration policies still apply. MCP servers are scoped to the private process but shared by sessions in the same workspace directory. Registering a URL or command alone does not prove the app tool bridge: `coordinator_bridge` stays unsupported until the application implements and exercises an actual MCP endpoint and durable host-tool claims. No mock delegation bridge or fictional cross-runtime parity is provided.
+
+`src/runtime/opencode_bridge.zig.serialize(allocator, common.Bridge)` returns an
+allocator-owned ACP array containing exactly one HTTP server named `spica`, its
+session-scoped URL, and `headers: [{name: "Authorization", value: "Bearer <token>"}]`.
+The factory retains this JSON until runtime shutdown and frees it on failure or
+destroy; the helper borrows URL/token only while serializing. JSON escaping is
+performed by the standard encoder, without an intermediate bearer allocation.
+The Host, not the helper, creates/authenticates/serves and shuts down the endpoint.
+Installed binary v2.1.4 SHA256
+`ca9b3ee262e33bb4e7aa0e1230dc61086a474c8c8016b980081d0719712fd2e7`
+contains the actual ACP schema: HTTP discriminator, `name`, `url`, and a headers
+array of `{name,value}` objects (not a headers map). Raw schema extraction is
+under `.artifacts/provider-factory/opencode-bridge/installed-schema.txt`.
+
+Focused `src/opencode_bridge_test.zig` tests exact registration, escaped input
+ownership and every allocation failure. `src/opencode_test.zig` additionally
+checks identical registration on create/resume, retained config through shutdown,
+invalid array/JSON errors, and readiness after initialization success/failure.
+The common Adapter readiness hook holds durable open dispatch during ACP
+initialization; an RPC error, version mismatch or process exit ends that wait and
+allows the Host to reject the open instead of stalling.
+
+These serializer/unit checks do not establish real MCP tool consumption. A live
+installed OpenCode callback through the actual Host endpoint, durable delegated
+task result and live permission roundtrip remains an integration evidence gap
+until that endpoint/factory consumer is available. Existing free-provider
+inference evidence is not rerun or relabeled as bridge evidence.
 
 ## Supported authentication and evidence
 

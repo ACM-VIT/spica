@@ -51,3 +51,14 @@ the Host shuts it down exactly once before factory memory-only destruction.
 Failed creation retains no process or allocation. Registry/native integration
 and actual provider bridge acceptance are tracked separately from this seam.
 Focused common-seam check: `zig build test-domain` exited 0.
+
+Concrete factory candidate allocates a final-address adapter and dedicated
+bounded transport per session; each instance retains its own selection, cwd,
+session identity and tool metadata. A two-instance `/bin/cat` process fixture
+proved distinct process IDs/context and stopping one leaves the other owned
+instance intact; failed spawn/exact-selection rejection used the leak-aware
+test allocator. `zig test src/provider_factory_test.zig
+src/platform/process_posix.c src/platform/process_linux.c -lc -I src -I
+src/platform`: 6/6 passed. This is process-lifetime evidence, not authenticated
+provider cancellation/inference or native task acceptance. Raw observed output:
+`.artifacts/provider-factory/factory-check.log`.

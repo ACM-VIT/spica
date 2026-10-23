@@ -17,6 +17,9 @@ pub const Adapter = struct {
         shutdown: *const fn (*anyopaque) void,
         pollTool: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!?ToolCall = null,
         respondTool: ?*const fn (*anyopaque, []const u8, bool, []const u8) anyerror!void = null,
+        /// True when initialization finished, including definitive failure.
+        /// Host retains a committed open claim while false; no open is retried.
+        ready: ?*const fn (*anyopaque) bool = null,
     };
     pub fn discover(self: Adapter) c.Discovery { return self.vtable.discover(self.context); }
     pub fn accountStatus(self: Adapter) c.Account { return self.vtable.accountStatus(self.context); }
@@ -25,6 +28,7 @@ pub const Adapter = struct {
     pub fn pump(self: Adapter) !void { return self.vtable.pump(self.context); }
     pub fn poll(self: Adapter, allocator: std.mem.Allocator) !?c.Observation { return self.vtable.poll(self.context, allocator); }
     pub fn shutdown(self: Adapter) void { self.vtable.shutdown(self.context); }
+    pub fn ready(self: Adapter) bool { return if (self.vtable.ready) |call| call(self.context) else true; }
     pub fn pollTool(self: Adapter, allocator: std.mem.Allocator) !?ToolCall {
         return if (self.vtable.pollTool) |call| call(self.context, allocator) else null;
     }
