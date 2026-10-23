@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .linux) module.addRPathSpecial(b.fmt("$ORIGIN/../../{s}/lib", .{prefix}));
     foundationDependencies(b, module, prefix);
     libraryDependencies(b, module, prefix);
+    scriptDependencies(b, module, prefix);
     const exe = b.addExecutable(.{ .name = "spica", .root_module = module });
     b.installArtifact(exe);
     const run = b.addRunArtifact(exe);
@@ -55,6 +56,7 @@ pub fn build(b: *std.Build) void {
     test_module.addOptions("build_options", options);
     foundationDependencies(b, test_module, prefix);
     libraryDependencies(b, test_module, prefix);
+    scriptDependencies(b, test_module, prefix);
     test_module.addCSourceFile(.{ .file = b.path("src/native/parse_arena_test.c"), .flags = &.{ "-std=c11", "-O2" } });
     const tests = b.addTest(.{ .root_module = test_module });
     const test_step = b.step("test", "Run reusable native, Unicode, content, platform, and bootstrap regressions");
@@ -140,4 +142,13 @@ fn storageDependencies(b: *std.Build, module: *std.Build.Module) void {
     module.addCSourceFile(.{ .file = b.path("src/platform/database.c"), .flags = &.{ "-std=c11", "-D_DEFAULT_SOURCE", "-O2" } });
     module.addCSourceFile(.{ .file = b.path("src/platform/store_fs.c"), .flags = &.{ "-std=c11", "-O2" } });
     module.linkSystemLibrary("sqlite3", .{ .use_pkg_config = .no });
+}
+
+fn scriptDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const u8) void {
+    module.addIncludePath(b.path("src/native"));
+    module.addIncludePath(b.path(b.fmt("{s}/include/lua54", .{prefix})));
+    module.addCSourceFile(.{ .file = b.path("src/native/script_lua.c"), .flags = &.{ "-std=c11", "-O2" } });
+    module.addObjectFile(b.path(b.fmt("{s}/lib/libspica-lua54.a", .{prefix})));
+    module.linkSystemLibrary("m", .{ .use_pkg_config = .no });
+    if (module.resolved_target.?.result.os.tag == .linux) module.linkSystemLibrary("pthread", .{ .use_pkg_config = .no });
 }

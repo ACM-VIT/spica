@@ -43,3 +43,37 @@ interrupted run, invalidated non-live approval and exactly two original effects.
 In-flight claims recover unknown; otherwise nonterminal runs recover interrupted;
 pending tools recover unknown with revision events. No ambiguous effect is replayed.
 The native UI/custom-root integration gate remains owned by the integration lead.
+
+## Aggregate publication and terminal metadata
+
+Each owner transaction records only touched aggregate IDs/revisions in a
+connection-local SQLite TEMP journal. Inserts and secondary updates participate
+in the same rollback/savepoint boundaries as canonical state. Before COMMIT the
+owner publishes each final changed revision not already represented by an
+explicit semantic event; no history-wide scan or retained history index is used.
+Command receipts include all changed aggregate revisions, including new
+session/messages/blocks/effects and cancellation-withdrawn approvals/effects.
+Claim transactions publish their effect revisions before returning a request.
+
+Completed, cancelled and failed runs finalize assistant-message `incomplete`
+metadata transactionally, including queued cancellation and rejected adapter
+delivery. Interrupted/unknown runs retain incomplete metadata. Content and
+tool-result descriptor changes advance the containing message revision and
+publish a message invalidation alongside block/tool/run events. Scoped
+subscriptions therefore observe canonical message finalization, not a UI-only
+interpretation of run state.
+
+The full `test` target imports coding/transcript/presentation/script regressions.
+Executable and full-test modules link the explicit isolated
+`libspica-lua54.a` and native script shim; Lua is never resolved through pkg-config.
+
+Source-backed rewrite reference: T3 pin
+`eb1510d2493cbf28600432d5193cc22a1af8f3d8`,
+`EventSink.ts:265–291,640–686` reserves receipts, applies projections and enqueues
+effects inside a transaction, then serializes post-commit publication. Native
+`Owner.command`/`Store.publishChanges` preserves that durability/publication
+ordering with one owner thread and ordered SQLite events, not an Effect/server
+architecture transplant. T3 recovery's explicit replayable-checkpoint distinction
+(`ProviderRuntimeRecoveryService.ts:198–225`) informs the native deliberate
+difference: claimed external effects remain unknown and cannot be replayed merely
+because the runtime restarts. No T3 source was copied.

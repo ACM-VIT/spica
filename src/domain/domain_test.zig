@@ -259,6 +259,8 @@ test "real reducers accept arbitrary prompt dedup before revision and withdraw q
     const receipt = try owner.command(allocator, command);
     try std.testing.expectEqual(.accepted, receipt.outcome);
     try std.testing.expectEqual(@as(usize, 2), receipt.effect_ids.len);
+    try std.testing.expectEqual(@as(usize, 9), receipt.committed_revisions.len);
+    try expectRevisionEvents(&f.store, receipt.committed_revisions, receipt.commit_sequence);
     const duplicate = try owner.command(allocator, command);
     var first: [8192]u8 = undefined;
     var second: [8192]u8 = undefined;
@@ -272,6 +274,8 @@ test "real reducers accept arbitrary prompt dedup before revision and withdraw q
     try std.testing.expectEqual(.accepted, cancel.outcome);
     try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM effects WHERE state='withdrawn'"));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='cancelled'"));
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM messages WHERE incomplete=1"));
+    try expectRevisionEvents(&f.store, cancel.committed_revisions, cancel.commit_sequence);
     try std.testing.expect((try owner.claimNext(allocator)) == null);
     try owner.recover();
     try std.testing.expect((try owner.claimNext(allocator)) == null);
@@ -448,7 +452,20 @@ test "public Host consumer streams approves cancels pages and reopens durable st
     const assistant = continuation.items[0].message;
     const content = try consumer.query(.{ .content = .{ .block = assistant.blocks[0].block_id, .start_byte = 0, .end_byte = assistant.blocks[0].committed_bytes } });
     try std.testing.expect(std.mem.indexOf(u8, content.items[0].content.bytes, "世界") != null);
+    _ = try consumer.host.subscribe(.{ .scope = .{ .thread = thread }, .after_position = content.snapshot_position });
+    const subscribed = try consumer.next();
+    try std.testing.expect(subscribed == .subscribed);
     _ = try consumer.command(.{ .command_id = .{ .value = "host-allow" }, .target = .{ .approval = approval.id }, .expected_revision = .{ .revision = approval.revision }, .payload = .{ .approval_respond = .{ .decision = .allow, .action_digest = approval.evidence.action_digest } } });
+    const batch = try consumer.next();
+    try std.testing.expect(batch == .event_batch);
+    var kinds = std.EnumSet(std.meta.Tag(t.AggregateRef)).initEmpty();
+    for (batch.event_batch.events) |value| kinds.insert(std.meta.activeTag(value.aggregate));
+    inline for (.{ .message, .block, .tool, .effect, .approval, .run }) |kind| try std.testing.expect(kinds.contains(kind));
+    _ = try consumer.host.unsubscribe(subscribed.subscribed.id);
+    try std.testing.expect((try consumer.next()) == .unsubscribed);
+    const finalized = try consumer.query(.{ .messages = .{ .thread = thread } });
+    try std.testing.expect(!finalized.items[1].message.incomplete);
+    try std.testing.expect(finalized.items[1].message.revision > assistant.revision);
     const runs = try consumer.query(.{ .runs = .{ .thread = thread } });
     try std.testing.expectEqual(t.RunState.completed, runs.items[0].run.state);
     const tools = try consumer.query(.{ .tools = .{ .run = run } });
@@ -461,6 +478,8 @@ test "public Host consumer streams approves cancels pages and reopens durable st
     _ = try consumer.command(.{ .command_id = .{ .value = "host-cancel" }, .target = .{ .run = second.entity_ids.run.? }, .expected_revision = .{ .revision = active_run.revision }, .payload = .{ .run_cancel = .{ .reason = "consumer cancel" } } });
     const cancelled = try consumer.query(.{ .runs = .{ .thread = thread } });
     try std.testing.expectEqual(t.RunState.cancelled, cancelled.items[1].run.state);
+    const cancelled_messages = try consumer.query(.{ .messages = .{ .thread = thread } });
+    try std.testing.expect(!cancelled_messages.items[3].message.incomplete);
     consumer.host.destroy();
     live = false;
     consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .wake = Consumer.wake, .wake_context = &consumer });
@@ -471,6 +490,9 @@ test "public Host consumer streams approves cancels pages and reopens durable st
     try std.testing.expectEqual(@as(usize, 2), retained.items.len);
     try std.testing.expectEqual(t.RunState.completed, retained.items[0].run.state);
     try std.testing.expectEqual(t.RunState.cancelled, retained.items[1].run.state);
+    const retained_messages = try consumer.query(.{ .messages = .{ .thread = thread } });
+    try std.testing.expect(!retained_messages.items[1].message.incomplete);
+    try std.testing.expect(!retained_messages.items[3].message.incomplete);
 }
 
 test "Host subscriptions retain delivery under small drain and unsubscribe generation checks" {
@@ -505,4 +527,43 @@ test "Host subscriptions retain delivery under small drain and unsubscribe gener
     const failure = try consumer.next();
     try std.testing.expect(failure == .failure);
     try std.testing.expectEqual(.cursor_invalid, failure.failure.failure.reason);
+}
+
+fn expectRevisionEvents(database: *storage.Store, revisions: []const t.CommittedRevision, sequence: u64) !void {
+    for (revisions) |revision| {
+        var buffer: [1024]u8 = undefined;
+        const target = try t.encode(revision.target, &buffer);
+        const s = try database.prepare("SELECT count(*) FROM events WHERE sequence=? AND aggregate=? AND revision=?", &.{ .{ .integer = @intCast(sequence) }, .{ .blob = target }, .{ .integer = @intCast(revision.revision) } });
+        defer s.deinit();
+        try std.testing.expect(try s.step());
+        try std.testing.expectEqual(@as(i64, 1), s.integer(0));
+    }
+}
+
+test "transaction journal rolls back rejected mutations and publishes each changed revision once" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "journal", .utc_ms = 1000 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const sent = try owner.command(allocator, conversation.send("journal-send", "hello", 1));
+    try expectRevisionEvents(&f.store, sent.committed_revisions, sent.commit_sequence);
+    const claimed = (try owner.claimNext(allocator)).?;
+    try expectRevisionEvents(&f.store, try f.store.committedRevisions(allocator), (try f.store.position()).commit_sequence);
+    try owner.delivered(allocator, claimed.id, .{ .outcome = .acknowledged, .session = .{ .id = sent.entity_ids.session.?, .instance = .{ .value = "journal" }, .upstream = .{ .value = "upstream" } } });
+    try expectRevisionEvents(&f.store, try f.store.committedRevisions(allocator), (try f.store.position()).commit_sequence);
+    try owner.observe(allocator, .{ .correlation = .{ .session = sent.entity_ids.session.?, .run = sent.entity_ids.run.? }, .upstream_event = "failure", .body = .{ .failure = .{ .code = "test", .detail = "terminal failure" } } });
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM messages WHERE incomplete=1"));
+    try expectRevisionEvents(&f.store, try f.store.committedRevisions(allocator), (try f.store.position()).commit_sequence);
+    const before = try f.store.position();
+    const rejected = try owner.command(allocator, conversation.send("journal-stale", "rejected", 1));
+    try std.testing.expectEqual(.rejected, rejected.outcome);
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM aggregate_changes"));
+    try std.testing.expectEqual(before, try f.store.position());
+    try f.store.begin();
+    try f.store.execute("UPDATE runs SET revision=revision+1 WHERE id=?", &.{.{ .text = sent.entity_ids.run.?.value }});
+    try f.store.rollback();
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM aggregate_changes"));
 }

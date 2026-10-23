@@ -1,6 +1,10 @@
 test {
     _ = @import("runtime/fake_test.zig");
     _ = @import("domain.zig");
+    _ = @import("script_test.zig");
+    _ = @import("ui/coding.zig");
+    _ = @import("ui/transcript.zig");
+    _ = @import("content/presentation.zig");
     _ = @import("options.zig");
     _ = @import("text/edit.zig");
     _ = @import("text/composer.zig");

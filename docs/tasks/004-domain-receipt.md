@@ -48,3 +48,34 @@ No UI/performance or power-loss acceptance claimed. Exhaustive changed-aggregate
 event coverage, terminal message incomplete-flag finalization and native consumer
 integration still warrant lead review. No substantive failed repairs; available
 model `openai-codex/gpt-6.1-sol`; resolved tier/usage unavailable; no descendants.
+
+## Reserved review repair
+
+Both reported domain findings are repaired: terminal completed/cancelled/failed
+messages finalize `incomplete` with revision publication; content/tool descriptor
+changes advance parent-message revisions. Transaction-local SQLite change
+journaling fills all missing final changed-aggregate events, preserves explicit
+semantic events without duplication, rolls back with savepoints and includes
+all committed aggregate revisions in command receipts. Claims publish effect
+revision events. Scoped real Host regression requires message/block/tool/effect/
+approval/run invalidations and verifies final metadata survives reopen.
+
+Narrow build/test integration links the explicit isolated Lua archive and imports
+script/coding/transcript/presentation regressions into full `test`. Immutable
+dependencies consumed privately: script `0df2098`, `51722c6`; UI chain through
+`d5838e3`. Those dependency-only cherry-picks are not new runtime changes.
+
+Checks: `zig fmt` owned Zig files; combined Debug/ReleaseSafe `zig build test
+build-domain-smoke` plus real flow/approval-crash/recover consumer succeeded;
+then final script-generation follow-up consumed and `zig build test` in both
+safety modes succeeded, **95/96 native tests passed, one skipped**, plus Python
+33 tests OK/two skipped. Initial check found absent private `.deps`; linking
+existing shared dependencies fixed environment without mutation or packages.
+One additive dependency-receipt conflict resolved retaining upstream text.
+Raw evidence `.artifacts/domain004/review/host-checks.json`, `host-final-*.log`,
+`host-{flow,crash,recover}-*.log`, `final-script-followup.log`.
+
+T3 pinned EventSink/recovery source behavior was consulted directly and mapped
+to native transaction/publication/recovery ownership in the contract doc; no
+TypeScript/Effect source copied. No outstanding reported domain finding;
+native UI acceptance/performance/power-loss remain integration gates.

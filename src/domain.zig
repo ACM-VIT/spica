@@ -101,6 +101,9 @@ pub const Owner = struct {
         } else {
             try self.database.exec("RELEASE mutation");
             receipt.outcome = .accepted;
+            if (envelope.target == .run) try self.finalizeMessages(envelope.target.run.value);
+            receipt.committed_revisions = try self.database.committedRevisions(allocator);
+            try self.database.publishChanges(sequence, envelope.command_id);
         }
         const bytes = try encoded(allocator, receipt);
         try self.database.recordCommand(envelope.command_id.value, canonical, bytes, sequence);
@@ -111,6 +114,20 @@ pub const Owner = struct {
         const statement = try self.database.prepare("SELECT 1 FROM effects WHERE run_id=? AND revision=9223372036854775807 UNION ALL SELECT 1 FROM approvals WHERE run_id=? AND revision=9223372036854775807 UNION ALL SELECT 1 FROM runs WHERE id=? AND revision=9223372036854775807", &.{ .{ .text = run }, .{ .text = run }, .{ .text = run } });
         defer statement.deinit();
         if (try statement.step()) return error.Limit;
+    }
+    fn touchMessage(self: *Owner, message: []const u8) !void {
+        const s = try self.database.prepare("SELECT revision FROM messages WHERE id=?", &.{.{ .text = message }});
+        defer s.deinit();
+        if (!try s.step()) return error.Corrupt;
+        if (s.integer(0) == std.math.maxInt(i64)) return error.Limit;
+        try self.database.execute("UPDATE messages SET revision=revision+1 WHERE id=?", &.{.{ .text = message }});
+    }
+    /// Terminal metadata is canonical domain state, not a UI-derived flag.
+    fn finalizeMessages(self: *Owner, run: []const u8) !void {
+        const s = try self.database.prepare("SELECT 1 FROM messages m JOIN runs r ON r.id=m.run_id WHERE r.id=? AND r.state IN('completed','cancelled','failed') AND m.incomplete=1 AND m.revision=9223372036854775807", &.{.{ .text = run }});
+        defer s.deinit();
+        if (try s.step()) return error.Limit;
+        try self.database.execute("UPDATE messages SET incomplete=0,revision=revision+1 WHERE run_id=? AND incomplete=1 AND EXISTS(SELECT 1 FROM runs WHERE id=? AND state IN('completed','cancelled','failed'))", &.{ .{ .text = run }, .{ .text = run } });
     }
     fn reduce(self: *Owner, allocator: std.mem.Allocator, e: t.CommandEnvelope, r: *t.Receipt) !?t.Reason {
         const db = self.database;
@@ -257,9 +274,6 @@ pub const Owner = struct {
                 revision_value = e.expected_revision.revision + 1;
             },
         }
-        const revisions = try allocator.alloc(t.CommittedRevision, 1);
-        revisions[0] = .{ .target = aggregate, .revision = revision_value };
-        r.committed_revisions = revisions;
         try self.event(allocator, seq, if (e.payload == .thread_send) 1 else 0, aggregate, revision_value, @tagName(e.payload), e.command_id, null, "");
         return null;
     }
@@ -277,6 +291,8 @@ pub const Owner = struct {
         };
         if (result) |effect| {
             if (!try self.database.claim(effect.id.value, self.epoch)) return error.Conflict;
+            const sequence = try self.database.nextSequence();
+            try self.database.publishChanges(sequence, null);
         }
         try self.database.commit();
         return result;
@@ -322,6 +338,8 @@ pub const Owner = struct {
             try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = next_state }, .{ .text = run } });
             try self.event(allocator, sequence, 2, .{ .run = .{ .value = run } }, @intCast(revision_statement.integer(0) + 1), "RunDelivery", null, effect, "");
         }
+        try self.finalizeMessages(run);
+        try db.publishChanges(sequence, null);
         try db.commit();
     }
 
@@ -361,6 +379,7 @@ pub const Owner = struct {
                 if (!try block.step()) return error.Conflict;
                 if (try db.appendChunk(chunk.block.value, chunk.offset, chunk.text) == .appended) {
                     try self.event(allocator, sequence, index, .{ .block = chunk.block }, @intCast(block.integer(0) + 1), "ContentAppended", null, observation.correlation.effect, try encoded(allocator, .{ .start_byte = chunk.offset, .end_byte = chunk.offset + chunk.text.len }));
+                    try self.touchMessage(chunk.message.value);
                     index += 1;
                 }
                 if (!terminal and !std.mem.eql(u8, current_state, "cancel_requested")) next_state = "streaming";
@@ -389,6 +408,7 @@ pub const Owner = struct {
                 defer ordinal.deinit();
                 if (!try ordinal.step()) return error.Corrupt;
                 try db.execute("INSERT INTO blocks(id,revision,message_id,ordinal,kind,tool_id) VALUES(?,1,?,?,'tool_result',?)", &.{ .{ .text = block }, .{ .text = message }, .{ .integer = ordinal.integer(0) }, .{ .text = tool.value } });
+                try self.touchMessage(message);
                 var offset: usize = 0;
                 while (offset < result.result.len) {
                     const end = @min(offset + 2048, result.result.len);
@@ -447,6 +467,8 @@ pub const Owner = struct {
         }
         try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = next_state }, .{ .text = run.value } });
         try self.event(allocator, sequence, index, .{ .run = run }, @intCast(state_statement.integer(1) + 1), "ObservationCommitted", null, observation.correlation.effect, "");
+        try self.finalizeMessages(run.value);
+        try db.publishChanges(sequence, null);
         try db.commit();
     }
 
@@ -454,6 +476,9 @@ pub const Owner = struct {
         try self.database.begin();
         errdefer self.database.rollback() catch {};
         try self.database.recoverClaims();
+        if (try self.database.scalar("SELECT count(*) FROM aggregate_changes") != 0) {
+            try self.database.publishChanges((try self.database.position()).commit_sequence, null);
+        }
         try self.database.commit();
     }
 };
@@ -748,7 +773,9 @@ pub const Host = struct {
             if (snapshot.generation == std.math.maxInt(u64)) return error.Limit;
             var database: ?*store.c.sqlite3 = null;
             try store.check(store.c.sqlite3_open_v2(self.path.ptr, &database, store.c.SQLITE_OPEN_READONLY | store.c.SQLITE_OPEN_NOFOLLOW, null));
-            errdefer if (database) |db| { _ = store.c.sqlite3_close(db); };
+            errdefer if (database) |db| {
+                _ = store.c.sqlite3_close(db);
+            };
             try store.check(store.c.sqlite3_exec(database, "BEGIN", null, null, null));
             var reader = self.database;
             reader.database = database.?;
@@ -760,7 +787,9 @@ pub const Host = struct {
         }
         // A new root query replaces the oldest ephemeral view; old IDs fail closed.
         var oldest: usize = 0;
-        for (self.snapshots[0..self.options.limits.snapshot_slots], 0..) |snapshot, i| if (snapshot.deadline < self.snapshots[oldest].deadline) { oldest = i; };
+        for (self.snapshots[0..self.options.limits.snapshot_slots], 0..) |snapshot, i| if (snapshot.deadline < self.snapshots[oldest].deadline) {
+            oldest = i;
+        };
         self.closeSnapshot(&self.snapshots[oldest]);
         return self.snapshotFor(page);
     }
@@ -833,19 +862,57 @@ pub const Host = struct {
                 return result;
             },
             .projects => sql = "SELECT rowid,id,revision,display_name FROM projects WHERE rowid>? ORDER BY rowid LIMIT ?",
-            .workspaces => |v| { sql = "SELECT rowid,id,revision,project_id,binding FROM workspaces WHERE project_id=? AND rowid>? ORDER BY rowid LIMIT ?"; values[0] = .{ .text = v.project.value }; n = 1; },
-            .threads => |v| { sql = "SELECT rowid,id,revision,project_id,workspace_id,session_id FROM threads WHERE project_id=? AND rowid>max(?,coalesce((SELECT rowid FROM threads WHERE id=?),0)) ORDER BY rowid LIMIT ?"; values[0] = .{ .text = v.project.value }; values[1] = .{ .integer = @intCast(cursor) }; values[2] = if (v.anchor) |anchor| .{ .text = anchor.value } else .null; n = 3; },
-            .thread => |v| { sql = "SELECT rowid,id,revision,project_id,workspace_id,session_id FROM threads WHERE id=? AND rowid>? LIMIT ?"; values[0] = .{ .text = v.value }; n = 1; },
+            .workspaces => |v| {
+                sql = "SELECT rowid,id,revision,project_id,binding FROM workspaces WHERE project_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                values[0] = .{ .text = v.project.value };
+                n = 1;
+            },
+            .threads => |v| {
+                sql = "SELECT rowid,id,revision,project_id,workspace_id,session_id FROM threads WHERE project_id=? AND rowid>max(?,coalesce((SELECT rowid FROM threads WHERE id=?),0)) ORDER BY rowid LIMIT ?";
+                values[0] = .{ .text = v.project.value };
+                values[1] = .{ .integer = @intCast(cursor) };
+                values[2] = if (v.anchor) |anchor| .{ .text = anchor.value } else .null;
+                n = 3;
+            },
+            .thread => |v| {
+                sql = "SELECT rowid,id,revision,project_id,workspace_id,session_id FROM threads WHERE id=? AND rowid>? LIMIT ?";
+                values[0] = .{ .text = v.value };
+                n = 1;
+            },
             .messages => |v| {
                 sql = if (v.direction == .newer) "SELECT ordinal+1,id,revision,ordinal,role,incomplete,run_id FROM messages WHERE thread_id=? AND ordinal+1>max(?,coalesce((SELECT ordinal+1 FROM messages WHERE id=? AND thread_id=?),0)) ORDER BY ordinal LIMIT ?" else "SELECT ordinal+1,id,revision,ordinal,role,incomplete,run_id FROM messages WHERE thread_id=? AND ordinal+1<min(nullif(?,0),coalesce((SELECT ordinal+1 FROM messages WHERE id=? AND thread_id=?),9223372036854775807)) ORDER BY ordinal DESC LIMIT ?";
                 if (v.direction == .older and cursor == 0) cursor = std.math.maxInt(i64);
-                values[0] = .{ .text = v.thread.value }; values[1] = .{ .integer = @intCast(cursor) }; values[2] = if (v.anchor) |anchor| .{ .text = anchor.value } else .null; values[3] = .{ .text = v.thread.value }; n = 4;
+                values[0] = .{ .text = v.thread.value };
+                values[1] = .{ .integer = @intCast(cursor) };
+                values[2] = if (v.anchor) |anchor| .{ .text = anchor.value } else .null;
+                values[3] = .{ .text = v.thread.value };
+                n = 4;
             },
-            .blocks => |v| { sql = "SELECT ordinal+1,id,revision,ordinal,kind,committed_bytes,tool_id FROM blocks WHERE message_id=? AND ordinal+1>? ORDER BY ordinal LIMIT ?"; values[0] = .{ .text = v.message.value }; n = 1; },
-            .runs => |v| { sql = "SELECT rowid,id,revision,thread_id,session_id,state,requested,effective FROM runs WHERE thread_id=? AND rowid>? ORDER BY rowid LIMIT ?"; values[0] = .{ .text = v.thread.value }; n = 1; },
-            .effects => |v| { sql = "SELECT rowid,id,revision,run_id,kind,state,outcome FROM effects WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?"; values[0] = .{ .text = v.run.value }; n = 1; },
-            .tools => |v| { sql = "SELECT rowid,id,revision,run_id,name,action_digest,outcome,result_block FROM tools WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?"; values[0] = .{ .text = v.run.value }; n = 1; },
-            .approvals => |v| { sql = "SELECT rowid,id,revision,run_id,state,session_id,tool_id,workspace_id,upstream_request,action_digest,scope,expires_at,live_epoch FROM approvals WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?"; values[0] = .{ .text = v.run.value }; n = 1; },
+            .blocks => |v| {
+                sql = "SELECT ordinal+1,id,revision,ordinal,kind,committed_bytes,tool_id FROM blocks WHERE message_id=? AND ordinal+1>? ORDER BY ordinal LIMIT ?";
+                values[0] = .{ .text = v.message.value };
+                n = 1;
+            },
+            .runs => |v| {
+                sql = "SELECT rowid,id,revision,thread_id,session_id,state,requested,effective FROM runs WHERE thread_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                values[0] = .{ .text = v.thread.value };
+                n = 1;
+            },
+            .effects => |v| {
+                sql = "SELECT rowid,id,revision,run_id,kind,state,outcome FROM effects WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                values[0] = .{ .text = v.run.value };
+                n = 1;
+            },
+            .tools => |v| {
+                sql = "SELECT rowid,id,revision,run_id,name,action_digest,outcome,result_block FROM tools WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                values[0] = .{ .text = v.run.value };
+                n = 1;
+            },
+            .approvals => |v| {
+                sql = "SELECT rowid,id,revision,run_id,state,session_id,tool_id,workspace_id,upstream_request,action_digest,scope,expires_at,live_epoch FROM approvals WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                values[0] = .{ .text = v.run.value };
+                n = 1;
+            },
             .content => |v| {
                 if (v.start_byte > v.end_byte or v.end_byte > std.math.maxInt(i64) or v.end_byte - v.start_byte > page.max_bytes) return error.InvalidQuery;
                 const s = try reader.prepare("SELECT revision,committed_bytes FROM blocks WHERE id=?", &.{.{ .text = v.block.value }});
@@ -872,14 +939,21 @@ pub const Host = struct {
                 return result;
             },
         }
-        if (q != .messages and q != .threads) { values[n] = .{ .integer = @intCast(cursor) }; n += 1; }
-        values[n] = .{ .integer = @as(i64, page.limit) + 1 }; n += 1;
+        if (q != .messages and q != .threads) {
+            values[n] = .{ .integer = @intCast(cursor) };
+            n += 1;
+        }
+        values[n] = .{ .integer = @as(i64, page.limit) + 1 };
+        n += 1;
         const statement = try reader.prepare(sql, values[0..n]);
         defer statement.deinit();
         var last_key: u64 = cursor;
         var encode_buffer: [131072]u8 = undefined;
         while (try statement.step()) {
-            if (count == page.limit) { result.next_cursor = try Owner.encoded(allocator, Cursor{ .query = identity, .key = last_key }); break; }
+            if (count == page.limit) {
+                result.next_cursor = try Owner.encoded(allocator, Cursor{ .query = identity, .key = last_key });
+                break;
+            }
             const s = statement;
             const row: t.Row = switch (q) {
                 .projects => .{ .project = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .display_name = try text(allocator, s, 3) } },
@@ -941,7 +1015,10 @@ pub const Host = struct {
             var buffer: [131072]u8 = undefined;
             while (try s.step()) {
                 scanned += 1;
-                if (scanned > self.options.limits.subscriber_lag_events) { overflow = true; break; }
+                if (scanned > self.options.limits.subscriber_lag_events) {
+                    overflow = true;
+                    break;
+                }
                 const event_value: t.Event = .{ .position = .{ .commit_sequence = try number(s, 0), .event_index = @intCast(try number(s, 1)) }, .event_id = .{ .value = try text(allocator, s, 2) }, .aggregate = try t.decode(t.AggregateRef, try s.bytes(3), allocator), .aggregate_revision = try number(s, 4), .kind = try text(allocator, s, 5), .causation_command_id = if (s.isNull(6)) null else .{ .value = try text(allocator, s, 6) }, .effect_id = if (s.isNull(7)) null else .{ .value = try text(allocator, s, 7) }, .payload = try text(allocator, s, 8) };
                 // A scoped subscriber receives invalidations, never misses a
                 // cross-aggregate content/tool event belonging to its scope.
@@ -952,7 +1029,10 @@ pub const Host = struct {
                 };
                 if (matches) {
                     const size = (try t.encode(event_value, &buffer)).len;
-                    if (count == events.len or size > sub.max_bytes - bytes) { overflow = true; break; }
+                    if (count == events.len or size > sub.max_bytes - bytes) {
+                        overflow = true;
+                        break;
+                    }
                     events[count] = event_value;
                     count += 1;
                     bytes += size;

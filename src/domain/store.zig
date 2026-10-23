@@ -106,6 +106,7 @@ pub const Store = struct {
         // Bounds per row and SQL statement, not a claimed total C/RSS/disk ceiling.
         _ = c.sqlite3_limit(database, c.SQLITE_LIMIT_LENGTH, 1024 * 1024);
         _ = c.sqlite3_limit(database, c.SQLITE_LIMIT_SQL_LENGTH, 64 * 1024);
+        try result.installChangeJournal();
         return result;
     }
     pub fn close(self: *Store) Error!void {
@@ -155,6 +156,7 @@ pub const Store = struct {
     pub fn begin(self: *Store) Error!void {
         if (self.in_transaction) return error.Conflict;
         try self.exec("BEGIN IMMEDIATE");
+        try self.exec("DELETE FROM aggregate_changes");
         self.in_transaction = true;
     }
     pub fn commit(self: *Store) Error!void {
@@ -217,6 +219,63 @@ pub const Store = struct {
             .{ .blob = event.payload },
         });
         try self.execute("UPDATE meta SET last_sequence=?,last_index=? WHERE singleton=1", &.{ .{ .integer = @intCast(event.position.commit_sequence) }, .{ .integer = event.position.event_index } });
+    }
+    const aggregates = .{
+        .{ "projects", "project" },   .{ "workspaces", "workspace" },
+        .{ "threads", "thread" },     .{ "runs", "run" },
+        .{ "sessions", "session" },   .{ "messages", "message" },
+        .{ "blocks", "block" },       .{ "tools", "tool" },
+        .{ "approvals", "approval" }, .{ "effects", "effect" },
+    };
+    /// Connection-local and transactional: no schema migration, history scan or
+    /// retained per-history index. One entry per aggregate actually touched.
+    fn installChangeJournal(self: *Store) Error!void {
+        try self.exec("CREATE TEMP TABLE aggregate_changes(kind TEXT NOT NULL,id TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(kind,id)) WITHOUT ROWID");
+        inline for (aggregates) |entry| {
+            try self.exec("CREATE TEMP TRIGGER changes_insert_" ++ entry[0] ++ " AFTER INSERT ON main." ++ entry[0] ++ " BEGIN INSERT INTO aggregate_changes VALUES('" ++ entry[1] ++ "',NEW.id,NEW.revision) ON CONFLICT(kind,id) DO UPDATE SET revision=excluded.revision; END");
+            try self.exec("CREATE TEMP TRIGGER changes_update_" ++ entry[0] ++ " AFTER UPDATE ON main." ++ entry[0] ++ " BEGIN INSERT INTO aggregate_changes VALUES('" ++ entry[1] ++ "',NEW.id,NEW.revision) ON CONFLICT(kind,id) DO UPDATE SET revision=excluded.revision; END");
+        }
+    }
+    fn changedAggregate(kind: []const u8, key: []const u8) Error!t.AggregateRef {
+        inline for (@typeInfo(t.AggregateRef).@"union".fields) |field| {
+            if (std.mem.eql(u8, kind, field.name)) return @unionInit(t.AggregateRef, field.name, .{ .value = key });
+        }
+        return error.Corrupt;
+    }
+    pub fn committedRevisions(self: *Store, allocator: std.mem.Allocator) Error![]const t.CommittedRevision {
+        const count = try self.scalar("SELECT count(*) FROM aggregate_changes");
+        const result = try allocator.alloc(t.CommittedRevision, @intCast(count));
+        const s = try self.prepare("SELECT kind,id,revision FROM aggregate_changes ORDER BY kind,id", &.{});
+        defer s.deinit();
+        var index: usize = 0;
+        while (try s.step()) : (index += 1) {
+            const key = try allocator.dupe(u8, try s.bytes(1));
+            result[index] = .{ .target = try changedAggregate(try s.bytes(0), key), .revision = @intCast(s.integer(2)) };
+        }
+        return result;
+    }
+    /// Explicit semantic events win. Fill only missing final aggregate revisions
+    /// in this transaction, preserving a single contiguous position ordering.
+    pub fn publishChanges(self: *Store, sequence: u64, causation: ?t.CommandId) Error!void {
+        if (!self.in_transaction) return error.Conflict;
+        const s = try self.prepare("SELECT kind,id,revision FROM aggregate_changes ORDER BY kind,id", &.{});
+        defer s.deinit();
+        while (try s.step()) {
+            const aggregate = try changedAggregate(try s.bytes(0), try s.bytes(1));
+            var target_buffer: [1024]u8 = undefined;
+            const target = t.encode(aggregate, &target_buffer) catch return error.Limit;
+            const exists = try self.prepare("SELECT 1 FROM events WHERE sequence=? AND aggregate=? AND revision=?", &.{ .{ .integer = @intCast(sequence) }, .{ .blob = target }, .{ .integer = s.integer(2) } });
+            const already_published = blk: {
+                defer exists.deinit();
+                break :blk try exists.step();
+            };
+            if (already_published) continue;
+            const position_value = try self.position();
+            const index = if (position_value.commit_sequence == sequence) std.math.add(u32, position_value.event_index, 1) catch return error.Limit else 0;
+            var id_buffer: [96]u8 = undefined;
+            const name = std.fmt.bufPrint(&id_buffer, "change:{d}:{d}", .{ sequence, index }) catch return error.Limit;
+            try self.appendEvent(.{ .event_id = .{ .value = name }, .position = .{ .commit_sequence = sequence, .event_index = index }, .aggregate = aggregate, .aggregate_revision = @intCast(s.integer(2)), .kind = "AggregateChanged", .causation_command_id = causation, .payload = "" });
+        }
     }
     /// Chunk, byte length, upstream dedup/cursor and public event are committed
     /// by the caller's single transaction. This method never advances on failure.
