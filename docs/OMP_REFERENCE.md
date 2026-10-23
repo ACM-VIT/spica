@@ -84,13 +84,13 @@ interfaces and state owners until their current writer finishes. One coordinator
 writes the shared task index. Workers write only their assigned receipt/manifests.
 Path ownership is a coordination rule, not OS-enforced isolation.
 
-Workers never switch branches, stash, reset, prune, or edit outside ownership. Staging and local commits are forbidden except for the single explicitly assigned Sol `task` integration packet in [AGENT_LOOP.md](AGENT_LOOP.md), after all other workers are quiescent and Astra has reviewed the candidate. Coordinate shared build output and serialize measurements. Freeze candidates during review. Record base SHA, branch, focused diff SHA-256 and hashes of new files; HEAD alone cannot identify dirty work. Never attribute another worker's changes to your task.
+Use the frequent-checkpoint policy in [AGENT_LOOP.md](AGENT_LOOP.md). Shared checkout packets assign exactly one active Sol Git owner and an exact path allowlist; other workers cannot mutate Git. Private assigned worktrees may commit owned slices directly. Check relevant behavior and the exact staged diff before each small local checkpoint, without waiting for final review. Record checkpoint SHAs and keep review fixes as follow-up commits. Checkpoints are not acceptance. Freeze candidate files during checks/commit and the full candidate during review/final integration. Never broadly stage or include another worker's unfinished changes; no push, branch switching, stash, reset, prune or edits outside ownership.
 
 OMP supports isolation and `omp worktree add`; nothing here creates a worktree.
 For an isolated task within the existing user-authorized scope, first make the intended source,
 configuration and task contracts available in a **recorded committed
-base**, then record that SHA in the packet. Only the sole assigned integration worker may make that local commit under
-the integration-packet exception. Routine local commits and worktree creation
+base**, then record that SHA in the packet. The assigned shared Git owner may make that local checkpoint under
+the commit policy. Routine local commits and worktree creation
 within authorized feature work need no fresh permission. Only then enable `task.isolation.enabled`, choose
 `isolation.backend` (`rcopy` uses git worktrees when available), and use per-item
 `isolated: true`. Keep `task.isolation.apply: false` until reviewed integration is
@@ -135,7 +135,7 @@ are optional but explicit here. Example shape, **not an instruction to launch**:
 
 ```json
 {
-  "context": "Spica shared checkout. Follow docs/AGENT_LOOP.md; ordinary worker, no Git mutations. Read docs/tasks/001-contracts.md.",
+  "context": "Spica shared checkout. Follow docs/AGENT_LOOP.md; Contracts001 is sole Git owner for its assigned paths; checkpoint verified slices. Read docs/tasks/001-contracts.md.",
   "tasks": [
     {
       "name": "Contracts001",
@@ -178,7 +178,7 @@ A worker's inline result is normally 100-250 words, with raw evidence on disk:
 
 ```text
 001-contracts; status: review / blocked:
-Base SHA; branch/workspace; focused diff hash + hashes of new files:
+Base/head and checkpoint SHAs; branch/workspace; remaining diff/new-file hashes:
 Behavior changed and why; changed paths / source entrypoints:
 Checks: exact command, exit/result, named assertion, evidence-manifest path:
 Open findings / limitations / shared-interface changes:

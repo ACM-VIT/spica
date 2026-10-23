@@ -20,7 +20,7 @@ Formatting includes existing and new project-owned sources, and excludes depende
 
 ## Working in parallel
 
-Use ./tools/agents for the Astra coordinator and the project Sol agents. Keep each task's ownership and acceptance gates in docs/tasks. Start with two concurrent workers; only independent paths proceed together. Workers return changes and evidence; integration and Git mutations are serialized after they stop. Commit the base before using isolated worktrees. Never commit personal OMP settings, sessions, private histories or auth data.
+Use ./tools/agents for the Astra coordinator and the project Sol agents. Keep each task's ownership and acceptance gates in docs/tasks. Start with two concurrent workers; only independent paths proceed together. Workers make frequent small checkpoint commits after cohesive slices pass relevant checks; do not wait for the final milestone or review. In the shared checkout, one explicitly assigned Git owner stages exact owned paths and commits while the other workers avoid Git mutations; private assigned worktrees can checkpoint directly. Checkpoints are not acceptance. Final integration uses a frozen, reviewed candidate after workers stop. Commit the base before using isolated worktrees. Never commit personal OMP settings, sessions, private histories or auth data.
 
 Use narrow tests during implementation and ./tools/check for integration. GUI work also needs inspected private-desktop screenshots and real input. Expensive profiling and repeated benchmark matrices are justified by an actual change or unresolved regression; they are not a mandatory loop for every edit. See docs/EVALUATION.md.
 

@@ -14,19 +14,21 @@ Default concurrency is two; raise project configuration to three only for indepe
 
 Before dispatch record branch, base HEAD, dirty paths and owners. Shared checkout is default; ownership is not filesystem isolation. Assign disjoint source, receipt and artifact paths; one writer owns each interface and shared output. Freeze candidates during review/measurement; serialize benchmarks after competing builds stop.
 
-Ordinary workers never stage, commit, switch branches, stash, reset, prune or edit outside ownership. There is ONE exception: Astra may explicitly assign a sole Sol `task` worker an integration packet after every other worker is quiescent and Astra has reviewed the frozen candidate. Record exact owned paths, base SHA, branch, candidate diff/new-file hashes, reviewed findings and affected checks. That packet permits only targeted staging of those paths, a local commit and affected checks within the existing user-authorized feature/milestone. Verify the index contains only owned paths; stop on unrelated staged changes or candidate drift. No push, branch switching, reset, stash or destructive operation is permitted. This exception grants no further implementation scope. Routine local commits/worktree creation within already authorized feature work need no fresh permission.
+Make frequent small, descriptive checkpoint commits throughout implementation and repair, after each cohesive working slice and its relevant checks. Do not wait for the whole task/milestone or Astra's final review. Keep implementation, tests and related docs together; preserve separate follow-up fix commits. No arbitrary commit quota, padding, automatic amend/squash or known-broken checkpoints. Committing is not acceptance.
+
+Task packets assign exactly one active Sol Git owner in a shared checkout and an exact path allowlist. Before each checkpoint verify branch/HEAD, a clean index before targeted staging, and the exact staged diff; stop on unrelated staged changes or candidate drift. Freeze owned candidate files during their checks/commit; other workers may edit disjoint paths but cannot mutate Git. Transfer Git ownership explicitly for another worker's checkpoint. Without that role, return a verified slice for serialized handoff. An assigned private worktree permits direct commits of owned slices. Local checkpoints use existing task authorization, without fresh permission. Never broadly stage, include others' unfinished files, push, switch branches, stash, reset or prune. Final integration is serialized with all writers stopped and the full candidate reviewed.
 
 Worktrees start from a recorded committed base; uncommitted work is not inherited by our workflow. Consult the reference before isolation: OMP can capture dirty snapshots and branch integration can stash/commit. Keep automatic apply disabled.
 
 ## Packets, repair and review
 
-Use `docs/tasks/README.md` and real records such as `docs/tasks/001-contracts.md`. States: `ready`, `running`, `review`, `accepted`, `blocked`; optionally record `repair` rounds. Reconcile existing children and checkout on resume to avoid duplicates. Before dispatch record outcome, authorized scope, dependencies, owned paths, immutable interfaces, base/branch/candidate identity, acceptance scenarios/checks, budget, attempts and receipt/manifest paths.
+Use `docs/tasks/README.md` and real records such as `docs/tasks/001-contracts.md`. States: `ready`, `running`, `review`, `accepted`, `blocked`; optionally record `repair` rounds. Reconcile existing children and checkout on resume to avoid duplicates. Before dispatch record outcome, authorized scope, dependencies, owned paths, immutable interfaces, base/branch/candidate identity, acceptance scenarios/checks, budget, attempts, commit checkpoints/Git owner and receipt/manifest paths.
 
 Minimal OMP batch syntax (example only):
 
 ```json
 {
-  "context": "Shared checkout; ordinary worker, no Git mutations. Follow docs/AGENT_LOOP.md.",
+  "context": "Shared checkout; Contracts001 is the sole Git owner for its assigned paths. Checkpoint verified slices under docs/AGENT_LOOP.md.",
   "tasks": [{
     "name": "Contracts001",
     "agent": "task",
@@ -42,7 +44,7 @@ Yield a 100–250 word receipt, with raw evidence on disk:
 
 ```text
 001-contracts; status: review (or blocked)
-Base SHA; branch; focused diff SHA-256 and new-file hashes
+Base/head and checkpoint SHAs; branch; remaining diff/new-file hashes
 Changed paths/behavior; exact checks and results; evidence manifest
 Findings/limitations; repair count; elapsed time; available usage
 Requested/actual model, thinking, tier; agent/job IDs (unknown if unavailable)

@@ -20,5 +20,7 @@ Acceptance:
 - Propose the smallest meaningful contract regression scenarios and implement only what this task owns.
 - Astra inspects source/diff and approves or returns specific interface changes before dependent implementation.
 
+Commit cadence: make small local commits as cohesive contract/scenario slices are verified; do not wait for the entire task or final review. Assign the single shared Git owner and concrete path allowlist before dispatch, then report checkpoint SHAs. Checkpoint commits do not imply acceptance.
+
 Attempts: none.
 Result/evidence: pending.
