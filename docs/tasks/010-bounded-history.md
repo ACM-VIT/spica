@@ -48,3 +48,34 @@ Subsequent source review found that a fixed preceding-chunk bound was not a vali
 Final backend repair adds a compact disk-backed grapheme-boundary bitmap computed once per complete semantic layout range. Distant CJK/Arabic/RI/ZWJ ranges require no ASCII sync. The256-style cutoff floors to an actual grapheme boundary, re-clips admitted spans and publishes the exact next byte cursor; it does not coalesce/drop styles. Dense whole/split-style accent/ZWJ regressions retain exact rendered concatenation and strong-style byte coverage.
 
 Latest focused checks: Debug/ReleaseSafe `test` each155native pass/2skip+4image; Python35/2skip; separately the unchanged domain cohort30/30 passed in both modes. Actual App tests are permanently registered. `style-debug.log`, `style-safe.log`, `semantic-{debug,safe}.log`, `style-native-build.log` retain raw results; ReleaseSafe native application builds. SQLite allocator peak delta for the16MiB/4KiB read was1,993,272bytes in the final cohorts (not a whole-process RSS claim). Main authorized at most two substantively changed pointer-focus/predicate-grounded interaction attempts after the repeated observation timeout; source checkpoint is frozen before those attempts.
+
+## Revision-scoped restore repair
+
+Review base/candidate: `5a80b520b267292ebd3b46c7a0cc60ba47ae6b86`, clean
+`task/010-bounded-history` private worktree/index; initial focused diff SHA256
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+Repair owner: RuntimeFactoryLead.HistoryRevisionRepair, reserved slot1, no
+descendants; only `src/app.zig`, this record and `docs/contracts/history.md`.
+The parent retains sole shared integration ownership.
+
+The selected canonical block's revision is reconciled after its ID is verified
+and before `startBlock`. Unchanged revisions retain exact semantic/rendered-byte,
+pixel and rendered-selection state. Changed revisions retain canonical message
+and block identity but restart at semantic range0/rendered byte0/relative pixel0,
+clear stale selection, preserve the existing changed-revision notice, and consume
+the one-shot revision marker. No metadata reread, allocation, byte reinterpretation
+or arbitrary scalar clamping is added.
+
+The existing App restore regression now checks unchanged-revision precision and
+one-shot behavior. A new regression parses `**bold` and its append-completed
+`**bold**` revision: rendered output shrinks from7 to5bytes, invalidating the old
+byte6 cursor. It checks safe canonical-beginning restart for both that cursor and
+a stale nonzero semantic-range cursor, including cleared selection, zero pixel
+anchor, notice and retained canonical IDs/ordinal.
+
+Cohesive checkpoint checks are `python3 build/driver.py test -Doptimize=Debug
+--summary all` and the same command with `ReleaseSafe`; both must pass before
+checkpoint. Exact commands/results and candidate identity are retained in
+`.artifacts/history010-revision/`. Existing native input/performance/original-source
+evidence is preserved unchanged; this repair does not claim a new UI/performance
+run or acceptance.

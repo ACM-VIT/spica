@@ -639,6 +639,17 @@ const Conversation = struct {
         return true;
     }
 
+    fn reconcileRestoredRevision(self: *Conversation, view: *Coding, revision: u64) void {
+        const restored = self.restored_revision orelse return;
+        self.restored_revision = null;
+        if (restored == revision) return;
+        // Rendered coordinates belong to one projection revision, not its source bytes.
+        self.history_start = .{ .key = undefined, .first_block = 0, .start_byte = 0 };
+        self.restored_pixel = 0;
+        view.rendered_selection = null;
+        view.notice = "History revision changed while away";
+    }
+
     fn askHistory(self: *Conversation, app: *App) !void {
         if (self.prepareHistoryRestore(&app.view)) return self.askBlocks();
         return self.askMessages();
@@ -1177,13 +1188,7 @@ const Conversation = struct {
                             return;
                         }
                     }
-                    if (self.restored_revision) |revision| {
-                        if (self.block_index < self.block_count and self.blocks[self.block_index].revision != revision) {
-                            app.view.notice = "History revision changed while away";
-                            app.view.rendered_selection = null;
-                        }
-                        self.restored_revision = null;
-                    }
+                    if (self.block_index < self.block_count) self.reconcileRestoredRevision(&app.view, self.blocks[self.block_index].revision);
                     app.view.clearHistory();
                     self.history_first = null;
                 }
@@ -1407,6 +1412,62 @@ test "bounded per-thread position restores stable history IDs bytes pixels and s
     try std.testing.expectEqual(@as(u32, 400123), conversation.history_start.?.start_byte);
     try std.testing.expectEqual(@as(f32, 3.5), conversation.restored_pixel.?);
     try std.testing.expectEqual(@as(u32, 404200), view.rendered_selection.?.caret);
+    const selection = view.rendered_selection.?;
+    conversation.reconcileRestoredRevision(&view, 7);
+    try std.testing.expectEqual(@as(u32, 8), conversation.history_start.?.first_block);
+    try std.testing.expectEqual(@as(u32, 400123), conversation.history_start.?.start_byte);
+    try std.testing.expectEqual(@as(f32, 3.5), conversation.restored_pixel.?);
+    try std.testing.expectEqualDeep(selection, view.rendered_selection.?);
+    try std.testing.expect(conversation.restored_revision == null);
+    // The revision check is one-shot, not a later projection's state reset.
+    conversation.reconcileRestoredRevision(&view, 8);
+    try std.testing.expectEqual(@as(u32, 400123), conversation.history_start.?.start_byte);
+    try std.testing.expectEqualDeep(selection, view.rendered_selection.?);
     try std.testing.expect(!view.history_restore and !view.follow_latest);
     try std.testing.expect(!conversation.prepareHistoryRestore(&view));
+}
+
+test "changed history revision restarts canonical block after Markdown append shrinks rendering" {
+    const markdown = @import("content/markdown.zig");
+    const source = "**bold";
+    var before = try markdown.parse(std.testing.allocator, @splat(26), source);
+    defer before.deinit();
+    var after = try markdown.parse(std.testing.allocator, @splat(26), source ++ "**");
+    defer after.deinit();
+    try std.testing.expectEqualStrings("**bold\n", before.text.items);
+    try std.testing.expectEqualStrings("bold\n", after.text.items);
+    const old_byte: u32 = @intCast(before.text.items.len - 1);
+    try std.testing.expect(old_byte > after.text.items.len);
+
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    view.follow_latest = false;
+    view.history_position = .{
+        .message = try Id.init("selected-old-message"),
+        .block = try Id.init("selected-old-block"),
+        .block_ordinal = 42,
+        .revision = 7,
+        .cursor = .{ .block = 0, .byte = old_byte },
+        .pixel_offset = 3.5,
+        .selection = .{ .source = @splat(26), .revision = 7, .anchor = 2, .caret = old_byte },
+    };
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    // Both an out-of-range byte and a stale semantic range must restart, never clamp.
+    for ([_]presentation.Cursor{ .{ .block = 0, .byte = old_byte }, .{ .block = 8, .byte = 400123 } }) |cursor| {
+        view.history_position.?.cursor = .{ .block = cursor.block, .byte = cursor.byte };
+        view.history_restore = true;
+        try std.testing.expect(conversation.prepareHistoryRestore(&view));
+        conversation.reconcileRestoredRevision(&view, 8);
+        try std.testing.expectEqualStrings("selected-old-message", conversation.messages[0].slice());
+        try std.testing.expectEqualStrings("selected-old-block", conversation.recovery_block.?.slice());
+        try std.testing.expectEqual(@as(u64, 42), conversation.desired_block.?);
+        try std.testing.expectEqual(@as(u32, 0), conversation.history_start.?.first_block);
+        try std.testing.expectEqual(@as(u32, 0), conversation.history_start.?.start_byte);
+        try std.testing.expect(!conversation.history_start.?.backward and !conversation.history_start.?.last);
+        try std.testing.expectEqual(@as(f32, 0), conversation.restored_pixel.?);
+        try std.testing.expect(view.rendered_selection == null);
+        try std.testing.expect(conversation.restored_revision == null);
+        try std.testing.expectEqualStrings("History revision changed while away", view.notice.?);
+        try std.testing.expect(!view.follow_latest);
+    }
 }

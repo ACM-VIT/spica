@@ -81,7 +81,15 @@ message/block IDs, canonical block ordinal/revision, semantic/rendered-byte curs
 relative viewport pixels and optional source-scoped selection endpoints. A root
 publishes this from actual top-visible geometry. Setting `history_restore` after
 swapping a retained position makes the native consumer query that same canonical
-block, restore its rendered cursor and selection, and reject old generations;
-it does not reload latest merely because old geometry was evicted. Task009 owns
+block and reject old generations. Exact semantic-range/rendered-byte, relative
+pixel and selection restoration is scoped to the captured canonical block revision.
+If that revision changed while away, the native consumer retains the canonical
+message/block identity but explicitly restarts at semantic range zero, rendered
+byte zero and relative pixel zero, clears stale rendered selection, and displays
+`History revision changed while away`. Appending Markdown source can complete
+delimiters and shrink or restructure rendering: old rendered coordinates are
+neither stable source anchors nor clamped into the new projection. An unchanged
+revision retains the exact captured coordinates/selection. Geometry eviction alone
+does not reload latest. Task009 owns
 the finite context roster/swap; combined thread-switch interaction requires the
 integrated candidate, not either isolated feature's claim.
