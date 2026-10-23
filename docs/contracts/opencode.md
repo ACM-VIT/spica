@@ -48,11 +48,14 @@ The common Adapter readiness hook holds durable open dispatch during ACP
 initialization; an RPC error, version mismatch or process exit ends that wait and
 allows the Host to reject the open instead of stalling.
 
-These serializer/unit checks do not establish real MCP tool consumption. A live
-installed OpenCode callback through the actual Host endpoint, durable delegated
-task result and live permission roundtrip remains an integration evidence gap
-until that endpoint/factory consumer is available. Existing free-provider
-inference evidence is not rerun or relabeled as bridge evidence.
+Serializer/unit checks alone do not establish real MCP consumption. The actual
+installed consumer attempt 4 now records an authenticated `task.delegate` claim,
+one actual OpenCode child completion (`SPICA_MCP_CHILD_OK`), an explicit public
+structured result and exact task/result retention across Host shutdown/reopen.
+Raw commands, isolated environment, candidate hashes and durable rows are in
+`.artifacts/provider-factory/consumer/host-manifest-4.json`, `host-run-4.log`
+and `host-durable-4.json`. This is not a live permission roundtrip, Codex
+inference, cross-runtime delegated execution or broad parity claim.
 
 `src/opencode_smoke_host.zig` is the actual NativeFactory consumer, not the old
 singleton-adapter seam. It creates isolated project/workspace/thread state, asks
@@ -62,6 +65,14 @@ explicit public `task_result` using the observed child text (structured results
 are not automatically synthesized from provider prose), then verifies one exact
 task/result after Host shutdown and read-only reopen. Its executable arguments
 are `OPENCODE_EXECUTABLE WORKSPACE ACCOUNT_DIRECTORY STATE_DIRECTORY`.
+
+Installed OpenCode defaults MCP tools to Code Mode. The model invokes them
+through `execute` under the `tools.spica` namespace (the catalog preserves the
+original `task.delegate` tool name); they are not directly callable model tools.
+The consumer allows this actual Code Mode wrapper but forbids shell, filesystem
+and native subagent substitutes. Attempt 3 connected all five actual MCP tools
+but its prompt incorrectly prohibited `execute`, so it produced no callback;
+that failed cohort is preserved, not counted as endpoint or bridge success.
 
 `src/opencode_factory_smoke.zig` independently exercises two actual per-session
 factory processes and buffers with the same explicit account/selection. It

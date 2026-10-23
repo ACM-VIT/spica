@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the actual public Host consumer with disposable OpenCode-owned state."""
+"""Run the actual NativeFactory/Host MCP consumer with disposable account state."""
 import os
 from pathlib import Path
 import shutil
@@ -15,9 +15,14 @@ with tempfile.TemporaryDirectory(prefix="spica-opencode-host-") as temporary:
     root = Path(temporary)
     workspace = root / "workspace"
     workspace.mkdir()
+    account = root / "account"
+    account.mkdir()
     env = {key: value for key, value in os.environ.items() if not key.startswith("OPENCODE_") and not any(word in key.upper() for word in ("TOKEN", "API_KEY", "AUTH", "SECRET"))}
-    env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), XDG_DATA_HOME=str(root / "data"), XDG_CACHE_HOME=str(root / "cache"), XDG_STATE_HOME=str(root / "state"))
+    env.update(HOME=str(account), XDG_CONFIG_HOME=str(account / "config"), XDG_DATA_HOME=str(account / "data"), XDG_CACHE_HOME=str(account / "cache"), XDG_STATE_HOME=str(account / "state"))
     with evidence.open("w") as log:
-        result = subprocess.run([str(binary), executable, str(workspace), str(root / "spica-state")], cwd=workspace, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=100)
+        command = [str(binary), executable, str(workspace), str(account), str(root / "spica-state")]
+        log.write(f"COMMAND {command!r}\nMODEL opencode/big-pickle; readiness unknown; isolated unsigned account\n")
+        log.flush()
+        result = subprocess.run(command, cwd=workspace, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=180)
     print(f"Host consumer exit={result.returncode}; raw evidence={evidence}")
     sys.exit(result.returncode)
