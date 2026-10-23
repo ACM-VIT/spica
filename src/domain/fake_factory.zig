@@ -15,10 +15,18 @@ const Instance = struct {
     head: usize = 0,
     count: usize = 0,
     stopped: bool = false,
-    fn cast(context: *anyopaque) *Instance { return @ptrCast(@alignCast(context)); }
-    fn discover(_: *anyopaque) c.Discovery { return .{ .capabilities = fake.defaultCapabilities(), .limits = .{} }; }
-    fn account(context: *anyopaque) c.Account { return .{ .reference = cast(context).selection.account_ref, .readiness = .ready }; }
-    fn resolve(_: *anyopaque, selection: c.Selection) c.SelectionResult { return .{ .requested = selection, .effective = selection, .readiness = .ready }; }
+    fn cast(context: *anyopaque) *Instance {
+        return @ptrCast(@alignCast(context));
+    }
+    fn discover(_: *anyopaque) c.Discovery {
+        return .{ .capabilities = fake.defaultCapabilities(), .limits = .{} };
+    }
+    fn account(context: *anyopaque) c.Account {
+        return .{ .reference = cast(context).selection.account_ref, .readiness = .ready };
+    }
+    fn resolve(_: *anyopaque, selection: c.Selection) c.SelectionResult {
+        return .{ .requested = selection, .effective = selection, .readiness = .ready };
+    }
     fn emit(self: *Instance, name: []const u8, body: @FieldType(c.Observation, "body")) !void {
         if (self.count == self.queue.len) return error.QueueFull;
         var correlation = self.correlation.?;
@@ -69,7 +77,11 @@ const Instance = struct {
         self.count -= 1;
         return result;
     }
-    fn shutdown(context: *anyopaque) void { const self = cast(context); std.debug.assert(!self.stopped); self.stopped = true; }
+    fn shutdown(context: *anyopaque) void {
+        const self = cast(context);
+        std.debug.assert(!self.stopped);
+        self.stopped = true;
+    }
     const vtable: common.Adapter.VTable = .{ .discover = discover, .accountStatus = account, .resolveSelection = resolve, .dispatch = dispatch, .pump = pump, .poll = poll, .shutdown = shutdown };
 };
 fn factoryDiscover(_: *anyopaque, _: c.Selection) c.Discovery {
@@ -77,7 +89,9 @@ fn factoryDiscover(_: *anyopaque, _: c.Selection) c.Discovery {
     result.capabilities[@intFromEnum(c.Capability.message)].status = .unsupported;
     return result;
 }
-fn factoryAccount(_: *anyopaque, selection: c.Selection) c.Account { return .{ .reference = selection.account_ref, .readiness = .ready }; }
+fn factoryAccount(_: *anyopaque, selection: c.Selection) c.Account {
+    return .{ .reference = selection.account_ref, .readiness = .ready };
+}
 fn create(_: *anyopaque, allocator: std.mem.Allocator, selection: c.Selection, _: []const u8, session: c.RuntimeSessionId, _: ?common.Bridge) !common.Adapter {
     const instance = try allocator.create(Instance);
     errdefer allocator.destroy(instance);
@@ -90,5 +104,12 @@ fn create(_: *anyopaque, allocator: std.mem.Allocator, selection: c.Selection, _
     instance.* = .{ .arena = arena, .selection = retained_selection, .session = retained_session, .tool = .{ .value = tool }, .approval = .{ .value = approval } };
     return .{ .context = instance, .vtable = &Instance.vtable };
 }
-fn destroy(_: *anyopaque, allocator: std.mem.Allocator, adapter: common.Adapter) void { const instance = Instance.cast(adapter.context); std.debug.assert(instance.stopped); instance.arena.deinit(); allocator.destroy(instance); }
-pub fn factory(context: *anyopaque) common.Factory { return .{ .context = context, .vtable = &.{ .discover = factoryDiscover, .accountStatus = factoryAccount, .resolveSelection = Instance.resolve, .create = create, .destroy = destroy } }; }
+fn destroy(_: *anyopaque, allocator: std.mem.Allocator, adapter: common.Adapter) void {
+    const instance = Instance.cast(adapter.context);
+    std.debug.assert(instance.stopped);
+    instance.arena.deinit();
+    allocator.destroy(instance);
+}
+pub fn factory(context: *anyopaque) common.Factory {
+    return .{ .context = context, .vtable = &.{ .discover = factoryDiscover, .accountStatus = factoryAccount, .resolveSelection = Instance.resolve, .create = create, .destroy = destroy } };
+}

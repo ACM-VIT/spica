@@ -740,9 +740,7 @@ pub const Owner = struct {
                     const task = args.task_id orelse return error.InvalidToolArguments;
                     if (try self.field(allocator, "SELECT run_id FROM tasks WHERE parent_run=? AND run_id=?", &.{ .{ .text = parent }, .{ .text = task } }) == null) return error.AuthorityUnavailable;
                     target = .{ .value = task };
-                    if (std.mem.eql(u8, name, "task.send")) payload = .{ .task_send = .{ .content = args.content orelse return error.InvalidToolArguments } }
-                    else if (std.mem.eql(u8, name, "task.cancel")) payload = .{ .task_cancel = .{ .reason = args.reason orelse return error.InvalidToolArguments } }
-                    else return error.UnsupportedTool;
+                    if (std.mem.eql(u8, name, "task.send")) payload = .{ .task_send = .{ .content = args.content orelse return error.InvalidToolArguments } } else if (std.mem.eql(u8, name, "task.cancel")) payload = .{ .task_cancel = .{ .reason = args.reason orelse return error.InvalidToolArguments } } else return error.UnsupportedTool;
                     if (args.packet != null) return error.InvalidToolArguments;
                 }
                 const command_id = try std.fmt.allocPrint(allocator, "tool:{s}:{s}", .{ session.value, key });
@@ -1062,8 +1060,9 @@ pub const Host = struct {
             if (try entry.adapter.pollTool(allocator)) |call| {
                 const reply: Owner.ToolReply = if (!std.mem.eql(u8, call.correlation.session.value, entry.session.value))
                     .{ .success = false, .json = "{\"error\":\"Session authority mismatch\"}" }
-                else owner.toolCall(allocator, entry.session, call.name, call.arguments_json) catch |err|
-                    .{ .success = false, .json = try t.encode(.{ .@"error" = @errorName(err) }, try allocator.alloc(u8, 4096)) };
+                else
+                    owner.toolCall(allocator, entry.session, call.name, call.arguments_json) catch |err|
+                        .{ .success = false, .json = try t.encode(.{ .@"error" = @errorName(err) }, try allocator.alloc(u8, 4096)) };
                 try entry.adapter.respondTool(call.request_id_json, reply.success, reply.json);
             }
             // Process ownership ends at a terminal/ambiguous boundary, while
@@ -1104,7 +1103,8 @@ pub const Host = struct {
             const Tool = struct { name: []const u8, description: []const u8, inputSchema: std.json.Value };
             var tools: [coordinator_tools.descriptors.len]Tool = undefined;
             for (coordinator_tools.descriptors, 0..) |tool_descriptor, index| tools[index] = .{
-                .name = tool_descriptor.name, .description = tool_descriptor.description,
+                .name = tool_descriptor.name,
+                .description = tool_descriptor.description,
                 .inputSchema = try std.json.parseFromSliceLeaky(std.json.Value, allocator, tool_descriptor.input_schema, .{}),
             };
             break :blk try t.encode(.{ .jsonrpc = "2.0", .id = id, .result = .{ .tools = tools } }, response);
@@ -1114,7 +1114,8 @@ pub const Host = struct {
             if (name != .string) return error.InvalidMcpRequest;
             const args = try t.encode(jsonField(params, "arguments"), try allocator.alloc(u8, 16384));
             const reply = owner.toolCall(allocator, .{ .value = invocation.session }, name.string, args) catch |err| Owner.ToolReply{
-                .success = false, .json = try t.encode(.{ .@"error" = @errorName(err) }, try allocator.alloc(u8, 4096)),
+                .success = false,
+                .json = try t.encode(.{ .@"error" = @errorName(err) }, try allocator.alloc(u8, 4096)),
             };
             break :blk try t.encode(.{ .jsonrpc = "2.0", .id = id, .result = .{ .content = .{.{ .type = "text", .text = reply.json }}, .isError = !reply.success } }, response);
         } else if (std.mem.eql(u8, method.string, "ping"))

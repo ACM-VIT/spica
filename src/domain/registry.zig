@@ -18,7 +18,8 @@ pub const Registry = struct {
                 self.adapter.dispatch(allocator, pending.request) catch |err| .{ .outcome = .unknown, .detail = @errorName(err) }
             else if (now -| self.created_ms >= 15000)
                 .{ .outcome = .rejected, .detail = "Runtime initialization timed out before open dispatch" }
-            else return null;
+            else
+                return null;
             self.pending_open = null;
             return .{ .effect = pending.effect, .receipt = receipt };
         }
@@ -47,7 +48,10 @@ pub const Registry = struct {
             try io.randomSecure(&random);
             const token = try allocator.alloc(u8, 32);
             const hex = "0123456789abcdef";
-            for (random, 0..) |byte, index| { token[index*2] = hex[byte>>4]; token[index*2+1] = hex[byte&15]; }
+            for (random, 0..) |byte, index| {
+                token[index * 2] = hex[byte >> 4];
+                token[index * 2 + 1] = hex[byte & 15];
+            }
             const bridge = try server.bindSession(allocator, retained_session.value, token);
             errdefer server.unbindSession(retained_session.value);
             const adapter = try self.factory.create(self.allocator, retained_selection, cwd, retained_session, bridge);

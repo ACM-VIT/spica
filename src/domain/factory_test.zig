@@ -37,10 +37,18 @@ const Factory = struct {
             self.tool_result_len = result.len;
             self.tool_responded.store(true, .release);
         }
-        fn cast(context: *anyopaque) *Instance { return @ptrCast(@alignCast(context)); }
-        fn discover(_: *anyopaque) c.Discovery { return .{ .capabilities = @splat(.{ .status = .supported }), .limits = .{} }; }
-        fn account(context: *anyopaque) c.Account { return .{ .reference = cast(context).selection.account_ref, .readiness = .unknown }; }
-        fn resolve(_: *anyopaque, selection: c.Selection) c.SelectionResult { return .{ .requested = selection, .effective = null, .readiness = .unknown }; }
+        fn cast(context: *anyopaque) *Instance {
+            return @ptrCast(@alignCast(context));
+        }
+        fn discover(_: *anyopaque) c.Discovery {
+            return .{ .capabilities = @splat(.{ .status = .supported }), .limits = .{} };
+        }
+        fn account(context: *anyopaque) c.Account {
+            return .{ .reference = cast(context).selection.account_ref, .readiness = .unknown };
+        }
+        fn resolve(_: *anyopaque, selection: c.Selection) c.SelectionResult {
+            return .{ .requested = selection, .effective = null, .readiness = .unknown };
+        }
         fn dispatch(context: *anyopaque, _: std.mem.Allocator, request: c.Request) !c.Receipt {
             const self = cast(context);
             switch (request) {
@@ -50,14 +58,23 @@ const Factory = struct {
                     _ = self.opens.fetchAdd(1, .release);
                     return .{ .outcome = .acknowledged, .session = .{ .id = self.session, .instance = .{ .value = self.session.value }, .upstream = .{ .value = self.session.value } } };
                 },
-                .start => { _ = self.starts.fetchAdd(1, .release); },
-                .cancel => { _ = self.cancels.fetchAdd(1, .release); self.stopping = true; },
+                .start => {
+                    _ = self.starts.fetchAdd(1, .release);
+                },
+                .cancel => {
+                    _ = self.cancels.fetchAdd(1, .release);
+                    self.stopping = true;
+                },
                 else => {},
             }
             return .{ .outcome = .acknowledged };
         }
-        fn pump(context: *anyopaque) !void { _ = cast(context).pumps.fetchAdd(1, .release); }
-        fn ready(context: *anyopaque) bool { return cast(context).ready_flag.load(.acquire); }
+        fn pump(context: *anyopaque) !void {
+            _ = cast(context).pumps.fetchAdd(1, .release);
+        }
+        fn ready(context: *anyopaque) bool {
+            return cast(context).ready_flag.load(.acquire);
+        }
         fn poll(context: *anyopaque, _: std.mem.Allocator) !?c.Observation {
             const self = cast(context);
             if (!self.stopping) return null;
@@ -69,7 +86,9 @@ const Factory = struct {
             std.debug.assert(!self.stopped);
             if (self.owner.server) |server| {
                 var found = false;
-                for (server.bindings) |binding| if (std.mem.eql(u8, binding.session, self.session.value)) { found = true; };
+                for (server.bindings) |binding| if (std.mem.eql(u8, binding.session, self.session.value)) {
+                    found = true;
+                };
                 std.debug.assert(found);
             }
             self.stopped = true;
@@ -84,9 +103,15 @@ const Factory = struct {
     fail_create: bool = false,
     auto_ready: bool = false,
     server: ?*Mcp = null,
-    fn factoryCast(context: *anyopaque) *Factory { return @ptrCast(@alignCast(context)); }
-    fn factoryDiscover(_: *anyopaque, _: c.Selection) c.Discovery { return Instance.discover(undefined); }
-    fn factoryAccount(_: *anyopaque, selection: c.Selection) c.Account { return .{ .reference = selection.account_ref, .readiness = .unknown }; }
+    fn factoryCast(context: *anyopaque) *Factory {
+        return @ptrCast(@alignCast(context));
+    }
+    fn factoryDiscover(_: *anyopaque, _: c.Selection) c.Discovery {
+        return Instance.discover(undefined);
+    }
+    fn factoryAccount(_: *anyopaque, selection: c.Selection) c.Account {
+        return .{ .reference = selection.account_ref, .readiness = .unknown };
+    }
     fn create(context: *anyopaque, allocator: std.mem.Allocator, selection: c.Selection, cwd: []const u8, session: c.RuntimeSessionId, bridge: ?common.Bridge) !common.Adapter {
         const self = factoryCast(context);
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -113,10 +138,16 @@ const Factory = struct {
         allocator.destroy(instance);
         _ = self.destroys.fetchAdd(1, .release);
     }
-    fn handle(self: *Factory) common.Factory { return .{ .context = self, .vtable = &.{ .discover = factoryDiscover, .accountStatus = factoryAccount, .resolveSelection = Instance.resolve, .create = create, .destroy = destroy } }; }
+    fn handle(self: *Factory) common.Factory {
+        return .{ .context = self, .vtable = &.{ .discover = factoryDiscover, .accountStatus = factoryAccount, .resolveSelection = Instance.resolve, .create = create, .destroy = destroy } };
+    }
 };
-fn sampleSelection(workspace: []const u8) c.Selection { return .{ .workspace = .{ .value = workspace }, .model_provider = "fake", .model_id = "exact-model", .account_ref = "local", .effort = "high" }; }
-fn open(session: []const u8, selected: c.Selection) c.Request { return .{ .open = .{ .create = .{ .effect = .{ .value = session }, .session = .{ .value = session }, .selection = selected } } }; }
+fn sampleSelection(workspace: []const u8) c.Selection {
+    return .{ .workspace = .{ .value = workspace }, .model_provider = "fake", .model_id = "exact-model", .account_ref = "local", .effort = "high" };
+}
+fn open(session: []const u8, selected: c.Selection) c.Request {
+    return .{ .open = .{ .create = .{ .effect = .{ .value = session }, .session = .{ .value = session }, .selection = selected } } };
+}
 
 test "three final address factory instances gate open and retain MCP through shutdown" {
     var server = try Mcp.init();
@@ -164,7 +195,9 @@ const Consumer = struct {
     host: *domain.Host = undefined,
     arena: std.heap.ArenaAllocator,
     event: std.Io.Event = .unset,
-    fn wake(context: ?*anyopaque) void { (@as(*Consumer, @ptrCast(@alignCast(context.?)))).event.set(std.testing.io); }
+    fn wake(context: ?*anyopaque) void {
+        (@as(*Consumer, @ptrCast(@alignCast(context.?)))).event.set(std.testing.io);
+    }
     fn next(self: *Consumer) !t.Output {
         var outputs: [1]t.Output = undefined;
         const storage = try self.arena.allocator().alloc(u8, 1024 * 1024);
@@ -203,7 +236,7 @@ const Consumer = struct {
         const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "curl", "--silent", "--show-error", "--max-time", "5", "--write-out", "\n%{http_code}", "-X", "POST", "-H", "Content-Type: application/json", "-H", auth, "--data-binary", body, bridge.url }, .stdout_limit = .limited(65536), .stderr_limit = .limited(4096) });
         if (result.term != .exited or result.term.exited != 0) return error.HttpConsumerFailed;
         const split = std.mem.lastIndexOfScalar(u8, result.stdout, '\n') orelse return error.InvalidHttpResponse;
-        return .{ .status = result.stdout[split+1..], .body = result.stdout[0..split] };
+        return .{ .status = result.stdout[split + 1 ..], .body = result.stdout[0..split] };
     }
     fn call(self: *Consumer, bridge: common.Bridge, name: []const u8, args: anytype) !std.json.Value {
         const allocator = self.arena.allocator();
@@ -369,9 +402,11 @@ test "Host cancellation before readiness never opens and partial create stays un
 
 fn gitFixture(allocator: std.mem.Allocator, root: []const u8, args: []const []const u8) !void {
     var argv: [20][]const u8 = undefined;
-    argv[0] = "git"; argv[1] = "-C"; argv[2] = root;
+    argv[0] = "git";
+    argv[1] = "-C";
+    argv[2] = root;
     @memcpy(argv[3..][0..args.len], args);
-    const result = try std.process.run(allocator, std.testing.io, .{ .argv = argv[0..args.len+3], .stdout_limit = .limited(16384), .stderr_limit = .limited(16384) });
+    const result = try std.process.run(allocator, std.testing.io, .{ .argv = argv[0 .. args.len + 3], .stdout_limit = .limited(16384), .stderr_limit = .limited(16384) });
     if (result.term != .exited or result.term.exited != 0) return error.GitFixtureFailed;
 }
 
@@ -386,12 +421,12 @@ test "real workspace Git capture rejects changed checkouts aliases and shared me
     const n = try temporary.dir.realPath(std.testing.io, &path_buffer);
     const root = try std.fmt.allocPrint(allocator, "{s}/repo", .{path_buffer[0..n]});
     const linked = try std.fmt.allocPrint(allocator, "{s}/linked", .{path_buffer[0..n]});
-    try gitFixture(allocator, root, &.{"init", "--initial-branch=fixture"});
-    try gitFixture(allocator, root, &.{"-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "base"});
+    try gitFixture(allocator, root, &.{ "init", "--initial-branch=fixture" });
+    try gitFixture(allocator, root, &.{ "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "base" });
     const binding = try domain.workspace_binding.capture(allocator, std.testing.io, root);
     try std.testing.expect(!binding.non_git);
     try std.testing.expect(try domain.workspace_binding.verify(allocator, std.testing.io, binding));
-    try gitFixture(allocator, root, &.{"worktree", "add", "-b", "linked-fixture", linked});
+    try gitFixture(allocator, root, &.{ "worktree", "add", "-b", "linked-fixture", linked });
     const linked_binding = try domain.workspace_binding.capture(allocator, std.testing.io, linked);
     try std.testing.expectEqualStrings(binding.repository_identity, linked_binding.repository_identity);
     try std.testing.expect(!std.mem.eql(u8, binding.checkout_identity, linked_binding.checkout_identity));
@@ -403,6 +438,6 @@ test "real workspace Git capture rejects changed checkouts aliases and shared me
     try std.testing.expect(!try domain.workspace_binding.validOwnedPath(allocator, binding, "src//file"));
     try temporary.dir.symLink(std.testing.io, "/tmp", "repo/escape", .{});
     try std.testing.expect(!try domain.workspace_binding.validOwnedPath(allocator, binding, "escape/write"));
-    try gitFixture(allocator, root, &.{"-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "changed"});
+    try gitFixture(allocator, root, &.{ "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "changed" });
     try std.testing.expect(!try domain.workspace_binding.verify(allocator, std.testing.io, binding));
 }

@@ -878,13 +878,14 @@ const Conversation = struct {
                     if (app.view.task_count == app.view.tasks.len) break;
                     const task = row.task;
                     const line = &app.view.tasks[app.view.task_count];
-                    const label = std.fmt.bufPrint(&line.bytes, "{s} | {s}/{s} | {s} | requests {d} | tokens {d}", .{
+                    const label = std.fmt.bufPrint(&line.bytes, "{s} | {s}/{s} | {s} | requests {d} | tokens {d} | {s}", .{
                         task.task.packet.purpose,
                         task.task.packet.selection.runtime_kind,
                         task.task.packet.selection.model_id,
                         @tagName(task.state),
                         task.task.requests,
                         task.task.input_tokens +| task.task.output_tokens,
+                        if (task.task.result) |result| result.summary[0..@min(result.summary.len, 80)] else "No result submitted",
                     }) catch fallback: {
                         const message = "Task label exceeds display budget";
                         @memcpy(line.bytes[0..message.len], message);

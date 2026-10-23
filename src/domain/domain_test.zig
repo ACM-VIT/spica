@@ -599,14 +599,23 @@ const AsyncAdapter = struct {
     fn handle(self: *AsyncAdapter) adapter.Adapter {
         return .{ .context = self, .vtable = &vtable };
     }
-    fn discoverFactory(context: *anyopaque, _: t.adapter.Selection) t.adapter.Discovery { return discover(context); }
-    fn accountFactory(context: *anyopaque, _: t.adapter.Selection) t.adapter.Account { return account(context); }
-    fn createFactory(context: *anyopaque, _: std.mem.Allocator, _: t.adapter.Selection, _: []const u8, _: t.adapter.RuntimeSessionId, _: ?adapter.Bridge) !adapter.Adapter { return (@as(*AsyncAdapter, @ptrCast(@alignCast(context)))).handle(); }
+    fn discoverFactory(context: *anyopaque, _: t.adapter.Selection) t.adapter.Discovery {
+        return discover(context);
+    }
+    fn accountFactory(context: *anyopaque, _: t.adapter.Selection) t.adapter.Account {
+        return account(context);
+    }
+    fn createFactory(context: *anyopaque, _: std.mem.Allocator, _: t.adapter.Selection, _: []const u8, _: t.adapter.RuntimeSessionId, _: ?adapter.Bridge) !adapter.Adapter {
+        return (@as(*AsyncAdapter, @ptrCast(@alignCast(context)))).handle();
+    }
     fn destroyFactory(_: *anyopaque, _: std.mem.Allocator, _: adapter.Adapter) void {}
     fn factory(self: *AsyncAdapter) adapter.Factory {
         return .{ .context = self, .vtable = &.{
-            .discover = discoverFactory, .accountStatus = accountFactory, .resolveSelection = selection,
-            .create = createFactory, .destroy = destroyFactory,
+            .discover = discoverFactory,
+            .accountStatus = accountFactory,
+            .resolveSelection = selection,
+            .create = createFactory,
+            .destroy = destroyFactory,
         } };
     }
 };
@@ -678,8 +687,12 @@ test "durable app task delegation deduplicates bounds and correlates out of orde
     const started = (try owner.claimNext(allocator)).?;
     try owner.delivered(allocator, started.id, .{ .outcome = .acknowledged });
     const packet: t.orchestration.Packet = .{
-        .purpose = "first child", .prompt = "implement first", .selection = conversation.send("", "", 1).payload.thread_send.selection,
-        .owned_paths = &.{"first.zig"}, .acceptance = "deterministic result", .result_location = "evidence/first",
+        .purpose = "first child",
+        .prompt = "implement first",
+        .selection = conversation.send("", "", 1).payload.thread_send.selection,
+        .owned_paths = &.{"first.zig"},
+        .acceptance = "deterministic result",
+        .result_location = "evidence/first",
         .budget = .{ .max_elapsed_ms = 1000 },
     };
     var command: t.CommandEnvelope = .{ .command_id = .{ .value = "delegate-one" }, .target = .{ .run = parent.entity_ids.run.? }, .expected_revision = .{ .revision = 3 }, .payload = .{ .task_delegate = packet } };

@@ -1,10 +1,14 @@
 //! Captures actual checkout identity; never trusts a display label as cwd.
 const std = @import("std");
 const t = @import("types.zig");
-const c = @cImport({ @cInclude("sys/stat.h"); });
+const c = @cImport({
+    @cInclude("sys/stat.h");
+});
 fn git(allocator: std.mem.Allocator, io: std.Io, root: []const u8, args: []const []const u8) ![]const u8 {
     var argv: [12][]const u8 = undefined;
-    argv[0] = "git"; argv[1] = "-C"; argv[2] = root;
+    argv[0] = "git";
+    argv[1] = "-C";
+    argv[2] = root;
     if (args.len > argv.len - 3) return error.Limit;
     @memcpy(argv[3..][0..args.len], args);
     const result = try std.process.run(allocator, io, .{ .argv = argv[0 .. args.len + 3], .stdout_limit = .limited(16384), .stderr_limit = .limited(4096) });
@@ -22,9 +26,12 @@ pub fn capture(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !t.Wo
     if (c.stat(path, &identity) != 0) return error.WorkspaceUnavailable;
     var binding: t.WorkspaceBinding = .{
         .canonical_root = canonical,
-        .filesystem_identity = try std.fmt.allocPrint(allocator, "{d}:{d}", .{identity.st_dev, identity.st_ino}),
-        .repository_identity = "", .checkout_identity = canonical,
-        .expected_branch = "", .base_revision = "", .non_git = true,
+        .filesystem_identity = try std.fmt.allocPrint(allocator, "{d}:{d}", .{ identity.st_dev, identity.st_ino }),
+        .repository_identity = "",
+        .checkout_identity = canonical,
+        .expected_branch = "",
+        .base_revision = "",
+        .non_git = true,
     };
     const common = git(allocator, io, canonical, &.{ "rev-parse", "--path-format=absolute", "--git-common-dir" }) catch |err| switch (err) {
         error.NotRepository => return binding,

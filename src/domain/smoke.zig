@@ -94,7 +94,7 @@ fn hostSmoke(io: std.Io, state_directory: []const u8, mode: []const u8) !void {
     consumer.host = try domain.Host.create(std.heap.page_allocator, io, .{ .state_directory = state_directory, .wake = Consumer.wake, .wake_context = &consumer });
     defer consumer.host.destroy();
     const project = (try consumer.command(.{ .command_id = .{ .value = "smoke-project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "temporary Host smoke" } } })).entity_ids.project.?;
-    const workspace = (try consumer.command(.{ .command_id = .{ .value = "smoke-workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = try domain.workspace_binding.capture(consumer.arena.allocator(), io, "/tmp") } } })).entity_ids.workspace.?;
+    const workspace = (try consumer.command(.{ .command_id = .{ .value = "smoke-workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = try domain.workspace_binding.capture(consumer.arena.allocator(), io, if (std.mem.eql(u8, mode, "host-tasks")) state_directory else "/tmp") } } })).entity_ids.workspace.?;
     const thread = (try consumer.command(.{ .command_id = .{ .value = "smoke-thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
     const selection: t.adapter.Selection = .{ .workspace = workspace, .model_provider = "fake", .model_id = "smoke", .effort = "none", .account_ref = "temporary" };
     const sent = try consumer.command(.{ .command_id = .{ .value = "smoke-send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "Hello café 世界", .selection = selection } } });
@@ -102,6 +102,28 @@ fn hostSmoke(io: std.Io, state_directory: []const u8, mode: []const u8) !void {
     const approvals = try consumer.query(.{ .approvals = .{ .run = run } });
     if (approvals.items.len != 1) return error.MissingApproval;
     const approval = approvals.items[0].approval;
+    if (std.mem.eql(u8, mode, "host-tasks")) {
+        for ([_][]const u8{ "first", "second" }) |name| {
+            const runs = try consumer.query(.{ .runs = .{ .thread = thread } });
+            _ = try consumer.command(.{
+                .command_id = .{ .value = name },
+                .target = .{ .run = run },
+                .expected_revision = .{ .revision = runs.items[0].run.revision },
+                .payload = .{ .task_delegate = .{
+                    .purpose = name,
+                    .prompt = "Independent deterministic task",
+                    .selection = selection,
+                    .owned_paths = &.{name},
+                    .acceptance = "Public durable fixture",
+                    .result_location = name,
+                } },
+            });
+        }
+        const tasks = try consumer.query(.{ .task_list = .{ .parent = run } });
+        if (tasks.items.len != 2) return error.MissingTasks;
+        try std.Io.File.stdout().writeStreamingAll(io, "{\"public_tasks\":2,\"backend\":\"per-session-fake\",\"shutdown\":\"no-replay-on-reopen\"}\n");
+        return;
+    }
     if (std.mem.eql(u8, mode, "host-crash-approval")) {
         if (!approval.live or approval.state != .pending) return error.NoLiveApproval;
         try std.Io.File.stdout().writeStreamingAll(io, "{\"stage\":\"durable-approval\",\"exit\":75}\n");

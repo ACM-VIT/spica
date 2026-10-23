@@ -57,7 +57,8 @@ pub const View = struct {
     custom_tile_sequence: u64 = std.math.maxInt(u64),
     pub const TaskCancel = struct { id: [32]u8, revision: u64 };
     pub const TaskLine = struct {
-        bytes: [320]u8 = undefined, len: usize = 0,
+        bytes: [320]u8 = undefined,
+        len: usize = 0,
         cancel: ?TaskCancel = null,
         cancel_bounds: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     };
