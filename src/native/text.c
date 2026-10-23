@@ -248,9 +248,9 @@ static hb_bool_t bitmap_extents(hb_font_t *font, void *data, hb_codepoint_t glyp
     double sy = (double)y / (64.0 * f->face->size->metrics.y_ppem);
     FT_Glyph_Metrics *m = &f->face->glyph->metrics;
     *extents = (hb_glyph_extents_t){.x_bearing = (hb_position_t)round(m->horiBearingX * sx),
-                                   .y_bearing = (hb_position_t)round(m->horiBearingY * sy),
-                                   .width = (hb_position_t)round(m->width * sx),
-                                   .height = (hb_position_t)round(-m->height * sy)};
+                                    .y_bearing = (hb_position_t)round(m->horiBearingY * sy),
+                                    .width = (hb_position_t)round(m->width * sx),
+                                    .height = (hb_position_t)round(-m->height * sy)};
     return true;
 }
 static bool reset_tables(Face *f) {
