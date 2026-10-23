@@ -56,3 +56,20 @@ Actual `tools/eval-starter --mode conversation --optimize Debug --output /home/a
 Focused checks: native Debug build passed after correcting the Zig Dir API; direct root with actual C/SQLite dependencies passed **50/50**, Python evaluator regressions **10/10**, formatting passed. Raw root command/log is parent `.artifacts/ui005/run-rich-native-check.py` / `host-native-check/native-root.log`. One narrow-check harness flag repair (`_DEFAULT_SOURCE`, matching build integration) was needed; production native build already had it. No broad suite or performance claim.
 
 Behavior reference inspected at exact T3 pin `eb1510d2493cbf28600432d5193cc22a1af8f3d8`: `apps/web/src/components/chat/ComposerPrimaryActions.tsx:112-154` preserves composer focus and gates Send/Interrupt; `ComposerPendingApprovalPanel.tsx:74-87` bounds detail and rejects non-resumable approval; `MessagesTimeline.tsx:1217-1221` records streaming-history geometry hazards. Native equivalents reuse retained primitives; no React/Effect architecture copied. Current slice is explicit-state opt-in; next separately authorized slice adds new independent XDG native default plus root-before-Host teardown. Lua root bridge, syntax token colors, distant history paging and independent performance evidence remain incomplete.
+
+## Independent default conversation and shutdown ordering
+
+The next separately authorized slice makes ordinary launch useful: the new
+`$XDG_DATA_HOME/spica-native/conversation` namespace (absolute XDG only), with
+`$HOME/.local/share` fallback, never discovers or migrates legacy application
+histories. Explicit `--state-directory` overrides it. `App.disconnect` joins its
+presentation worker before main destroys Host; SDL/wake remain alive through
+both joins. App teardown remains idempotent.
+
+Focused `zig test src/options.zig` passed3/3, including absolute XDG/fallback/error
+cases. Actual new `tools/eval-starter --mode conversation --default-state
+--optimize Debug --output /home/ashman/Documents/spica/.artifacts/ui005/native-default-state`
+passed the real prompt/allow/tool/cancel/reopen flow **without a state-directory
+argument**, with XDG_DATA_HOME isolated below evidence output. All other evaluator
+modes now pass explicit disposable state too, so no test opens user histories.
+Formatting passed. Lua bridge remains the next separate slice.

@@ -19,7 +19,7 @@ python3 build/driver.py run      # native starter window
 ./tools/eval-starter --mode editor # private Unicode/clipboard/focus input scenario
 ```
 
-For the native durable fake-provider coding flow, explicitly choose separate state:
+The default native coding UI opens its independent fake-provider conversation:
 
 ```bash
 zig-out/bin/spica --state-directory /tmp/spica-disposable-conversation
@@ -28,8 +28,9 @@ zig-out/bin/spica --state-directory /tmp/spica-disposable-conversation
 
 Enter sends, Shift+Enter inserts newline, F6 cancels, F7 allows the current live
 approval, F8 denies, and Ctrl+Q closes. Reopening that directory retains committed
-output and run status. Without `--state-directory`, only the local draft editor
-opens; no existing history is discovered or migrated.
+output and run status. Ordinary launch uses `$XDG_DATA_HOME/spica-native/conversation`
+(or `$HOME/.local/share/spica-native/conversation`); legacy histories are never
+discovered or migrated. `--state-directory` selects isolated state explicitly.
 
 For a clean machine, run `python3 build/bootstrap.py` first. Dependencies are pinned in deps.lock.json; see [CONTRIBUTING.md](CONTRIBUTING.md).
 Both check commands use local dependencies only; the core target needs the locked

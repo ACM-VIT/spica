@@ -87,12 +87,18 @@ pub const App = struct {
         return .{ .window = window, .renderer = renderer, .text = text, .layout = layout, .view = view };
     }
 
+    /// Dispose replaceable presentation before Host join, retaining SDL/wake.
+    pub fn disconnect(self: *App) void {
+        if (self.conversation) |conversation| conversation.destroy();
+        self.conversation = null;
+    }
+
     pub fn deinit(self: *App) void {
         if (self.live) |live| {
             live.file.close(live.io);
             self.view.allocator.destroy(live);
         }
-        if (self.conversation) |conversation| conversation.destroy();
+        self.disconnect();
         self.view.deinit();
         self.layout.deinit();
         c.spica_text_destroy(self.text);

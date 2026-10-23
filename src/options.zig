@@ -43,12 +43,33 @@ pub const Options = struct {
     }
 };
 
+/// Native rewrite's independent namespace. No legacy discovery or migration.
+pub fn defaultStateDirectory(allocator: std.mem.Allocator, xdg_data_home: ?[]const u8, home: ?[]const u8) ![]u8 {
+    if (xdg_data_home) |root| {
+        if (std.fs.path.isAbsolute(root)) return std.fs.path.join(allocator, &.{ root, "spica-native", "conversation" });
+    }
+    const root = home orelse return error.HomeUnavailable;
+    if (!std.fs.path.isAbsolute(root)) return error.HomeUnavailable;
+    return std.fs.path.join(allocator, &.{ root, ".local", "share", "spica-native", "conversation" });
+}
+
+test "native default state path is independent and honors absolute XDG only" {
+    const allocator = std.testing.allocator;
+    const xdg = try defaultStateDirectory(allocator, "/temporary/data", "/temporary/home");
+    defer allocator.free(xdg);
+    try std.testing.expectEqualStrings("/temporary/data/spica-native/conversation", xdg);
+    const fallback = try defaultStateDirectory(allocator, "relative", "/temporary/home");
+    defer allocator.free(fallback);
+    try std.testing.expectEqualStrings("/temporary/home/.local/share/spica-native/conversation", fallback);
+    try std.testing.expectError(error.HomeUnavailable, defaultStateDirectory(allocator, null, null));
+}
+
 pub const help =
     \\Spica — native coding workspace
     \\Usage: spica [--state-directory DIRECTORY] [--quit-after-ms MILLISECONDS]
     \\
-    \\--state-directory opens an explicit isolated durable fake-provider conversation.
-    \\Without it, only the local Unicode draft editor is opened; no history is accessed.
+    \\--state-directory overrides the independent durable fake-provider conversation.
+    \\Default: $XDG_DATA_HOME/spica-native/conversation ($HOME/.local/share fallback).
     \\Enter sends; Shift+Enter inserts newline. F6 cancels; F7 allows; F8 denies.
     \\Escape dismisses local editing state. Ctrl+Q or window close exits.
     \\--quit-after-ms exits after a bounded smoke run (0 exits immediately).

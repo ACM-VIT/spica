@@ -176,6 +176,7 @@ def main():
     parser.add_argument('--binary-sha256')
     parser.add_argument('--source-sha256')
     parser.add_argument('--optimize', choices=('Debug', 'ReleaseSafe'), default='ReleaseSafe')
+    parser.add_argument('--default-state', action='store_true', help='Exercise native default with isolated XDG_DATA_HOME, never user history')
     parser.add_argument('--warmup', type=float, default=10)
     parser.add_argument('--phase-seconds', type=float, default=15)
     parser.add_argument('--cycles', type=int, default=3)
@@ -220,9 +221,12 @@ def main():
         duration = args.warmup + args.phase_seconds * (1 + 2 * args.cycles)
         argv = [str(binary), '--quit-after-ms', str(math.ceil((duration + 60) * 1000)),
                 '--automation-output', str(output / 'automation.json')]
+        if args.default_state:
+            argv = ['env', 'XDG_DATA_HOME=' + str(output / 'xdg-data'), *argv]
+        else:
+            argv += ['--state-directory', str(output / 'conversation-state')]
         if args.mode == 'conversation':
-            state = output / 'conversation-state'
-            argv += ['--state-directory', str(state), '--automation-live', str(output / 'live.json')]
+            argv += ['--automation-live', str(output / 'live.json')]
         if not args.disable_metrics:
             argv += ['--metrics-output', str(output / 'native.json')]
         launch = json.loads(run('vd', 'run', session, '--bg', '--log', str(output / 'app.log'), '--', *argv))

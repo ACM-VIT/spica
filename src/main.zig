@@ -55,7 +55,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (wake.event_type == 0) return error.UserEventRegistration;
     var host: ?*Host = null;
     defer if (host) |value| value.destroy();
-    if (options.state_directory) |directory| {
+    defer app.disconnect();
+    {
+        const directory = options.state_directory orelse try options_module.defaultStateDirectory(arena.allocator(), init.environ.getPosix("XDG_DATA_HOME"), init.environ.getPosix("HOME"));
         host = try Host.create(std.heap.page_allocator, threaded.io(), .{ .state_directory = directory, .wake = Wake.notify, .wake_context = &wake });
         const dir = try std.Io.Dir.cwd().openDir(threaded.io(), directory, .{});
         defer dir.close(threaded.io());
