@@ -312,3 +312,83 @@ test "ACP pump error during a turn preserves run correlation and drains accepted
     try std.testing.expect((try runtime.poll(a)) == null);
     try std.testing.expectEqual(@as(usize, 0), runtime.transport.polls);
 }
+
+fn permissionForTool(runtime: *Runtime, a: std.mem.Allocator, tool: []const u8) !c.Observation {
+    const bytes = try std.json.Stringify.valueAlloc(a, .{
+        .jsonrpc = "2.0",
+        .id = tool,
+        .method = "session/request_permission",
+        .params = .{
+            .sessionId = "ses_upstream",
+            .toolCall = .{ .toolCallId = tool, .title = "controlled printf", .rawInput = .{ .command = "printf proof" } },
+            .options = .{ .{ .optionId = "once", .kind = "allow_once" }, .{ .optionId = "reject", .kind = "reject_once" } },
+        },
+    }, .{});
+    return (try consume(runtime, a, bytes)).?;
+}
+
+fn toolUpdate(runtime: *Runtime, a: std.mem.Allocator, tool: []const u8, status: []const u8, input: ?[]const u8) !?c.Observation {
+    const bytes = try std.json.Stringify.valueAlloc(a, .{
+        .jsonrpc = "2.0",
+        .method = "session/update",
+        .params = .{
+            .sessionId = "ses_upstream",
+            .update = .{ .sessionUpdate = "tool_call_update", .toolCallId = tool, .status = status, .title = "controlled printf", .rawInput = if (input) |command| .{ .command = command } else null, .content = .{} },
+        },
+    }, .{});
+    return consume(runtime, a, bytes);
+}
+
+test "ACP approved tool authority survives postdecision status updates and interleaving" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var runtime: Runtime = undefined;
+    try prompting(&runtime, a);
+    defer runtime.shutdown();
+    const first = (try permissionForTool(&runtime, a, "tool-A")).body.approval;
+    _ = try runtime.dispatch(a, .{ .respond_approval = .{ .correlation = first.correlation, .decision = .allow, .action_digest = first.action_digest } });
+    const second = (try permissionForTool(&runtime, a, "tool-B")).body.approval;
+    _ = try runtime.dispatch(a, .{ .respond_approval = .{ .correlation = second.correlation, .decision = .deny, .action_digest = second.action_digest } });
+    const first_update = (try toolUpdate(&runtime, a, "tool-A", "in_progress", null)).?;
+    try std.testing.expectEqualStrings(first.action_digest, first_update.body.tool_started.action_digest);
+    const second_update = (try toolUpdate(&runtime, a, "tool-B", "in_progress", "printf proof")).?;
+    try std.testing.expectEqualStrings(second.action_digest, second_update.body.tool_started.action_digest);
+    try std.testing.expectError(error.ActionChanged, toolUpdate(&runtime, a, "tool-A", "in_progress", "different command"));
+    try std.testing.expectError(error.ActionChanged, toolUpdate(&runtime, a, "tool-A", "completed", "different command"));
+    const result = (try toolUpdate(&runtime, a, "tool-A", "completed", null)).?;
+    try std.testing.expect(result.body == .chunk);
+    try std.testing.expectEqualStrings("tool-A", result.correlation.tool.?.value);
+    const terminal = (try runtime.poll(a)).?;
+    try std.testing.expect(terminal.body == .tool_completed);
+    try std.testing.expect(terminal.body.tool_completed.outcome == .succeeded);
+    _ = try toolUpdate(&runtime, a, "tool-B", "failed", null);
+    const denied = (try runtime.poll(a)).?;
+    try std.testing.expect(denied.body == .tool_completed);
+    try std.testing.expect(denied.body.tool_completed.outcome == .failed);
+    try std.testing.expect(runtime.tool_authorities == null);
+}
+
+test "ACP permission authority index is bounded by turn storage and reset per turn" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var runtime: Runtime = undefined;
+    try prompting(&runtime, a);
+    defer runtime.shutdown();
+    _ = try permissionForTool(&runtime, a, "prior-tool");
+    _ = try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"stopReason\":\"end_turn\"}}");
+    _ = try runtime.dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = "next" } });
+    try std.testing.expect(runtime.tool_authorities == null);
+    const update = (try toolUpdate(&runtime, a, "prior-tool", "in_progress", null)).?;
+    try std.testing.expectEqualStrings("prior-tool", update.body.tool_started.action_digest);
+    for (0..256) |_| {
+        const event = permissionForTool(&runtime, a, "bounded-tool") catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            return;
+        };
+        const approval = event.body.approval;
+        _ = try runtime.dispatch(a, .{ .respond_approval = .{ .correlation = approval.correlation, .decision = .deny, .action_digest = approval.action_digest } });
+    }
+    return error.ExpectedBoundedAuthorityStorage;
+}

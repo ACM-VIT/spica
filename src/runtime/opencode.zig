@@ -31,6 +31,12 @@ const clone = common.clone;
 pub fn RuntimeFor(comptime Transport: type) type {
     return struct {
         const Self = @This();
+        const ToolAuthority = struct {
+            next: ?*ToolAuthority,
+            tool: []const u8,
+            digest: []const u8,
+            raw_input: []const u8,
+        };
         allocator: std.mem.Allocator,
         transport: Transport,
         config: Config,
@@ -50,6 +56,10 @@ pub fn RuntimeFor(comptime Transport: type) type {
         approval_digest: []const u8 = "",
         approval_allow: []const u8 = "",
         approval_deny: []const u8 = "",
+        // Permission refines the initial tool-ID placeholder. Preserve that
+        // authority across status-only updates, including interleaved tools.
+        // All nodes/strings share the existing bounded per-turn allocator.
+        tool_authorities: ?*ToolAuthority = null,
         offset: u64 = 0,
         sequence: u64 = 0,
         load_supported: bool = false,
@@ -193,6 +203,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
                 .open => |open| {
                     if (self.phase != .idle) return error.NotReady;
                     self.turn.reset();
+                    self.tool_authorities = null;
                     switch (open) {
                         .create => |r| {
                             if (!self.compatibleSelection(r.selection)) return error.SelectionUnavailable;
@@ -213,6 +224,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
                     if (self.phase != .ready or self.session == null) return error.NotReady;
                     if (r.correlation.effect == null or r.correlation.run == null or !c.equal(r.correlation.session, self.session.?.id)) return error.InvalidCorrelation;
                     self.turn.reset();
+                    self.tool_authorities = null;
                     self.correlation = try clone(self.turn.allocator(), r.correlation);
                     try self.rpc("session/prompt", .{ .sessionId = self.session.?.upstream.value, .prompt = .{.{ .type = "text", .text = r.prompt }} });
                     self.prompt_id = self.pending_id;
@@ -431,6 +443,14 @@ pub fn RuntimeFor(comptime Transport: type) type {
                 self.approval_allow = try self.turn.allocator().dupe(u8, allow);
                 self.approval_deny = try self.turn.allocator().dupe(u8, deny);
                 self.approval_id = if (id == .string) .{ .string = try self.turn.allocator().dupe(u8, id.string) } else id;
+                const authority = try self.turn.allocator().create(ToolAuthority);
+                authority.* = .{
+                    .next = self.tool_authorities,
+                    .tool = self.approval_tool,
+                    .digest = self.approval_digest,
+                    .raw_input = try std.json.Stringify.valueAlloc(self.turn.allocator(), field(tool, "rawInput"), .{}),
+                };
+                self.tool_authorities = authority;
                 var correlation = self.correlation;
                 correlation.tool = .{ .value = self.approval_tool };
                 correlation.approval = .{ .value = self.approval_digest };
@@ -466,8 +486,29 @@ pub fn RuntimeFor(comptime Transport: type) type {
                 const tool_id = text(field(update, "toolCallId"));
                 if (tool_id.len == 0) return error.InvalidProtocol;
                 const status = text(field(update, "status"));
+                var action_digest = tool_id;
+                var authority = self.tool_authorities;
+                while (authority) |entry| : (authority = entry.next) {
+                    if (!eq(entry.tool, tool_id)) continue;
+                    const raw_input = field(update, "rawInput");
+                    if (raw_input != .null) {
+                        var writer = std.Io.Writer.fixed(&self.pending_bytes);
+                        std.json.Stringify.value(raw_input, .{}, &writer) catch return error.FrameTooLarge;
+                        if (!eq(entry.raw_input, writer.buffered())) return error.ActionChanged;
+                    }
+                    action_digest = entry.digest;
+                    break;
+                }
                 if (eq(status, "completed") or eq(status, "failed")) {
                     if (tool_id.len > self.pending_tool.len) return error.FrameTooLarge;
+                    var link = &self.tool_authorities;
+                    while (link.*) |entry| {
+                        if (eq(entry.tool, tool_id)) {
+                            link.* = entry.next;
+                            break;
+                        }
+                        link = &entry.next;
+                    }
                     var writer = std.Io.Writer.fixed(&self.pending_bytes);
                     std.json.Stringify.value(field(update, "content"), .{}, &writer) catch return error.FrameTooLarge;
                     @memcpy(self.pending_tool[0..tool_id.len], tool_id);
@@ -478,7 +519,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
                     self.pending_kind = if (self.pending_len == 0) .tool_terminal else .tool;
                     return self.drainPending(allocator);
                 }
-                var result = try self.observation(allocator, kind, .{ .tool_started = .{ .name = text(field(update, "title")), .action_digest = tool_id } });
+                var result = try self.observation(allocator, kind, .{ .tool_started = .{ .name = text(field(update, "title")), .action_digest = action_digest } });
                 result.correlation.tool = .{ .value = try allocator.dupe(u8, tool_id) };
                 result.correlation.upstream_tool = result.correlation.tool.?.value;
                 return result;

@@ -25,6 +25,16 @@ factory instance without polling a duplicate diagnostic.
 
 `session/request_permission` carries JSON-RPC request ID, session, tool call and offered options. The adapter hashes the complete request, binds approval to session/run/tool/digest, uses only the actual offered `allow_once`/`reject_once` option IDs, rejects stale/duplicate responses, and never selects `allow_always`. Scope comes from the upstream title; no upstream expiry is invented. The Host permits a null deadline only for a pending request in the current live epoch with the exact action digest and awaiting-approval run; a nonnull deadline is checked against the trusted clock. Restart does not make an old callback live again.
 
+The initial tool-ID placeholder digest is refined by the complete permission
+request. The adapter retains that final authority for each pending upstream
+tool inside the existing 16 KiB turn buffer, so post-decision status-only updates
+cannot overwrite an approved action with its old tool ID. Interleaved A/B/A
+updates preserve each tool's digest; explicit changed `rawInput` fails closed as
+`ActionChanged`. Terminal results unlink the authority, and the next turn resets
+the bounded storage. Regression tests cover allow/deny, interleaving, terminal
+result closure, action drift and exhaustion/reset. No Host resolved-approval
+immutability rule is relaxed.
+
 OpenCode accepts stdio or HTTP `mcpServers` in `session/new` and `session/resume`. `Config.mcp_servers` accepts the serialized ACP array from the actual application MCP owner. This is NOT an ACP tool-call response channel: OpenCode does not support MCP-over-ACP. HTTP registration forwards explicit headers; integration policies still apply. MCP servers are scoped to the private process but shared by sessions in the same workspace directory. Registering a URL or command alone does not prove the app tool bridge: `coordinator_bridge` stays unsupported until the application implements and exercises an actual MCP endpoint and durable host-tool claims. No mock delegation bridge or fictional cross-runtime parity is provided.
 
 `src/runtime/opencode_bridge.zig.serialize(allocator, common.Bridge)` returns an
