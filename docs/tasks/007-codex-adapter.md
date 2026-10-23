@@ -69,3 +69,9 @@ The user-authorized finite worker budgets are 60 minutes, 200 requests soft,
 Native startup remains an identified candidate until the domain factory seam
 and actual provider/native checks are assembled; checkpointing the concrete
 factory alone is not acceptance.
+
+Follow-up factory coverage adds an actual surviving-session pipe exchange
+after stopping its peer and exhaustive allocation-failure injection for both
+Codex and OpenCode creation with tool/endpoint metadata. Same focused command:
+7/7 passed with the leak-aware allocator. This still does not substitute for a
+provider turn cancellation or authenticated native workflow.

@@ -39,5 +39,38 @@ test "two concrete sessions retain independent processes and cancellation owners
     first.shutdown();
     try std.testing.expect(right.wire.process.pid > 0);
     try std.testing.expect(!right.wire.exited);
+    try right.wire.send("{\"other_session\":\"still-alive\"}");
+    var received = false;
+    for (0..100) |_| {
+        try right.wire.pump();
+        while (try right.wire.poll(std.testing.allocator)) |line| {
+            defer std.testing.allocator.free(line);
+            if (std.mem.eql(u8, line, "{\"other_session\":\"still-alive\"}")) received = true;
+        }
+        if (received) break;
+        _ = @import("runtime/transport.zig").c.spica_process_poll(&right.wire.process, -1, 0, 10);
+    }
+    try std.testing.expect(received);
     second.shutdown();
+}
+
+fn failedCreation(a: std.mem.Allocator) !void {
+    for ([_][]const u8{ "codex", "opencode" }) |kind| {
+        var chosen = selection;
+        chosen.runtime_kind = kind;
+        chosen.required_runtime_version = if (std.mem.eql(u8, kind, "codex")) "0.163.0" else "2.1.4";
+        var config: native.NativeFactory = .{ .selection = chosen, .executable = "/does/not/exist", .environment = &.{} };
+        const factory = config.asFactory();
+        const adapter = factory.create(a, chosen, "/tmp", .{ .value = "allocation-failure" }, .{ .url = "http://127.0.0.1/mcp/session", .token = "isolated-fixture" }) catch |err| {
+            if (err == error.SpawnFailed) continue;
+            return err;
+        };
+        adapter.shutdown();
+        factory.destroy(a, adapter);
+        return error.UnexpectedSpawn;
+    }
+}
+
+test "factory cleans every partial allocation failure for both providers" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, failedCreation, .{});
 }
