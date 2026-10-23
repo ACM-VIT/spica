@@ -35,5 +35,10 @@ binary/environment/source identities and rows: `consumer/host-manifest-4.json`,
 `host-run-4.log`, `host-durable-4.json`. Earlier schema-error and no-callback
 cohorts remain evidence, not relabeled passes. Codex/OpenCode simultaneous
 handshake/OpenCode inference passed in a single explicitly mixed factory;
-Codex was unsigned and performed no inference. Native desktop and live
-permission interaction are separate remaining evidence gates.
+Codex was unsigned and performed no inference. Native desktop real typing/Enter
+completed `SPICA_NATIVE_FACTORY_OK`; F6 sent an actual upstream cancellation,
+retained as durable `unknown` because stopped provider tools cannot be proven.
+Read-only reopen retained that exact run and previous completed content. The
+reopen used a newer explicitly identified binary, not a same-binary claim.
+Screenshots/raw inputs/manifests: `consumer/desktop-1/` under the evidence root.
+Live permission interaction remains a separate evidence gate.
