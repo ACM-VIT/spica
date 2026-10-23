@@ -58,3 +58,12 @@ wording assertion; focused LuaBootstrapTests 2/2 passed. Shared selected Lua pre
 prepared from verified local archive with source bootstrap, without network or
 packages; `.artifacts/script006/shared-prefix-build.log`. No further broad checks
 before actual app assembly.
+
+Concrete integration review repair: `51722c6` integrated as `92473ee` revokes
+completed but unconsumed old-generation action proposals atomically before VM
+replacement; identities remain delivered as explicit failures with cleared
+intents. New focused regression passed Debug/ReleaseSafe 1/1 each; evidence
+`.artifacts/script006/queued-generation-revocation.log`. No ABI shape change or
+new Host capability. Native still gates installed generation before admission.
+Formatter-only native checkpoint `8944e7d` integrated as `1de4ab5`; strict C
+syntax/warnings and formatting passed, preparing the final combined check.
