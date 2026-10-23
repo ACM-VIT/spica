@@ -23,7 +23,7 @@ factory instance without polling a duplicate diagnostic.
 
 ## Permissions and real bridge semantics
 
-`session/request_permission` carries JSON-RPC request ID, session, tool call and offered options. The adapter hashes the complete request, binds approval to session/run/tool/digest, uses only the actual offered `allow_once`/`reject_once` option IDs, rejects stale/duplicate responses, and never selects `allow_always`. Scope comes from the upstream title; no upstream expiry is invented. The domain's fail-closed handling of absent expiry remains applicable.
+`session/request_permission` carries JSON-RPC request ID, session, tool call and offered options. The adapter hashes the complete request, binds approval to session/run/tool/digest, uses only the actual offered `allow_once`/`reject_once` option IDs, rejects stale/duplicate responses, and never selects `allow_always`. Scope comes from the upstream title; no upstream expiry is invented. The Host permits a null deadline only for a pending request in the current live epoch with the exact action digest and awaiting-approval run; a nonnull deadline is checked against the trusted clock. Restart does not make an old callback live again.
 
 OpenCode accepts stdio or HTTP `mcpServers` in `session/new` and `session/resume`. `Config.mcp_servers` accepts the serialized ACP array from the actual application MCP owner. This is NOT an ACP tool-call response channel: OpenCode does not support MCP-over-ACP. HTTP registration forwards explicit headers; integration policies still apply. MCP servers are scoped to the private process but shared by sessions in the same workspace directory. Registering a URL or command alone does not prove the app tool bridge: `coordinator_bridge` stays unsupported until the application implements and exercises an actual MCP endpoint and durable host-tool claims. No mock delegation bridge or fictional cross-runtime parity is provided.
 
@@ -67,8 +67,9 @@ task/result after Host shutdown and read-only reopen. Its executable arguments
 are `OPENCODE_EXECUTABLE WORKSPACE ACCOUNT_DIRECTORY STATE_DIRECTORY`.
 
 Installed OpenCode defaults MCP tools to Code Mode. The model invokes them
-through `execute` under the `tools.spica` namespace (the catalog preserves the
-original `task.delegate` tool name); they are not directly callable model tools.
+through `execute` under the `tools.spica` namespace. The observed catalog path
+is `tools.spica.task_delegate`, normalized from the original MCP `task.delegate`
+name; these are not directly callable model tools.
 The consumer allows this actual Code Mode wrapper but forbids shell, filesystem
 and native subagent substitutes. Attempt 3 connected all five actual MCP tools
 but its prompt incorrectly prohibited `execute`, so it produced no callback;

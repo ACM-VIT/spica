@@ -303,6 +303,7 @@ test "public factory Host authenticates MCP durable retries and pumps three isol
     packet.selection.account_ref = "child-two-account";
     packet.owned_paths = &.{"src/a"};
     packet.detached = true;
+    packet.budget.max_requests = 2;
     const second = try Consumer.receipt(try consumer.call(bridge, "task.delegate", .{ .request_key = "delegate-second", .packet = packet }), allocator);
     try std.testing.expectEqual(.accepted, second.outcome);
     _ = try consumer.query(.{ .task_list = .{ .parent = parent.entity_ids.run.? } });
@@ -316,6 +317,13 @@ test "public factory Host authenticates MCP durable retries and pumps three isol
     }
     try std.testing.expectEqualStrings("child-one-account", factory.instances[1].?.selection.account_ref);
     try std.testing.expectEqualStrings("child-two-model", factory.instances[2].?.selection.model_id);
+    const steering_args = .{ .request_key = "send-second", .task_id = second.entity_ids.run.?.value, .content = "one durable steering request" };
+    const steering = try Consumer.receipt(try consumer.call(bridge, "task.send", steering_args), allocator);
+    try std.testing.expectEqual(.accepted, steering.outcome);
+    const steering_retry = try Consumer.receipt(try consumer.call(bridge, "task.send", steering_args), allocator);
+    try std.testing.expectEqual(steering.commit_sequence, steering_retry.commit_sequence);
+    const over_budget = try Consumer.receipt(try consumer.call(bridge, "task.send", .{ .request_key = "send-over-budget", .task_id = second.entity_ids.run.?.value, .content = "must not dispatch" }), allocator);
+    try std.testing.expectEqual(t.Reason.admission_limit, over_budget.reason.?);
     const denied = try consumer.call(factory.instances[2].?.bridge, "task.cancel", .{ .request_key = "steal", .task_id = first.entity_ids.run.?.value, .reason = "unauthorized sibling" });
     try std.testing.expect(denied.object.get("isError").?.bool);
     const conflicting = try consumer.call(bridge, "task.cancel", .{ .request_key = "delegate-first", .task_id = first.entity_ids.run.?.value, .reason = "conflicting key" });

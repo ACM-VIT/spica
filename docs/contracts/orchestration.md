@@ -14,6 +14,8 @@ Session-specific loopback HTTP endpoints accept authenticated JSON-response MCP 
 
 Schema 3 adds task packets, usage, result/review and bridge request identities. Migration from schema 1/2 preserves existing conversation/event identities. Runtime upstream block/event mappings remain transactional; duplicate observations require equal digests. Pending tool action refinement invalidates pending approvals; resolved authority is immutable.
 
+An approval with no provider expiry remains explicitly session-bound, not immortal: admission requires the same live Host epoch, pending permission identity/action digest and a run still awaiting approval. An actual supplied expiry is enforced. Recovery invalidates pending approvals; terminal/ambiguous run state cannot grant them. No upstream expiry or local execution authority is fabricated from a missing timestamp.
+
 ## Workspace and evidence boundaries
 
 Workspace registration captures real canonical filesystem identity plus Git common directory, checkout directory, branch and base revision. Dispatch rechecks the recorded binding before open/start/message so a changed checkout cannot silently receive work. Task packets require finite request/time/token budgets, explicit owned paths, acceptance and result location. The app owns task lifetimes rather than replaceable presentation/configuration.

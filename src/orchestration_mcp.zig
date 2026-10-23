@@ -7,7 +7,6 @@ const c = @cImport({
     @cInclude("netinet/in.h");
     @cInclude("arpa/inet.h");
     @cInclude("unistd.h");
-    @cInclude("fcntl.h");
 });
 pub const Server = struct {
     const Client = struct {
@@ -41,8 +40,9 @@ pub const Server = struct {
         return .{ .fd = fd, .port = c.ntohs(address.sin_port) };
     }
     fn nonblocking(fd: c_int) !void {
-        const flags = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
-        if (flags < 0 or c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK) < 0 or c.fcntl(fd, c.F_SETFD, @as(c_int, c.FD_CLOEXEC)) < 0) return error.SocketUnavailable;
+        const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+        const nonblock: c_int = @bitCast(@as(std.posix.O, .{ .NONBLOCK = true }));
+        if (flags < 0 or std.c.fcntl(fd, std.c.F.SETFL, flags | nonblock) < 0 or std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC)) < 0) return error.SocketUnavailable;
     }
     pub fn deinit(self: *Server) void {
         for (&self.clients) |*client| close(client);
