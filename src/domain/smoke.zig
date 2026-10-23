@@ -1,4 +1,4 @@
-//! Standalone storage-boundary consumer, not the unfinished Host conversation gate.
+//! Standalone public Host and storage consumers using isolated temporary state.
 //! Abrupt modes deliberately bypass Zig defers to exercise SQLite recovery.
 const std = @import("std");
 const domain = @import("domain");
@@ -14,6 +14,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer arena.deinit();
     const args = try init.args.toSlice(arena.allocator());
     if (args.len != 4) return error.UsageExpectedStateDirectoryModeAndName;
+    if (std.mem.startsWith(u8, args[2], "host-")) return hostSmoke(io, args[1], args[2]);
     var store = try Store.open(io, args[1]);
     defer store.close() catch @panic("storage consumer close failed");
     const mode = args[2];
@@ -51,4 +52,81 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (crash_after) _exit(74);
     try std.Io.File.stdout().writeStreamingAll(io, receipt_bytes);
     try std.Io.File.stdout().writeStreamingAll(io, "\n");
+}
+
+const Consumer = struct {
+    host: *domain.Host = undefined,
+    io: std.Io,
+    event: std.Io.Event = .unset,
+    arena: std.heap.ArenaAllocator,
+    fn wake(context: ?*anyopaque) void {
+        const self: *Consumer = @ptrCast(@alignCast(context.?));
+        self.event.set(self.io);
+    }
+    fn next(self: *Consumer) !t.Output {
+        var output: [1]t.Output = undefined;
+        const bytes = try self.arena.allocator().alloc(u8, 1024 * 1024);
+        while (true) {
+            self.event.reset();
+            const result = self.host.drain(&output, bytes);
+            if (result.output_count != 0) return output[0];
+            if (result.required_bytes_for_next != 0) return error.OutputTooLarge;
+            self.event.waitUncancelable(self.io);
+        }
+    }
+    fn command(self: *Consumer, envelope: t.CommandEnvelope) !t.Receipt {
+        _ = try self.host.submit(envelope);
+        const output = try self.next();
+        if (output != .command_receipt or output.command_receipt.receipt.outcome != .accepted) return error.CommandFailed;
+        return output.command_receipt.receipt;
+    }
+    fn query(self: *Consumer, q: t.Query) !t.QueryPage {
+        _ = try self.host.query(q);
+        const output = try self.next();
+        if (output != .query_page) return error.QueryFailed;
+        return output.query_page.page;
+    }
+};
+
+fn hostSmoke(io: std.Io, state_directory: []const u8, mode: []const u8) !void {
+    var consumer: Consumer = .{ .io = io, .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    defer consumer.arena.deinit();
+    consumer.host = try domain.Host.create(std.heap.page_allocator, io, .{ .state_directory = state_directory, .wake = Consumer.wake, .wake_context = &consumer });
+    defer consumer.host.destroy();
+    const project = (try consumer.command(.{ .command_id = .{ .value = "smoke-project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "temporary Host smoke" } } })).entity_ids.project.?;
+    const workspace = (try consumer.command(.{ .command_id = .{ .value = "smoke-workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = .{ .canonical_root = "/tmp", .filesystem_identity = "smoke", .repository_identity = "", .checkout_identity = "smoke", .expected_branch = "", .base_revision = "", .non_git = true } } } })).entity_ids.workspace.?;
+    const thread = (try consumer.command(.{ .command_id = .{ .value = "smoke-thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+    const selection: t.adapter.Selection = .{ .workspace = workspace, .model_provider = "fake", .model_id = "smoke", .effort = "none", .account_ref = "temporary" };
+    const sent = try consumer.command(.{ .command_id = .{ .value = "smoke-send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "Hello café 世界", .selection = selection } } });
+    const run = sent.entity_ids.run.?;
+    const approvals = try consumer.query(.{ .approvals = .{ .run = run } });
+    if (approvals.items.len != 1) return error.MissingApproval;
+    const approval = approvals.items[0].approval;
+    if (std.mem.eql(u8, mode, "host-crash-approval")) {
+        if (!approval.live or approval.state != .pending) return error.NoLiveApproval;
+        try std.Io.File.stdout().writeStreamingAll(io, "{\"stage\":\"durable-approval\",\"exit\":75}\n");
+        _exit(75);
+    }
+    if (std.mem.eql(u8, mode, "host-recover")) {
+        const runs = try consumer.query(.{ .runs = .{ .thread = thread } });
+        if (runs.items.len != 1 or runs.items[0].run.state != .interrupted or approval.live or approval.state != .invalidated) return error.UnsafeRecovery;
+        const effects = try consumer.query(.{ .effects = .{ .run = run } });
+        if (effects.items.len != 2) return error.DuplicateDispatchIntent;
+        try std.Io.File.stdout().writeStreamingAll(io, "{\"recovery\":\"interrupted\",\"approval\":\"invalidated\",\"effects\":2,\"replayed\":false}\n");
+        return;
+    }
+    if (!std.mem.eql(u8, mode, "host-flow")) return error.UnknownMode;
+    const messages = try consumer.query(.{ .messages = .{ .thread = thread } });
+    const assistant = messages.items[1].message;
+    const content = try consumer.query(.{ .content = .{ .block = assistant.blocks[0].block_id, .start_byte = 0, .end_byte = assistant.blocks[0].committed_bytes } });
+    if (std.mem.indexOf(u8, content.items[0].content.bytes, "世界") == null) return error.MissingStream;
+    _ = try consumer.command(.{ .command_id = .{ .value = "smoke-allow" }, .target = .{ .approval = approval.id }, .expected_revision = .{ .revision = approval.revision }, .payload = .{ .approval_respond = .{ .decision = .allow, .action_digest = approval.evidence.action_digest } } });
+    const completed = try consumer.query(.{ .runs = .{ .thread = thread } });
+    if (completed.items[0].run.state != .completed) return error.NotCompleted;
+    const second = try consumer.command(.{ .command_id = .{ .value = "smoke-send-2" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "Cancel this run", .selection = selection } } });
+    const active = try consumer.query(.{ .runs = .{ .thread = thread } });
+    _ = try consumer.command(.{ .command_id = .{ .value = "smoke-cancel" }, .target = .{ .run = second.entity_ids.run.? }, .expected_revision = .{ .revision = active.items[1].run.revision }, .payload = .{ .run_cancel = .{ .reason = "consumer cancellation" } } });
+    const cancelled = try consumer.query(.{ .runs = .{ .thread = thread } });
+    if (cancelled.items[1].run.state != .cancelled) return error.NotCancelled;
+    try std.Io.File.stdout().writeStreamingAll(io, "{\"prompt\":true,\"unicode_stream\":true,\"tool_approval\":\"allowed\",\"run\":\"completed\",\"second_run\":\"cancelled\"}\n");
 }

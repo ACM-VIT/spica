@@ -271,7 +271,7 @@ pub const Store = struct {
     pub fn recoverClaims(self: *Store) Error!void {
         if (!self.in_transaction) return error.Conflict;
         const affected = try self.prepare(
-            "SELECT 'effect',id,revision FROM effects WHERE state='in_flight' UNION ALL SELECT 'approval',id,revision FROM approvals WHERE live_epoch IS NOT NULL UNION ALL SELECT 'run',id,revision FROM runs WHERE EXISTS(SELECT 1 FROM effects e WHERE e.run_id=runs.id AND e.state='in_flight') AND state NOT IN('completed','cancelled','failed')",
+            "SELECT 'effect',id,revision FROM effects WHERE state='in_flight' UNION ALL SELECT 'approval',id,revision FROM approvals WHERE live_epoch IS NOT NULL UNION ALL SELECT 'run',id,revision FROM runs WHERE state IN('queued','starting','streaming','awaiting_approval','cancel_requested') OR (EXISTS(SELECT 1 FROM effects e WHERE e.run_id=runs.id AND e.state='in_flight') AND state NOT IN('completed','cancelled','failed')) UNION ALL SELECT 'tool',t.id,t.revision FROM tools t JOIN runs r ON r.id=t.run_id WHERE t.outcome='pending' AND r.state IN('queued','starting','streaming','awaiting_approval','cancel_requested','unknown','interrupted')",
             &.{},
         );
         defer affected.deinit();
@@ -283,15 +283,17 @@ pub const Store = struct {
             if (sequence == null) sequence = try self.nextSequence();
             const kind = try affected.bytes(0);
             const key = try affected.bytes(1);
-            const aggregate: t.AggregateRef = if (std.mem.eql(u8, kind, "effect")) .{ .effect = .{ .value = key } } else if (std.mem.eql(u8, kind, "approval")) .{ .approval = .{ .value = key } } else .{ .run = .{ .value = key } };
+            const aggregate: t.AggregateRef = if (std.mem.eql(u8, kind, "effect")) .{ .effect = .{ .value = key } } else if (std.mem.eql(u8, kind, "approval")) .{ .approval = .{ .value = key } } else if (std.mem.eql(u8, kind, "tool")) .{ .tool = .{ .value = key } } else .{ .run = .{ .value = key } };
             var event_id: [96]u8 = undefined;
             const name = std.fmt.bufPrint(&event_id, "recovery:{d}:{d}", .{ sequence.?, index }) catch return error.Limit;
             try self.appendEvent(.{ .event_id = .{ .value = name }, .position = .{ .commit_sequence = sequence.?, .event_index = index }, .aggregate = aggregate, .aggregate_revision = @intCast(revision + 1), .kind = "RecoveryUnknown", .payload = "" });
             index = std.math.add(u32, index, 1) catch return error.Limit;
         }
         try self.exec("UPDATE runs SET state='unknown',revision=revision+1 WHERE EXISTS(SELECT 1 FROM effects e WHERE e.run_id=runs.id AND e.state='in_flight') AND state NOT IN('completed','cancelled','failed')");
+        try self.exec("UPDATE runs SET state='interrupted',revision=revision+1 WHERE state IN('queued','starting','streaming','awaiting_approval','cancel_requested')");
+        try self.exec("UPDATE tools SET outcome='unknown',revision=revision+1 WHERE outcome='pending' AND EXISTS(SELECT 1 FROM runs r WHERE r.id=tools.run_id AND r.state IN('unknown','interrupted'))");
         try self.exec("UPDATE effects SET state='unknown',outcome='crash_after_claim',revision=revision+1 WHERE state='in_flight'");
-        try self.exec("UPDATE approvals SET live_epoch=NULL,revision=revision+1 WHERE live_epoch IS NOT NULL");
+        try self.exec("UPDATE approvals SET state=CASE WHEN state='pending' THEN 'invalidated' ELSE state END,live_epoch=NULL,revision=revision+1 WHERE live_epoch IS NOT NULL");
     }
 };
 

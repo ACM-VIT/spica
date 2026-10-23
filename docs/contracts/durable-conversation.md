@@ -29,3 +29,17 @@ The Host executes a fixed fake-v1 conversation: committed open/start, Unicode/co
 `Owner.delivered` persists receipt evidence separately from lifecycle completion; a create acknowledgement without session identity becomes unknown, not permission to start. `Owner.observe` commits bounded chunk/tool/approval/lifecycle observations with identity/digest dedup and session cursor events. It retains exact content bytes and never revives terminal/unknown runs from late completion/cancellation. The caller must retain the complete observation until commit succeeds. Approval authority is connection-epoch scoped and UTC-expiring; cancellation withdraws an accepted but not yet dispatched reply.
 
 Queries cover every `types.Query` projection, including tools, same-snapshot message/block continuation, older/newer ordinal traversal and exact content ranges. Two read-only SQLite transactions pin ephemeral views; generation/TTL/query-bound cursors reject stale reuse. Root queries replace the oldest snapshot when full. Pages enforce row/encoded nested-byte limits; requests/results/subscriptions are fixed-slot bounded. Subscriptions replay durable ordered events and fail closed with `resync_required` on excess batch/lag. Physical SQLite/C allocator/RSS/WAL bounds and power-loss behavior are not established by process-crash tests.
+
+## Public consumer evidence entrypoint
+
+`zig build test-domain build-domain-smoke -Doptimize=Debug --summary all`
+(also ReleaseSafe) runs the public Host consumer and subscription regressions.
+The isolated executable accepts `STATE_DIR host-flow fixture`,
+`STATE_DIR host-crash-approval fixture` (deliberate `_exit(75)`), and
+`STATE_DIR host-recover fixture`. Use fresh separate directories for flow and crash.
+Flow exercises real command admission/receipts, streamed bytes, tool approval and
+cancellation. Recovery replays exact setup/send command IDs, requires one
+interrupted run, invalidated non-live approval and exactly two original effects.
+In-flight claims recover unknown; otherwise nonterminal runs recover interrupted;
+pending tools recover unknown with revision events. No ambiguous effect is replayed.
+The native UI/custom-root integration gate remains owned by the integration lead.

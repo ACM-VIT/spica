@@ -472,3 +472,37 @@ test "public Host consumer streams approves cancels pages and reopens durable st
     try std.testing.expectEqual(t.RunState.completed, retained.items[0].run.state);
     try std.testing.expectEqual(t.RunState.cancelled, retained.items[1].run.state);
 }
+
+test "Host subscriptions retain delivery under small drain and unsubscribe generation checks" {
+    const Host = @import("../domain.zig").Host;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var consumer: Consumer = .{ .host = undefined, .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer consumer.arena.deinit();
+    consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .wake = Consumer.wake, .wake_context = &consumer });
+    defer consumer.host.destroy();
+    _ = try consumer.host.subscribe(.{ .scope = .all, .after_position = .{} });
+    const subscribed = try consumer.next();
+    try std.testing.expect(subscribed == .subscribed);
+    const id_value = subscribed.subscribed.id;
+    _ = try consumer.command(.{ .command_id = .{ .value = "subscription-project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "event consumer" } } });
+    const batch = try consumer.next();
+    try std.testing.expect(batch == .event_batch);
+    try std.testing.expectEqual(@as(usize, 1), batch.event_batch.events.len);
+    try std.testing.expectEqual(id_value.generation, batch.event_batch.id.generation);
+    consumer.event.reset();
+    _ = try consumer.host.unsubscribe(id_value);
+    consumer.event.waitUncancelable(std.testing.io);
+    var output: [1]t.Output = undefined;
+    var tiny: [1]u8 = undefined;
+    const retained = consumer.host.drain(&output, &tiny);
+    try std.testing.expectEqual(@as(usize, 0), retained.output_count);
+    try std.testing.expect(retained.more_pending and retained.required_bytes_for_next > tiny.len);
+    try std.testing.expect((try consumer.next()) == .unsubscribed);
+    _ = try consumer.host.unsubscribe(id_value);
+    const failure = try consumer.next();
+    try std.testing.expect(failure == .failure);
+    try std.testing.expectEqual(.cursor_invalid, failure.failure.failure.reason);
+}

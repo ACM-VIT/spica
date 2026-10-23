@@ -19,3 +19,32 @@ Affected checks after this slice: `zig build test-domain -Doptimize=Debug --summ
 Second cohesive continuation slice: internal adapter delivery/observation reduction, exact observation dedup, content/tool result persistence, approval digest/epoch/UTC checks, cancel-vs-queued-reply withdrawal, no terminal/unknown lifecycle revival, cursor+session revision events. Exact final affected commands: `zig fmt src/domain.zig src/domain/store.zig src/domain/domain_test.zig`; `zig build test-domain -Doptimize=Debug --summary all`; `zig build test-domain -Doptimize=ReleaseSafe --summary all`. Both safety modes **17/17 pass** (Debug 475ms tests, ReleaseSafe 434ms tests). No adapter calls, UI interaction, performance sampling or new abrupt-crash smoke ran; predecessor storage evidence remains separately scoped.
 
 Finding dispositions: committed-range replay fixed with subrange/combined replay tests; recovery bulk mutation now atomically emits exact effect/approval/run events (test checks effect/run projections; approval query implemented but specific approval-recovery regression remains open); newly created directory ancestry sync implemented and exercised by temporary store opens, but no power-loss fault test; i64 revision guards cover implemented chunk/claim/recovery/reducer mutations, not future Host/projection paths. Observation-ID allocation/mapping, exhaustive changed-aggregate event coverage, immutable fake scenario, bounded Host/query/subscription execution and public-gateway conversation/crash acceptance are still open. No task004 acceptance claim. The 40-request soft-budget notice required wrapping this successful slice rather than beginning an unverified Host. NativeUI005 and Script006 were explicitly told that planned signatures are not an implemented Host.
+
+## RuntimeShip004 shipping continuation
+
+Status: review, not native milestone acceptance. Recovered clean private
+`task/004-domain` HEAD `9088964156a2a9d2e126fb6652aa6122f2eae6dd`,
+preserving every predecessor checkpoint and source change. Dependency checkpoint
+`50b65b6` ships asynchronous `Host`, pinned projections, bounded queues,
+read-only snapshot transactions, subscriptions and actual fake dispatch after
+committed claims. Native executable linkage now includes retained content/storage.
+
+The follow-up slice adds public temporary-state smoke and conservative reopen
+reduction: active runs without ambiguous claims become interrupted; in-flight
+claims remain unknown; approvals invalidate and pending tools become unknown,
+with atomic revision events. Subscription tests cover ordered replay, tiny-drain
+retention and stale unsubscribe generations.
+
+Executed `python3 .artifacts/domain004/check_host.py`: internally runs
+`zig build test-domain build-domain-smoke -Doptimize=Debug --summary all` and
+ReleaseSafe, **19/19 tests pass each**. Both actual binaries complete prompt,
+Unicode/code stream, allow/tool completion and second-run cancellation; deliberate
+`_exit(75)` at durable approval reopens interrupted with invalidated authority and
+exactly two original effects. Existing claim-ambiguity tests cover unknown/no-replay.
+
+Evidence manifest: ignored `.artifacts/domain004/host-checks.json`,
+`host-final-{Debug,ReleaseSafe}.log`, and per-mode `host-{flow,crash,recover}-*.log`.
+No UI/performance or power-loss acceptance claimed. Exhaustive changed-aggregate
+event coverage, terminal message incomplete-flag finalization and native consumer
+integration still warrant lead review. No substantive failed repairs; available
+model `openai-codex/gpt-6.1-sol`; resolved tier/usage unavailable; no descendants.
