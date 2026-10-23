@@ -140,7 +140,7 @@ def frame_summary(native, phase):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / '.artifacts/starter')
-    parser.add_argument('--mode', choices=('smoke', 'measure'), default='smoke')
+    parser.add_argument('--mode', choices=('smoke', 'editor', 'measure'), default='smoke')
     parser.add_argument('--binary', type=Path, help='Explicit frozen binary; requires --binary-sha256 and --source-sha256')
     parser.add_argument('--binary-sha256')
     parser.add_argument('--source-sha256')
@@ -177,7 +177,7 @@ def main():
                     build_mode=args.optimize if not args.binary else 'externally frozen; see supplied binary provenance',
                     build_command=None if args.binary else ['python3', 'build/driver.py', '-Doptimize=' + args.optimize],
                     zig=run('zig', 'version'), scenario=args.mode, commands=COMMANDS, passed=False,
-                    input_origin='real private vd Escape and compositor resize, not SDL event injection',
+                    input_origin='real private vd Ctrl+Q and compositor resize, not SDL event injection',
                     limitations=['Software timing, not physical latency or scanout.', 'Paced 10Hz resize is demand, not maximum render capacity.',
                                  'GPU hardware not established by SDL renderer name.', 'Low-N p99 is weak; dropped telemetry is not a complete cohort.',
                                  'Cache ledger excludes external metadata/driver allocations; idle states carry forward only because this shell mutates cache during paint.'])
@@ -196,7 +196,7 @@ def main():
         root_identity = measure.identity(measure.stat(Path('/proc') / str(launch['pid']) / 'stat'))
         manifest['root_identity'] = root_identity
         windows = wait_windows(session, True)
-        if 'Spica — Native Foundation' not in windows:
+        if 'Spica' not in windows:
             raise RuntimeError('Wrong native window')
         manifest['windows_before'] = windows
         window_id = windows.splitlines()[0].split()[0]
@@ -207,6 +207,21 @@ def main():
         ipc(f'[con_id={window_id}] floating enable')
         ipc(f'[con_id={window_id}] resize set width 1100 px height 740 px')
         run('vd', 'shot', session, str(output / 'before.png'))
+        if args.mode == 'editor':
+            original = 'hello e\u0301 שלום 👩‍💻'
+            editor_actions = [
+                ('text', original), ('key', 'ctrl+a'), ('key', 'ctrl+c'),
+                ('key', 'ctrl+x'), ('key', 'ctrl+v'), ('key', 'ctrl+z'),
+                ('key', 'ctrl+shift+z'), ('key', 'End'), ('key', 'shift+Return'),
+                ('text', 'second line'), ('key', 'ctrl+Home'), ('key', 'shift+Right'),
+                ('key', 'BackSpace'), ('key', 'ctrl+z'), ('key', 'Escape'),
+                ('key', 'Tab'), ('text', 'MUST_NOT_INSERT'), ('key', 'Tab'),
+            ]
+            for operation, value in editor_actions:
+                begin = time.monotonic()
+                run('vd', operation, session, window_id, value)
+                actions.append(dict(operation=operation, value=value, begin=begin, end=time.monotonic()))
+            expected_draft = original + '\nsecond line'
         if args.mode == 'measure':
             schedule = [('warmup', args.warmup), ('idle', args.phase_seconds)]
             for cycle in range(1, args.cycles + 1):
@@ -240,13 +255,19 @@ def main():
                                    requested_actions=math.ceil(seconds * 10) if name.startswith('active') else 0, delivered_actions=count))
         # Captures and export follow all resource phase boundaries.
         run('vd', 'shot', session, str(output / 'after.png'))
-        run('vd', 'key', session, window_id, 'Escape')
+        run('vd', 'key', session, window_id, 'ctrl+q')
         wait_windows(session, False)
         deadline = time.monotonic() + 10
         snapshot = read_export(output / 'automation.json', deadline)
-        if snapshot['close_reason'] != 'escape' or snapshot['running']:
-            raise RuntimeError('Real Escape not observed through native dispatch')
+        if snapshot['close_reason'] != 'ctrl_q' or snapshot['running']:
+            raise RuntimeError('Real Ctrl+Q not observed through native dispatch')
         manifest['snapshot'] = snapshot
+        if args.mode == 'editor':
+            if snapshot.get('draft') != expected_draft or not snapshot.get('editor_focused'):
+                raise RuntimeError('Real Unicode editor input/clipboard/undo/focus round-trip failed')
+            targets = {target['id']: target for target in snapshot.get('targets', [])}
+            if targets.get('composer.input', {}).get('pointer_bounds') is None:
+                raise RuntimeError('Painted composer target bounds unavailable')
         if not args.disable_metrics:
             native = read_export(output / 'native.json', deadline)
             validate_native(native)

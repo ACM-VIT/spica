@@ -34,7 +34,7 @@ pub const EditorView = struct {
         if (self.layout) |layout| c.spica_text_layout_release(layout);
         self.layout = null;
         const bytes = editor.textBytes();
-        const range = editor.viewportRange(8192);
+        const range = editor.viewportRange(4096);
         if (range.start != self.start) self.scroll = 0;
         self.start = range.start;
         self.end = range.end;
@@ -46,6 +46,7 @@ pub const EditorView = struct {
 
     pub fn caret(self: *const EditorView, editor: *const Composer) ?c.SDL_FRect {
         const layout = self.layout orelse return null;
+        if (editor.caret < self.start or editor.caret > self.end) return null;
         var rect: c.SDL_FRect = undefined;
         return if (c.spica_text_layout_caret(layout, editor.caret - self.start, &rect)) rect else null;
     }

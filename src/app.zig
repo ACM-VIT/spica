@@ -2,19 +2,18 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("native/bindings.zig").c;
 const Layout = @import("ui/clay.zig").Layout;
-const Foundation = @import("ui/foundation.zig").View;
+const Coding = @import("ui/coding.zig").View;
 const build_options = @import("build_options");
 const telemetry = @import("native/metrics.zig");
 const automation = @import("native/automation.zig");
 
-/// Native window lifecycle only. Future workspace state and agent execution
-/// belong behind their own APIs; this starter owns no process or data store.
+/// Native lifetime and input dispatch. Replaceable presentation owns no domain.
 pub const App = struct {
     window: *c.SDL_Window,
     renderer: *c.SDL_Renderer,
     text: *c.SpicaText,
     layout: Layout,
-    view: Foundation = .{},
+    view: Coding,
     running: bool = true,
     dirty: bool = true,
     minimized: bool = false,
@@ -25,7 +24,7 @@ pub const App = struct {
     pub fn init(allocator: std.mem.Allocator) !App {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SDLInitialization;
         errdefer c.SDL_Quit();
-        const window = c.SDL_CreateWindow("Spica — Native Foundation", 1100, 740, c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY) orelse return error.WindowCreation;
+        const window = c.SDL_CreateWindow("Spica", 1100, 740, c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY) orelse return error.WindowCreation;
         errdefer c.SDL_DestroyWindow(window);
         if (!c.SDL_SetWindowMinimumSize(window, 720, 480)) return error.WindowMinimumSize;
         const driver: [*:0]const u8 = switch (builtin.os.tag) {
@@ -45,8 +44,11 @@ pub const App = struct {
         }
         var layout = try Layout.init(allocator, 1100, 740);
         errdefer layout.deinit();
-        std.log.info("Spica foundation ready; renderer={s}; video={s}", .{ c.SDL_GetRendererName(renderer), c.SDL_GetCurrentVideoDriver() });
-        return .{ .window = window, .renderer = renderer, .text = text, .layout = layout };
+        var view = try Coding.init(allocator);
+        errdefer view.deinit();
+        if (!c.SDL_StartTextInput(window)) return error.TextInputStart;
+        std.log.info("Spica ready; renderer={s}; video={s}", .{ c.SDL_GetRendererName(renderer), c.SDL_GetCurrentVideoDriver() });
+        return .{ .window = window, .renderer = renderer, .text = text, .layout = layout, .view = view };
     }
 
     pub fn deinit(self: *App) void {
@@ -88,21 +90,21 @@ pub const App = struct {
                     continue;
                 }
             } else if (!c.SDL_WaitEvent(&event)) return error.EventWait;
-            self.handle(event);
-            while (c.SDL_PollEvent(&event)) self.handle(event);
+            try self.handle(event);
+            while (c.SDL_PollEvent(&event)) try self.handle(event);
         }
         std.log.info("Spica foundation stopped; frames={d}", .{self.frames});
     }
 
-    fn handle(self: *App, event: c.SDL_Event) void {
+    fn handle(self: *App, event: c.SDL_Event) !void {
         self.snapshot.event_sequence += 1;
         switch (event.type) {
             c.SDL_EVENT_QUIT, c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
                 self.snapshot.close_reason = "window_close";
                 self.running = false;
             },
-            c.SDL_EVENT_KEY_DOWN => if (event.key.key == c.SDLK_ESCAPE) {
-                self.snapshot.close_reason = "escape";
+            c.SDL_EVENT_KEY_DOWN => if (event.key.key == c.SDLK_Q and event.key.mod & c.SDL_KMOD_CTRL != 0) {
+                self.snapshot.close_reason = "ctrl_q";
                 self.running = false;
             },
             c.SDL_EVENT_WINDOW_RESIZED, c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, c.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED => {
@@ -118,6 +120,14 @@ pub const App = struct {
             },
             else => {},
         }
+        const changed = self.view.handle(event, self.window, self.text) catch |err| switch (err) {
+            error.TextTooLarge, error.PieceLimit, error.InvalidUtf8, error.ClipboardRead, error.ClipboardWrite => blk: {
+                self.view.notice = @errorName(err);
+                break :blk true;
+            },
+            else => return err,
+        };
+        self.dirty = self.dirty or changed;
     }
 
     fn paint(self: *App) !void {
@@ -138,7 +148,15 @@ pub const App = struct {
         const scale_y = @as(f32, @floatFromInt(pixel_height)) / h;
         if (!c.SDL_SetRenderScale(self.renderer, scale_x, scale_y) or !c.spica_text_set_render_scale(self.text, scale_x, scale_y)) return error.RenderScale;
         self.layout.resize(w, h);
-        try self.view.draw(self.renderer, self.text, self.layout.foundation(w));
+        try self.view.draw(self.renderer, self.text, self.window, self.layout.coding(w));
+        self.snapshot.draft = self.view.editor.textBytes();
+        self.snapshot.caret = self.view.editor.caret;
+        self.snapshot.anchor = self.view.editor.anchor;
+        self.snapshot.editor_focused = self.view.focused;
+        self.snapshot.preedit_bytes = self.view.preedit_len;
+        self.snapshot.draft_revision = self.view.revision;
+        const editor_bounds = self.view.editor_view.bounds;
+        self.snapshot.targets[1].pointer_bounds = .{ @intFromFloat(editor_bounds.x), @intFromFloat(editor_bounds.y), @intFromFloat(editor_bounds.w), @intFromFloat(editor_bounds.h) };
         const present_begin = if (self.metrics != null) c.SDL_GetTicksNS() else 0;
         const succeeded = c.SDL_RenderPresent(self.renderer);
         const present_end = if (self.metrics != null) c.SDL_GetTicksNS() else 0;

@@ -45,14 +45,14 @@ def run_smoke_fixture(value):
             if args[:2] == ('vd', 'run'):
                 return json.dumps(dict(pid=os.getpid()))
             if args[:2] == ('vd', 'key'):
-                (output / 'automation.json').write_text(json.dumps(dict(close_reason='escape', running=False)))
+                (output / 'automation.json').write_text(json.dumps(dict(close_reason='ctrl_q', running=False)))
                 (output / 'native.json').write_text(json.dumps(value))
             if args[0] == 'swaymsg':
                 return '[{\"success\":true}]'
             return ''
         argv = ['eval-starter', '--binary', str(binary), '--binary-sha256', m.sha(binary),
                 '--source-sha256', 'fixture', '--output', str(output)]
-        with patch('sys.argv', argv), patch.object(m, 'source_fingerprint', return_value='fixture'), patch.object(m, 'run', side_effect=command), patch.object(m, 'wait_windows', return_value='1 Spica — Native Foundation'):
+        with patch('sys.argv', argv), patch.object(m, 'source_fingerprint', return_value='fixture'), patch.object(m, 'run', side_effect=command), patch.object(m, 'wait_windows', return_value='1 Spica'):
             try:
                 m.main()
             except RuntimeError:

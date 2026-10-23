@@ -1,0 +1,18 @@
+# Task005 native UI implementation record
+
+Status: first retained editor slice under review, not task005 acceptance. Base `3c18aac45d732f217bc9af98d466f3c569c8dd61`; private branch `task/005-ui`. Production allocation is recorded in parent task005 packet; no domain/build paths are changed here.
+
+This slice replaces the foundation card with a native Unicode draft surface. It uses the existing bounded Composer, retained EditorView/text engine, Clay arena, clipboard and selection geometry. Ordinary SDL text, grapheme/word navigation, selection, paste/cut/copy, undo/redo, vertical/line-edge movement, focus, local Escape and Ctrl+Q lifecycle are wired. Domain is deliberately not connected in this slice; no fake conversation/control or provider lifecycle is fabricated. Enter preserves the draft with an explicit unavailable notice; Shift+Enter inserts newline. The visible disconnected status is temporary integration state, not the task005 deliverable or accepted product behavior.
+
+Explicit automation output v2 includes bounded draft bytes, caret/anchor/focus/preedit/revision and actual painted composer bounds; exporting draft text requires the existing explicit `--automation-output` option. Treat generated exports as private. `tools/eval-starter --mode editor` exercises real private-vd Unicode input, OS clipboard, undo/redo, selection deletion/undo, local Escape and focus exclusion, then Ctrl+Q. It does not inject internal text or domain state.
+
+Evidence belongs to ignored `.artifacts/ui005/`; exact checks/results and checkpoint identity are supplied in the final worker receipt. The editor scenario establishes no streaming, durable command, approval, cancellation, restart, replacement-root, memory plateau or physical latency acceptance. Those gates still require subsequent domain integration and complete rendered evidence. Platform IME is not established by ordinary Unicode text input.
+
+
+## Exercised checks and unresolved blocker
+
+Debug build passed after correcting one Color type mismatch. Direct `zig test` rooted at main with the existing native dependencies exercised15tests (new Unicode/rejected-edit test plus retained Composer/label/edit regressions), all passed. `zig fmt` on changed owned Zig files made no changes. Python runner boundary regressions passed7tests before the editor-mode addition; this is not claimed as coverage of that new path.
+
+Actual `./tools/eval-starter --mode editor --optimize Debug` **failed**, preserved at parent `.artifacts/ui005/editor-first/`. Real `vd text` typed `hello é שלום 👩‍💻`; native exited `EditorLayout`, SDL `Text: shaping tables exceed the shared font budget`. Last painted export ends at woman scalar; exact subsequent failing prefix is not established. The next ctrl+a consequently found no application. This is a retained native-text repair boundary (`src/native/text.c:203–230,842–864`; existing emoji regression `src/native/text_test.zig:174–225`), not a passing Unicode scenario. No font budget increase, emoji removal, suppression or failing-cohort rerun. Coordinator authorized a verified controller checkpoint with this unresolved acceptance blocker and a separate retained-C repair owner. No durable send, streaming or transcript acceptance is claimed.
+
+Failure source fingerprint `6d01ff1029615b8e78a2c8409e38a2b471a66d49d17e971499710092051e42e3`; binary `3d398c607e8271aae0e70c08a0d44a9f2c17988dd52ec6ffe876462efa5aa317`, Debug. Source preparation/identity evidence remains parent `.artifacts/ui005/preparation.md` and manifest. Current controller still needs event-boundary text-cache observations for uncommon out-of-paint re-layout, exact pointer/IME and streaming checks; no idle cache plateau is asserted.

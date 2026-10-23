@@ -85,3 +85,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return err;
     };
 }
+
+test {
+    _ = @import("ui/coding.zig");
+}

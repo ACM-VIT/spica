@@ -1,6 +1,6 @@
 # Spica — native agent workspace
 
-A fresh rewrite branch using Spica's Zig/SDL3/Clay and Unicode text foundations. T3 Code is a behavior reference. The old Pi-specific application has been removed from this branch; the runnable starter is a foundation, not a working agent client yet.
+A fresh rewrite branch using Spica's Zig/SDL3/Clay and Unicode text foundations. T3 Code is a behavior reference. The old Pi-specific application has been removed. The current native draft surface is not a connected agent client; domain integration and rendered acceptance remain in progress.
 
 ## Start the development loop
 
@@ -16,7 +16,7 @@ python3 build/driver.py          # build (existing local dependencies)
 python3 build/driver.py run      # native starter window
 ./tools/check                   # formatting, Debug/ReleaseSafe builds + regressions + CLI smoke
 ./tools/check --core            # isolated Unicode/core checks in both safety modes
-./tools/eval-starter            # private desktop screenshot + Escape smoke check
+./tools/eval-starter --mode editor # private Unicode/clipboard/focus input scenario
 ```
 
 For a clean machine, run `python3 build/bootstrap.py` first. Dependencies are pinned in deps.lock.json; see [CONTRIBUTING.md](CONTRIBUTING.md).
