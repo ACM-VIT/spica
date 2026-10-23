@@ -81,3 +81,8 @@ readiness: implemented create/start/stream operations are supported metadata
 without process IO; account/effective selection remain unknown until handshake.
 Unsupported messaging is not advertised. A focused metadata regression confirms
 this admission contract; the same 7-test consumer command passed.
+
+The real-process independence scenario now runs through **both** concrete
+factories, including OpenCode's final-address inline allocator ownership. Each
+surviving instance exchanges a pipe frame after its peer stops; teardown is
+also protected on failed test assertions. Focused consumer: 7/7 passed.
