@@ -121,6 +121,9 @@ test "chunk append retains Unicode bytes across boundaries and rejects gap overl
     try std.testing.expectEqual(.appended, try f.store.appendChunk("b", 0, bytes[0..1]));
     try std.testing.expectEqual(.appended, try f.store.appendChunk("b", 1, bytes[1..]));
     try std.testing.expectEqual(.duplicate, try f.store.appendChunk("b", 0, bytes[0..1]));
+    try std.testing.expectEqual(.duplicate, try f.store.appendChunk("b", 0, bytes));
+    try std.testing.expectEqual(.duplicate, try f.store.appendChunk("b", 2, bytes[2..6]));
+    try std.testing.expectError(error.Conflict, f.store.appendChunk("b", bytes.len - 1, bytes));
     try std.testing.expectError(error.Conflict, f.store.appendChunk("b", 0, "wrong"));
     try std.testing.expectError(error.Conflict, f.store.appendChunk("b", bytes.len + 1, "gap"));
     try f.store.commit();
@@ -162,6 +165,9 @@ test "claimed ambiguity and withdrawn effects never return to dispatchable state
     try f.store.commit();
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE id='start' AND state='unknown'"));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE id='reply' AND state='withdrawn'"));
+    try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM events WHERE kind='RecoveryUnknown'"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM events WHERE kind='RecoveryUnknown' AND CAST(aggregate AS TEXT) LIKE '%effect%'"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM events WHERE kind='RecoveryUnknown' AND CAST(aggregate AS TEXT) LIKE '%run%'"));
 }
 
 test "SQLite FULL rolls back intent without advancing durable sequence" {
@@ -223,4 +229,93 @@ test "pinned read snapshot does not mix a later writer transaction" {
     try std.testing.expectEqual(@as(i64, 1), try readScalar(reader.?, "SELECT count(*) FROM events"));
     try storage.check(c.sqlite3_exec(reader, "ROLLBACK", null, null, null));
     try std.testing.expectEqual(@as(i64, 2), try readScalar(reader.?, "SELECT count(*) FROM events"));
+}
+
+const domain = @import("../domain.zig");
+const Conversation = struct {
+    project: t.ProjectId,
+    workspace: t.adapter.WorkspaceId,
+    thread: t.ThreadId,
+    fn create(owner: *domain.Owner, allocator: std.mem.Allocator) !Conversation {
+        const p = try owner.command(allocator, .{ .command_id = .{ .value = "project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "真实 project" } } });
+        const w = try owner.command(allocator, .{ .command_id = .{ .value = "workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = p.entity_ids.project.?, .binding = .{ .canonical_root = "/tmp/isolated", .filesystem_identity = "test", .repository_identity = "", .checkout_identity = "", .expected_branch = "", .base_revision = "", .non_git = true } } } });
+        const h = try owner.command(allocator, .{ .command_id = .{ .value = "thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = p.entity_ids.project.?, .workspace = w.entity_ids.workspace.? } } });
+        return .{ .project = p.entity_ids.project.?, .workspace = w.entity_ids.workspace.?, .thread = h.entity_ids.thread.? };
+    }
+    fn send(self: Conversation, id: []const u8, text: []const u8, revision: u64) t.CommandEnvelope {
+        return .{ .command_id = .{ .value = id }, .target = .{ .thread = self.thread }, .expected_revision = .{ .revision = revision }, .payload = .{ .thread_send = .{ .text = text, .selection = .{ .model_provider = "fake", .model_id = "test", .effort = "low", .account_ref = "local", .workspace = self.workspace } } } };
+    }
+};
+
+test "real reducers accept arbitrary prompt dedup before revision and withdraw queued effects" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "one", .utc_ms = 1000 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const command = conversation.send("send", "Any user text: 世界 é\x00\xf0\x9f", 1);
+    const receipt = try owner.command(allocator, command);
+    try std.testing.expectEqual(.accepted, receipt.outcome);
+    try std.testing.expectEqual(@as(usize, 2), receipt.effect_ids.len);
+    const duplicate = try owner.command(allocator, command);
+    var first: [8192]u8 = undefined;
+    var second: [8192]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, try t.encode(receipt, &first), try t.encode(duplicate, &second));
+    const conflict = try owner.command(allocator, conversation.send("send", "changed", 1));
+    try std.testing.expectEqual(t.Reason.command_id_conflict, conflict.reason.?);
+    const stale_command = conversation.send("stale", "later", 1);
+    const stale = try owner.command(allocator, stale_command);
+    try std.testing.expectEqual(t.Reason.revision_conflict, stale.reason.?);
+    const cancel = try owner.command(allocator, .{ .command_id = .{ .value = "cancel" }, .target = .{ .run = receipt.entity_ids.run.? }, .expected_revision = .{ .revision = 1 }, .payload = .{ .run_cancel = .{ .reason = "before dispatch" } } });
+    try std.testing.expectEqual(.accepted, cancel.outcome);
+    try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM effects WHERE state='withdrawn'"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='cancelled'"));
+    try std.testing.expect((try owner.claimNext(allocator)) == null);
+    try owner.recover();
+    try std.testing.expect((try owner.claimNext(allocator)) == null);
+    const stale_again = try owner.command(allocator, stale_command);
+    try std.testing.expectEqual(stale.commit_sequence, stale_again.commit_sequence);
+}
+
+test "committed effect claims recover unknown without replay and explicit reconciliation clears only evidence" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "one", .utc_ms = null };
+    const conversation = try Conversation.create(&owner, allocator);
+    const sent = try owner.command(allocator, conversation.send("send", "arbitrary prompt", 1));
+    const claimed = (try owner.claimNext(allocator)).?;
+    try std.testing.expectEqualStrings(sent.effect_ids[0].value, claimed.id.value);
+    try std.testing.expect(!f.store.in_transaction);
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE state='in_flight'"));
+    try owner.recover();
+    try std.testing.expect((try owner.claimNext(allocator)) == null);
+    var reconcile: t.CommandEnvelope = .{ .command_id = .{ .value = "reconcile-no-proof" }, .target = .{ .run = sent.entity_ids.run.? }, .expected_revision = .{ .revision = 2 }, .payload = .{ .run_reconcile = .{ .session = sent.entity_ids.session.?, .effects = sent.effect_ids[0..1] } } };
+    const denied = try owner.command(allocator, reconcile);
+    try std.testing.expectEqual(t.Reason.authority_unavailable, denied.reason.?);
+    reconcile.command_id.value = "reconcile-proof";
+    reconcile.payload.run_reconcile.resolution = .{ .actor = "operator", .evidence = "external verified no call", .no_execution = true };
+    try std.testing.expectEqual(.accepted, (try owner.command(allocator, reconcile)).outcome);
+    try std.testing.expect((try owner.claimNext(allocator)) == null);
+    const approval = try owner.command(allocator, .{ .command_id = .{ .value = "missing-approval" }, .target = .{ .approval = .{ .value = "missing" } }, .expected_revision = .{ .revision = 1 }, .payload = .{ .approval_respond = .{ .decision = .allow, .action_digest = "x" } } });
+    try std.testing.expectEqual(t.Reason.not_found, approval.reason.?);
+}
+
+test "revision exhaustion rejects chunks claims and recovery without numeric promotion" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.store.begin();
+    try seed(&f.store);
+    try effect(&f.store, "exhausted", "planned", "start");
+    try f.store.exec("UPDATE blocks SET revision=9223372036854775807; UPDATE effects SET revision=9223372036854775807");
+    try std.testing.expectError(error.Limit, f.store.appendChunk("b", 0, "x"));
+    try std.testing.expectError(error.Limit, f.store.claim("exhausted", "owner"));
+    try f.store.exec("UPDATE effects SET state='in_flight'");
+    try std.testing.expectError(error.Limit, f.store.recoverClaims());
+    try f.store.rollback();
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM events"));
 }

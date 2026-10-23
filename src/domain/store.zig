@@ -6,7 +6,7 @@ pub const c = @cImport({
 });
 extern fn spica_database_bind_text(?*c.sqlite3_stmt, c_int, [*]const u8, c_int) c_int;
 extern fn spica_database_bind_blob(?*c.sqlite3_stmt, c_int, [*]const u8, c_int) c_int;
-extern fn spica_store_sync_directory([*:0]const u8) c_int;
+extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, Closed };
 pub const application_id = 0x53504334;
@@ -101,7 +101,7 @@ pub const Store = struct {
             if (try result.scalar("PRAGMA application_id") != application_id) return error.Corrupt;
             try result.exec("COMMIT");
             const dir_z = try std.fmt.bufPrintZ(&path_buffer, "{s}", .{directory[0..n]});
-            if (spica_store_sync_directory(dir_z.ptr) != 0) return error.Storage;
+            if (spica_store_sync_ancestry(dir_z.ptr) != 0) return error.Storage;
         }
         // Bounds per row and SQL statement, not a claimed total C/RSS/disk ceiling.
         _ = c.sqlite3_limit(database, c.SQLITE_LIMIT_LENGTH, 1024 * 1024);
@@ -222,26 +222,46 @@ pub const Store = struct {
     /// by the caller's single transaction. This method never advances on failure.
     pub fn appendChunk(self: *Store, block: []const u8, offset: u64, bytes: []const u8) Error!enum { appended, duplicate } {
         if (!self.in_transaction or offset > std.math.maxInt(i64) or bytes.len > 2048) return error.Limit;
-        const statement = try self.prepare("SELECT committed_bytes FROM blocks WHERE id=?", &.{.{ .text = block }});
+        const statement = try self.prepare("SELECT committed_bytes,revision FROM blocks WHERE id=?", &.{.{ .text = block }});
         defer statement.deinit();
         if (!try statement.step()) return error.Conflict;
         const length: u64 = @intCast(statement.integer(0));
+        if (bytes.len == 0 and offset <= length) return .duplicate;
         if (offset < length) {
-            const existing = try self.prepare("SELECT bytes FROM chunks WHERE block_id=? AND byte_offset=?", &.{ .{ .text = block }, .{ .integer = @intCast(offset) } });
+            if (bytes.len > length - offset) return error.Conflict;
+            const existing = try self.prepare("SELECT byte_offset,bytes FROM chunks WHERE block_id=? AND byte_offset<=? ORDER BY byte_offset DESC LIMIT 1", &.{ .{ .text = block }, .{ .integer = @intCast(offset) } });
             defer existing.deinit();
-            if (try existing.step() and std.mem.eql(u8, try existing.bytes(0), bytes)) return .duplicate;
-            return error.Conflict;
+            if (!try existing.step()) return error.Corrupt;
+            const first = existing.integer(0);
+            const range = try self.prepare("SELECT byte_offset,bytes FROM chunks WHERE block_id=? AND byte_offset>=? AND byte_offset<? ORDER BY byte_offset", &.{ .{ .text = block }, .{ .integer = first }, .{ .integer = @intCast(offset + bytes.len) } });
+            defer range.deinit();
+            var matched: usize = 0;
+            while (try range.step()) {
+                const chunk_start: u64 = @intCast(range.integer(0));
+                const chunk = try range.bytes(1);
+                const skip: usize = @intCast(offset + matched - chunk_start);
+                if (skip > chunk.len) return error.Corrupt;
+                const count = @min(chunk.len - skip, bytes.len - matched);
+                if (!std.mem.eql(u8, chunk[skip..][0..count], bytes[matched..][0..count])) return error.Conflict;
+                matched += count;
+                if (matched == bytes.len) return .duplicate;
+            }
+            return error.Corrupt;
         }
         if (offset != length) return error.Conflict;
         if (bytes.len == 0) return .duplicate;
         const end = std.math.add(u64, offset, bytes.len) catch return error.Limit;
         if (end > std.math.maxInt(i64)) return error.Limit;
+        if (statement.integer(1) == std.math.maxInt(i64)) return error.Limit;
         try self.execute("INSERT INTO chunks(block_id,byte_offset,bytes) VALUES(?,?,?)", &.{ .{ .text = block }, .{ .integer = @intCast(offset) }, .{ .blob = bytes } });
         try self.execute("UPDATE blocks SET committed_bytes=?,revision=revision+1 WHERE id=?", &.{ .{ .integer = @intCast(end) }, .{ .text = block } });
         return .appended;
     }
     pub fn claim(self: *Store, effect: []const u8, owner: []const u8) Error!bool {
         if (!self.in_transaction) return error.Conflict;
+        const exhausted = try self.prepare("SELECT 1 FROM effects WHERE id=? AND state='planned' AND revision=9223372036854775807", &.{.{ .text = effect }});
+        defer exhausted.deinit();
+        if (try exhausted.step()) return error.Limit;
         try self.execute("UPDATE effects SET state='in_flight',claim_owner=?,revision=revision+1 WHERE id=? AND state='planned' AND EXISTS(SELECT 1 FROM runs r WHERE r.id=effects.run_id AND (effects.read_only=1 OR r.state IN('queued','starting','streaming','awaiting_approval') OR (effects.kind='cancel' AND r.state='cancel_requested'))) AND (depends_on IS NULL OR EXISTS(SELECT 1 FROM effects d WHERE d.id=effects.depends_on AND d.state='confirmed'))", &.{ .{ .text = owner }, .{ .text = effect } });
         return c.sqlite3_changes(self.database) == 1;
     }
@@ -249,8 +269,28 @@ pub const Store = struct {
     /// Planned and withdrawn effects remain unchanged; nothing is externally called.
     pub fn recoverClaims(self: *Store) Error!void {
         if (!self.in_transaction) return error.Conflict;
+        const affected = try self.prepare(
+            "SELECT 'effect',id,revision FROM effects WHERE state='in_flight' UNION ALL SELECT 'approval',id,revision FROM approvals WHERE live_epoch IS NOT NULL UNION ALL SELECT 'run',id,revision FROM runs WHERE EXISTS(SELECT 1 FROM effects e WHERE e.run_id=runs.id AND e.state='in_flight') AND state NOT IN('completed','cancelled','failed')",
+            &.{},
+        );
+        defer affected.deinit();
+        var sequence: ?u64 = null;
+        var index: u32 = 0;
+        while (try affected.step()) {
+            const revision = affected.integer(2);
+            if (revision == std.math.maxInt(i64)) return error.Limit;
+            if (sequence == null) sequence = try self.nextSequence();
+            const kind = try affected.bytes(0);
+            const key = try affected.bytes(1);
+            const aggregate: t.AggregateRef = if (std.mem.eql(u8, kind, "effect")) .{ .effect = .{ .value = key } } else if (std.mem.eql(u8, kind, "approval")) .{ .approval = .{ .value = key } } else .{ .run = .{ .value = key } };
+            var event_id: [96]u8 = undefined;
+            const name = std.fmt.bufPrint(&event_id, "recovery:{d}:{d}", .{ sequence.?, index }) catch return error.Limit;
+            try self.appendEvent(.{ .event_id = .{ .value = name }, .position = .{ .commit_sequence = sequence.?, .event_index = index }, .aggregate = aggregate, .aggregate_revision = @intCast(revision + 1), .kind = "RecoveryUnknown", .payload = "" });
+            index = std.math.add(u32, index, 1) catch return error.Limit;
+        }
+        try self.exec("UPDATE runs SET state='unknown',revision=revision+1 WHERE EXISTS(SELECT 1 FROM effects e WHERE e.run_id=runs.id AND e.state='in_flight') AND state NOT IN('completed','cancelled','failed')");
         try self.exec("UPDATE effects SET state='unknown',outcome='crash_after_claim',revision=revision+1 WHERE state='in_flight'");
-        try self.exec("UPDATE approvals SET live_epoch=NULL WHERE live_epoch IS NOT NULL");
+        try self.exec("UPDATE approvals SET live_epoch=NULL,revision=revision+1 WHERE live_epoch IS NOT NULL");
     }
 };
 

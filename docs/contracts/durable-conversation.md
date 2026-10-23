@@ -4,7 +4,7 @@ Core v1 remains normative. `src/domain/types.zig` provides the domain-only typed
 
 `types.encode(value,buffer)` uses fixed-buffer deterministic structural JSON (explicit tagged unions, null fields, declaration field order, exact string bytes). Its format is private versioned storage encoding, not a replacement public contract. It allocates nothing and fails before buffer overflow. Command envelope encoding includes target, version and precondition, not only payload. Dedup must compare exact bytes, not hash alone. Event positions order `(commit_sequence,event_index)`, preserving unseen same-revision events.
 
-The current checkpoints implement domain value encoding/ordering and the real SQLite storage primitives described below. No Host/dispatcher/query execution is exposed and no persisted-conversation milestone is claimed. Further executable slices remain under task004's assigned owner.
+The storage and single-owner command reducer checkpoints are implemented; `Owner.command` is an internal owner-thread API, not a UI gateway. Async Host, adapter execution, projections/subscriptions and public-gateway crash acceptance remain separate gates.
 
 Focused check (system SQLite/libc only; no SDL/native text dependencies): `zig build test-domain -Doptimize=Debug` and `-Doptimize=ReleaseSafe`.
 
@@ -20,4 +20,8 @@ One thread owns Store. `begin/commit/rollback`, `nextSequence`, `recordCommand`,
 
 `zig build test-domain -Doptimize=Debug` (also ReleaseSafe) executes actual temporary-SQLite regressions without SDL/dependencies. `zig build build-domain-smoke -Doptimize=Debug` builds `zig-out/bin/domain-smoke`. Its arguments are `STATE_DIR write|read|crash-uncommitted|crash-committed NAME`. The storage-only consumer records one synthetic project command/receipt/event, verifies exact redelivery and deliberately `_exit`s before/after COMMIT (73/74). It is **not** the Host/fake conversation command path, approval implementation or no-duplicate-external-call proof.
 
-The present storage checkpoint exposes no Host/dispatcher implementation. Its tested transactions are useful internal boundaries, not task004 acceptance. Physical SQLite/C allocator/RSS/WAL bounds and power-loss behavior are not established by process-crash tests.
+The command reducer accepts project/workspace/thread/send, approval reply, cancellation and explicit evidence-based reconciliation in one transaction with receipt/event persistence. Planned effects contain exact immutable typed requests. `Owner.claimNext` commits its claim before returning a request; recovery makes claimed effects unknown and never replays them. Cancellation before any dispatch withdraws effects; after possible dispatch it journals a separate cancel intent. Approval requires matching current connection epoch, digest and unexpired UTC authority; reopen invalidates live authority.
+
+Committed range replay compares indexed chunks over the requested bounded byte range, including different chunk boundaries; a replay extending beyond committed bytes is rejected rather than speculatively appended. Recovery increments revisions and emits exact effect/approval/run aggregate events atomically. New-store directory durability syncs the absolute state directory and every ancestor to root, including parent entries created by nested directory creation. This is fsync ordering, not an exercised power-loss guarantee.
+
+The present checkpoint exposes no async Host or adapter execution. The internal reducer tests are not public fake-conversation or duplicate-external-call acceptance. Physical SQLite/C allocator/RSS/WAL bounds and power-loss behavior are not established by process-crash tests.
