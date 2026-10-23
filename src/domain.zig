@@ -458,6 +458,534 @@ pub const Owner = struct {
     }
 };
 
+/// Bounded asynchronous gateway. The worker is the only database/adapter owner.
+/// Admission copies input; drain relocates every output slice into caller storage.
+pub const Host = struct {
+    pub const Options = struct {
+        state_directory: []const u8,
+        limits: t.Limits = .{},
+        wake: ?*const fn (?*anyopaque) void = null,
+        wake_context: ?*anyopaque = null,
+    };
+    const Request = union(enum) { command: t.CommandEnvelope, query: t.Query, subscribe: t.Subscribe, unsubscribe: t.SubscriptionId };
+    const Frame = struct { ticket: t.Ticket = .{ .value = 0 }, len: usize = 0, bytes: [65536]u8 = undefined };
+    const Result = struct { len: usize = 0, bytes: [262144]u8 = undefined };
+    const Snapshot = struct { generation: u64 = 0, database: ?*store.c.sqlite3 = null, position: t.EventPosition = .{}, deadline: u64 = 0 };
+    const Subscription = struct { generation: u64 = 0, active: bool = false, scope: t.Scope = .all, after: t.EventPosition = .{}, max_bytes: usize = 65536, arena: std.heap.ArenaAllocator };
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+    database: store.Store,
+    thread: ?std.Thread = null,
+    mutex: std.Io.Mutex = .init,
+    changed: std.Io.Condition = .init,
+    closed: bool = false,
+    next_ticket: u64 = 1,
+    requests: [8]Frame = undefined,
+    request_head: usize = 0,
+    request_count: usize = 0,
+    results: [8]Result = undefined,
+    result_head: usize = 0,
+    result_count: usize = 0,
+    snapshots: [2]Snapshot = .{ .{}, .{} },
+    subscriptions: [4]Subscription = undefined,
+    epoch: [32]u8 = undefined,
+    path: [:0]u8,
+
+    pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Host {
+        const l = options.limits;
+        if (l.request_slots == 0 or l.request_slots > 8 or l.result_slots == 0 or l.result_slots > 8 or l.snapshot_slots == 0 or l.snapshot_slots > 2 or l.subscription_slots > 4 or l.command_bytes > 65536 or l.page_bytes > 65536 or l.page_rows > 128 or l.page_rows == 0) return error.InvalidLimits;
+        const self = try allocator.create(Host);
+        errdefer allocator.destroy(self);
+        var database = try store.Store.open(io, options.state_directory);
+        errdefer database.close() catch {};
+        var filename: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const dir = try std.Io.Dir.cwd().openDir(io, options.state_directory, .{});
+        defer dir.close(io);
+        const n = try dir.realPath(io, &filename);
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/conversation.sqlite3", .{filename[0..n]}, 0);
+        errdefer allocator.free(path);
+        self.* = .{ .allocator = allocator, .io = io, .options = options, .database = database, .path = path };
+        for (&self.subscriptions) |*sub| sub.* = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var owner: Owner = .{ .database = &self.database, .io = io, .epoch = "", .utc_ms = null };
+        @memcpy(&self.epoch, try owner.id(arena.allocator()));
+        try owner.recover();
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return self;
+    }
+    pub fn destroy(self: *Host) void {
+        self.mutex.lockUncancelable(self.io);
+        self.closed = true;
+        self.changed.broadcast(self.io);
+        self.mutex.unlock(self.io);
+        if (self.thread) |thread| thread.join();
+        for (&self.snapshots) |*snapshot| self.closeSnapshot(snapshot);
+        for (&self.subscriptions) |*sub| sub.arena.deinit();
+        self.database.close() catch {};
+        self.allocator.free(self.path);
+        self.allocator.destroy(self);
+    }
+    pub fn submit(self: *Host, command: t.CommandEnvelope) t.AdmissionError!t.Ticket {
+        return self.admit(.{ .command = command });
+    }
+    pub fn query(self: *Host, request: t.Query) t.AdmissionError!t.Ticket {
+        return self.admit(.{ .query = request });
+    }
+    pub fn subscribe(self: *Host, request: t.Subscribe) t.AdmissionError!t.Ticket {
+        return self.admit(.{ .subscribe = request });
+    }
+    pub fn unsubscribe(self: *Host, id_value: t.SubscriptionId) t.AdmissionError!t.Ticket {
+        return self.admit(.{ .unsubscribe = id_value });
+    }
+    fn admit(self: *Host, request: Request) t.AdmissionError!t.Ticket {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.closed) return error.Closed;
+        if (self.request_count == self.options.limits.request_slots or self.next_ticket == std.math.maxInt(u64)) return error.Full;
+        const frame = &self.requests[(self.request_head + self.request_count) % 8];
+        const bytes = t.encode(request, frame.bytes[0..self.options.limits.command_bytes]) catch return error.TooLarge;
+        frame.len = bytes.len;
+        frame.ticket = .{ .value = self.next_ticket };
+        self.next_ticket += 1;
+        self.request_count += 1;
+        self.changed.signal(self.io);
+        return frame.ticket;
+    }
+    pub fn drain(self: *Host, outputs: []t.Output, storage_bytes: []u8) t.DrainResult {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var fixed = std.heap.FixedBufferAllocator.init(storage_bytes);
+        var count: usize = 0;
+        var required: usize = 0;
+        while (count < outputs.len and self.result_count != 0) {
+            const frame = &self.results[self.result_head];
+            const before = fixed.end_index;
+            outputs[count] = t.decode(t.Output, frame.bytes[0..frame.len], fixed.allocator()) catch {
+                fixed.end_index = before;
+                required = frame.len * 8 + 8192;
+                break;
+            };
+            count += 1;
+            self.result_count -= 1;
+            self.result_head = (self.result_head + 1) % 8;
+        }
+        self.changed.signal(self.io);
+        return .{ .output_count = count, .bytes_used = fixed.end_index, .more_pending = self.result_count != 0, .required_bytes_for_next = required };
+    }
+    fn publish(self: *Host, output: t.Output) !void {
+        self.mutex.lockUncancelable(self.io);
+        while (!self.closed and self.result_count == self.options.limits.result_slots) self.changed.waitUncancelable(self.io, &self.mutex);
+        if (self.closed) {
+            self.mutex.unlock(self.io);
+            return error.Closed;
+        }
+        const frame = &self.results[(self.result_head + self.result_count) % 8];
+        const encoded_output = t.encode(output, &frame.bytes) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        frame.len = encoded_output.len;
+        self.result_count += 1;
+        self.mutex.unlock(self.io);
+        if (self.options.wake) |wake| wake(self.options.wake_context);
+    }
+    fn now(self: *Host) u64 {
+        return @intCast(@max(0, std.Io.Clock.awake.now(self.io).toMilliseconds()));
+    }
+    fn closeSnapshot(_: *Host, snapshot: *Snapshot) void {
+        if (snapshot.database) |database| _ = store.c.sqlite3_close(database);
+        snapshot.database = null;
+    }
+    fn run(self: *Host) void {
+        var owner: Owner = .{ .database = &self.database, .io = self.io, .epoch = &self.epoch, .utc_ms = null };
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var operation_memory: [2 * 1024 * 1024]u8 = undefined;
+        while (true) {
+            self.mutex.lockUncancelable(self.io);
+            while (!self.closed and self.request_count == 0) self.changed.waitUncancelable(self.io, &self.mutex);
+            if (self.closed) {
+                self.mutex.unlock(self.io);
+                return;
+            }
+            const frame = self.requests[self.request_head];
+            self.request_head = (self.request_head + 1) % 8;
+            self.request_count -= 1;
+            self.mutex.unlock(self.io);
+            var fixed = std.heap.FixedBufferAllocator.init(&operation_memory);
+            const allocator = fixed.allocator();
+            owner.utc_ms = @intCast(@max(0, std.Io.Clock.real.now(self.io).toMilliseconds()));
+            for (&self.snapshots) |*snapshot| if (snapshot.database != null and self.now() >= snapshot.deadline) {
+                self.closeSnapshot(snapshot);
+            };
+            const request = t.decode(Request, frame.bytes[0..frame.len], allocator) catch {
+                self.fail(frame.ticket, .admission_limit);
+                continue;
+            };
+            self.handle(&owner, allocator, frame.ticket, request) catch |err| {
+                self.database.rollback() catch {};
+                self.fail(frame.ticket, switch (err) {
+                    error.CursorInvalid => .cursor_invalid,
+                    error.NotFound => .not_found,
+                    error.InvalidQuery => .invalid_query,
+                    error.Limit, error.OutOfMemory, error.TooLarge => .admission_limit,
+                    else => .storage_unavailable,
+                });
+            };
+            // Each adapter call follows a committed claim. A failed delivery is
+            // left in_flight and recovery will mark it unknown, never retry it.
+            var steps: usize = 0;
+            while (steps < 8) : (steps += 1) {
+                _ = arena.reset(.retain_capacity);
+                const claimed = owner.claimNext(arena.allocator()) catch break;
+                const effect = claimed orelse break;
+                self.dispatch(&owner, arena.allocator(), effect) catch break;
+            }
+            self.deliverSubscriptions(allocator) catch {};
+        }
+    }
+    fn fail(self: *Host, ticket: t.Ticket, reason: @FieldType(t.Failure, "reason")) void {
+        self.publish(.{ .failure = .{ .ticket = ticket, .failure = .{ .reason = reason, .refresh_required = reason == .cursor_invalid } } }) catch {};
+    }
+    fn handle(self: *Host, owner: *Owner, allocator: std.mem.Allocator, ticket: t.Ticket, request: Request) !void {
+        switch (request) {
+            .command => |command| {
+                const used = try self.database.scalar("PRAGMA page_count");
+                const page_size = try self.database.scalar("PRAGMA page_size");
+                if (@as(u64, @intCast(used)) *| @as(u64, @intCast(page_size)) >= self.options.limits.durable_bytes) return error.Limit;
+                try self.publish(.{ .command_receipt = .{ .ticket = ticket, .receipt = try owner.command(allocator, command) } });
+            },
+            .query => |q| try self.publish(.{ .query_page = .{ .ticket = ticket, .page = try self.project(allocator, q) } }),
+            .subscribe => |subscription| {
+                if (subscription.max_batch_bytes == 0 or subscription.max_batch_bytes > self.options.limits.page_bytes) return error.Limit;
+                const position = try self.database.position();
+                if (subscription.after_position.order(position) == .gt) return error.CursorInvalid;
+                for (self.subscriptions[0..self.options.limits.subscription_slots], 0..) |*sub, i| {
+                    if (sub.active) continue;
+                    if (sub.generation == std.math.maxInt(u64)) return error.Limit;
+                    _ = sub.arena.reset(.retain_capacity);
+                    var buffer: [4096]u8 = undefined;
+                    sub.scope = try t.decode(t.Scope, try t.encode(subscription.scope, &buffer), sub.arena.allocator());
+                    sub.generation += 1;
+                    sub.active = true;
+                    sub.after = subscription.after_position;
+                    sub.max_bytes = subscription.max_batch_bytes;
+                    try self.publish(.{ .subscribed = .{ .ticket = ticket, .id = .{ .slot = @intCast(i), .generation = sub.generation }, .after_position = sub.after } });
+                    return;
+                }
+                return error.Limit;
+            },
+            .unsubscribe => |id_value| {
+                if (id_value.slot >= self.options.limits.subscription_slots) return error.CursorInvalid;
+                const sub = &self.subscriptions[id_value.slot];
+                if (!sub.active or sub.generation != id_value.generation) return error.CursorInvalid;
+                sub.active = false;
+                _ = sub.arena.reset(.retain_capacity);
+                try self.publish(.{ .unsubscribed = .{ .ticket = ticket } });
+            },
+        }
+    }
+
+    const fake = @import("runtime/fake.zig");
+    /// Fixed fake-v1 scenario. IDs derive from durable run identity, not UI state.
+    /// Each call is exercised through the accepted bounded fake adapter, with no
+    /// external provider or script owning lifecycle. No recovered run is started.
+    fn dispatch(self: *Host, owner: *Owner, allocator: std.mem.Allocator, effect: Owner.Claimed) !void {
+        const request = effect.request;
+        const s = try self.database.prepare("SELECT e.run_id,e.session_id,r.requested,m.id,b.id FROM effects e JOIN runs r ON r.id=e.run_id JOIN messages m ON m.run_id=r.id AND m.role='assistant' JOIN blocks b ON b.message_id=m.id AND b.ordinal=0 WHERE e.id=?", &.{.{ .text = effect.id.value }});
+        defer s.deinit();
+        if (!try s.step()) return error.Corrupt;
+        const run_id = a.RunId{ .value = try allocator.dupe(u8, try s.bytes(0)) };
+        const session_id = a.RuntimeSessionId{ .value = try allocator.dupe(u8, try s.bytes(1)) };
+        const selection = try t.decode(a.Selection, try s.bytes(2), allocator);
+        const tool_id = a.ToolCallId{ .value = try std.fmt.allocPrint(allocator, "{s}-tool", .{run_id.value}) };
+        const approval_id = a.ApprovalId{ .value = try std.fmt.allocPrint(allocator, "{s}-approval", .{run_id.value}) };
+        const correlation: a.Correlation = .{ .session = session_id, .run = run_id, .tool = tool_id, .approval = approval_id, .upstream_tool = "fake-tool", .upstream_request = "fake-approval" };
+        var receipt: a.Receipt = .{ .outcome = .acknowledged };
+        if (request == .open) receipt.session = .{ .id = session_id, .instance = .{ .value = &self.epoch }, .upstream = .{ .value = session_id.value } };
+        var script: [6]fake.Step = undefined;
+        script[0] = .{ .expect = .{ .request = request, .receipt = receipt } };
+        var count: usize = 1;
+        switch (request) {
+            .start => {
+                script[1] = .{ .emit = .{ .correlation = correlation, .upstream_event = "selection", .body = .{ .selection = .{ .requested = selection, .effective = selection, .readiness = .ready } } } };
+                script[2] = .{ .emit = .{ .correlation = correlation, .upstream_event = "response", .body = .{ .chunk = .{ .message = .{ .value = try s.bytes(3) }, .block = .{ .value = try s.bytes(4) }, .offset = 0, .text = "Fake response: café 世界 👩‍💻\n\n```zig\nconst answer = 42;\n```\n" } } } };
+                script[3] = .{ .emit = .{ .correlation = correlation, .upstream_event = "tool-start", .body = .{ .tool_started = .{ .name = "workspace.inspect", .action_digest = "fake-v1-inspect" } } } };
+                script[4] = .{ .emit = .{ .correlation = correlation, .upstream_event = "approval", .body = .{ .approval = .{ .correlation = correlation, .workspace = selection.workspace, .action_digest = "fake-v1-inspect", .scope = "one workspace inspection" } } } };
+                count = 5;
+            },
+            .respond_approval => |reply| {
+                script[1] = .{ .emit = .{ .correlation = correlation, .upstream_event = "tool-result", .body = .{ .tool_completed = .{ .outcome = if (reply.decision == .allow) .succeeded else .failed, .result = if (reply.decision == .allow) "Inspection approved; temporary workspace inspected." else "Inspection denied; no action executed." } } } };
+                script[2] = .{ .emit = .{ .correlation = correlation, .upstream_event = "completed", .body = .completed } };
+                count = 3;
+            },
+            .cancel => {
+                script[1] = .{ .emit = .{ .correlation = correlation, .upstream_event = "cancelled", .body = .{ .cancelled = .{ .tools_stopped = true } } } };
+                count = 2;
+            },
+            .open => {},
+            else => receipt = .{ .outcome = .unknown, .detail = "no live recovery continuity" },
+        }
+        script[0] = .{ .expect = .{ .request = request, .receipt = receipt } };
+        var runtime = try fake.Runtime(16, 32).init(.{ .account = .{ .reference = selection.account_ref, .readiness = .ready }, .selection = .{ .requested = selection, .effective = selection, .readiness = .ready } }, script[0..count]);
+        try owner.delivered(allocator, effect.id, try runtime.dispatch(request));
+        try runtime.pump();
+        while (runtime.poll()) |observation| try owner.observe(allocator, observation);
+    }
+
+    fn snapshotFor(self: *Host, page: t.Page) !struct { id: t.SnapshotId, value: *Snapshot } {
+        if (page.snapshot) |id_value| {
+            if (id_value.slot >= self.options.limits.snapshot_slots) return error.CursorInvalid;
+            const snapshot = &self.snapshots[id_value.slot];
+            if (snapshot.database == null or snapshot.generation != id_value.generation or self.now() >= snapshot.deadline) return error.CursorInvalid;
+            return .{ .id = id_value, .value = snapshot };
+        }
+        if (page.cursor != null) return error.CursorInvalid;
+        for (self.snapshots[0..self.options.limits.snapshot_slots], 0..) |*snapshot, i| {
+            if (snapshot.database != null) continue;
+            if (snapshot.generation == std.math.maxInt(u64)) return error.Limit;
+            var database: ?*store.c.sqlite3 = null;
+            try store.check(store.c.sqlite3_open_v2(self.path.ptr, &database, store.c.SQLITE_OPEN_READONLY | store.c.SQLITE_OPEN_NOFOLLOW, null));
+            errdefer if (database) |db| { _ = store.c.sqlite3_close(db); };
+            try store.check(store.c.sqlite3_exec(database, "BEGIN", null, null, null));
+            var reader = self.database;
+            reader.database = database.?;
+            snapshot.position = try reader.position();
+            snapshot.database = database;
+            snapshot.generation += 1;
+            snapshot.deadline = self.now() +| self.options.limits.snapshot_ttl_ms;
+            return .{ .id = .{ .slot = @intCast(i), .generation = snapshot.generation }, .value = snapshot };
+        }
+        // A new root query replaces the oldest ephemeral view; old IDs fail closed.
+        var oldest: usize = 0;
+        for (self.snapshots[0..self.options.limits.snapshot_slots], 0..) |snapshot, i| if (snapshot.deadline < self.snapshots[oldest].deadline) { oldest = i; };
+        self.closeSnapshot(&self.snapshots[oldest]);
+        return self.snapshotFor(page);
+    }
+    fn text(allocator: std.mem.Allocator, statement: store.Statement, column: c_int) ![]const u8 {
+        return allocator.dupe(u8, try statement.bytes(column));
+    }
+    fn enumeration(comptime T: type, statement: store.Statement, column: c_int) !T {
+        return std.meta.stringToEnum(T, try statement.bytes(column)) orelse error.Corrupt;
+    }
+    fn number(statement: store.Statement, column: c_int) !u64 {
+        const value = statement.integer(column);
+        if (value < 0) return error.Corrupt;
+        return @intCast(value);
+    }
+    fn descriptor(allocator: std.mem.Allocator, s: store.Statement) !t.BlockDescriptor {
+        return .{ .block_id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .ordinal = try number(s, 3), .kind = try enumeration(@FieldType(t.BlockDescriptor, "kind"), s, 4), .committed_bytes = try number(s, 5), .tool_id = if (s.isNull(6)) null else .{ .value = try text(allocator, s, 6) } };
+    }
+    fn project(self: *Host, allocator: std.mem.Allocator, q: t.Query) !t.QueryPage {
+        const page: t.Page = switch (q) {
+            .projects => |p| p,
+            .workspaces => |v| v.page,
+            .threads => |v| v.page,
+            .messages => |v| v.page,
+            .blocks => |v| v.page,
+            .content => |v| v.page,
+            .runs => |v| v.page,
+            .effects => |v| v.page,
+            .tools => |v| v.page,
+            .approvals => |v| v.page,
+            .thread, .capabilities => .{},
+        };
+        if (page.limit == 0 or page.limit > self.options.limits.page_rows or page.max_bytes == 0 or page.max_bytes > self.options.limits.page_bytes) return error.InvalidQuery;
+        const snapshot = try self.snapshotFor(page);
+        var reader = self.database;
+        reader.database = snapshot.value.database.?;
+        var result: t.QueryPage = .{ .snapshot_id = snapshot.id, .snapshot_position = snapshot.value.position, .items = &.{}, .expires_at = snapshot.value.deadline };
+        const rows = try allocator.alloc(t.Row, page.limit);
+        var count: usize = 0;
+        var bytes_used: usize = 0;
+        const Cursor = struct { query: []const u8, key: u64 };
+        const identity_buffer = try allocator.alloc(u8, 65536);
+        var identity_query = q;
+        switch (identity_query) {
+            .projects => |*v| v.* = .{},
+            .workspaces => |*v| v.page = .{},
+            .threads => |*v| v.page = .{},
+            .messages => |*v| v.page = .{},
+            .blocks => |*v| v.page = .{},
+            .content => |*v| v.page = .{},
+            .runs => |*v| v.page = .{},
+            .effects => |*v| v.page = .{},
+            .tools => |*v| v.page = .{},
+            .approvals => |*v| v.page = .{},
+            else => {},
+        }
+        const identity = try t.encode(identity_query, identity_buffer);
+        var cursor: u64 = 0;
+        if (page.cursor) |raw| {
+            const parsed = t.decode(Cursor, raw, allocator) catch return error.CursorInvalid;
+            if (!std.mem.eql(u8, parsed.query, identity) or parsed.key > std.math.maxInt(i64)) return error.CursorInvalid;
+            cursor = parsed.key;
+        }
+        var sql: [:0]const u8 = undefined;
+        var values: [5]V = undefined;
+        var n: usize = 0;
+        switch (q) {
+            .capabilities => {
+                rows[0] = .{ .capabilities = .{ .capabilities = fake.defaultCapabilities(), .limits = .{} } };
+                result.items = rows[0..1];
+                return result;
+            },
+            .projects => sql = "SELECT rowid,id,revision,display_name FROM projects WHERE rowid>? ORDER BY rowid LIMIT ?",
+            .workspaces => |v| { sql = "SELECT rowid,id,revision,project_id,binding FROM workspaces WHERE project_id=? AND rowid>? ORDER BY rowid LIMIT ?"; values[0] = .{ .text = v.project.value }; n = 1; },
+            .threads => |v| { sql = "SELECT rowid,id,revision,project_id,workspace_id,session_id FROM threads WHERE project_id=? AND rowid>max(?,coalesce((SELECT rowid FROM threads WHERE id=?),0)) ORDER BY rowid LIMIT ?"; values[0] = .{ .text = v.project.value }; values[1] = .{ .integer = @intCast(cursor) }; values[2] = if (v.anchor) |anchor| .{ .text = anchor.value } else .null; n = 3; },
+            .thread => |v| { sql = "SELECT rowid,id,revision,project_id,workspace_id,session_id FROM threads WHERE id=? AND rowid>? LIMIT ?"; values[0] = .{ .text = v.value }; n = 1; },
+            .messages => |v| {
+                sql = if (v.direction == .newer) "SELECT ordinal+1,id,revision,ordinal,role,incomplete,run_id FROM messages WHERE thread_id=? AND ordinal+1>max(?,coalesce((SELECT ordinal+1 FROM messages WHERE id=? AND thread_id=?),0)) ORDER BY ordinal LIMIT ?" else "SELECT ordinal+1,id,revision,ordinal,role,incomplete,run_id FROM messages WHERE thread_id=? AND ordinal+1<min(nullif(?,0),coalesce((SELECT ordinal+1 FROM messages WHERE id=? AND thread_id=?),9223372036854775807)) ORDER BY ordinal DESC LIMIT ?";
+                if (v.direction == .older and cursor == 0) cursor = std.math.maxInt(i64);
+                values[0] = .{ .text = v.thread.value }; values[1] = .{ .integer = @intCast(cursor) }; values[2] = if (v.anchor) |anchor| .{ .text = anchor.value } else .null; values[3] = .{ .text = v.thread.value }; n = 4;
+            },
+            .blocks => |v| { sql = "SELECT ordinal+1,id,revision,ordinal,kind,committed_bytes,tool_id FROM blocks WHERE message_id=? AND ordinal+1>? ORDER BY ordinal LIMIT ?"; values[0] = .{ .text = v.message.value }; n = 1; },
+            .runs => |v| { sql = "SELECT rowid,id,revision,thread_id,session_id,state,requested,effective FROM runs WHERE thread_id=? AND rowid>? ORDER BY rowid LIMIT ?"; values[0] = .{ .text = v.thread.value }; n = 1; },
+            .effects => |v| { sql = "SELECT rowid,id,revision,run_id,kind,state,outcome FROM effects WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?"; values[0] = .{ .text = v.run.value }; n = 1; },
+            .tools => |v| { sql = "SELECT rowid,id,revision,run_id,name,action_digest,outcome,result_block FROM tools WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?"; values[0] = .{ .text = v.run.value }; n = 1; },
+            .approvals => |v| { sql = "SELECT rowid,id,revision,run_id,state,session_id,tool_id,workspace_id,upstream_request,action_digest,scope,expires_at,live_epoch FROM approvals WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?"; values[0] = .{ .text = v.run.value }; n = 1; },
+            .content => |v| {
+                if (v.start_byte > v.end_byte or v.end_byte > std.math.maxInt(i64) or v.end_byte - v.start_byte > page.max_bytes) return error.InvalidQuery;
+                const s = try reader.prepare("SELECT revision,committed_bytes FROM blocks WHERE id=?", &.{.{ .text = v.block.value }});
+                defer s.deinit();
+                if (!try s.step()) return error.NotFound;
+                const committed = try number(s, 1);
+                if (v.start_byte > committed) return error.InvalidQuery;
+                const end = @min(v.end_byte, committed);
+                const bytes = try allocator.alloc(u8, @intCast(end - v.start_byte));
+                const chunks = try reader.prepare("SELECT byte_offset,bytes FROM chunks WHERE block_id=? AND byte_offset<? AND byte_offset+length(bytes)>? ORDER BY byte_offset", &.{ .{ .text = v.block.value }, .{ .integer = @intCast(end) }, .{ .integer = @intCast(v.start_byte) } });
+                defer chunks.deinit();
+                var copied: usize = 0;
+                while (try chunks.step()) {
+                    const start = try number(chunks, 0);
+                    const chunk = try chunks.bytes(1);
+                    const low = @max(start, v.start_byte);
+                    const high = @min(start + chunk.len, end);
+                    @memcpy(bytes[@intCast(low - v.start_byte)..@intCast(high - v.start_byte)], chunk[@intCast(low - start)..@intCast(high - start)]);
+                    copied += @intCast(high - low);
+                }
+                if (copied != bytes.len) return error.Corrupt;
+                rows[0] = .{ .content = .{ .block_id = v.block, .revision = try number(s, 0), .start_byte = v.start_byte, .end_byte = end, .next_byte = if (end < committed) end else null, .bytes = bytes } };
+                result.items = rows[0..1];
+                return result;
+            },
+        }
+        if (q != .messages and q != .threads) { values[n] = .{ .integer = @intCast(cursor) }; n += 1; }
+        values[n] = .{ .integer = @as(i64, page.limit) + 1 }; n += 1;
+        const statement = try reader.prepare(sql, values[0..n]);
+        defer statement.deinit();
+        var last_key: u64 = cursor;
+        var encode_buffer: [131072]u8 = undefined;
+        while (try statement.step()) {
+            if (count == page.limit) { result.next_cursor = try Owner.encoded(allocator, Cursor{ .query = identity, .key = last_key }); break; }
+            const s = statement;
+            const row: t.Row = switch (q) {
+                .projects => .{ .project = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .display_name = try text(allocator, s, 3) } },
+                .workspaces => .{ .workspace = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .binding = try t.decode(t.WorkspaceBinding, try s.bytes(4), allocator) } },
+                .threads, .thread => .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) } } },
+                .blocks => .{ .block = try descriptor(allocator, s) },
+                .messages => blk: {
+                    const message_id = a.MessageId{ .value = try text(allocator, s, 1) };
+                    // One descriptor keeps nested work bounded; continuation uses
+                    // the same snapshot and the explicit blocks query.
+                    const blocks = try reader.prepare("SELECT ordinal+1,id,revision,ordinal,kind,committed_bytes,tool_id FROM blocks WHERE message_id=? ORDER BY ordinal LIMIT 2", &.{.{ .text = message_id.value }});
+                    defer blocks.deinit();
+                    var descriptors: []t.BlockDescriptor = &.{};
+                    var next: ?[]const u8 = null;
+                    if (try blocks.step()) {
+                        descriptors = try allocator.alloc(t.BlockDescriptor, 1);
+                        descriptors[0] = try descriptor(allocator, blocks);
+                        const key = try number(blocks, 0);
+                        if (try blocks.step()) {
+                            const block_query: t.Query = .{ .blocks = .{ .message = message_id } };
+                            next = try Owner.encoded(allocator, Cursor{ .query = try t.encode(block_query, try allocator.alloc(u8, 2048)), .key = key });
+                        }
+                    }
+                    break :blk .{ .message = .{ .message_id = message_id, .revision = try number(s, 2), .ordinal = try number(s, 3), .role = try enumeration(@FieldType(@FieldType(t.Row, "message"), "role"), s, 4), .incomplete = s.integer(5) != 0, .run_id = .{ .value = try text(allocator, s, 6) }, .blocks = descriptors, .next_block_cursor = next } };
+                },
+                .runs => .{ .run = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .thread = .{ .value = try text(allocator, s, 3) }, .session = .{ .value = try text(allocator, s, 4) }, .state = try enumeration(t.RunState, s, 5), .requested = try t.decode(a.Selection, try s.bytes(6), allocator), .effective = if (s.isNull(7)) null else try t.decode(a.Selection, try s.bytes(7), allocator) } },
+                .effects => .{ .effect = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .run = .{ .value = try text(allocator, s, 3) }, .kind = try enumeration(t.EffectKind, s, 4), .state = try enumeration(t.EffectState, s, 5), .outcome = try text(allocator, s, 6) } },
+                .tools => .{ .tool = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .run = .{ .value = try text(allocator, s, 3) }, .name = try text(allocator, s, 4), .action_digest = try text(allocator, s, 5), .outcome = try enumeration(t.ToolOutcome, s, 6), .result_block = if (s.isNull(7)) null else .{ .value = try text(allocator, s, 7) } } },
+                .approvals => .{ .approval = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .run = .{ .value = try text(allocator, s, 3) }, .state = try enumeration(t.ApprovalState, s, 4), .evidence = .{ .correlation = .{ .session = .{ .value = try text(allocator, s, 5) }, .run = .{ .value = try text(allocator, s, 3) }, .tool = .{ .value = try text(allocator, s, 6) }, .approval = .{ .value = try text(allocator, s, 1) }, .upstream_request = try text(allocator, s, 8) }, .workspace = .{ .value = try text(allocator, s, 7) }, .action_digest = try text(allocator, s, 9), .scope = try text(allocator, s, 10), .expires_at = if (s.isNull(11)) null else try number(s, 11) }, .live = !s.isNull(12) and std.mem.eql(u8, try s.bytes(12), &self.epoch) } },
+                else => unreachable,
+            };
+            const row_bytes = (try t.encode(row, &encode_buffer)).len;
+            if (row_bytes > page.max_bytes - bytes_used) {
+                if (count == 0) return error.Limit;
+                result.next_cursor = try Owner.encoded(allocator, Cursor{ .query = identity, .key = last_key });
+                break;
+            }
+            rows[count] = row;
+            count += 1;
+            bytes_used += row_bytes;
+            last_key = try number(s, 0);
+        }
+        result.items = rows[0..count];
+        if (q == .thread and count == 0) return error.NotFound;
+        return result;
+    }
+    fn deliverSubscriptions(self: *Host, allocator: std.mem.Allocator) !void {
+        const position = try self.database.position();
+        for (self.subscriptions[0..self.options.limits.subscription_slots], 0..) |*sub, i| {
+            if (!sub.active or sub.after.order(position) != .lt) continue;
+            const id_value: t.SubscriptionId = .{ .slot = @intCast(i), .generation = sub.generation };
+            const s = try self.database.prepare("SELECT sequence,event_index,event_id,aggregate,revision,kind,command_id,effect_id,payload FROM events WHERE (sequence,event_index)>(?,?) ORDER BY sequence,event_index LIMIT ?", &.{ .{ .integer = @intCast(sub.after.commit_sequence) }, .{ .integer = sub.after.event_index }, .{ .integer = @intCast(self.options.limits.subscriber_lag_events +| 1) } });
+            defer s.deinit();
+            var events: [128]t.Event = undefined;
+            var count: usize = 0;
+            var scanned: usize = 0;
+            var bytes: usize = 0;
+            var overflow = false;
+            var buffer: [131072]u8 = undefined;
+            while (try s.step()) {
+                scanned += 1;
+                if (scanned > self.options.limits.subscriber_lag_events) { overflow = true; break; }
+                const event_value: t.Event = .{ .position = .{ .commit_sequence = try number(s, 0), .event_index = @intCast(try number(s, 1)) }, .event_id = .{ .value = try text(allocator, s, 2) }, .aggregate = try t.decode(t.AggregateRef, try s.bytes(3), allocator), .aggregate_revision = try number(s, 4), .kind = try text(allocator, s, 5), .causation_command_id = if (s.isNull(6)) null else .{ .value = try text(allocator, s, 6) }, .effect_id = if (s.isNull(7)) null else .{ .value = try text(allocator, s, 7) }, .payload = try text(allocator, s, 8) };
+                // A scoped subscriber receives invalidations, never misses a
+                // cross-aggregate content/tool event belonging to its scope.
+                const matches = switch (sub.scope) {
+                    .all => true,
+                    .thread => |thread_id| try self.belongs(event_value.aggregate, thread_id.value, null),
+                    .run => |run_id| try self.belongs(event_value.aggregate, null, run_id.value),
+                };
+                if (matches) {
+                    const size = (try t.encode(event_value, &buffer)).len;
+                    if (count == events.len or size > sub.max_bytes - bytes) { overflow = true; break; }
+                    events[count] = event_value;
+                    count += 1;
+                    bytes += size;
+                }
+            }
+            if (overflow) {
+                sub.active = false;
+                try self.publish(.{ .resync_required = .{ .id = id_value } });
+            } else {
+                sub.after = position;
+                if (count != 0) try self.publish(.{ .event_batch = .{ .id = id_value, .events = events[0..count], .end_position = position } });
+            }
+        }
+    }
+    fn belongs(self: *Host, aggregate: t.AggregateRef, thread_id: ?[]const u8, run_id: ?[]const u8) !bool {
+        const sql: [:0]const u8, const key: []const u8 = switch (aggregate) {
+            .run => |v| .{ "SELECT thread_id,id FROM runs WHERE id=?", v.value },
+            .thread => |v| return thread_id != null and std.mem.eql(u8, thread_id.?, v.value),
+            .message => |v| .{ "SELECT thread_id,run_id FROM messages WHERE id=?", v.value },
+            .block => |v| .{ "SELECT m.thread_id,m.run_id FROM blocks b JOIN messages m ON m.id=b.message_id WHERE b.id=?", v.value },
+            .tool => |v| .{ "SELECT r.thread_id,r.id FROM tools t JOIN runs r ON r.id=t.run_id WHERE t.id=?", v.value },
+            .approval => |v| .{ "SELECT r.thread_id,r.id FROM approvals a JOIN runs r ON r.id=a.run_id WHERE a.id=?", v.value },
+            .effect => |v| .{ "SELECT r.thread_id,r.id FROM effects e JOIN runs r ON r.id=e.run_id WHERE e.id=?", v.value },
+            .session => |v| .{ "SELECT thread_id,id FROM runs WHERE session_id=?", v.value },
+            else => return false,
+        };
+        const s = try self.database.prepare(sql, &.{.{ .text = key }});
+        defer s.deinit();
+        if (!try s.step()) return false;
+        return if (thread_id) |id_value| std.mem.eql(u8, id_value, try s.bytes(0)) else std.mem.eql(u8, run_id.?, try s.bytes(1));
+    }
+};
+
 test {
     _ = types;
     _ = @import("domain/domain_test.zig");

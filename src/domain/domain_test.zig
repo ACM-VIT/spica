@@ -383,3 +383,92 @@ test "adapter evidence reduction persists bytes approval expiry and cancel reply
     observation.body = .{ .ambiguous = .{ .reason = "unknown" } };
     try owner.observe(allocator, observation);
 }
+
+const Consumer = struct {
+    host: *@import("../domain.zig").Host,
+    event: std.Io.Event = .unset,
+    arena: std.heap.ArenaAllocator,
+    fn wake(context: ?*anyopaque) void {
+        const self: *Consumer = @ptrCast(@alignCast(context.?));
+        self.event.set(std.testing.io);
+    }
+    fn next(self: *Consumer) !t.Output {
+        var output: [1]t.Output = undefined;
+        const bytes = try self.arena.allocator().alloc(u8, 1024 * 1024);
+        while (true) {
+            self.event.reset();
+            const result = self.host.drain(&output, bytes);
+            if (result.output_count != 0) return output[0];
+            if (result.required_bytes_for_next != 0) return error.OutputTooLarge;
+            self.event.waitUncancelable(std.testing.io);
+        }
+    }
+    fn command(self: *Consumer, envelope: t.CommandEnvelope) !t.Receipt {
+        const ticket = try self.host.submit(envelope);
+        const output = try self.next();
+        if (output != .command_receipt) return error.ExpectedReceipt;
+        try std.testing.expectEqual(ticket.value, output.command_receipt.ticket.value);
+        try std.testing.expectEqual(.accepted, output.command_receipt.receipt.outcome);
+        return output.command_receipt.receipt;
+    }
+    fn query(self: *Consumer, q: t.Query) !t.QueryPage {
+        const ticket = try self.host.query(q);
+        const output = try self.next();
+        if (output != .query_page) return error.ExpectedPage;
+        try std.testing.expectEqual(ticket.value, output.query_page.ticket.value);
+        return output.query_page.page;
+    }
+};
+
+test "public Host consumer streams approves cancels pages and reopens durable state" {
+    const Host = @import("../domain.zig").Host;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var consumer: Consumer = .{ .host = undefined, .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer consumer.arena.deinit();
+    consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .wake = Consumer.wake, .wake_context = &consumer });
+    var live = true;
+    defer if (live) consumer.host.destroy();
+    const project = (try consumer.command(.{ .command_id = .{ .value = "host-project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "consumer" } } })).entity_ids.project.?;
+    const workspace = (try consumer.command(.{ .command_id = .{ .value = "host-workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = .{ .canonical_root = path_buffer[0..n], .filesystem_identity = "temporary", .repository_identity = "", .checkout_identity = "temporary", .expected_branch = "", .base_revision = "", .non_git = true } } } })).entity_ids.workspace.?;
+    const thread = (try consumer.command(.{ .command_id = .{ .value = "host-thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+    const selection: t.adapter.Selection = .{ .workspace = workspace, .model_provider = "fake", .model_id = "fixture", .effort = "none", .account_ref = "fixture" };
+    const send: t.CommandEnvelope = .{ .command_id = .{ .value = "host-send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "Hello 世界", .selection = selection } } };
+    const sent = try consumer.command(send);
+    const run = sent.entity_ids.run.?;
+    const approvals = try consumer.query(.{ .approvals = .{ .run = run } });
+    try std.testing.expectEqual(@as(usize, 1), approvals.items.len);
+    const approval = approvals.items[0].approval;
+    try std.testing.expect(approval.live);
+    const messages = try consumer.query(.{ .messages = .{ .thread = thread, .page = .{ .limit = 1 } } });
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    const continuation = try consumer.query(.{ .messages = .{ .thread = thread, .page = .{ .limit = 1, .snapshot = messages.snapshot_id, .cursor = messages.next_cursor.? } } });
+    const assistant = continuation.items[0].message;
+    const content = try consumer.query(.{ .content = .{ .block = assistant.blocks[0].block_id, .start_byte = 0, .end_byte = assistant.blocks[0].committed_bytes } });
+    try std.testing.expect(std.mem.indexOf(u8, content.items[0].content.bytes, "世界") != null);
+    _ = try consumer.command(.{ .command_id = .{ .value = "host-allow" }, .target = .{ .approval = approval.id }, .expected_revision = .{ .revision = approval.revision }, .payload = .{ .approval_respond = .{ .decision = .allow, .action_digest = approval.evidence.action_digest } } });
+    const runs = try consumer.query(.{ .runs = .{ .thread = thread } });
+    try std.testing.expectEqual(t.RunState.completed, runs.items[0].run.state);
+    const tools = try consumer.query(.{ .tools = .{ .run = run } });
+    try std.testing.expectEqual(t.ToolOutcome.succeeded, tools.items[0].tool.outcome);
+    const blocks = try consumer.query(.{ .blocks = .{ .message = sent.entity_ids.assistant_message.? } });
+    try std.testing.expectEqual(@as(usize, 2), blocks.items.len);
+    const second = try consumer.command(.{ .command_id = .{ .value = "host-send-2" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "cancel me", .selection = selection } } });
+    const active = try consumer.query(.{ .runs = .{ .thread = thread } });
+    const active_run = active.items[1].run;
+    _ = try consumer.command(.{ .command_id = .{ .value = "host-cancel" }, .target = .{ .run = second.entity_ids.run.? }, .expected_revision = .{ .revision = active_run.revision }, .payload = .{ .run_cancel = .{ .reason = "consumer cancel" } } });
+    const cancelled = try consumer.query(.{ .runs = .{ .thread = thread } });
+    try std.testing.expectEqual(t.RunState.cancelled, cancelled.items[1].run.state);
+    consumer.host.destroy();
+    live = false;
+    consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .wake = Consumer.wake, .wake_context = &consumer });
+    live = true;
+    const replay = try consumer.command(send);
+    try std.testing.expectEqualStrings(run.value, replay.entity_ids.run.?.value);
+    const retained = try consumer.query(.{ .runs = .{ .thread = thread } });
+    try std.testing.expectEqual(@as(usize, 2), retained.items.len);
+    try std.testing.expectEqual(t.RunState.completed, retained.items[0].run.state);
+    try std.testing.expectEqual(t.RunState.cancelled, retained.items[1].run.state);
+}

@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     module.addOptions("build_options", options);
     if (target.result.os.tag == .linux) module.addRPathSpecial(b.fmt("$ORIGIN/../../{s}/lib", .{prefix}));
     foundationDependencies(b, module, prefix);
+    libraryDependencies(b, module, prefix);
     const exe = b.addExecutable(.{ .name = "spica", .root_module = module });
     b.installArtifact(exe);
     const run = b.addRunArtifact(exe);
