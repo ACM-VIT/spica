@@ -1,10 +1,29 @@
 # Durable task ledger
 
+## CURRENT
+
+| task | parent/worker | status | branch/worktree | HEAD | blocker | integration commit |
+| --- | --- | --- | --- | --- | --- | --- |
+| 007/008/012 milestone | Main / RuntimeFactoryLead (slot2; sole shared Git/integration owner) | implementation review | `rewrite/native-agent-workspace` / shared checkout | `5b6cfb3` | Authenticated Codex inference/mixed delegation requires Codex authentication; not a blocker for independent work | `5b6cfb3` (current integrated milestone) |
+| 012 producer | RuntimeFactoryLead / completed private producer | source already integrated | `task/012-orchestration` / `.artifacts/worktrees/012-orchestration` | `58fe1a1` | none for landed source | source integrated through `5b6cfb3` |
+| lead workflow policy | RuntimeFactoryLead / RuntimeFactoryLead.LeadWorkflowPolicy (slot1) | review; frozen private policy candidate | `task/lead-workflow-policy` / `.artifacts/worktrees/lead-workflow-policy` | base `5b6cfb3`; actual checkpoint in worker receipt | none | pending lead review/no-ff merge |
+| 010 bounded history | RuntimeFactoryLead / RuntimeFactoryLead.BoundedHistory010 (slot3) | running | `task/010-bounded-history` / `.artifacts/worktrees/010-bounded-history` | initial `5b6cfb3` | none; ownership-foundations 4–6 eligible without Codex auth | pending |
+
+Snapshot at dispatch from committed `5b6cfb3`; checkpoint receipts identify later private heads. The lead updates this table after each reviewed merge; no future SHA is predicted. Historical ownership below is not a current slot reservation or Git/publication grant.
+
+## Operating contract
+
+The Sol integration lead owns routine decomposition/delegation/integration and this current ledger, may allocate/reassign free slots without fresh Astra authorization, and inspects registered worker state/jobs before every spawn to prevent duplicates. Astra retains consequential decisions and milestone review, not routine compiler turns. At most three active Sol workers across the whole tree INCLUDING the lead/waiting parents; descendants inherit only explicitly reserved slots and subset scopes/paths. Preserve one writer per interface/output and exactly one shared Git/integration owner; private Git applies only to owned slices. Actual `gpt-6.1-sol` only, no inherited model, fallback or advisors; stop on mismatch/unavailability. Each worker: 60 minutes, 200 requests soft, 300 forced yield (or smaller packet limits).
+
+Every independent feature uses a named branch/private worktree from a recorded committed base; future fresh branches use the latest reviewed integration. Preserve frequent cohesive verified checkpoints and follow-up fixes. After review and stopped feature writers, the lead performs user-authorized `git merge --no-ff <feature-branch>` into `rewrite/native-agent-workspace` with a meaningful message, resolves conflicts, and runs combined checks plus actual changed-path smoke. Preserve existing cherry-picked history as-is; do not merge already-landed old branches to manufacture a graph. No push, reset, stash, history rewrite or branch switching. After each verified integration continue the next eligible authorized roadmap feature under true provider/auth/workspace prerequisites; missing Codex authentication does not block independent task010. No unattended scheduler.
+
+## Ledger format
+
 One Markdown record per bounded task: NNN-short-name.md. Start a record before dispatch; keep its status current. ROADMAP.md is the dependency order, not a record of completed work.
 
 Fields: status (ready/running/review/accepted/blocked), owner/model, base/head revisions and checkpoint SHAs/checks, owned paths and current Git owner, dependencies, scope, acceptance commands/scenarios, attempts with failures, result revision/diff, evidence, reviewer decision and remaining limitations. Include task/child session identifiers when available. On restart reconcile active OMP children and the working tree before redispatching; do not create duplicate workers.
 
-Workers own only assigned paths. Astra directs integration and owns this ledger; task packets assign one shared Git owner for frequent verified checkpoint commits under AGENTS.md; final integration waits for stopped workers and review; workers return receipts for the coordinator to record. Mark accepted only after actual change/evidence review and affected integration checks. Keep large logs in ignored .artifacts/ rather than copying them into model context.
+Workers own only assigned paths. The designated Sol lead directs routine integration and maintains the current ledger; other workers update only explicitly assigned records/index slices. Task packets assign one shared Git owner for frequent verified checkpoints under AGENTS.md. Final integration waits for stopped feature writers and review; workers return receipts for the lead to record. Mark accepted only after actual change/evidence review and affected integration checks, with consequential decisions/milestone acceptance retained by Astra. Keep large logs in ignored .artifacts/ rather than copying them into model context.
 
 ## Queue
 
@@ -13,28 +32,28 @@ Workers own only assigned paths. Astra directs integration and owns this ledger;
 - [002-build-checks.md](002-build-checks.md): accepted; Debug/ReleaseSafe checks, isolated core regressions, tool pins and Linux CI configuration. Remote CI/clean-host execution remain explicitly unexercised.
 - [003-fake-harness.md](003-fake-harness.md): accepted at `3c18aac45d732f217bc9af98d466f3c569c8dd61`; frozen fake/native repairs, combined Debug/ReleaseSafe checks, actual native smoke and independent asynchronous measurements reviewed.
 - [004-durable-conversation.md](004-durable-conversation.md), [005-native-coding-ui.md](005-native-coding-ui.md) and [006-public-api-proof.md](006-public-api-proof.md): review — integrated runnable default/custom native fake-provider conversation, actual reload/restart proof and assembled Debug/ReleaseSafe checks passed. Final evidence review remains Main-owned; the shared milestone is not marked accepted.
-- [007-codex-adapter.md](007-codex-adapter.md), [008-opencode-adapter.md](008-opencode-adapter.md): blocked on their stated implementation/live gates, not lack of roadmap authorization.
-- 009 projects/threads/background runs, 010 bounded history, 011 workspace/Git identity: pending prerequisites.
-- [012-app-orchestration.md](012-app-orchestration.md): pending fake/runtime/workspace gates; 013 queueing/recovery/portability follows.
+- [007-codex-adapter.md](007-codex-adapter.md), [008-opencode-adapter.md](008-opencode-adapter.md), [012-app-orchestration.md](012-app-orchestration.md): current integrated implementation milestone at `5b6cfb3`, in review. Actual isolated OpenCode inference/MCP delegation/results/reopen and native allow/deny were exercised; Codex handshake/device sign-in initiation does not establish authenticated Codex inference or mixed delegation.
+- 009 projects/threads/background runs and 011 workspace/Git identity: evaluate true prerequisites; task010 bounded history is now running independently (see CURRENT).
+- 013 queueing/recovery/portability follows its actual runtime/workspace dependencies, not a blanket Codex-auth gate.
 - 014 extension primitives, 015 explicitly demanded further integrations, 016 performance/soak and 017 Linux release readiness: pending acceptance/dependency gates. Item 015 does not authorize inventing an additional provider.
 
-## Continuation authorization
+## Historical continuation authorization
 
 After task 001 acceptance, the user explicitly requested completion of all sixteen remaining roadmap tasks. This supersedes the earlier startup-only boundary for this continuation, not the historical task 001 receipt. Subsequent user direction requires RSS/PSS/CPU/frame-time/FPS verification, private worktrees where useful, asynchronous larger evaluations and optional high-reasoning Sol repairs. Project ceiling is now three after ownership/config review; use two unless a genuinely independent third lane exists. No unattended goal loop, scheduler, blanket approval or account/profile rewrite.
 
 Continuation base: 0d82092f0578310903d5ff49556acc820ed7179b, rewrite/native-agent-workspace, initially clean. Infra002 is sole shared Git/integration owner; Fake003/NativeHarness003 own disjoint private task003 worktrees, with Native003 as asynchronous evaluator. DomainPrep004 owns future domain types/store/owner integration; NativeUI005 prepares native UI independently. Astra owns task records/index and reviews actual diffs/evidence. Performance measurements exclude competing builds/recordings/profilers only during bounded sampled windows; release leases between cohorts for queued builds. Independent edits/builds/correctness checks otherwise run concurrently. Real entitlement, credentials, human checkpoints and distribution licensing remain explicit gates; mocks or missing prerequisites cannot count as acceptance.
 
-Explicit publication authorization: the user requested continuing checkpoint pushes to `thinkter/spica`. Verified origin fetch/push identity and GitHub repository permission; nonforce HTTPS push published `cb96d258a605d2905ad7125e7f1448b3bc6651e3` to `refs/heads/rewrite/native-agent-workspace`, confirmed by ls-remote. Evidence `.artifacts/infra002/push-checkpoint.json`. SSH publickey authentication failed; invocation-local GitHub HTTPS helper succeeded without changing remotes/global configuration. Existing pre-push build/format/regression hooks ran and passed. Infra002 owns subsequent reviewed integrated checkpoint pushes to this same destination/ref; never force, publish artifacts/credentials or imply incomplete private slices are accepted.
+Historical publication authorization/evidence (not a current push grant): the user previously requested checkpoint pushes to `thinkter/spica`. Verified origin identity/permission and nonforce HTTPS publication of `cb96d258a605d2905ad7125e7f1448b3bc6651e3` to `refs/heads/rewrite/native-agent-workspace` were recorded in `.artifacts/infra002/push-checkpoint.json`. SSH publickey authentication failed; invocation-local HTTPS helper succeeded without remote/global configuration changes. Pre-push checks passed. The current operating contract prohibits pushes and supersedes the former Infra002 publication ownership.
 
 Domain ownership recovery: DomainPrep004 stopped at its runtime cap with clean private `004-domain` HEAD `c0d7fb27a64558791824f7286f637cb611bd6289`, five preserved types/storage checkpoints. No code-failure escalation or discarded changes. DomainRuntime004 (high Sol) now owns the same domain allowlist/candidate and remaining reducer/Host implementation; read-only inventory `.artifacts/infra002/004-recovery.json`. NativeUI005 continues independently; TextBudget005's retained-text fix was reviewed for dependency integration.
 
-## Resumed feature shipping — 2026-10-23
+## Historical resumed feature shipping — 2026-10-23
 
 User requested immediate Sol feature continuation after enabling nested delegation. Harness checkpoint `cbeea74` permits explicit cross-type Sol spawning with unlimited configured depth; live `NestedSmoke -> MeasureChild -> RepairLeaf` executed `SPICA_NESTED_DEPTH_3_OK`. Three aggregate active worker slots remain the operating ceiling.
 
-Current exclusive private owners: `RuntimeShip004` resumes `.artifacts/worktrees/004-domain` (recovered clean `9088964`) for the task004 production allowlist; `UIShip005` resumes `.artifacts/worktrees/005-ui` for task005; `ScriptShip006` resumes `.artifacts/worktrees/006-script` for task006. Prior preparation-only/no-grandchildren clauses do not replace these production allocations. All three slots are allocated to these workers, with no descendant reservations. Each retains private Git ownership only for its task's paths; no shared integration/push owner is currently assigned. Native/UI/runtime contracts remain those pinned in tasks004–006. Source edits run concurrently; workers coordinate bounded build/check windows and exclusive performance sampling. Actual native/durable/custom-root acceptance remains pending, not implied by dispatch or checkpoint commits.
+At that historical dispatch, exclusive private owners were `RuntimeShip004` in `.artifacts/worktrees/004-domain` (recovered clean `9088964`), `UIShip005` in `.artifacts/worktrees/005-ui`, and `ScriptShip006` in `.artifacts/worktrees/006-script`. Those three slots had no descendant reservations; each retained private Git only for assigned paths, with no shared integration/push owner then assigned. These are superseded ownership records, not current reservations. Native/UI/runtime contracts remained those pinned in tasks004–006. Workers coordinated bounded builds and exclusive performance sampling. Actual native/durable/custom-root acceptance was pending, not implied by dispatch or checkpoint commits.
 
-## Serialized feature integration ownership
+## Historical serialized feature integration ownership
 
 Main assigned ScriptShip006 the sole shared Git/integration role for the union of
 task004/005/006 production allowlists and their existing task records/index.
@@ -76,7 +95,7 @@ or descendants are active. Isolated private correctness builds may run
 concurrently; only performance excludes all builds/recordings/profilers.
 Shared dependency-prefix mutation requires explicit exclusive ownership.
 
-## Integration lead recovery
+## Historical integration lead recovery
 
 `ShipLeadContinue` replaces runtime-capped ScriptShip006 as exclusive shared
 Git/integration owner for the exact task004–006 union and these records. Shared
