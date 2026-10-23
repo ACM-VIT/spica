@@ -9,3 +9,9 @@ Checks: `zig fmt` on the four owned Zig paths completed. `zig test src/test.zig 
 Evidence: private `.artifacts/fake003/manifest.json`, `candidate.diff`, both `test-*.log`, both `smoke-*.log`, throwaway consumer and hash-identical module copies. No build/test failures; one implementation attempt; review refinements landed before checkpoint. Full combined integration remains Infra002's check after Astra review. No domain persistence, live provider, native UI, usage or coordinator acceptance is claimed.
 
 Actual session header: manifest path; `openai-codex/gpt-6.1-sol`, fallback=false, medium; assigned default tier (runtime tier unavailable), agent Fake003/session `01a1694b-8615-77cc-abf8-77e1d20c63d0`. Usage totals unavailable.
+
+## Review round 1
+
+Removed an unrelated FailingAllocator probe; no allocation-denial test is claimed. No allocator is accepted and runtime storage is inline: this is a source/API invariant. The historical-completion test now asserts exact correlation, upstream event identity, completed body and drained queue while retaining unsupported-start and invalid capability/limit cases. API documentation distinguishes these evidence categories.
+
+After Native003's benchmark END, `zig fmt --check src/contract.zig src/runtime/fake.zig src/runtime/fake_test.zig src/test.zig` passed; the same focused test commands passed 7/7 in Debug and ReleaseSafe. The separate module consumer again passed both modes with O0/S1/A1/C1/I0/T0/D0/X1. Raw evidence is `.artifacts/fake003/review1-{format,test-Debug,test-ReleaseSafe,smoke-Debug,smoke-ReleaseSafe}.log`; `review1.json` identifies the narrow source/doc diff. One review repair, no failed repair attempts. Earlier manifests describe their original checkpoints; `review1-final-state.json` identifies the final repair checkpoint and complete exported diff.

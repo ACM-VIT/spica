@@ -171,16 +171,17 @@ test "mismatch, invalid correlation, selection failures and caller string lifeti
     try t.expectError(error.SelectionUnavailable, unverified.openSession(.{ .create = .{ .effect = corr.effect.?, .session = session.id, .selection = selection } }));
 }
 
-test "inline runtime works with every allocation denied and historical inspect does not require start" {
-    var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
-    try t.expectError(error.OutOfMemory, failing.allocator().alloc(u8, 1));
-    // No allocator is accepted or called by the adapter; every operation uses inline storage.
+test "historical completion preserves correlation without start and validates capability limits" {
     var configuration = cfg(1, 1);
     configuration.discovery.capabilities[@intFromEnum(c.Capability.start)].status = .unsupported;
     const script = [_]f.Step{.{ .emit = .{ .correlation = corr, .upstream_event = "old-terminal", .body = .{ .completed = {} } } }};
     var runtime = try f.Runtime(1, 1).init(configuration, &script);
     try runtime.pump();
-    try t.expect(runtime.poll() != null);
+    const observed = runtime.poll().?;
+    try t.expect(c.equal(corr, observed.correlation));
+    try t.expectEqualStrings("old-terminal", observed.upstream_event);
+    try t.expectEqual(.completed, std.meta.activeTag(observed.body));
+    try t.expect(runtime.poll() == null);
     configuration.discovery.limits.queue_frames = 2;
     try t.expectError(error.InvalidLimits, f.Runtime(1, 1).init(configuration, &.{}));
     configuration = cfg(1, 1);
