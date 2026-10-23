@@ -42,9 +42,9 @@ def run_smoke_fixture(value):
         def command(*args, **kwargs):
             if args[:2] == ('vd', 'start'):
                 return str(session)
-            if args[:2] == ('vd', 'run'):
+            if args[:2] == ('vd', 'run') and 'wtype' not in args:
                 return json.dumps(dict(pid=os.getpid()))
-            if args[:2] == ('vd', 'key'):
+            if args[:2] == ('vd', 'key') or (args[:2] == ('vd', 'run') and 'wtype' in args):
                 (output / 'automation.json').write_text(json.dumps(dict(close_reason='ctrl_q', running=False)))
                 (output / 'native.json').write_text(json.dumps(value))
             if args[0] == 'swaymsg':
@@ -61,6 +61,14 @@ def run_smoke_fixture(value):
 
 
 class RunnerBoundaries(unittest.TestCase):
+    def test_key_chords_hold_and_release_real_wtype_modifiers(self):
+        self.assertEqual(m.key_command('session', '5', 'Escape'), ('vd', 'key', 'session', '5', 'Escape'))
+        self.assertEqual(m.key_command('session', '5', 'ctrl+shift+z'),
+                         ('vd', 'run', 'session', '--', 'wtype', '-s', '150', '-M', 'ctrl',
+                          '-M', 'shift', '-k', 'z', '-m', 'shift', '-m', 'ctrl'))
+        with self.assertRaises(ValueError):
+            m.key_command('session', '5', 'arbitrary+a')
+
     def test_missing_clock_fails_required_frame_assertion(self):
         value = native()
         value['clock_mapping'] = None

@@ -137,10 +137,27 @@ def frame_summary(native, phase):
                 clock_mapping_uncertainty_ns=mapping['native_after_ns'] - mapping['native_before_ns'])
 
 
+def key_command(session, window_id, value):
+    """vd key accepts one keysym, not chord syntax. Modifiers use real wtype."""
+    parts = value.split('+')
+    if len(parts) == 1:
+        return ('vd', 'key', session, window_id, value)
+    modifiers, key = parts[:-1], parts[-1]
+    if not key or any(modifier not in ('ctrl', 'shift', 'alt', 'logo') for modifier in modifiers):
+        raise ValueError('Unsupported native key chord')
+    command = ['vd', 'run', session, '--', 'wtype', '-s', '150']
+    for modifier in modifiers:
+        command += ['-M', modifier]
+    command += ['-k', key]
+    for modifier in reversed(modifiers):
+        command += ['-m', modifier]
+    return tuple(command)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / '.artifacts/starter')
-    parser.add_argument('--mode', choices=('smoke', 'editor', 'measure'), default='smoke')
+    parser.add_argument('--mode', choices=('smoke', 'editor', 'capacity', 'measure'), default='smoke')
     parser.add_argument('--binary', type=Path, help='Explicit frozen binary; requires --binary-sha256 and --source-sha256')
     parser.add_argument('--binary-sha256')
     parser.add_argument('--source-sha256')
@@ -204,6 +221,9 @@ def main():
             result = json.loads(run('swaymsg', '--socket', record['environment']['SWAYSOCK'], '--raw', command))
             if not all(item.get('success') for item in result):
                 raise RuntimeError(result)
+        def key(value):
+            ipc(f'[con_id={window_id}] focus')
+            run(*key_command(session, window_id, value))
         ipc(f'[con_id={window_id}] floating enable')
         ipc(f'[con_id={window_id}] resize set width 1100 px height 740 px')
         run('vd', 'shot', session, str(output / 'before.png'))
@@ -219,9 +239,20 @@ def main():
             ]
             for operation, value in editor_actions:
                 begin = time.monotonic()
-                run('vd', operation, session, window_id, value)
+                if operation == 'key':
+                    key(value)
+                else:
+                    run('vd', operation, session, window_id, value)
                 actions.append(dict(operation=operation, value=value, begin=begin, end=time.monotonic()))
             expected_draft = original + '\nsecond line'
+        if args.mode == 'capacity':
+            run('vd', 'run', session, '--', 'wl-copy', '--', 'x' * (64 * 1024))
+            key('ctrl+v')
+            run('vd', 'shot', session, str(output / 'full.png'))
+            run('vd', 'run', session, '--', 'wl-copy', '--', 'overflow')
+            key('ctrl+v')
+            run('vd', 'shot', session, str(output / 'rejected.png'))
+            key('ctrl+z')
         if args.mode == 'measure':
             schedule = [('warmup', args.warmup), ('idle', args.phase_seconds)]
             for cycle in range(1, args.cycles + 1):
@@ -255,7 +286,7 @@ def main():
                                    requested_actions=math.ceil(seconds * 10) if name.startswith('active') else 0, delivered_actions=count))
         # Captures and export follow all resource phase boundaries.
         run('vd', 'shot', session, str(output / 'after.png'))
-        run('vd', 'key', session, window_id, 'ctrl+q')
+        key('ctrl+q')
         wait_windows(session, False)
         deadline = time.monotonic() + 10
         snapshot = read_export(output / 'automation.json', deadline)
@@ -268,6 +299,9 @@ def main():
             targets = {target['id']: target for target in snapshot.get('targets', [])}
             if targets.get('composer.input', {}).get('pointer_bounds') is None:
                 raise RuntimeError('Painted composer target bounds unavailable')
+        if args.mode == 'capacity':
+            if snapshot.get('draft') != '' or snapshot.get('admission_errors') != 1 or snapshot.get('last_admission_error') != 'TextTooLarge':
+                raise RuntimeError('Real oversized clipboard paste did not preserve draft/undo and report local rejection')
         if not args.disable_metrics:
             native = read_export(output / 'native.json', deadline)
             validate_native(native)

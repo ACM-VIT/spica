@@ -121,8 +121,10 @@ pub const App = struct {
             else => {},
         }
         const changed = self.view.handle(event, self.window, self.text) catch |err| switch (err) {
-            error.TextTooLarge, error.PieceLimit, error.InvalidUtf8, error.ClipboardRead, error.ClipboardWrite => blk: {
+            error.TextTooLarge, error.PieceLimit, error.InvalidUtf8, error.ClipboardRead, error.ClipboardWrite, error.ClipboardContainsNul => blk: {
                 self.view.notice = @errorName(err);
+                self.snapshot.admission_errors += 1;
+                self.snapshot.last_admission_error = @errorName(err);
                 break :blk true;
             },
             else => return err,
@@ -188,3 +190,25 @@ pub const App = struct {
         self.snapshot.frame_id = self.frames;
     }
 };
+
+test "ordinary text admission failure stays local and preserves draft and undo" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    app.snapshot = .{};
+    app.dirty = false;
+    var full: [64 * 1024]u8 = @splat('x');
+    try app.view.editor.setText(&full);
+    app.view.editor.selectAll();
+    try app.view.insert("retained", .paste);
+    try std.testing.expect(app.view.editor.undo());
+    var event: c.SDL_Event = std.mem.zeroes(c.SDL_Event);
+    app.view.editor.setCaret(app.view.editor.len, false);
+    event.type = c.SDL_EVENT_TEXT_INPUT;
+    event.text.text = "extra";
+    try app.handle(event);
+    try std.testing.expectEqualStrings("TextTooLarge", app.view.notice.?);
+    try std.testing.expectEqualSlices(u8, &full, app.view.editor.textBytes());
+    try std.testing.expect(app.view.editor.redo());
+    try std.testing.expectEqualStrings("retained", app.view.editor.textBytes());
+}

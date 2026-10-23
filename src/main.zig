@@ -88,4 +88,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
 test {
     _ = @import("ui/coding.zig");
+    _ = @import("app.zig");
+    _ = @import("ui/transcript.zig");
 }

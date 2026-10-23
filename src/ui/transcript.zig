@@ -1,0 +1,336 @@
+const std = @import("std");
+const domain = @import("../domain/types.zig");
+
+pub const metadata_page_bytes = 64 * 1024;
+pub const metadata_page_rows = 32;
+pub const metadata_page_count = 3;
+pub const content_page_bytes = 16 * 1024;
+pub const content_page_count = 8;
+pub const id_bytes = 256;
+
+pub const Id = struct {
+    bytes: [id_bytes]u8 = undefined,
+    len: u16 = 0,
+
+    pub fn init(value: []const u8) !Id {
+        if (value.len == 0 or value.len > id_bytes) return error.InvalidId;
+        var result: Id = .{};
+        @memcpy(result.bytes[0..value.len], value);
+        result.len = @intCast(value.len);
+        return result;
+    }
+
+    pub fn slice(self: *const Id) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    pub fn eql(self: *const Id, value: []const u8) bool {
+        return std.mem.eql(u8, self.slice(), value);
+    }
+};
+
+/// IDs and logical byte offsets survive cache eviction/reflow. No global y/index.
+pub const Anchor = struct {
+    message: Id,
+    block: ?Id = null,
+    byte_offset: u64 = 0,
+    pixel_offset: f32 = 0,
+};
+
+pub const Selection = struct {
+    block: Id,
+    revision: domain.Revision,
+    projection: enum { source, rendered },
+    anchor: u64,
+    caret: u64,
+};
+
+const Metadata = struct {
+    storage: []u8,
+    page: ?domain.QueryPage = null,
+    used: u64 = 0,
+};
+
+pub const Content = struct {
+    block: Id = .{},
+    revision: domain.Revision = 0,
+    start: u64 = 0,
+    len: usize = 0,
+    next_byte: ?u64 = null,
+    used: u64 = 0,
+    valid: bool = false,
+    bytes: [content_page_bytes]u8 = undefined,
+
+    pub fn source(self: *const Content) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+const Storage = struct {
+    metadata: [metadata_page_count + 1][metadata_page_bytes]u8,
+    content: [content_page_count]Content,
+};
+
+/// A view-local bounded neighborhood, never canonical history or domain state.
+/// All admitted slices are copied before Host.drain storage can be reused.
+pub const Transcript = struct {
+    allocator: std.mem.Allocator,
+    storage: *Storage,
+    pages: [metadata_page_count]Metadata,
+    staging: []u8,
+    snapshot: ?domain.SnapshotId = null,
+    snapshot_position: domain.EventPosition = .{},
+    applied_position: domain.EventPosition = .{},
+    clock: u64 = 0,
+    generation: u64 = 1,
+    anchor: ?Anchor = null,
+    selection: ?Selection = null,
+    following: bool = true,
+    refresh_required: bool = false,
+    newer_output: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) !Transcript {
+        const storage = try allocator.create(Storage);
+        storage.content = [_]Content{.{}} ** content_page_count;
+        var pages: [metadata_page_count]Metadata = undefined;
+        for (&pages, 0..) |*page, index| page.* = .{ .storage = &storage.metadata[index] };
+        return .{ .allocator = allocator, .storage = storage, .pages = pages, .staging = &storage.metadata[metadata_page_count] };
+    }
+
+    pub fn deinit(self: *Transcript) void {
+        self.allocator.destroy(self.storage);
+        self.* = undefined;
+    }
+
+    pub fn reset(self: *Transcript) void {
+        for (&self.pages) |*page| page.page = null;
+        for (&self.storage.content) |*page| page.valid = false;
+        self.snapshot = null;
+        self.snapshot_position = .{};
+        self.applied_position = .{};
+        self.selection = null;
+        self.refresh_required = false;
+        self.generation +%= 1;
+        // Keep stable scroll anchor across refresh; do not silently jump latest.
+    }
+
+    /// New snapshot is explicit. Later pages must use exactly this snapshot.
+    pub fn begin(self: *Transcript, page: domain.QueryPage) !void {
+        // Stage first: malformed/over-budget output must not destroy old view.
+        const owned = try self.stage(page);
+        self.reset();
+        self.snapshot = page.snapshot_id;
+        self.snapshot_position = page.snapshot_position;
+        self.applied_position = page.snapshot_position;
+        self.publish(0, owned);
+    }
+
+    pub fn addPage(self: *Transcript, page: domain.QueryPage) !void {
+        const snapshot = self.snapshot orelse return error.NoSnapshot;
+        if (!std.meta.eql(snapshot, page.snapshot_id) or domain.EventPosition.order(self.snapshot_position, page.snapshot_position) != .eq) return error.MixedSnapshot;
+        const owned = try self.stage(page);
+        var replacement: usize = 0;
+        for (self.pages, 0..) |slot, index| {
+            if (slot.page == null) {
+                replacement = index;
+                break;
+            }
+            if (slot.used < self.pages[replacement].used) replacement = index;
+        }
+        self.publish(replacement, owned);
+    }
+
+    fn stage(self: *Transcript, page: domain.QueryPage) !domain.QueryPage {
+        if (page.items.len > metadata_page_rows) return error.PageRows;
+        var previous: ?u64 = null;
+        var direction: ?std.math.Order = null;
+        for (page.items) |row| switch (row) {
+            .message => |message| {
+                _ = try Id.init(message.message_id.value);
+                if (previous) |ordinal| {
+                    const order = std.math.order(message.ordinal, ordinal);
+                    if (order == .eq) return error.MessageOrder;
+                    if (direction) |expected| {
+                        if (order != expected) return error.MessageOrder;
+                    } else direction = order;
+                }
+                previous = message.ordinal;
+                for (message.blocks) |block| _ = try Id.init(block.block_id.value);
+            },
+            else => return error.NotMetadata,
+        };
+        var fixed = std.heap.FixedBufferAllocator.init(self.staging);
+        return copyValue(domain.QueryPage, fixed.allocator(), page);
+    }
+
+    fn publish(self: *Transcript, index: usize, page: domain.QueryPage) void {
+        const old = self.pages[index].storage;
+        self.clock += 1;
+        self.pages[index] = .{ .storage = self.staging, .page = page, .used = self.clock };
+        self.staging = old;
+    }
+
+    pub fn rowCount(self: *const Transcript) usize {
+        var total: usize = 0;
+        for (self.pages) |slot| if (slot.page) |page| {
+            total += page.items.len;
+        };
+        return total;
+    }
+
+    /// Exact bytes, including NUL and incomplete UTF-8, are presentation input.
+    /// Decoding and grapheme/paragraph boundaries are a separate visible step.
+    pub fn putContent(self: *Transcript, row: domain.Row) !void {
+        const value = switch (row) {
+            .content => |value| value,
+            else => return error.NotContent,
+        };
+        const block = try Id.init(value.block_id.value);
+        if (value.bytes.len > content_page_bytes or value.end_byte < value.start_byte or value.end_byte - value.start_byte != value.bytes.len) return error.ContentRange;
+        if (value.next_byte) |next| if (next != value.end_byte) return error.ContentRange;
+        var replacement: usize = 0;
+        for (self.storage.content, 0..) |slot, index| {
+            if (slot.valid and slot.block.eql(value.block_id.value) and slot.revision == value.revision and slot.start == value.start_byte) {
+                if (!std.mem.eql(u8, slot.source(), value.bytes)) return error.ContentConflict;
+                return;
+            }
+            if (!slot.valid or slot.used < self.storage.content[replacement].used) replacement = index;
+        }
+        const slot = &self.storage.content[replacement];
+        self.clock += 1;
+        slot.* = .{ .block = block, .revision = value.revision, .start = value.start_byte, .len = value.bytes.len, .next_byte = value.next_byte, .used = self.clock, .valid = true };
+        @memcpy(slot.bytes[0..value.bytes.len], value.bytes);
+    }
+
+    pub fn content(self: *Transcript, block: []const u8, revision: domain.Revision, start: u64) ?*const Content {
+        for (&self.storage.content) |*slot| {
+            if (slot.valid and slot.revision == revision and slot.start == start and slot.block.eql(block)) {
+                self.clock += 1;
+                slot.used = self.clock;
+                return slot;
+            }
+        }
+        return null;
+    }
+
+    /// Every unseen position matters, even when aggregate revisions are equal.
+    /// Until typed reducer payloads land, invalidate only the bounded neighborhood.
+    pub fn events(self: *Transcript, values: []const domain.Event, end_position: domain.EventPosition) !void {
+        if (domain.EventPosition.order(end_position, self.applied_position) != .gt) return;
+        var position = self.applied_position;
+        var unseen = false;
+        for (values) |event| {
+            if (domain.EventPosition.order(event.position, position) != .gt) continue;
+            if (domain.EventPosition.order(event.position, end_position) == .gt) return error.EventPosition;
+            position = event.position;
+            unseen = true;
+        }
+        if (domain.EventPosition.order(end_position, position) != .eq) return error.EventPosition;
+        if (unseen) {
+            self.applied_position = position;
+            self.refresh_required = true;
+            self.newer_output = !self.following;
+            self.selection = null;
+            for (&self.storage.content) |*slot| slot.valid = false;
+        }
+    }
+
+    pub fn scrollAnchor(self: *Transcript, anchor: Anchor) void {
+        self.anchor = anchor;
+        self.following = false;
+    }
+
+    pub fn followLatest(self: *Transcript) void {
+        self.following = true;
+        self.newer_output = false;
+        self.anchor = null;
+    }
+};
+
+/// Deep-copy domain values into a fixed page arena. No JSON round trip or hidden
+/// borrowed IDs. Only scalar/optional/array/slice/struct/tagged-union values occur.
+fn copyValue(comptime T: type, allocator: std.mem.Allocator, value: T) std.mem.Allocator.Error!T {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| blk: {
+            if (pointer.size != .slice) @compileError("domain page contains non-slice pointer");
+            const result = try allocator.alloc(pointer.child, value.len);
+            for (result, value) |*destination, source| destination.* = try copyValue(pointer.child, allocator, source);
+            break :blk result;
+        },
+        .optional => |optional| if (value) |inner| try copyValue(optional.child, allocator, inner) else null,
+        .array => |array| blk: {
+            var result: T = undefined;
+            for (0..array.len) |index| result[index] = try copyValue(array.child, allocator, value[index]);
+            break :blk result;
+        },
+        .@"struct" => |structure| blk: {
+            var result: T = undefined;
+            inline for (structure.fields) |field| @field(result, field.name) = try copyValue(field.type, allocator, @field(value, field.name));
+            break :blk result;
+        },
+        .@"union" => |u| blk: {
+            inline for (u.fields) |field| {
+                if (std.meta.activeTag(value) == @field(u.tag_type.?, field.name)) break :blk @unionInit(T, field.name, try copyValue(field.type, allocator, @field(value, field.name)));
+            }
+            unreachable;
+        },
+        else => value,
+    };
+}
+
+fn makeMessage(ordinal: u64, name: []const u8) domain.Row {
+    return .{ .message = .{ .message_id = .{ .value = name }, .revision = 1, .ordinal = ordinal, .role = .assistant, .incomplete = false, .run_id = .{ .value = "run" }, .blocks = &.{} } };
+}
+
+fn makePage(rows: []const domain.Row) domain.QueryPage {
+    return .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{ .commit_sequence = 1, .event_index = 2 }, .items = rows, .expires_at = 5000 };
+}
+
+test "metadata pages own all drain bytes and stage errors preserve view" {
+    var transcript = try Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+    var id = [_]u8{'a'};
+    const rows = [_]domain.Row{makeMessage(1, &id)};
+    try transcript.begin(makePage(&rows));
+    id[0] = 'z';
+    try std.testing.expectEqualStrings("a", transcript.pages[0].page.?.items[0].message.message_id.value);
+    const bad = [_]domain.Row{ makeMessage(1, "b"), makeMessage(1, "a") };
+    try std.testing.expectError(error.MessageOrder, transcript.addPage(makePage(&bad)));
+    try std.testing.expectEqual(@as(usize, 1), transcript.rowCount());
+    var other = makePage(&rows);
+    other.snapshot_id.generation = 2;
+    try std.testing.expectError(error.MixedSnapshot, transcript.addPage(other));
+}
+
+test "history and content retention plateau independent of source length" {
+    var transcript = try Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+    const rows = [_]domain.Row{makeMessage(1, "a")};
+    try transcript.begin(makePage(&rows));
+    for (0..1000) |index| {
+        try transcript.addPage(makePage(&rows));
+        var raw = [_]u8{ 0, 0xf0, 0x9f, @truncate(index) };
+        try transcript.putContent(.{ .content = .{ .block_id = .{ .value = "block" }, .revision = 1, .start_byte = index * 4, .end_byte = index * 4 + 4, .next_byte = index * 4 + 4, .bytes = &raw } });
+        raw[0] = 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), transcript.rowCount());
+    try std.testing.expect(transcript.content("block", 1, 0) == null);
+    try std.testing.expectEqual(@as(u8, 0), transcript.content("block", 1, 999 * 4).?.source()[0]);
+}
+
+test "same revision unseen positions invalidate selection without stealing scroll" {
+    var transcript = try Transcript.init(std.testing.allocator);
+    defer transcript.deinit();
+    const rows = [_]domain.Row{makeMessage(1, "a")};
+    try transcript.begin(makePage(&rows));
+    transcript.scrollAnchor(.{ .message = try Id.init("a"), .byte_offset = 42 });
+    const events = [_]domain.Event{
+        .{ .event_id = .{ .value = "e1" }, .position = .{ .commit_sequence = 2, .event_index = 0 }, .aggregate = .{ .thread = .{ .value = "thread" } }, .aggregate_revision = 2, .kind = "ContentAppended", .payload = "" },
+        .{ .event_id = .{ .value = "e2" }, .position = .{ .commit_sequence = 2, .event_index = 1 }, .aggregate = .{ .thread = .{ .value = "thread" } }, .aggregate_revision = 2, .kind = "ContentAppended", .payload = "" },
+    };
+    try transcript.events(events[0..1], events[0].position);
+    try transcript.events(events[1..], events[1].position);
+    try std.testing.expectEqual(@as(u32, 1), transcript.applied_position.event_index);
+    try std.testing.expectEqual(@as(u64, 42), transcript.anchor.?.byte_offset);
+    try std.testing.expect(transcript.newer_output);
+}

@@ -20,6 +20,8 @@ pub const Snapshot = struct {
     editor_focused: bool = false,
     preedit_bytes: usize = 0,
     draft_revision: u64 = 0,
+    admission_errors: u64 = 0,
+    last_admission_error: ?[]const u8 = null,
     targets: [2]Target = .{ .{}, .{ .id = "composer.input", .role = "textbox", .key = "Tab" } },
 };
 
