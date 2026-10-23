@@ -120,6 +120,7 @@ pub const Projector = struct {
     scratch: std.heap.ArenaAllocator.State = .init,
     scratch_reserved: usize = 0,
     header: ?Header = null,
+    boundary_offset: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) !Projector {
         return .{ .allocator = allocator, .io = io, .file = file };
@@ -151,7 +152,37 @@ pub const Projector = struct {
         var sink = Sink{ .io = self.io, .file = self.file };
         try doc.serialize(&sink);
         try sink.flush();
-        try self.file.setLength(self.io, sink.offset);
+        // Derived trailer: one bit per rendered-byte boundary. Compute complete
+        // Unicode context once per semantic layout range, never per tile.
+        const boundary_count = (doc.text.items.len + 8) / 8;
+        if (boundary_count > spool_limit - sink.offset) return error.SpoolBudget;
+        const breaks = try arena.allocator().alloc(u8, doc.text.items.len);
+        @memset(breaks, unicode_breaks.GRAPHEMEBREAK_NOBREAK);
+        for (doc.blocks.items) |block| {
+            if (!renderable(block.kind)) continue;
+            const start = block.text_start;
+            const end = block.text_end;
+            if (end > start) {
+                unicode_breaks.set_graphemebreaks_utf8(doc.text.items[start..end].ptr, end - start, null, @ptrCast(breaks[start..].ptr));
+                breaks[end - 1] = unicode_breaks.GRAPHEMEBREAK_BREAK;
+            }
+            if (start != 0) breaks[start - 1] = unicode_breaks.GRAPHEMEBREAK_BREAK;
+        }
+        var boundary_buffer: [4096]u8 = undefined;
+        var base: usize = 0;
+        while (base < boundary_count) {
+            const amount = @min(boundary_buffer.len, boundary_count - base);
+            @memset(boundary_buffer[0..amount], 0);
+            for (base * 8..@min((base + amount) * 8, doc.text.items.len + 1)) |point| {
+                if (point == 0 or point == doc.text.items.len or breaks[point - 1] == unicode_breaks.GRAPHEMEBREAK_BREAK) {
+                    boundary_buffer[point / 8 - base] |= @as(u8, 1) << @as(u3, @intCast(point % 8));
+                }
+            }
+            try self.file.writePositionalAll(self.io, boundary_buffer[0..amount], sink.offset + base);
+            base += amount;
+        }
+        try self.file.setLength(self.io, sink.offset + boundary_count);
+        self.boundary_offset = sink.offset;
         var raw: [header_bytes]u8 = undefined;
         try self.read(&raw, 0);
         if (!std.mem.eql(u8, raw[0..4], "SPMD") or number(&raw, 4) != 1 or !std.mem.eql(u8, raw[8..24], &key.source)) return error.InvalidProjection;
@@ -186,21 +217,14 @@ pub const Projector = struct {
         if (index >= header.block_count) return error.EndOfProjection;
         const start = if (index == cursor.block) cursor.byte else 0;
         const length = block.end - block.start;
-        if (start > length) return error.InvalidCursor;
+        if (start > length or (try self.findBoundary(block.start + start, block.start + start, false)) == null) return error.InvalidCursor;
         out.* = .{ .key = key, .block = block, .state = .rich, .start_byte = start };
         var amount: usize = @min(page_text_bytes, length - start);
-        // One lookahead scalar makes arbitrary byte anchors fail explicitly and
-        // page ends scalar-safe. Prefer complete lines when they fit.
-        var lookahead: usize = @min(amount + 4, length - start);
-        try self.read(out.text[0..lookahead], header.text_offset + block.start + start);
-        while (lookahead > amount and !std.unicode.utf8ValidateSlice(out.text[0..lookahead])) lookahead -= 1;
-        if (amount != 0 and out.text[0] & 0xc0 == 0x80) return error.InvalidCursor;
+        try self.read(out.text[0..amount], header.text_offset + block.start + start);
         if (amount < length - start) {
-            while (amount > 0 and out.text[amount] & 0xc0 == 0x80) amount -= 1;
             if (std.mem.lastIndexOfScalar(u8, out.text[0..amount], '\n')) |newline| amount = newline + 1;
-            var breaks: [page_text_bytes + 4]u8 = undefined;
-            unicode_breaks.set_graphemebreaks_utf8(out.text[0..lookahead].ptr, lookahead, null, @ptrCast(&breaks));
-            while (amount > 0 and breaks[amount - 1] != unicode_breaks.GRAPHEMEBREAK_BREAK) amount -= 1;
+            const end = (try self.findBoundary(block.start + start, block.start + start + @as(u32, @intCast(amount)), true)) orelse return error.InvalidProjection;
+            amount = end - block.start - start;
             if (amount == 0) return error.DisplayBudget;
         }
         if (!std.unicode.utf8ValidateSlice(out.text[0..amount])) return error.InvalidProjection;
@@ -212,6 +236,10 @@ pub const Projector = struct {
         var low = block.first_run;
         var high = block.end_run;
         const absolute = block.start + start;
+        const first_boundary_byte = absolute / 8;
+        const boundary_length = (absolute + @as(u32, @intCast(out.len))) / 8 - first_boundary_byte + 1;
+        var boundaries: [page_text_bytes / 8 + 2]u8 = undefined;
+        try self.read(boundaries[0..boundary_length], self.boundary_offset + first_boundary_byte);
         while (low < high) {
             const middle = low + (high - low) / 2;
             const raw = try self.readRun(middle);
@@ -221,15 +249,18 @@ pub const Projector = struct {
             const raw = try self.readRun(low);
             const run_start = number(&raw, 4);
             if (run_start >= absolute + out.len) break;
+            const raw_end = @min(number(&raw, 8), absolute + @as(u32, @intCast(out.len)));
+            if (raw_end <= absolute or raw_end <= run_start) return error.InvalidProjection;
             if (out.span_count == tile_runs) {
-                // End before the unadmitted run, retaining its exact next cursor.
-                out.len = run_start - absolute;
+                const cut = boundaryIn(&boundaries, first_boundary_byte, absolute, run_start, true) orelse return error.InvalidProjection;
+                if (cut == absolute) return error.DisplayBudget;
+                out.len = cut - absolute;
+                while (out.span_count != 0 and out.spans[out.span_count - 1].start >= out.len) out.span_count -= 1;
+                if (out.span_count != 0) out.spans[out.span_count - 1].end = @min(out.spans[out.span_count - 1].end, @as(u32, @intCast(out.len)));
                 out.next = .{ .block = index, .byte = start + @as(u32, @intCast(out.len)) };
                 break;
             }
-            const run_end = @min(number(&raw, 8), absolute + @as(u32, @intCast(out.len)));
-            if (run_end <= absolute or run_end <= run_start) return error.InvalidProjection;
-            out.spans[out.span_count] = .{ .start = @max(run_start, absolute) - absolute, .end = run_end - absolute, .kind = std.enums.fromInt(markdown.RunKind, number(&raw, 0)) orelse return error.InvalidProjection, .flags = number(&raw, 12) };
+            out.spans[out.span_count] = .{ .start = @max(run_start, absolute) - absolute, .end = raw_end - absolute, .kind = std.enums.fromInt(markdown.RunKind, number(&raw, 0)) orelse return error.InvalidProjection, .flags = number(&raw, 12) };
             out.span_count += 1;
         }
         if (block.info_len != 0) {
@@ -246,49 +277,48 @@ pub const Projector = struct {
         const high = @max(selection.anchor, selection.caret);
         if (high > header.text_bytes) return error.InvalidCursor;
         if (high - low > copy_bytes) return error.CopyBudget;
+        if ((try self.findBoundary(low, low, false)) == null or (try self.findBoundary(high, high, false)) == null) return error.InvalidCursor;
         out.* = .{ .key = header.key, .len = high - low };
         try self.read(out.bytes[0..out.len], header.text_offset + low);
     }
 
     /// Locate a preceding bounded range without retaining a document-wide index.
     pub fn before(self: *Projector, cursor: Cursor) !?Cursor {
+        const header = self.header orelse return error.NoProjection;
+        if (header.state != .rich) return error.DisplayBudget;
+        if (cursor.block > header.block_count) return error.InvalidCursor;
         var index = cursor.block;
         if (cursor.byte != 0) {
+            if (index >= self.header.?.block_count) return error.InvalidCursor;
             const block = try self.readBlock(index);
-            if (cursor.byte > block.end - block.start) return error.InvalidCursor;
+            if (cursor.byte > block.end - block.start or (try self.findBoundary(block.start + cursor.byte, block.start + cursor.byte, false)) == null) return error.InvalidCursor;
             const desired = cursor.byte - @min(cursor.byte, page_text_bytes);
-            const window_start = desired - @min(desired, page_text_bytes);
-            var bytes: [page_text_bytes * 2]u8 = undefined;
-            var breaks: [page_text_bytes * 2]u8 = undefined;
-            const amount = cursor.byte - window_start;
-            try self.read(bytes[0..amount], self.header.?.text_offset + block.start + window_start);
-            // A bounded lookbehind needs a PROVEN UAX29 restart, not merely a
-            // scalar boundary: Prepend/Extend/ZWJ and RI state can cross it.
-            // LF resets grapheme state; an adjacent ASCII pair (except CRLF)
-            // proves a break before its second scalar and resets that context.
-            var sync: ?usize = if (window_start == 0) 0 else null;
-            var at: usize = desired - window_start;
-            while (at > 0) : (at -= 1) {
-                if (bytes[at - 1] == '\n' or
-                    (bytes[at - 1] < 0x80 and bytes[at - 1] != '\r' and bytes[at] < 0x80))
-                {
-                    sync = at;
-                    break;
-                }
-            }
-            const begin = sync orelse return error.DisplayBudget;
-            if (!std.unicode.utf8ValidateSlice(bytes[begin..amount])) return error.InvalidCursor;
-            unicode_breaks.set_graphemebreaks_utf8(bytes[begin..amount].ptr, amount - begin, null, @ptrCast(breaks[begin..].ptr));
-            at = desired - window_start;
-            while (at < amount and at != begin and breaks[at - 1] != unicode_breaks.GRAPHEMEBREAK_BREAK) : (at += 1) {}
-            if (at == amount) return error.DisplayBudget;
-            return .{ .block = index, .byte = window_start + @as(u32, @intCast(at)) };
+            const start = (try self.findBoundary(block.start + desired, block.start + cursor.byte - 1, false)) orelse return error.DisplayBudget;
+            return .{ .block = index, .byte = start - block.start };
         }
         while (index != 0) {
             index -= 1;
             const block = try self.readBlock(index);
             if (!renderable(block.kind)) continue;
             return if (block.end > block.start) try self.before(.{ .block = index, .byte = block.end - block.start }) else .{ .block = index };
+        }
+        return null;
+    }
+
+    fn findBoundary(self: *Projector, low: u32, high: u32, reverse: bool) !?u32 {
+        const header = self.header orelse return error.NoProjection;
+        if (low > high or high > header.text_bytes or high - low > page_text_bytes) return error.InvalidCursor;
+        const first = low / 8;
+        const amount = high / 8 - first + 1;
+        var bytes: [page_text_bytes / 8 + 2]u8 = undefined;
+        try self.read(bytes[0..amount], self.boundary_offset + first);
+        return boundaryIn(&bytes, first, low, high, reverse);
+    }
+
+    fn boundaryIn(bytes: []const u8, first: u32, low: u32, high: u32, reverse: bool) ?u32 {
+        for (0..high - low + 1) |offset| {
+            const point = if (reverse) high - @as(u32, @intCast(offset)) else low + @as(u32, @intCast(offset));
+            if (bytes[point / 8 - first] & (@as(u8, 1) << @as(u3, @intCast(point % 8))) != 0) return point;
         }
         return null;
     }
@@ -799,7 +829,7 @@ test "backward ranges prove complete combining and ZWJ grapheme starts" {
     source[12006] = 'a';
     @memcpy(source[12007..], "\n```\n");
     _ = try projector.project(key, source);
-    try std.testing.expectError(error.DisplayBudget, projector.before(.{ .block = 0, .byte = 9001 }));
+    try std.testing.expectError(error.DisplayBudget, projector.before(.{ .block = 0, .byte = 11999 }));
 }
 
 test "whole rendered selection spans pages exactly with explicit copy budget" {
@@ -820,4 +850,104 @@ test "whole rendered selection spans pages exactly with explicit copy budget" {
     stale.revision += 1;
     try std.testing.expectError(error.StaleProjection, projector.copySelection(.{ .key = stale, .anchor = 4050, .caret = 4200 }, &copied));
     try std.testing.expectError(error.InvalidCursor, projector.copySelection(.{ .key = key, .anchor = 0, .caret = 100000 }, &copied));
+}
+
+test "paged boundary metadata handles distant non Latin RI and ZWJ without ASCII sync" {
+    var projector = try tempProjector();
+    defer projector.deinit();
+    const key = Key{ .source = @splat(26), .revision = 1, .generation = 1 };
+    for ([_][]const u8{ "漢字", "سلام", "🇺🇸🇨🇦", "👩‍💻🇺🇸" }) |fragment| {
+        const source = try std.testing.allocator.alloc(u8, 7 + fragment.len * 4000 + 5);
+        defer std.testing.allocator.free(source);
+        @memcpy(source[0..7], "```zig\n");
+        for (0..4000) |index| @memcpy(source[7 + index * fragment.len ..][0..fragment.len], fragment);
+        @memcpy(source[source.len - 5 ..], "\n```\n");
+        const header = try projector.project(key, source);
+        try std.testing.expectEqual(markdown.State.rich, header.state);
+        const breaks = try std.testing.allocator.alloc(u8, header.text_bytes);
+        defer std.testing.allocator.free(breaks);
+        unicode_breaks.set_graphemebreaks_utf8(source[7 .. source.len - 4].ptr, header.text_bytes, null, @ptrCast(breaks.ptr));
+        var cursor: Cursor = .{ .block = 0 };
+        var tile_value: Tile = undefined;
+        var total: usize = 0;
+        while (true) {
+            try projector.page(key, cursor, &tile_value);
+            try std.testing.expect(tile_value.len > 0 and tile_value.len <= page_text_bytes);
+            try std.testing.expectEqualSlices(u8, source[7 + tile_value.start_byte ..][0..tile_value.len], tile_value.bytes());
+            if (tile_value.start_byte > 8192) {
+                const previous = (try projector.before(cursor)).?;
+                try std.testing.expect(previous.byte < cursor.byte);
+                try std.testing.expect(previous.byte == 0 or breaks[previous.byte - 1] == unicode_breaks.GRAPHEMEBREAK_BREAK);
+            }
+            total += tile_value.len;
+            cursor = tile_value.next orelse break;
+            try std.testing.expect(breaks[cursor.byte - 1] == unicode_breaks.GRAPHEMEBREAK_BREAK);
+        }
+        try std.testing.expectEqual(@as(usize, header.text_bytes), total);
+    }
+}
+
+test "adjacent semantic layouts reset grapheme context at their own edges" {
+    var projector = try tempProjector();
+    defer projector.deinit();
+    const key = Key{ .source = @splat(27), .revision = 1, .generation = 1 };
+    const header = try projector.project(key, "🇺🇸\n\n🇨🇦\n\n```text\n👩‍💻\n```\n\n👩‍💻\n");
+    var cursor: Cursor = .{ .block = 0 };
+    var tile_value: Tile = undefined;
+    var count: usize = 0;
+    while (true) {
+        try projector.page(key, cursor, &tile_value);
+        try std.testing.expectEqual(@as(u32, 0), tile_value.start_byte);
+        try std.testing.expectEqual(tile_value.block.start, (try projector.findBoundary(tile_value.block.start, tile_value.block.start, false)).?);
+        try std.testing.expectEqual(tile_value.block.end, (try projector.findBoundary(tile_value.block.end, tile_value.block.end, false)).?);
+        count += 1;
+        cursor = tile_value.next orelse break;
+    }
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqual(markdown.State.rich, header.state);
+}
+
+test "style budget cuts retain dense combining and ZWJ clusters and exact styles" {
+    var projector = try tempProjector();
+    defer projector.deinit();
+    const key = Key{ .source = @splat(28), .revision = 1, .generation = 1 };
+    const cases = .{
+        .{ "**é**x", "éx", 3 },
+        .{ "e**́**x", "éx", 2 },
+        .{ "**👩‍💻**x", "👩‍💻x", 11 },
+        .{ "👩**‍**💻x", "👩‍💻x", 3 },
+    };
+    inline for (cases) |case| {
+        const source = try std.testing.allocator.alloc(u8, case[0].len * 2000);
+        defer std.testing.allocator.free(source);
+        const expected = try std.testing.allocator.alloc(u8, case[1].len * 2000 + 1);
+        defer std.testing.allocator.free(expected);
+        for (0..2000) |index| {
+            @memcpy(source[index * case[0].len ..][0..case[0].len], case[0]);
+            @memcpy(expected[index * case[1].len ..][0..case[1].len], case[1]);
+        }
+        expected[expected.len - 1] = '\n';
+        _ = try projector.project(key, source);
+        var tile_value: Tile = undefined;
+        var cursor: Cursor = .{ .block = 0 };
+        var compared: usize = 0;
+        var strong_bytes: usize = 0;
+        var pages: usize = 0;
+        while (true) {
+            try projector.page(key, cursor, &tile_value);
+            try std.testing.expect(tile_value.len != 0 and tile_value.span_count <= tile_runs);
+            try std.testing.expectEqualSlices(u8, expected[compared..][0..tile_value.len], tile_value.bytes());
+            for (tile_value.spans[0..tile_value.span_count]) |span| {
+                try std.testing.expect(span.start < span.end and span.end <= tile_value.len);
+                if (span.flags & 2 != 0) strong_bytes += span.end - span.start;
+            }
+            compared += tile_value.len;
+            pages += 1;
+            cursor = tile_value.next orelse break;
+            try std.testing.expectEqual(tile_value.block.start + cursor.byte, (try projector.findBoundary(tile_value.block.start + cursor.byte, tile_value.block.start + cursor.byte, false)).?);
+        }
+        try std.testing.expect(pages > 2);
+        try std.testing.expectEqual(expected.len, compared);
+        try std.testing.expectEqual(@as(usize, case[2] * 2000), strong_bytes);
+    }
 }

@@ -605,6 +605,44 @@ const Conversation = struct {
     history_retrying: bool = false,
     recovery_block: ?Id = null,
     copy_pending: ?presentation.Selection = null,
+    restored_pixel: ?f32 = null,
+    restored_revision: ?u64 = null,
+
+    fn prepareHistoryRestore(self: *Conversation, view: *Coding) bool {
+        if (!view.history_restore) return false;
+        view.history_restore = false;
+        if (view.follow_latest) return false;
+        const position = view.history_position orelse return false;
+        self.generation += 1;
+        self.message_count = 1;
+        self.message_index = 0;
+        self.messages[0] = position.message;
+        self.desired_block = position.block_ordinal;
+        self.recovery_block = position.block;
+        self.block_cursor = null;
+        self.block_snapshot = null;
+        self.message_snapshot = null;
+        self.worker_key = null;
+        self.projected_key = null;
+        self.source_pending = false;
+        self.tile_request = null;
+        self.history_paused = false;
+        self.history_first = null;
+        self.history_retrying = false;
+        self.pending_history_move = null;
+        self.copy_pending = null;
+        self.history_start = .{ .key = undefined, .first_block = position.cursor.block, .start_byte = position.cursor.byte };
+        self.restored_pixel = position.pixel_offset;
+        self.restored_revision = position.revision;
+        view.rendered_selection = if (position.selection) |selection| .{ .key = .{ .source = selection.source, .revision = selection.revision, .generation = self.generation }, .anchor = selection.anchor, .caret = selection.caret } else null;
+        view.clearHistory();
+        return true;
+    }
+
+    fn askHistory(self: *Conversation, app: *App) !void {
+        if (self.prepareHistoryRestore(&app.view)) return self.askBlocks();
+        return self.askMessages();
+    }
 
     fn recoveryQuery(self: *Conversation, kind: QueryKind) ?struct { kind: QueryKind, value: types.Query } {
         if (self.history_retrying or self.message_count == 0) return null;
@@ -654,7 +692,7 @@ const Conversation = struct {
                 self.history_paused = false;
                 self.worker_key = null;
                 self.tile_request = null;
-                try self.askMessages();
+                try self.askHistory(app);
             },
             .next => {
                 app.view.follow_latest = false;
@@ -667,7 +705,7 @@ const Conversation = struct {
                     self.message_anchor = self.messages[0];
                     self.message_direction = .newer;
                     self.message_snapshot = null;
-                    try self.askMessages();
+                    try self.askHistory(app);
                 }
             },
             .previous => {
@@ -702,7 +740,7 @@ const Conversation = struct {
                     self.message_anchor = self.messages[0];
                     self.message_direction = .older;
                     self.message_snapshot = null;
-                    try self.askMessages();
+                    try self.askHistory(app);
                 }
             },
         }
@@ -859,6 +897,17 @@ const Conversation = struct {
                         app.view.admitTile(app.text, tile, @min(960, @as(f32, @floatFromInt(width)) - 48)) catch |err| {
                             app.view.notice = @errorName(err);
                         };
+                        for (app.view.rich_tiles[0..app.view.rich_count]) |*retained| {
+                            if (retained.key) |retained_key| if (std.meta.eql(retained_key, key) and retained.block_index == tile.block.index and retained.start_byte == tile.start_byte) {
+                                retained.message = self.messages[self.message_index];
+                                retained.canonical_block = self.blocks[self.block_index].id;
+                                retained.canonical_ordinal = self.blocks[self.block_index].ordinal;
+                            };
+                        }
+                        if (self.restored_pixel) |offset| {
+                            app.view.transcript_scroll = @max(0, 10 + offset);
+                            self.restored_pixel = null;
+                        }
                         app.dirty = true;
                         self.tile_request = if (tile.next) |next| .{ .key = key, .first_block = next.block, .start_byte = next.byte } else null;
                         if (app.view.rich_count == app.view.rich_tiles.len or !app.view.follow_latest) {
@@ -1052,7 +1101,7 @@ const Conversation = struct {
                     try self.askRuns();
                 } else {
                     self.approval_live = false;
-                    if (self.run.len != 0) try self.ask(.approvals, .{ .approvals = .{ .run = .{ .value = self.run.slice() }, .page = page } }) else try self.askMessages();
+                    if (self.run.len != 0) try self.ask(.approvals, .{ .approvals = .{ .run = .{ .value = self.run.slice() }, .page = page } }) else try self.askHistory(app);
                 }
             },
             .approvals => {
@@ -1092,7 +1141,7 @@ const Conversation = struct {
                 }
                 if (value.next_cursor) |cursor| {
                     try self.ask(.tasks, .{ .task_list = .{ .parent = .{ .value = self.run.slice() }, .page = .{ .limit = 16, .max_bytes = 64 * 1024, .snapshot = value.snapshot_id, .cursor = cursor } } });
-                } else if (app.view.follow_latest or self.message_count == 0) try self.askMessages();
+                } else if (app.view.follow_latest or self.message_count == 0 or app.view.history_restore) try self.askHistory(app);
             },
             .messages => {
                 if (value.items.len == 0) {
@@ -1127,6 +1176,13 @@ const Conversation = struct {
                             self.history_paused = true;
                             return;
                         }
+                    }
+                    if (self.restored_revision) |revision| {
+                        if (self.block_index < self.block_count and self.blocks[self.block_index].revision != revision) {
+                            app.view.notice = "History revision changed while away";
+                            app.view.rendered_selection = null;
+                        }
+                        self.restored_revision = null;
                     }
                     app.view.clearHistory();
                     self.history_first = null;
@@ -1328,4 +1384,29 @@ test "expired history continuation restarts queries once at stable block and byt
     try std.testing.expectEqual(@as(u64, 11), conversation.desired_block.?);
     try std.testing.expectEqual(@as(u32, 400000), conversation.history_start.?.start_byte);
     try std.testing.expect(conversation.recoveryQuery(.content) == null);
+}
+
+test "bounded per-thread position restores stable history IDs bytes pixels and selection" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    view.follow_latest = false;
+    view.history_restore = true;
+    view.history_position = .{
+        .message = try Id.init("selected-old-message"),
+        .block = try Id.init("selected-old-block"),
+        .block_ordinal = 42,
+        .revision = 7,
+        .cursor = .{ .block = 8, .byte = 400123 },
+        .pixel_offset = 3.5,
+        .selection = .{ .source = @splat(25), .revision = 7, .anchor = 400100, .caret = 404200 },
+    };
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    try std.testing.expect(conversation.prepareHistoryRestore(&view));
+    try std.testing.expectEqualStrings("selected-old-message", conversation.messages[0].slice());
+    try std.testing.expectEqualStrings("selected-old-block", conversation.recovery_block.?.slice());
+    try std.testing.expectEqual(@as(u32, 400123), conversation.history_start.?.start_byte);
+    try std.testing.expectEqual(@as(f32, 3.5), conversation.restored_pixel.?);
+    try std.testing.expectEqual(@as(u32, 404200), view.rendered_selection.?.caret);
+    try std.testing.expect(!view.history_restore and !view.follow_latest);
+    try std.testing.expect(!conversation.prepareHistoryRestore(&view));
 }

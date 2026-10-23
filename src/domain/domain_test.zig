@@ -747,6 +747,21 @@ test "indexed distant history pages retain boundaries cursors and exact source r
         var raw: [2048]u8 = undefined;
         for (&raw, 0..) |*byte, index| byte.* = @truncate(index);
         for (0..256) |index| _ = try database.appendChunk("b", index * raw.len, &raw);
+        const imported = try std.testing.allocator.alloc(u8, 523183);
+        defer std.testing.allocator.free(imported);
+        for (imported, 0..) |*byte, index| byte.* = @truncate(index);
+        try database.exec("INSERT INTO blocks(id,revision,message_id,ordinal,kind,committed_bytes) VALUES('large-import',1,'m',1,'text',524207)");
+        try database.execute("INSERT INTO chunks VALUES('large-import',0,?)", &.{.{ .blob = imported }});
+        const tail: [1024]u8 = @splat('z');
+        try database.execute("INSERT INTO chunks VALUES('large-import',523183,?)", &.{.{ .blob = &tail }});
+        const seek = try database.prepare("EXPLAIN QUERY PLAN SELECT byte_offset FROM chunks WHERE block_id=? AND byte_offset<=? ORDER BY byte_offset DESC LIMIT 1", &.{ .{ .text = "large-import" }, .{ .integer = 100000 } });
+        defer seek.deinit();
+        try std.testing.expect(try seek.step());
+        try std.testing.expect(std.mem.indexOf(u8, try seek.bytes(3), "SEARCH") != null);
+        // Model an explicit independent/older importer, not Store's current
+        // 1MiB writer-value admission cap. Snapshot reads must remain bounded.
+        _ = c.sqlite3_limit(database.database, c.SQLITE_LIMIT_LENGTH, 32 * 1024 * 1024);
+        try database.exec("INSERT INTO blocks(id,revision,message_id,ordinal,kind,committed_bytes) VALUES('huge-import',1,'m',2,'text',16777216); INSERT INTO chunks VALUES('huge-import',0,zeroblob(16777216))");
         try database.commit();
     }
     var consumer: Consumer = .{ .host = undefined, .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
@@ -781,4 +796,19 @@ test "indexed distant history pages retain boundaries cursors and exact source r
     try std.testing.expectEqualStrings("b", fresh.items[0].block.block_id.value);
     const restored = try consumer.query(.{ .content = .{ .block = fresh.items[0].block.block_id, .start_byte = 500001, .end_byte = 504097, .page = .{ .snapshot = fresh.snapshot_id } } });
     try std.testing.expectEqualSlices(u8, range.items[0].content.bytes, restored.items[0].content.bytes);
+    const interior = try consumer.query(.{ .content = .{ .block = .{ .value = "large-import" }, .start_byte = 100000, .end_byte = 104096 } });
+    for (interior.items[0].content.bytes, 0..) |byte, index| try std.testing.expectEqual(@as(u8, @truncate(100000 + index)), byte);
+    const crossing = try consumer.query(.{ .content = .{ .block = .{ .value = "large-import" }, .start_byte = 522111, .end_byte = 524000 } });
+    for (crossing.items[0].content.bytes, 0..) |byte, index| try std.testing.expectEqual(if (522111 + index < 523183) @as(u8, @truncate(522111 + index)) else @as(u8, 'z'), byte);
+    var heap_before: i64 = 0;
+    var heap_peak: i64 = 0;
+    try storage.check(c.sqlite3_status64(c.SQLITE_STATUS_MEMORY_USED, &heap_before, &heap_peak, 1));
+    const bounded = try consumer.query(.{ .content = .{ .block = .{ .value = "huge-import" }, .start_byte = 8000000, .end_byte = 8004096 } });
+    try std.testing.expectEqual(@as(usize, 4096), bounded.items[0].content.bytes.len);
+    for (bounded.items[0].content.bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    var heap_after: i64 = 0;
+    try storage.check(c.sqlite3_status64(c.SQLITE_STATUS_MEMORY_USED, &heap_after, &heap_peak, 0));
+    const query_peak = heap_peak - heap_before;
+    std.debug.print("incremental blob 16MiB/4KiB query SQLite peak delta={d} bytes\n", .{query_peak});
+    try std.testing.expect(query_peak < 4 * 1024 * 1024);
 }

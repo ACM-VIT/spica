@@ -52,6 +52,8 @@ pub const View = struct {
     transcript_drag: ?usize = null,
     rendered_selection: ?presentation.Selection = null,
     copy_selection: ?presentation.Selection = null,
+    history_position: ?ThreadHistory = null,
+    history_restore: bool = false,
     custom_root: ?*const @import("../script.zig").Root = null,
     custom_render: ?*const @import("../script.zig").Render = null,
     custom_bounds: [64]c.Clay_BoundingBox = undefined,
@@ -60,6 +62,15 @@ pub const View = struct {
     custom_render_sequence: u64 = 0,
     custom_tile_sequence: u64 = std.math.maxInt(u64),
     pub const HistoryMove = enum { previous, next, first, latest };
+    pub const ThreadHistory = struct {
+        message: transcript.Id,
+        block: transcript.Id,
+        block_ordinal: u64,
+        revision: u64,
+        cursor: struct { block: u32, byte: u32 = 0 },
+        pixel_offset: f32 = 0,
+        selection: ?struct { source: [16]u8, revision: u64, anchor: u32, caret: u32 } = null,
+    };
     pub const TaskCancel = struct { id: [32]u8, revision: u64 };
     pub const TaskLine = struct {
         bytes: [320]u8 = undefined,
@@ -183,6 +194,20 @@ pub const View = struct {
             self.rendered_selection.?.caret = caret;
         } else self.rendered_selection = .{ .key = key, .anchor = caret, .caret = caret };
         for (self.rich_tiles[0..self.rich_count]) |*slot| self.applySelection(slot);
+    }
+
+    pub fn captureHistory(self: *View, tile: *const transcript.RichTile, point: transcript.RichTile.ScrollPoint) void {
+        if (tile.message.len == 0 or tile.canonical_block.len == 0) return;
+        const key = tile.key orelse return;
+        self.history_position = .{
+            .message = tile.message,
+            .block = tile.canonical_block,
+            .block_ordinal = tile.canonical_ordinal,
+            .revision = key.revision,
+            .cursor = .{ .block = tile.block_index, .byte = tile.start_byte + @as(u32, @intCast(point.byte)) },
+            .pixel_offset = point.offset,
+            .selection = if (self.rendered_selection) |selection| if (selection.sameSource(key)) .{ .source = selection.key.source, .revision = selection.key.revision, .anchor = selection.anchor, .caret = selection.caret } else null else null,
+        };
     }
 
     fn hasComposer(self: *const View) bool {
@@ -309,7 +334,7 @@ pub const View = struct {
                 const mods = event.key.mod;
                 const ctrl = mods & c.SDL_KMOD_CTRL != 0;
                 const shift = mods & c.SDL_KMOD_SHIFT != 0;
-                if (ctrl and mods & c.SDL_KMOD_ALT != 0 and self.window_active) {
+                if (!ctrl and mods & c.SDL_KMOD_ALT != 0 and self.window_active) {
                     self.history_move = switch (key) {
                         c.SDLK_PAGEUP => .previous,
                         c.SDLK_PAGEDOWN => .next,
@@ -483,10 +508,15 @@ pub const View = struct {
             const max_scroll = @max(0, total_height - self.transcript_bounds.h);
             self.transcript_scroll = if (self.follow_latest) max_scroll else @min(max_scroll, restored orelse self.transcript_scroll);
             var tile_y = self.transcript_bounds.y - self.transcript_scroll;
+            var captured = false;
             for (0..self.rich_count) |offset| {
                 const index = if (self.rich_count == self.rich_tiles.len) (self.rich_next + offset) % self.rich_tiles.len else offset;
                 const tile = &self.rich_tiles[index];
                 if (tile_y + tile.height() >= self.transcript_bounds.y and tile_y < self.transcript_bounds.y + self.transcript_bounds.h) {
+                    if (!captured) {
+                        self.captureHistory(tile, tile.capture(self.transcript_bounds.y - tile_y));
+                        captured = true;
+                    }
                     try tile.draw(renderer, text, bounds.transcript.x, tile_y);
                 } else tile.bounds = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
                 tile_y += tile.height() + 8;
@@ -692,7 +722,7 @@ test "history shortcuts preserve focused composer document edges and inactive in
     try std.testing.expectEqual(@as(usize, 0), view.editor.anchor);
     try std.testing.expect(view.history_move == null);
     view.window_active = false;
-    event.key.mod = c.SDL_KMOD_CTRL | c.SDL_KMOD_ALT;
+    event.key.mod = c.SDL_KMOD_ALT;
     try std.testing.expect(!try view.handle(event, undefined, undefined));
     try std.testing.expect(view.history_move == null);
     view.window_active = true;
