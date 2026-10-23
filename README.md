@@ -1,6 +1,6 @@
 # Spica — native agent workspace
 
-A fresh rewrite branch using Spica's Zig/SDL3/Clay and Unicode text foundations. T3 Code is a behavior reference. The native coding interface connects to an independent durable fake-provider Host; real Codex/OpenCode adapters are not connected.
+A fresh rewrite branch using Spica's Zig/SDL3/Clay and Unicode text foundations. T3 Code is a behavior reference. The native coding interface uses a durable Host with session-scoped fake, Codex app-server and OpenCode ACP factories; real-provider use requires explicit runtime/account/model/workspace selection.
 
 ## Start the development loop
 
@@ -42,23 +42,38 @@ Custom Send actions pass captured targets/revisions and a stable command ID to
 the same actual public Host. `./tools/eval-starter --mode custom` exercises this
 bridge with real isolated-desktop input and temporary state.
 
-For a clean machine, run `python3 build/bootstrap.py` first. Dependencies are pinned in deps.lock.json; see [CONTRIBUTING.md](CONTRIBUTING.md).
-Both check commands use local dependencies only; the core target needs the locked
-libunibreak, not SDL/fonts/a display. Linux CI bootstraps the locked sources before
-running the same default check. Host prerequisites are documented, not vendored;
-the build is not claimed to be hermetic.
+### Explicit native providers and mixed-runtime children
 
-## What to build next
+Codex targets app-server **0.163.0** and supported ChatGPT sign-in; OpenCode
+targets **2.1.4** ACP. Create a disposable absolute workspace and use separate
+managed account directories. No OMP credentials or old histories are imported.
+For an OpenCode coordinator with an explicitly authorized Codex child runtime:
 
-[ROADMAP.md](docs/ROADMAP.md) is the ordered backlog. Begin with core contracts and the deterministic fake-provider/evaluation harness. The first feature milestone is a persisted conversation with streaming, approval/cancel, restart and one minimal custom root. After that gate, add Codex with ChatGPT sign-in, then OpenCode v2; build app-owned delegation/review orchestration after runtime and workspace gates. These integrations are planned and are not connected by this scaffold.
+```bash
+zig-out/bin/spica --provider opencode \
+  --runtime-executable /usr/bin/opencode \
+  --runtime-account-directory /tmp/spica-opencode-account \
+  --model-provider opencode --model big-pickle --effort default \
+  --workspace /tmp/spica-disposable-project \
+  --state-directory /tmp/spica-mixed-conversation \
+  --additional-provider codex \
+  --additional-runtime-account-directory /tmp/spica-codex-account \
+  --additional-model-provider openai \
+  --additional-runtime-executable /usr/bin/codex
+```
 
-The selected protected Lua 5.4.9 runtime exposes bounded root/renderer descriptors and explicit action proposals; native code owns actual public command admission. Users can replace the composition without owning durable work. Built-in boards and alternate workspace presets are not deliverables. See [the scripting contract](docs/contracts/scripting.md), [ARCHITECTURE.md](docs/ARCHITECTURE.md) and [provider/orchestration design](docs/PROVIDERS_AND_ORCHESTRATION.md).
+Use the actual absolute executable locations. Swap the primary and additional
+providers for a Codex coordinator. Child packets name the authorized runtime,
+model provider and canonical account directory, an explicit model/effort, and a
+registered workspace. Model/effort are never silently copied or substituted.
+The Host bounds one coordinator and two children with independent process state.
 
-[Task records](docs/tasks/README.md) retain decisions, ownership, attempts and evidence between sessions. [EVALUATION.md](docs/EVALUATION.md) defines verification and human checkpoints.
+Before Codex inference, sign in to the **same selected Codex directory**:
 
-## Recovery
-
-Branch: `rewrite/native-agent-workspacei --model gpt-6.1-sol --effort medium \
+```bash
+zig-out/bin/spica --provider codex \
+  --runtime-account-directory /tmp/spica-codex-account \
+  --model-provider openai --model gpt-6.1-sol --effort medium \
   --workspace /tmp/spica-disposable-project --codex-auth device
 ```
 
@@ -71,7 +86,6 @@ global discovery within the selected account; native startup supplies both and
 disables Claude configuration discovery. This is not a filesystem sandbox.
 Cold concurrent OpenCode account bootstrap can fail on upstream SQLite locking;
 failures remain visible rather than retrying external work.
-
 
 For a clean machine, run `python3 build/bootstrap.py` first. Dependencies are pinned in deps.lock.json; see [CONTRIBUTING.md](CONTRIBUTING.md).
 Both check commands use local dependencies only; the core target needs the locked
