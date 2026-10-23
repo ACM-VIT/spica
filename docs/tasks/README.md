@@ -27,3 +27,37 @@ Continuation base: 0d82092f0578310903d5ff49556acc820ed7179b, rewrite/native-agen
 Explicit publication authorization: the user requested continuing checkpoint pushes to `thinkter/spica`. Verified origin fetch/push identity and GitHub repository permission; nonforce HTTPS push published `cb96d258a605d2905ad7125e7f1448b3bc6651e3` to `refs/heads/rewrite/native-agent-workspace`, confirmed by ls-remote. Evidence `.artifacts/infra002/push-checkpoint.json`. SSH publickey authentication failed; invocation-local GitHub HTTPS helper succeeded without changing remotes/global configuration. Existing pre-push build/format/regression hooks ran and passed. Infra002 owns subsequent reviewed integrated checkpoint pushes to this same destination/ref; never force, publish artifacts/credentials or imply incomplete private slices are accepted.
 
 Domain ownership recovery: DomainPrep004 stopped at its runtime cap with clean private `004-domain` HEAD `c0d7fb27a64558791824f7286f637cb611bd6289`, five preserved types/storage checkpoints. No code-failure escalation or discarded changes. DomainRuntime004 (high Sol) now owns the same domain allowlist/candidate and remaining reducer/Host implementation; read-only inventory `.artifacts/infra002/004-recovery.json`. NativeUI005 continues independently; TextBudget005's retained-text fix was reviewed for dependency integration.
+
+## Resumed feature shipping — 2026-10-23
+
+User requested immediate Sol feature continuation after enabling nested delegation. Harness checkpoint `cbeea74` permits explicit cross-type Sol spawning with unlimited configured depth; live `NestedSmoke -> MeasureChild -> RepairLeaf` executed `SPICA_NESTED_DEPTH_3_OK`. Three aggregate active worker slots remain the operating ceiling.
+
+Current exclusive private owners: `RuntimeShip004` resumes `.artifacts/worktrees/004-domain` (recovered clean `9088964`) for the task004 production allowlist; `UIShip005` resumes `.artifacts/worktrees/005-ui` for task005; `ScriptShip006` resumes `.artifacts/worktrees/006-script` for task006. Prior preparation-only/no-grandchildren clauses do not replace these production allocations. All three slots are allocated to these workers, with no descendant reservations. Each retains private Git ownership only for its task's paths; no shared integration/push owner is currently assigned. Native/UI/runtime contracts remain those pinned in tasks004–006. Source edits run concurrently; workers coordinate bounded build/check windows and exclusive performance sampling. Actual native/durable/custom-root acceptance remains pending, not implied by dispatch or checkpoint commits.
+
+## Serialized feature integration ownership
+
+Main assigned ScriptShip006 the sole shared Git/integration role for the union of
+task004/005/006 production allowlists and their existing task records/index.
+RuntimeShip004 and UIShip005 remain exclusive private writers; no pushes are
+authorized. Main delegates routine review/integration of verified cohesive
+producer checkpoints; material semantic/ownership changes and final acceptance
+remain Main-owned.
+
+Main reviewed standalone dependency/runtime checkpoints `b3e8f97` and `0df2098`
+for integration. Actual default/custom native+durable proof remains unaccepted.
+The integrator preserves predecessor coordination edits and applies explicit
+immutable task006 checkpoints; domain owns its private build/test adaptation.
+Final combined checks/native smoke wait for the assembled real app candidate;
+profiling runs separately after builds stop.
+
+Task006 integrated as `4f33f91` (locked dependency), `d4690d0` (protected runtime)
+and `ef10ef2` (behavioral bootstrap test review fix), preserving private source
+checkpoints `b3e8f97`, `0df2098`, `3b4ed06`. Focused follow-up LuaBootstrapTests:
+2 passed; no broad repeat. Shared Lua prefix prepared only from the already
+verified local archive; log `.artifacts/script006/shared-prefix-build.log`.
+Prefix mutation ownership released after completion.
+
+Slot accounting: RuntimeShip004 remains slot1; UIShip005's yielded slot2 was
+explicitly re-reserved to the same worker for preserving/checkpointing its
+verified native candidate and continuing actual Host integration; ScriptShip006
+holds slot3 and shared Git. No descendants or fourth active worker authorized.

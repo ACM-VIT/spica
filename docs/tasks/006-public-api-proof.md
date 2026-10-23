@@ -1,6 +1,6 @@
 # 006: Minimal public API proof
 
-Status: feasibility proof reviewed; Lua5.4.9 selected. Production bindings await concrete native root seam/allocation while task004/005 implementation proceeds.
+Status: standalone production Lua runtime reviewed for integration; actual native/default-custom/durable Host acceptance remains open.
 Authorization: user continuation through roadmap002–017. Scope is a small replaceable root/renderer, public commands/queries, invalid-config retention and durable-work independence. No built-in alternate presets or two production scripting runtimes.
 Base: accepted task003 `3c18aac45d732f217bc9af98d466f3c569c8dd61`; task004 Host gateway pinned in its packet, task005 native UI preparation/implementation concurrent.
 Owner: Astra chooses runtime after evidence; Native003 performs bounded feasibility proof in ignored `.artifacts/api006/` only. All tracked files and other worktrees read-only; no Git mutation. Parent Git owner Infra002; DomainPrep004 owns domain gateway/types/build, NativeUI005 owns future native UI surface.
@@ -16,3 +16,45 @@ Select Lua5.4.9 only. `.artifacts/api006/proof.md`, actual `proof.c` and raw out
 Official source: https://www.lua.org/ftp/lua-5.4.9.tar.gz, 373429bytes, SHA256 `2335b6c582a52654f94612bf10d2f4672805d05329aa6568b1d8cd9e5c6fb8e6`. Matching official listing and actual downloaded archive/license evidence live in `.artifacts/api006/upstream-manifest.json`; exact integration map is `dependency-handoff.md`. Preserve archive MIT notice1994–2026; project-root distribution license remains a separate gate.
 
 Production design must enforce distinct staging/render/action/closing/disposed phases; only current-generation explicit actions admit commands. Root/render remain pure even when active. Revoke capabilities before lua_close finalizers. All Lua allocation/errors/callbacks stay inside protected C boundary, never longjmp across Zig frames. Instruction hooks do not preempt C calls; exported C calls are bounded/nonblocking, not a sandbox guarantee. Public domain values remain runtime-neutral and u64 values marshal losslessly. Domain owner retains build.zig/src/test.zig; future scripting owner receives exact lock/bootstrap/shim/module paths separately. No dual runtime implementation.
+
+## Production runtime allocation
+
+Script006 (high Sol) owns one private runtime/dependency lane from published `81db41af608cb2b918378004ea5f4234557262c7`, worktree `.artifacts/worktrees/006-script`, branch `task/006-script`. Exact allowlist: `deps.lock.json`, `build/bootstrap.py`, `build/bootstrap_test.py`, `CONTRIBUTING.md`, new `docs/licenses/lua-5.4.9.txt`, `src/script.zig`, `src/native/script_lua.c`, `src/native/script_lua.h`, `src/script_test.zig`, `docs/contracts/scripting.md`, `docs/tasks/006-script-receipt.md`, `examples/minimal.lua`. No domain/native-root/build.zig/src/test.zig writes; DomainRuntime004 owns narrow link/test integration, NativeUI005 owns root/render/input integration. Runtime-neutral descriptor and callback details are pinned between those owners before they depend on fields; no competing Host.
+
+Independent first slice is a real capped, protected VM/descriptor/action implementation plus locked source bootstrap, not a synthetic Host accepted as integration. Native bindings must use actual Host gateway; root/renderer consume bounded immutable visible snapshots and emit finite descriptors, never full histories or native pointers. Effectful callbacks only run for explicit current-generation actions. No allocation/error longjmp across Zig frames. Keep expensive scripting off the SDL thread; retained last-good output stays usable during evaluation, bounded queues coalesce superseded renders without losing action/command identity. Host/domain lifetime outlives scripts, shutdown/reload cannot cancel accepted work.
+
+Use one selected runtime and one example replacing root and renderer, with meaningful reload/phase/budget/lifetime regressions and actual default/custom native proof before task006 acceptance. Commit cohesive working slices after checks, not end-only. Private dependency builds must not modify the shared read-only .deps symlink; compile the selected verified archive into an isolated prefix for standalone runtime checks, then coordinate shared dependency installation/linking only through integration owner. No system package installation/global configuration/network module fetch.
+
+## Reviewed standalone implementation
+
+Main reviewed dependency checkpoint `b3e8f976873fcd48faa4b3e9e98dd6ecbbe87dc1`
+and runtime checkpoint `0df2098ae8346c19098c50ff7855de0dbe970d9a`: concrete ABI,
+protected C evaluation, worker/admission/disposal paths, contract and actual
+example consumer evidence. Standalone slice is approved for integration, not
+native acceptance. Runtime entrypoints are `src/script.zig` and
+`src/native/script_lua.c/h`; the immutable native handoff is documented in
+`docs/contracts/scripting.md`, with the executable example `examples/minimal.lua`.
+
+Evidence in `.artifacts/script006/`: five regressions passed in Debug and
+ReleaseSafe, nine bootstrap tests passed, strict C warnings/format checks passed,
+and the real example C consumer passed under ASan/UBSan (Lua archive itself not
+instrumented). Raw logs and consumer source are enumerated in
+`006-script-receipt.md`. No synthetic Host result establishes integration.
+
+ScriptShip006 owns serialized shared Git integration for the union of task004–006
+production paths and existing task records, without push authorization.
+RuntimeShip004 retains private domain/build.zig/src/test.zig adaptation;
+UIShip005 retains private native App/root/input integration. Main delegates
+routine verified-candidate review/integration to ScriptShip006; material contract
+decisions and final acceptance remain Main-owned. Native must admit current-
+generation action proposals through the actual Host with captured immutable
+targets and stable command IDs. Default/custom native operation, invalid reload
+retention in the real App and durable restart remain the shared acceptance gate.
+
+
+Integrated task006 checkpoints: `4f33f91`, `d4690d0`, `ef10ef2` (private sources
+`b3e8f97`, `0df2098`, `3b4ed06`). Review follow-up removes only incidental license
+wording assertion; focused LuaBootstrapTests 2/2 passed. Shared selected Lua prefix
+prepared from verified local archive with source bootstrap, without network or
+packages; `.artifacts/script006/shared-prefix-build.log`. No further broad checks
+before actual app assembly.
