@@ -1,5 +1,8 @@
 # Spica native workspace rewrite
 
+Build Spica like a video game engine for a data-intensive application: data-oriented layouts, explicit ownership, bounded memory, and incremental work.
+Performance is a primary acceptance requirement: target low-end hardware and prove responsiveness/frame times, CPU cost, and whole-process-tree RSS/PSS with measurements, not architectural claims.
+
 Read README.md, docs/ROADMAP.md and your task record before working. This branch is a new application foundation, not the old Pi chat client. Do not restore deleted application code wholesale to make a check pass.
 
 ## Product boundaries
