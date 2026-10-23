@@ -37,6 +37,12 @@ Thread creation supplies model, provider, workspace, effort, workspace-write
 sandbox and on-request approval. Provider/model fallback is explicitly disabled.
 Reported thread identity is checked against requested model/provider/workspace/
 effort. Unsupported message, replay and inspection surfaces reject explicitly.
+
+`Config.cwd` is the canonical absolute provider working directory. Public
+`Selection.workspace` remains an opaque durable workspace ID, never a pathname.
+Host admission checks that workspace's persisted canonical root against the
+startup provider root; provider selection checks retain all other explicit
+metadata and preserve the admitted workspace ID in observations and approvals.
 Approval RPCs are live-only; one-action accept/decline never approves a session.
 Interrupted turns do not claim all external tools have stopped.
 
@@ -50,3 +56,30 @@ until the domain owner binds it to durable app commands and scoped authority.
 `coordinator_bridge` remains unknown, not supported, until that actual integration
 and a disposable authenticated invocation are exercised. No prompt-based bridge
 or stand-in tool endpoint is provided.
+
+## Native startup and sign-in
+
+`src/main.zig` now creates final-address provider storage before Host startup,
+passes the adapter/selection/root to the Host, and retains its context until
+after Host destruction. The worker owns process shutdown; main then frees Codex
+retained state without closing the transport twice. There is no fake fallback.
+Only the explicit account directory supplies HOME/CODEX_HOME/XDG state; the
+parent environment, credentials and histories are not copied.
+
+```sh
+zig-out/bin/spica --provider codex --workspace /absolute/disposable/project \
+  --runtime-account-directory /absolute/isolated/codex \
+  --model-provider openai --model gpt-6.1-sol --effort medium \
+  --codex-auth status
+```
+
+Use `--codex-auth browser` or `device` with the same arguments to initiate the
+supported flow. The actual runtime result is printed and the process keeps the
+login transport alive for up to 120 seconds; incomplete/error flows fail rather
+than reporting authentication. Omit `--codex-auth` to open the native app.
+`--runtime-executable` accepts an absolute installed binary override.
+
+Recovery evidence: `.artifacts/provider-recovery/native-build.log` and
+`native-auth-status.log` exercise the actual Debug executable and isolated
+account status (sign-in required). Browser/device completion, authenticated
+inference and native provider desktop interactions remain unexercised.

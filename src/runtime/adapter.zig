@@ -3,6 +3,7 @@
 //! accountStatus and resolveSelection borrow immutable runtime-owned metadata.
 const std = @import("std");
 const c = @import("../contract.zig");
+pub const ToolCall = struct { request_id_json: []const u8, call_id: []const u8, name: []const u8, arguments_json: []const u8, correlation: c.Correlation };
 pub const Adapter = struct {
     context: *anyopaque,
     vtable: *const VTable,
@@ -14,6 +15,8 @@ pub const Adapter = struct {
         pump: *const fn (*anyopaque) anyerror!void,
         poll: *const fn (*anyopaque, std.mem.Allocator) anyerror!?c.Observation,
         shutdown: *const fn (*anyopaque) void,
+        pollTool: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!?ToolCall = null,
+        respondTool: ?*const fn (*anyopaque, []const u8, bool, []const u8) anyerror!void = null,
     };
     pub fn discover(self: Adapter) c.Discovery { return self.vtable.discover(self.context); }
     pub fn accountStatus(self: Adapter) c.Account { return self.vtable.accountStatus(self.context); }
@@ -22,6 +25,13 @@ pub const Adapter = struct {
     pub fn pump(self: Adapter) !void { return self.vtable.pump(self.context); }
     pub fn poll(self: Adapter, allocator: std.mem.Allocator) !?c.Observation { return self.vtable.poll(self.context, allocator); }
     pub fn shutdown(self: Adapter) void { self.vtable.shutdown(self.context); }
+    pub fn pollTool(self: Adapter, allocator: std.mem.Allocator) !?ToolCall {
+        return if (self.vtable.pollTool) |call| call(self.context, allocator) else null;
+    }
+    pub fn respondTool(self: Adapter, request_id: []const u8, success: bool, result: []const u8) !void {
+        const call = self.vtable.respondTool orelse return error.ToolBridgeUnsupported;
+        return call(self.context, request_id, success, result);
+    }
 };
 /// Copies every borrowed string in a contract frame; use an arena for disposal.
 pub fn clone(allocator: std.mem.Allocator, value: anytype) !@TypeOf(value) {
