@@ -14,7 +14,9 @@ pub const NativeFactory = struct {
 
     const CodexInstance = struct { arena: std.heap.ArenaAllocator, wire: transport.Transport, runtime: Codex.Runtime };
     const OpenCodeInstance = struct { arena: std.heap.ArenaAllocator, runtime: OpenCode.Runtime };
-    fn cast(p: *anyopaque) *NativeFactory { return @ptrCast(@alignCast(p)); }
+    fn cast(p: *anyopaque) *NativeFactory {
+        return @ptrCast(@alignCast(p));
+    }
     fn compatible(self: *const NativeFactory, selection: c.Selection) bool {
         var expected = self.selection;
         expected.workspace = selection.workspace;
@@ -23,7 +25,9 @@ pub const NativeFactory = struct {
     fn discovery(p: *anyopaque, selection: c.Selection) c.Discovery {
         const self = cast(p);
         var caps = [_]c.CapabilityInfo{.{ .status = .unknown, .evidence = "Instance handshake has not run" }} ** @typeInfo(c.Capability).@"enum".fields.len;
-        if (!self.compatible(selection)) for (&caps) |*cap| { cap.status = .unsupported; };
+        if (!self.compatible(selection)) for (&caps) |*cap| {
+            cap.status = .unsupported;
+        };
         return .{ .runtime_kind = self.selection.runtime_kind, .runtime_version = self.selection.required_runtime_version, .capabilities = caps, .limits = .{} };
     }
     fn account(p: *anyopaque, selection: c.Selection) c.Account {

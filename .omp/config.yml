@@ -26,8 +26,8 @@ task:
   speculativeLaunch: false
   maxConcurrency: 3
   maxRecursionDepth: -1 # Unlimited nesting depth; concurrency remains separately bounded.
-  maxRuntimeMs: 1800000
-  softRequestBudget: 40
+  maxRuntimeMs: 3600000
+  softRequestBudget: 200
   softRequestBudgetNotice: true
   completionProbe: false
   enableEffort: false
@@ -46,9 +46,9 @@ task:
     sol-measure: default
     sol-repair: default
   agentSoftRequestBudget:
-    task: 40
-    sol-measure: 40
-    sol-repair: 40
+    task: 200
+    sol-measure: 200
+    sol-repair: 200
   agentPrewalk:
     task: off
     sol-measure: off

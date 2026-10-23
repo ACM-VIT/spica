@@ -21,14 +21,30 @@ pub const Adapter = struct {
         /// Host retains a committed open claim while false; no open is retried.
         ready: ?*const fn (*anyopaque) bool = null,
     };
-    pub fn discover(self: Adapter) c.Discovery { return self.vtable.discover(self.context); }
-    pub fn accountStatus(self: Adapter) c.Account { return self.vtable.accountStatus(self.context); }
-    pub fn resolveSelection(self: Adapter, selection: c.Selection) c.SelectionResult { return self.vtable.resolveSelection(self.context, selection); }
-    pub fn dispatch(self: Adapter, allocator: std.mem.Allocator, request: c.Request) !c.Receipt { return self.vtable.dispatch(self.context, allocator, request); }
-    pub fn pump(self: Adapter) !void { return self.vtable.pump(self.context); }
-    pub fn poll(self: Adapter, allocator: std.mem.Allocator) !?c.Observation { return self.vtable.poll(self.context, allocator); }
-    pub fn shutdown(self: Adapter) void { self.vtable.shutdown(self.context); }
-    pub fn ready(self: Adapter) bool { return if (self.vtable.ready) |call| call(self.context) else true; }
+    pub fn discover(self: Adapter) c.Discovery {
+        return self.vtable.discover(self.context);
+    }
+    pub fn accountStatus(self: Adapter) c.Account {
+        return self.vtable.accountStatus(self.context);
+    }
+    pub fn resolveSelection(self: Adapter, selection: c.Selection) c.SelectionResult {
+        return self.vtable.resolveSelection(self.context, selection);
+    }
+    pub fn dispatch(self: Adapter, allocator: std.mem.Allocator, request: c.Request) !c.Receipt {
+        return self.vtable.dispatch(self.context, allocator, request);
+    }
+    pub fn pump(self: Adapter) !void {
+        return self.vtable.pump(self.context);
+    }
+    pub fn poll(self: Adapter, allocator: std.mem.Allocator) !?c.Observation {
+        return self.vtable.poll(self.context, allocator);
+    }
+    pub fn shutdown(self: Adapter) void {
+        self.vtable.shutdown(self.context);
+    }
+    pub fn ready(self: Adapter) bool {
+        return if (self.vtable.ready) |call| call(self.context) else true;
+    }
     pub fn pollTool(self: Adapter, allocator: std.mem.Allocator) !?ToolCall {
         return if (self.vtable.pollTool) |call| call(self.context, allocator) else null;
     }
@@ -54,11 +70,21 @@ pub const Factory = struct {
         create: *const fn (*anyopaque, std.mem.Allocator, c.Selection, []const u8, c.RuntimeSessionId, ?Bridge) anyerror!Adapter,
         destroy: *const fn (*anyopaque, std.mem.Allocator, Adapter) void,
     };
-    pub fn discover(self: Factory, selection: c.Selection) c.Discovery { return self.vtable.discover(self.context, selection); }
-    pub fn accountStatus(self: Factory, selection: c.Selection) c.Account { return self.vtable.accountStatus(self.context, selection); }
-    pub fn resolveSelection(self: Factory, selection: c.Selection) c.SelectionResult { return self.vtable.resolveSelection(self.context, selection); }
-    pub fn create(self: Factory, allocator: std.mem.Allocator, selection: c.Selection, cwd: []const u8, session: c.RuntimeSessionId, bridge: ?Bridge) !Adapter { return self.vtable.create(self.context, allocator, selection, cwd, session, bridge); }
-    pub fn destroy(self: Factory, allocator: std.mem.Allocator, instance: Adapter) void { self.vtable.destroy(self.context, allocator, instance); }
+    pub fn discover(self: Factory, selection: c.Selection) c.Discovery {
+        return self.vtable.discover(self.context, selection);
+    }
+    pub fn accountStatus(self: Factory, selection: c.Selection) c.Account {
+        return self.vtable.accountStatus(self.context, selection);
+    }
+    pub fn resolveSelection(self: Factory, selection: c.Selection) c.SelectionResult {
+        return self.vtable.resolveSelection(self.context, selection);
+    }
+    pub fn create(self: Factory, allocator: std.mem.Allocator, selection: c.Selection, cwd: []const u8, session: c.RuntimeSessionId, bridge: ?Bridge) !Adapter {
+        return self.vtable.create(self.context, allocator, selection, cwd, session, bridge);
+    }
+    pub fn destroy(self: Factory, allocator: std.mem.Allocator, instance: Adapter) void {
+        self.vtable.destroy(self.context, allocator, instance);
+    }
 };
 /// Copies every borrowed string in a contract frame; use an arena for disposal.
 pub fn clone(allocator: std.mem.Allocator, value: anytype) !@TypeOf(value) {
@@ -66,13 +92,23 @@ pub fn clone(allocator: std.mem.Allocator, value: anytype) !@TypeOf(value) {
     return switch (@typeInfo(T)) {
         .pointer => try allocator.dupe(u8, value),
         .optional => if (value) |v| try clone(allocator, v) else null,
-        .@"struct" => blk: { var result: T = undefined; inline for (@typeInfo(T).@"struct".fields) |f| @field(result, f.name) = try clone(allocator, @field(value, f.name)); break :blk result; },
-        .@"union" => blk: { inline for (@typeInfo(T).@"union".fields) |f| { if (std.meta.activeTag(value) == @field(std.meta.Tag(T), f.name)) break :blk @unionInit(T, f.name, try clone(allocator, @field(value, f.name))); } unreachable; },
+        .@"struct" => blk: {
+            var result: T = undefined;
+            inline for (@typeInfo(T).@"struct".fields) |f| @field(result, f.name) = try clone(allocator, @field(value, f.name));
+            break :blk result;
+        },
+        .@"union" => blk: {
+            inline for (@typeInfo(T).@"union".fields) |f| {
+                if (std.meta.activeTag(value) == @field(std.meta.Tag(T), f.name)) break :blk @unionInit(T, f.name, try clone(allocator, @field(value, f.name)));
+            }
+            unreachable;
+        },
         else => value,
     };
 }
 test "frames own nested strings" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator); defer arena.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var bytes = [_]u8{'a'};
     const copied = try clone(arena.allocator(), c.Receipt{ .outcome = .rejected, .detail = &bytes });
     bytes[0] = 'b';

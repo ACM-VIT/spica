@@ -62,3 +62,10 @@ src/platform/process_posix.c src/platform/process_linux.c -lc -I src -I
 src/platform`: 6/6 passed. This is process-lifetime evidence, not authenticated
 provider cancellation/inference or native task acceptance. Raw observed output:
 `.artifacts/provider-factory/factory-check.log`.
+
+Current owner RuntimeFactoryLead holds slot2 and sole shared Git integration.
+The user-authorized finite worker budgets are 60 minutes, 200 requests soft,
+300 forced; project configuration is propagated before replacement dispatch.
+Native startup remains an identified candidate until the domain factory seam
+and actual provider/native checks are assembled; checkpointing the concrete
+factory alone is not acceptance.
