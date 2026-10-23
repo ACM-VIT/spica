@@ -40,3 +40,14 @@ Combined tools/check, actual provider desktop smoke, completed ChatGPT sign-in,
 authenticated inference and durable app-task dynamic-call/MCP acceptance remain
 open. No credentials, private account history or model entitlement were copied
 or claimed. Requested/resolved model: openai-codex/gpt-6.1-sol; default tier.
+
+## Session factory recovery — RuntimeFactoryLead
+
+The common ABI now exposes side-effect-free factory metadata and session-scoped
+creation with exact selection, absolute cwd, durable session ID and optional
+Host-owned authenticated MCP endpoint. Unknown pre-instance readiness is not
+authentication evidence. A successful create transfers one adapter to the Host;
+the Host shuts it down exactly once before factory memory-only destruction.
+Failed creation retains no process or allocation. Registry/native integration
+and actual provider bridge acceptance are tracked separately from this seam.
+Focused common-seam check: `zig build test-domain` exited 0.

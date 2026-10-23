@@ -33,6 +33,29 @@ pub const Adapter = struct {
         return call(self.context, request_id, success, result);
     }
 };
+
+/// A session-scoped MCP endpoint owned by the Host, alive until shutdown.
+pub const Bridge = struct { url: []const u8, token: []const u8 };
+/// Metadata queries MUST NOT spawn a process or perform external IO. Unknown
+/// readiness admits an open claim; the instance handshake remains authoritative.
+/// create cleans every partial failure. Host calls shutdown once, then destroy;
+/// destroy releases memory only and must not call shutdown again.
+pub const Factory = struct {
+    context: *anyopaque,
+    vtable: *const VTable,
+    pub const VTable = struct {
+        discover: *const fn (*anyopaque, c.Selection) c.Discovery,
+        accountStatus: *const fn (*anyopaque, c.Selection) c.Account,
+        resolveSelection: *const fn (*anyopaque, c.Selection) c.SelectionResult,
+        create: *const fn (*anyopaque, std.mem.Allocator, c.Selection, []const u8, c.RuntimeSessionId, ?Bridge) anyerror!Adapter,
+        destroy: *const fn (*anyopaque, std.mem.Allocator, Adapter) void,
+    };
+    pub fn discover(self: Factory, selection: c.Selection) c.Discovery { return self.vtable.discover(self.context, selection); }
+    pub fn accountStatus(self: Factory, selection: c.Selection) c.Account { return self.vtable.accountStatus(self.context, selection); }
+    pub fn resolveSelection(self: Factory, selection: c.Selection) c.SelectionResult { return self.vtable.resolveSelection(self.context, selection); }
+    pub fn create(self: Factory, allocator: std.mem.Allocator, selection: c.Selection, cwd: []const u8, session: c.RuntimeSessionId, bridge: ?Bridge) !Adapter { return self.vtable.create(self.context, allocator, selection, cwd, session, bridge); }
+    pub fn destroy(self: Factory, allocator: std.mem.Allocator, instance: Adapter) void { self.vtable.destroy(self.context, allocator, instance); }
+};
 /// Copies every borrowed string in a contract frame; use an arena for disposal.
 pub fn clone(allocator: std.mem.Allocator, value: anytype) !@TypeOf(value) {
     const T = @TypeOf(value);
