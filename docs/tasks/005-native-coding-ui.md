@@ -45,3 +45,26 @@ passing editor smoke. It consumed immutable domain chain through `50b65b6` and
 continues the real App/main Host wake/drain/query/command bridge, then minimal
 Lua custom-root/renderer/action integration. Domain owns build.zig/src/test.zig;
 no duplicate Host, providers, store or copied mutable sibling source.
+
+## Actual native Host checkpoint and successor ownership
+
+Private App checkpoint `b393a5c` is integrated as shared `67f942a`, atop
+runtime review repair `610ebef`. `ShipLeadContinue` now owns shared Git and
+integration; UIShip005 retains the exclusive private UI allocation.
+
+Producer checks passed 50/50 native-root tests and 10/10 evaluator regressions.
+Real private-desktop Unicode prompt, response/code, geometry-derived approval,
+completed tool result, second-prompt cancellation and reopened retained state
+passed at `.artifacts/ui005/host-native-cohesive/manifest.json`. The frozen
+binary is `spica-exercised`, SHA256
+`51b7d2ae5470b66f54cf0bfc23683f8cf198ad0ad0d4a954ff2c6b8bf1832a7f`;
+source fingerprint is
+`36ee58584bf2bbffcc3892d67d595a4d0cc7d9c05bbfcf2133ca71dcb32c4246`.
+Successor source review inspected command receipt identity, copied projections,
+subscription refresh and shutdown ownership. The reopened screenshot visibly
+retains cancelled status, Unicode response, code and approved inspection output.
+This is explicit-state native proof, not yet the assembled custom-root gate.
+
+UIShip005 continues independent XDG default/disconnect, followed by actual Lua
+root/renderer/current-generation action integration and last-good retention.
+Previously passing smoke is preserved, not rerun for confirmation.

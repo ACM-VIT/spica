@@ -67,3 +67,16 @@ intents. New focused regression passed Debug/ReleaseSafe 1/1 each; evidence
 new Host capability. Native still gates installed generation before admission.
 Formatter-only native checkpoint `8944e7d` integrated as `1de4ab5`; strict C
 syntax/warnings and formatting passed, preparing the final combined check.
+
+## Successor integration allocation
+
+`ShipLeadContinue` replaces the runtime-capped `ScriptShip006` as exclusive
+shared Git/integration owner. Shared candidate `67f942a` already includes the
+actual native default conversation App, runtime lifetime repairs and domain
+review fixes. UIShip005 remains the only private App/root/input writer and owns
+the upcoming actual Lua root, renderer and action bridge. The existing child
+`ScriptShip006.HostScriptMeasure` retains reserved slot1 for a real standalone
+Host+Lua consumer only; that evidence cannot replace the required frontend proof.
+No fourth worker or duplicate native writer is authorized. Combined
+`./tools/check`, actual assembled default/custom private-desktop interaction and
+exclusive independent profiling follow the concrete native integration.

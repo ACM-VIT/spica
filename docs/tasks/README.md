@@ -75,3 +75,16 @@ slot3 ScriptShip006 remains sole shared Git owner/coordinator. No fourth worker
 or descendants are active. Isolated private correctness builds may run
 concurrently; only performance excludes all builds/recordings/profilers.
 Shared dependency-prefix mutation requires explicit exclusive ownership.
+
+## Integration lead recovery
+
+`ShipLeadContinue` replaces runtime-capped ScriptShip006 as exclusive shared
+Git/integration owner for the exact task004–006 union and these records. Shared
+base is `67f942a904368e2840493500dc7936ae90f4915e`, clean on recovery:
+runtime repair `37ba691` already integrated as `610ebef`, actual native Host App
+`b393a5c` already integrated as `67f942a`. Preserve these checkpoints.
+UIShip005 retains slot2/private UI ownership for independent XDG startup,
+disconnect and Lua bridge; existing HostScriptMeasure retains slot1 for its
+standalone actual Host/Lua evidence. Successor occupies slot3; no duplicate
+workers. Default native conversation passed real private-desktop interaction and
+restart; actual custom-root integration and combined checks remain outstanding.

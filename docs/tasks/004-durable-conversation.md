@@ -51,3 +51,21 @@ terminal message incomplete finalization and changed-aggregate revision/event
 coverage, plus its owned narrow Lua/native build/test-root integration. Preserve
 same-candidate follow-up checkpoints and add focused actual Host/subscription
 coverage; do not rerun old passing cohorts just to reconfirm them. No descendants.
+
+## Continued integration review
+
+Shared integration ownership transferred from the stopped `ScriptShip006` to
+`ShipLeadContinue`; RuntimeShip004's completed private candidate is preserved.
+The review-repair source checkpoint `37ba691` is integrated as `610ebef`.
+Source review covers terminal-message finalization and transaction-local
+changed-aggregate publication; the producer's exact Debug/ReleaseSafe native
+95/96 pass (one skipped) and Python 33 OK (two skipped) evidence is retained in
+`.artifacts/worktrees/004-domain/.artifacts/domain004/review/`.
+Those checks are not repeated merely to confirm reported success.
+
+Actual App Host hookup `b393a5c` is integrated as `67f942a`. Public Host
+queries/subscriptions feed bounded copied projections; native command admission
+retains identity until its receipt, and the coding root does not own dispatch.
+The actual private-desktop conversation/reopen evidence is recorded in task005.
+Default-state startup, root-before-Host teardown and the Lua bridge remain owned
+by UIShip005 until its next immutable checkpoints; no competing App writer.
