@@ -171,6 +171,42 @@ test "DPR transitions rebuild raster pixels without changing wrapping or logical
     }
 }
 
+test "OS fallback incremental mixed bidi emoji typing stays within the shared font cap" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const source = "hello e\u{301} שלום 👩‍💻";
+    var end: usize = 0;
+    while (end < source.len) {
+        end += try std.unicode.utf8ByteSequenceLength(source[end]);
+        const layout = c.spica_text_layout_create(f.engine, source.ptr, end, 900, 16, false) orelse {
+            std.debug.print("prefix bytes={d}: {s}\nSDL: {s}\n", .{ end, source[0..end], c.SDL_GetError() });
+            return error.Layout;
+        };
+        defer c.spica_text_layout_release(layout);
+        try f.clear();
+        try std.testing.expect(c.spica_text_layout_draw(f.engine, layout, 5, 4, white));
+        var stats: c.SpicaTextStats = undefined;
+        try std.testing.expect(c.spica_text_get_stats(f.engine, &stats));
+        try std.testing.expect(stats.font_bytes <= 4 * 1024 * 1024);
+        if (end == source.len) {
+            const emoji_start = source.len - "👩‍💻".len;
+            var start: c.SDL_FRect = undefined;
+            var inside: c.SDL_FRect = undefined;
+            var finish: c.SDL_FRect = undefined;
+            try std.testing.expect(c.spica_text_layout_caret(layout, emoji_start, &start));
+            try std.testing.expect(c.spica_text_layout_caret(layout, emoji_start + "👩".len, &inside));
+            try std.testing.expect(c.spica_text_layout_caret(layout, end, &finish));
+            try std.testing.expectEqual(start.x, inside.x);
+            const advance = @abs(finish.x - start.x);
+            try std.testing.expect(advance > 8 and advance < 32);
+            var rect: c.SDL_FRect = undefined;
+            try std.testing.expectEqual(@as(usize, 1), c.spica_text_layout_selection_rects(layout, emoji_start, end, &rect, 1));
+            try std.testing.expectApproxEqAbs(advance, rect.w, 1.0 / 64.0);
+            std.debug.print("full mixed input font_bytes={d}; emoji advance={d}\n", .{ stats.font_bytes, advance });
+        }
+    }
+}
+
 test "bitmap color ZWJ emoji and adjacent flag have distinct logical advances" {
     const f = try Fixture.init();
     defer f.deinit();

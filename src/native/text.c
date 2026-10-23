@@ -44,7 +44,7 @@ typedef struct {
     FT_Fixed normal_weight, bold_weight;
     unsigned weight_axis, axis_count;
     FT_Fixed coordinates[16];
-    bool variable_bold, registered, tables_failed;
+    bool variable_bold, registered, tables_failed, metrics_failed;
     unsigned active_x, active_y, active_style;
     float raster_scale_x, raster_scale_y;
 } Face;
@@ -229,6 +229,30 @@ static hb_blob_t *reference_table(hb_face_t *face, hb_tag_t tag, void *data) {
         f->tables_failed = true;
     return blob;
 }
+/* HarfBuzz's OT extents callback references the entire CBDT/sbix image table,
+ * even when shaping only needs one bitmap's bearings (e.g. an unfinished ZWJ
+ * sequence). Stream that glyph's metrics through our budgeted FreeType face
+ * instead; do not decode its image or hide a failed table allocation. */
+static hb_bool_t bitmap_extents(hb_font_t *font, void *data, hb_codepoint_t glyph,
+                                hb_glyph_extents_t *extents, void *user) {
+    (void)user;
+    Face *f = data;
+    if (FT_Load_Glyph(f->face, glyph, FT_LOAD_COLOR | FT_LOAD_BITMAP_METRICS_ONLY) ||
+        !f->face->size->metrics.x_ppem || !f->face->size->metrics.y_ppem) {
+        f->metrics_failed = true;
+        return false;
+    }
+    int x, y;
+    hb_font_get_scale(font, &x, &y);
+    double sx = (double)x / (64.0 * f->face->size->metrics.x_ppem);
+    double sy = (double)y / (64.0 * f->face->size->metrics.y_ppem);
+    FT_Glyph_Metrics *m = &f->face->glyph->metrics;
+    *extents = (hb_glyph_extents_t){.x_bearing = (hb_position_t)round(m->horiBearingX * sx),
+                                   .y_bearing = (hb_position_t)round(m->horiBearingY * sy),
+                                   .width = (hb_position_t)round(m->width * sx),
+                                   .height = (hb_position_t)round(-m->height * sy)};
+    return true;
+}
 static bool reset_tables(Face *f) {
     hb_face_t *face = hb_face_create_for_tables(reference_table, f, NULL);
     if (face == hb_face_get_empty())
@@ -236,9 +260,36 @@ static bool reset_tables(Face *f) {
     hb_face_set_index(face, (unsigned)f->face->face_index);
     hb_face_set_upem(face, f->face->units_per_EM ? f->face->units_per_EM : 2048);
     hb_face_set_glyph_count(face, (unsigned)f->face->num_glyphs);
-    hb_font_set_face(f->font, face);
-    hb_ot_font_set_funcs(f->font);
+    /* Keep variation coordinates on an existing scalable font during a retry. */
+    if (f->font && FT_IS_SCALABLE(f->face)) {
+        hb_font_set_face(f->font, face);
+        hb_ot_font_set_funcs(f->font);
+        hb_face_destroy(face);
+        f->tables_failed = false;
+        return true;
+    }
+    hb_font_t *parent = hb_font_create(face);
     hb_face_destroy(face);
+    if (parent == hb_font_get_empty())
+        return error("shaping font allocation failed");
+    hb_ot_font_set_funcs(parent);
+    hb_font_t *font = parent;
+    if (!FT_IS_SCALABLE(f->face)) {
+        hb_font_funcs_t *funcs = hb_font_funcs_create();
+        font = hb_font_create_sub_font(parent);
+        if (funcs == hb_font_funcs_get_empty() || font == hb_font_get_empty()) {
+            hb_font_funcs_destroy(funcs);
+            hb_font_destroy(font);
+            hb_font_destroy(parent);
+            return error("bitmap shaping font allocation failed");
+        }
+        hb_font_funcs_set_glyph_extents_func(funcs, bitmap_extents, NULL, NULL);
+        hb_font_set_funcs(font, funcs, f, NULL);
+        hb_font_funcs_destroy(funcs);
+        hb_font_destroy(parent);
+    }
+    hb_font_destroy(f->font);
+    f->font = font;
     f->tables_failed = false;
     return true;
 }
@@ -337,9 +388,6 @@ static int open_face(SpicaText *t, const char *path, long index, bool registered
         goto fail;
     if (FT_Set_Pixel_Sizes(f->face, 0, 15) &&
         (!f->face->num_fixed_sizes || FT_Select_Size(f->face, 0)))
-        goto fail;
-    f->font = hb_font_create(hb_face_get_empty());
-    if (!f->font || f->font == hb_font_get_empty())
         goto fail;
     if (!reset_tables(f))
         goto fail;
@@ -849,6 +897,9 @@ static bool shape(SpicaText *t, Run run, unsigned line_start, unsigned line_end,
     /* Table-based advances are independent of FT bitmap-strike metrics.
      * FT_Get_Advance is not supported by every bitmap-only color font. */
     hb_font_set_scale(f->font, (int)size * 64, (int)size * 64);
+    if (!FT_IS_SCALABLE(f->face))
+        hb_font_set_scale(hb_font_get_parent(f->font), (int)size * 64, (int)size * 64);
+    f->metrics_failed = false;
     hb_buffer_clear_contents(t->buffer);
     hb_buffer_set_cluster_level(t->buffer, HB_BUFFER_CLUSTER_LEVEL_MONOTONE_GRAPHEMES);
     hb_buffer_set_direction(t->buffer, run.level & 1 ? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
@@ -862,6 +913,8 @@ static bool shape(SpicaText *t, Run run, unsigned line_start, unsigned line_end,
     hb_shape(f->font, t->buffer, NULL, 0);
     if (f->tables_failed)
         return error("shaping tables exceed the shared font budget");
+    if (f->metrics_failed)
+        return error("bitmap glyph metrics unavailable within the shared font budget");
     if (!hb_buffer_allocation_successful(t->buffer))
         return error("shaping allocation failed");
     *info = hb_buffer_get_glyph_infos(t->buffer, count);
