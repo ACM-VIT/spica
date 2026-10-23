@@ -238,7 +238,7 @@ const Conversation = struct {
     thread: t.ThreadId,
     fn create(owner: *domain.Owner, allocator: std.mem.Allocator) !Conversation {
         const p = try owner.command(allocator, .{ .command_id = .{ .value = "project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "真实 project" } } });
-        const w = try owner.command(allocator, .{ .command_id = .{ .value = "workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = p.entity_ids.project.?, .binding = .{ .canonical_root = "/tmp/isolated", .filesystem_identity = "test", .repository_identity = "", .checkout_identity = "", .expected_branch = "", .base_revision = "", .non_git = true } } } });
+        const w = try owner.command(allocator, .{ .command_id = .{ .value = "workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = p.entity_ids.project.?, .binding = try domain.workspace_binding.capture(allocator, owner.io, "/tmp") } } });
         const h = try owner.command(allocator, .{ .command_id = .{ .value = "thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = p.entity_ids.project.?, .workspace = w.entity_ids.workspace.? } } });
         return .{ .project = p.entity_ids.project.?, .workspace = w.entity_ids.workspace.?, .thread = h.entity_ids.thread.? };
     }

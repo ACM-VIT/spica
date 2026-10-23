@@ -178,11 +178,11 @@ pub const Owner = struct {
                 const thread = e.target.thread.value;
                 const workspace = try self.field(allocator, "SELECT workspace_id FROM threads WHERE id=?", &.{.{ .text = thread }}) orelse return .not_found;
                 if (!std.mem.eql(u8, workspace, p.selection.workspace.value)) return .workspace_mismatch;
-                if (self.workspace_root) |root| {
+                if (self.factory != null or self.workspace_root != null) {
                     const binding_bytes = try self.field(allocator, "SELECT binding FROM workspaces WHERE id=?", &.{.{ .text = workspace }}) orelse return .workspace_mismatch;
                     const binding = try t.decode(t.WorkspaceBinding, binding_bytes, allocator);
                     if (!(workspace_binding.verify(allocator, self.io, binding) catch false)) return .workspace_mismatch;
-                    if (!std.mem.eql(u8, binding.canonical_root, root)) return .workspace_mismatch;
+                    if (self.workspace_root) |root| if (!std.mem.eql(u8, binding.canonical_root, root)) return .workspace_mismatch;
                 }
                 if (p.selection.account_ref.len == 0 or p.selection.model_id.len == 0 or p.selection.model_provider.len == 0) return .capability_unavailable;
                 if (self.factory) |runtime| {
@@ -198,6 +198,7 @@ pub const Owner = struct {
                     for ([_]a.Capability{ .create, .start, .stream }) |capability|
                         if (discovery.capabilities[@intFromEnum(capability)].status != .supported) return .capability_unavailable;
                 } else if (!std.mem.eql(u8, p.selection.runtime_kind, "fake") or !std.mem.eql(u8, p.selection.required_runtime_version, "1") or p.selection.capability_revision != 1) return .capability_unavailable;
+                if (self.factory != null and try db.scalar("SELECT count(*) FROM runs WHERE state NOT IN('completed','cancelled','failed')") >= 3) return .admission_limit;
                 if (try self.field(allocator, "SELECT id FROM runs WHERE thread_id=? AND (state IN('queued','starting','streaming','awaiting_approval','cancel_requested','unknown','interrupted') OR EXISTS(SELECT 1 FROM effects WHERE run_id=runs.id AND state IN('unknown','in_flight')))", &.{.{ .text = thread }}) != null) return .unresolved_effects;
                 const run = try self.id(allocator);
                 const session = try self.id(allocator);
@@ -339,21 +340,27 @@ pub const Owner = struct {
                 const project = try allocator.dupe(u8, try parent.bytes(0));
                 const workspace_project = try self.field(allocator, "SELECT project_id FROM workspaces WHERE id=?", &.{.{ .text = packet.selection.workspace.value }}) orelse return .workspace_mismatch;
                 if (!std.mem.eql(u8, project, workspace_project)) return .workspace_mismatch;
+                const binding_bytes = try self.field(allocator, "SELECT binding FROM workspaces WHERE id=?", &.{.{ .text = packet.selection.workspace.value }}) orelse return .workspace_mismatch;
+                const binding = try t.decode(t.WorkspaceBinding, binding_bytes, allocator);
                 for (packet.owned_paths) |path| {
-                    if (path.len == 0 or path[0] == '/' or std.mem.indexOf(u8, path, "..") != null) return .invalid_command;
+                    if (!try workspace_binding.validOwnedPath(allocator, binding, path)) return .invalid_command;
                 }
-                const siblings = try db.prepare("SELECT t.packet FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.parent_run=? AND r.state NOT IN('completed','cancelled','failed')", &.{.{ .text = run }});
+                // Workspace IDs and different coordinators are not isolation:
+                // compare real checkout paths and shared Git metadata ownership.
+                const siblings = try db.prepare("SELECT t.packet,w.binding FROM tasks t JOIN runs r ON r.id=t.run_id JOIN sessions s ON s.id=r.session_id JOIN workspaces w ON w.id=s.workspace_id WHERE r.state NOT IN('completed','cancelled','failed')", &.{});
                 defer siblings.deinit();
                 while (try siblings.step()) {
                     const other = try t.decode(t.orchestration.Packet, try siblings.bytes(0), allocator);
-                    if (!std.mem.eql(u8, other.selection.workspace.value, packet.selection.workspace.value)) continue;
+                    const other_binding = try t.decode(t.WorkspaceBinding, try siblings.bytes(1), allocator);
                     for (other.owned_paths) |left| for (packet.owned_paths) |right| {
-                        if (std.mem.startsWith(u8, left, right) or std.mem.startsWith(u8, right, left)) return .workspace_mismatch;
+                        if (try workspace_binding.ownershipOverlaps(allocator, other_binding, left, binding, right)) return .workspace_mismatch;
                     };
                 }
                 const thread = try self.id(allocator);
                 try db.execute("INSERT INTO threads(id,revision,project_id,workspace_id) VALUES(?,1,?,?)", &.{ .{ .text = thread }, .{ .text = project }, .{ .text = packet.selection.workspace.value } });
-                const reason = try self.reduce(allocator, .{ .command_id = e.command_id, .target = .{ .thread = .{ .value = thread } }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = packet.prompt, .selection = packet.selection } } }, r);
+                var child_owner = self.*;
+                child_owner.workspace_root = null;
+                const reason = try child_owner.reduce(allocator, .{ .command_id = e.command_id, .target = .{ .thread = .{ .value = thread } }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = packet.prompt, .selection = packet.selection } } }, r);
                 if (reason != null) return reason;
                 try db.execute("INSERT INTO tasks(run_id,parent_run,packet,detached,created_at) VALUES(?,?,?,?,?)", &.{ .{ .text = r.entity_ids.run.?.value }, .{ .text = run }, .{ .blob = try encoded(allocator, packet) }, .{ .integer = @intFromBool(packet.detached) }, .{ .integer = @intCast(self.utc_ms.?) } });
             },
@@ -456,7 +463,8 @@ pub const Owner = struct {
         const current = try revision_statement.bytes(1);
         // Delivery after terminal evidence never revives the lifecycle.
         if (!(std.mem.eql(u8, current, "completed") or std.mem.eql(u8, current, "cancelled") or std.mem.eql(u8, current, "failed"))) {
-            try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = next_state }, .{ .text = run } });
+            const applied_state = if (std.mem.eql(u8, current, "cancel_requested") and std.mem.eql(u8, kind, "create_session")) current else next_state;
+            try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = applied_state }, .{ .text = run } });
             try self.event(allocator, sequence, 2, .{ .run = .{ .value = run } }, @intCast(revision_statement.integer(0) + 1), "RunDelivery", null, effect, "");
         }
         try self.finalizeMessages(run);
@@ -1091,7 +1099,7 @@ pub const Host = struct {
         }
         const response = try allocator.alloc(u8, 65536);
         const bytes = if (std.mem.eql(u8, method.string, "initialize"))
-            try t.encode(.{ .jsonrpc = "2.0", .id = id, .result = .{ .protocolVersion = "2025-03-26", .capabilities = .{ .tools = .{} }, .serverInfo = .{ .name = "spica", .version = "1" } } }, response)
+            try t.encode(.{ .jsonrpc = "2.0", .id = id, .result = .{ .protocolVersion = "2025-03-26", .capabilities = .{ .tools = .{ .listChanged = false } }, .serverInfo = .{ .name = "spica", .version = "1" } } }, response)
         else if (std.mem.eql(u8, method.string, "tools/list")) blk: {
             const Tool = struct { name: []const u8, description: []const u8, inputSchema: std.json.Value };
             var tools: [coordinator_tools.descriptors.len]Tool = undefined;
@@ -1110,7 +1118,7 @@ pub const Host = struct {
             };
             break :blk try t.encode(.{ .jsonrpc = "2.0", .id = id, .result = .{ .content = .{.{ .type = "text", .text = reply.json }}, .isError = !reply.success } }, response);
         } else if (std.mem.eql(u8, method.string, "ping"))
-            try t.encode(.{ .jsonrpc = "2.0", .id = id, .result = .{} }, response)
+            try t.encode(.{ .jsonrpc = "2.0", .id = id, .result = std.json.Value{ .object = .empty } }, response)
         else
             try t.encode(.{ .jsonrpc = "2.0", .id = id, .@"error" = .{ .code = -32601, .message = "Unsupported MCP method" } }, response);
         try self.mcp.?.respond(invocation.client, 200, bytes);
@@ -1177,6 +1185,19 @@ pub const Host = struct {
                     try owner.delivered(allocator, effect.id, .{ .outcome = .unknown, .detail = @errorName(err) });
                 };
             } else if (registry.find(session)) |entry| {
+                if (effect.request == .cancel) if (entry.pending_open) |pending| {
+                    entry.pending_open = null;
+                    try owner.delivered(allocator, pending.effect, .{ .outcome = .rejected, .detail = "Cancelled before open dispatch" });
+                    try owner.delivered(allocator, effect.id, .{ .outcome = .acknowledged });
+                    try owner.observe(allocator, .{ .correlation = effect.request.cancel.correlation, .upstream_event = "host-cancel-before-open", .body = .{ .cancelled = .{ .tools_stopped = true } } });
+                    for (registry.entries, 0..) |optional, index| if (optional) |value| {
+                        if (std.mem.eql(u8, value.session.value, session.value)) {
+                            registry.release(&self.mcp.?, index);
+                            break;
+                        }
+                    };
+                    return;
+                };
                 try owner.delivered(allocator, effect.id, try entry.adapter.dispatch(allocator, effect.request));
             } else {
                 try owner.delivered(allocator, effect.id, .{ .outcome = .unknown, .detail = "No live instance for durable session; explicit reconciliation required" });
