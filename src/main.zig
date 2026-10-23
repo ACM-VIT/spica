@@ -2,6 +2,13 @@ const std = @import("std");
 const App = @import("app.zig").App;
 const options_module = @import("options.zig");
 const c = @import("native/bindings.zig").c;
+const telemetry = @import("native/metrics.zig");
+
+fn exportJson(io: std.Io, path: []const u8, value: anytype) !void {
+    const bytes = try std.json.Stringify.valueAlloc(std.heap.page_allocator, value, .{ .whitespace = .indent_2 });
+    defer std.heap.page_allocator.free(bytes);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+}
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .async_limit = .nothing });
@@ -22,7 +29,42 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return err;
     };
     defer app.deinit();
-    app.run(options.quit_after_ms) catch |err| {
+    const storage: []telemetry.Frame = if (options.metrics_output != null)
+        try std.heap.page_allocator.alloc(telemetry.Frame, options.metrics_capacity)
+    else
+        &.{};
+    defer if (options.metrics_output != null) std.heap.page_allocator.free(storage);
+    if (options.metrics_output != null) app.metrics = .{ .storage = storage };
+    const mapping = if (options.metrics_output != null) telemetry.mapClock(c.SDL_GetTicksNS) else null;
+    const run_result = app.run(options.quit_after_ms);
+    if (run_result) |_| {} else |err| std.log.err("Native run failed before export: {s}", .{@errorName(err)});
+    // All allocation, serialization and file I/O happen after run's end boundary.
+    if (options.automation_output) |path| try exportJson(threaded.io(), path, app.snapshot);
+    if (options.metrics_output) |path| {
+        var stats: c.SpicaTextStats = undefined;
+        const stats_ok = c.spica_text_get_stats(app.text, &stats);
+        const metrics = &app.metrics.?;
+        try exportJson(threaded.io(), path, .{
+            .version = 1,
+            .clock = "SDL_GetTicksNS monotonic nanoseconds",
+            .clock_mapping = mapping,
+            .begin_ns = metrics.begin_ns,
+            .end_ns = metrics.end_ns,
+            .capacity = metrics.storage.len,
+            .attempts = metrics.attempts,
+            .failures = metrics.failures,
+            .dropped = metrics.dropped,
+            .frames = metrics.samples(),
+            .snapshot = app.snapshot,
+            .renderer = std.mem.span(c.SDL_GetRendererName(app.renderer)),
+            .video = std.mem.span(c.SDL_GetCurrentVideoDriver()),
+            .hardware_acceleration = "not established by renderer name",
+            .text_stats = if (stats_ok) @as(?c.SpicaTextStats, stats) else null,
+            .text_stats_scope = "final ledger only; excludes external metadata and driver memory; no eviction or miss counters",
+            .run_error = if (run_result) |_| @as(?[]const u8, null) else |err| @errorName(err),
+        });
+    }
+    run_result catch |err| {
         std.log.err("Native foundation stopped: {s}; SDL: {s}", .{ @errorName(err), c.SDL_GetError() });
         return err;
     };

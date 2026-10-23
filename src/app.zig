@@ -4,6 +4,8 @@ const c = @import("native/bindings.zig").c;
 const Layout = @import("ui/clay.zig").Layout;
 const Foundation = @import("ui/foundation.zig").View;
 const build_options = @import("build_options");
+const telemetry = @import("native/metrics.zig");
+const automation = @import("native/automation.zig");
 
 /// Native window lifecycle only. Future workspace state and agent execution
 /// belong behind their own APIs; this starter owns no process or data store.
@@ -17,6 +19,8 @@ pub const App = struct {
     dirty: bool = true,
     minimized: bool = false,
     frames: u64 = 0,
+    metrics: ?telemetry.Metrics = null,
+    snapshot: automation.Snapshot = .{},
 
     pub fn init(allocator: std.mem.Allocator) !App {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SDLInitialization;
@@ -56,8 +60,16 @@ pub const App = struct {
 
     pub fn run(self: *App, quit_after_ms: ?u32) !void {
         const deadline: ?u64 = if (quit_after_ms) |ms| c.SDL_GetTicks() + ms else null;
+        if (self.metrics) |*metrics| metrics.begin_ns = c.SDL_GetTicksNS();
+        defer {
+            if (self.metrics) |*metrics| metrics.end_ns = c.SDL_GetTicksNS();
+            self.snapshot.running = false;
+        }
         while (self.running) {
-            if (deadline) |due| if (c.SDL_GetTicks() >= due) break;
+            if (deadline) |due| if (c.SDL_GetTicks() >= due) {
+                self.snapshot.close_reason = "deadline";
+                break;
+            };
             if (self.dirty and !self.minimized) {
                 try self.paint();
                 self.dirty = false;
@@ -65,7 +77,10 @@ pub const App = struct {
             var event: c.SDL_Event = undefined;
             if (deadline) |due| {
                 const now = c.SDL_GetTicks();
-                if (now >= due) break;
+                if (now >= due) {
+                    self.snapshot.close_reason = "deadline";
+                    break;
+                }
                 const timeout: c_int = @intCast(@min(due - now, std.math.maxInt(c_int)));
                 _ = c.SDL_ClearError();
                 if (!c.SDL_WaitEventTimeout(&event, timeout)) {
@@ -80,12 +95,22 @@ pub const App = struct {
     }
 
     fn handle(self: *App, event: c.SDL_Event) void {
+        self.snapshot.event_sequence += 1;
         switch (event.type) {
-            c.SDL_EVENT_QUIT, c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => self.running = false,
-            c.SDL_EVENT_KEY_DOWN => if (event.key.key == c.SDLK_ESCAPE) {
+            c.SDL_EVENT_QUIT, c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
+                self.snapshot.close_reason = "window_close";
                 self.running = false;
             },
-            c.SDL_EVENT_WINDOW_EXPOSED, c.SDL_EVENT_WINDOW_RESIZED, c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, c.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED, c.SDL_EVENT_RENDER_TARGETS_RESET, c.SDL_EVENT_RENDER_DEVICE_RESET => self.dirty = true,
+            c.SDL_EVENT_KEY_DOWN => if (event.key.key == c.SDLK_ESCAPE) {
+                self.snapshot.close_reason = "escape";
+                self.running = false;
+            },
+            c.SDL_EVENT_WINDOW_RESIZED, c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, c.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED => {
+                self.snapshot.resize_events += 1;
+                self.snapshot.generation += 1;
+                self.dirty = true;
+            },
+            c.SDL_EVENT_WINDOW_EXPOSED, c.SDL_EVENT_RENDER_TARGETS_RESET, c.SDL_EVENT_RENDER_DEVICE_RESET => self.dirty = true,
             c.SDL_EVENT_WINDOW_MINIMIZED => self.minimized = true,
             c.SDL_EVENT_WINDOW_RESTORED, c.SDL_EVENT_WINDOW_SHOWN => {
                 self.minimized = false;
@@ -96,12 +121,17 @@ pub const App = struct {
     }
 
     fn paint(self: *App) !void {
+        const paint_begin = if (self.metrics != null) c.SDL_GetTicksNS() else 0;
         var width: c_int = 0;
         var height: c_int = 0;
         var pixel_width: c_int = 0;
         var pixel_height: c_int = 0;
         if (!c.SDL_GetWindowSize(self.window, &width, &height) or !c.SDL_GetRenderOutputSize(self.renderer, &pixel_width, &pixel_height)) return error.WindowSize;
         if (width <= 0 or height <= 0 or pixel_width <= 0 or pixel_height <= 0) return;
+        self.snapshot.logical_width = width;
+        self.snapshot.logical_height = height;
+        self.snapshot.output_width = pixel_width;
+        self.snapshot.output_height = pixel_height;
         const w: f32 = @floatFromInt(width);
         const h: f32 = @floatFromInt(height);
         const scale_x = @as(f32, @floatFromInt(pixel_width)) / w;
@@ -109,7 +139,19 @@ pub const App = struct {
         if (!c.SDL_SetRenderScale(self.renderer, scale_x, scale_y) or !c.spica_text_set_render_scale(self.text, scale_x, scale_y)) return error.RenderScale;
         self.layout.resize(w, h);
         try self.view.draw(self.renderer, self.text, self.layout.foundation(w));
-        if (!c.SDL_RenderPresent(self.renderer)) return error.RenderPresent;
+        const present_begin = if (self.metrics != null) c.SDL_GetTicksNS() else 0;
+        const succeeded = c.SDL_RenderPresent(self.renderer);
+        const present_end = if (self.metrics != null) c.SDL_GetTicksNS() else 0;
+        if (self.metrics) |*metrics| metrics.record(.{
+            .frame_id = self.frames + 1,
+            .event_sequence = self.snapshot.event_sequence,
+            .paint_begin_ns = paint_begin,
+            .present_begin_ns = present_begin,
+            .present_end_ns = present_end,
+            .succeeded = succeeded,
+        });
+        if (!succeeded) return error.RenderPresent;
         self.frames += 1;
+        self.snapshot.frame_id = self.frames;
     }
 };

@@ -1,0 +1,11 @@
+# 003-native — review candidate
+
+NativeHarness003; status: review, not acceptance. Private `task/003-native`, base `d2e4e9250c9c9dd7cfde8ce2d68c8d5c9040f28b`. Checkpoint SHA is supplied with the handoff (this receipt is part of that commit). No parent checkout mutation.
+
+Changed entrypoints: App ordinary event/paint path, options/main exports, native automation/metrics, sole eval-starter runner, process-tree sampler, build-discovered synthetic tests and EVALUATION schema/commands. Event-driven idle remains; only real window/Escape semantics are exported. Preallocated frame attempts separate CPU work/present/return timing and count failures/drops. PID+starttime tree records retain incomplete reads and child boundary uncertainty.
+
+Checks: eight Python synthetic tests passed; standalone metrics test passed; two options tests passed; ReleaseSafe build passed after one const-slice compile repair. `./tools/eval-starter --output .artifacts/native-harness003/smoke` passed actual private window/capture/real Escape/export/cleanup. Both screenshots inspected: clean foundation card/footer, Latin/Greek/Arabic sample visible, no apparent overlap/clipping. Two successful frame samples, zero drops/failures, actual 1100×740 logical/output, SDL opengl/wayland; no hardware acceleration claim. Final cache ledger within existing bounds.
+
+Evidence: `.artifacts/native-harness003/` session-header.json, check-initial.log (preserved failure), build-repair1.log, sampler-tests.log, smoke.log and smoke/{manifest.json,native.json,automation.json,samples.json,actions.json,before.png,after.png,app.log,compositor.log}. Smoke source `6b7bed6d23211dcdc1607f3a8efe7b30f1a71ea63a1b7f138bd07b764a2cecd4`; binary `cd32f3b24d0b14987652e9a4c18ce3efa96e1e30c7ba39eddd26169105af8675`.
+
+Limitations: larger repeated resource/frame evaluation is Native003's frozen-candidate handoff, not performed here. Final-only cache ledger cannot validate every idle tail. No physical latency, domain/provider UI, absolute memory ceiling or production acceptance claimed. Actual header verifies gpt-6.1-sol, no fallback, medium; assigned default tier, usage unavailable. One substantive compile repair; aggregate import/full integration belongs to Infra002.

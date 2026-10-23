@@ -1,107 +1,241 @@
 #!/usr/bin/env python3
-"""Capture the built foundation on a private desktop and exercise Escape."""
-
+"""Finite private-desktop native smoke or phase-based resource/frame evaluation."""
 import argparse
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
 import subprocess
 import time
+import measure_process as measure
 
 ROOT = Path(__file__).resolve().parents[1]
+COMMANDS = []
 
 
-def run(*args):
-    return subprocess.check_output(args, cwd=ROOT, text=True, timeout=30).strip()
+def run(*args, timeout=30):
+    begin = time.monotonic()
+    result = subprocess.run(args, cwd=ROOT, text=True, capture_output=True, timeout=timeout)
+    COMMANDS.append(dict(argv=args, begin=begin, end=time.monotonic(), exit=result.returncode,
+                         stdout=result.stdout, stderr=result.stderr))
+    result.check_returncode()
+    return result.stdout.strip()
 
 
 def wait_windows(session, present):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        windows = run("vd", "windows", session)
+        windows = run('vd', 'windows', session)
         if bool(windows) == present:
             return windows
         time.sleep(0.1)
-    raise RuntimeError("Timed out waiting for the starter window state")
+    raise RuntimeError('Timed out waiting for starter window state')
 
 
 def source_fingerprint():
     digest = hashlib.sha256()
-    names = run("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
-    for name in sorted(set(names.split("\0")) - {""}):
-        if not (name.startswith(("src/", "assets/", "build/"))
-                or name in {"build.zig", "build.zig.zon", "deps.lock.json"}):
+    names = run('git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z')
+    for name in sorted(set(names.split('\0')) - {''}):
+        if not (name.startswith(('src/', 'assets/', 'build/', 'tools/'))
+                or name in {'build.zig', 'build.zig.zon', 'deps.lock.json'}):
             continue
         path = ROOT / name
-        digest.update(name.encode() + b"\0")
-        digest.update(path.read_bytes() if path.is_file() else b"<deleted>")
-        digest.update(b"\0")
+        digest.update(name.encode() + b'\0')
+        digest.update(path.read_bytes() if path.is_file() else b'<deleted>')
+        digest.update(b'\0')
     return digest.hexdigest()
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def frame_summary(native, phase):
+    mapping = native['clock_mapping']
+    if not mapping or mapping['host_monotonic_ns'] is None:
+        return dict(error='No host/native clock mapping; phase correlation unavailable')
+    offset = mapping['host_monotonic_ns'] - (mapping['native_before_ns'] + mapping['native_after_ns']) / 2
+    frames = [f for f in native['frames'] if f['succeeded'] and
+              phase['begin'] * 1e9 <= f['present_end_ns'] + offset < phase['end'] * 1e9]
+    work = [f['present_begin_ns'] - f['paint_begin_ns'] for f in frames]
+    present = [f['present_end_ns'] - f['present_begin_ns'] for f in frames]
+    total = [f['present_end_ns'] - f['paint_begin_ns'] for f in frames]
+    intervals = [b['present_end_ns'] - a['present_end_ns'] for a, b in zip(frames, frames[1:])]
+    return dict(successful_samples=len(frames), achieved_fps=len(frames) / (phase['end'] - phase['begin']),
+                frame_work_ns=measure.distribution(work), present_call_ns=measure.distribution(present),
+                total_paint_ns=measure.distribution(total), successful_return_interval_ns=measure.distribution(intervals),
+                long_work={str(t): sum(v > t for v in work) for t in (16667000, 33333000, 50000000)},
+                long_total={str(t): sum(v > t for v in total) for t in (16667000, 33333000, 50000000)},
+                return_intervals_over_150ms=sum(v > 150000000 for v in intervals),
+                full_cohort=native['dropped'] == 0, low_sample_tail_warning=len(frames) < 100,
+                clock_mapping_uncertainty_ns=mapping['native_after_ns'] - mapping['native_before_ns'])
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=ROOT / ".artifacts" / "starter")
+    parser.add_argument('--output', type=Path, default=ROOT / '.artifacts/starter')
+    parser.add_argument('--mode', choices=('smoke', 'measure'), default='smoke')
+    parser.add_argument('--binary', type=Path, help='Explicit frozen binary; requires --binary-sha256 and --source-sha256')
+    parser.add_argument('--binary-sha256')
+    parser.add_argument('--source-sha256')
+    parser.add_argument('--optimize', choices=('Debug', 'ReleaseSafe'), default='ReleaseSafe')
+    parser.add_argument('--warmup', type=float, default=10)
+    parser.add_argument('--phase-seconds', type=float, default=15)
+    parser.add_argument('--cycles', type=int, default=3)
+    parser.add_argument('--interval', type=float, default=.25)
+    parser.add_argument('--disable-metrics', action='store_true', help='Same binary opt-in overhead comparison; frame metrics unavailable')
     args = parser.parse_args()
+    if not all(math.isfinite(v) and v > 0 for v in (args.warmup, args.phase_seconds, args.interval)) or not 1 <= args.cycles <= 100:
+        parser.error('finite positive durations and cycles 1..100 required')
+    if args.binary and not (args.binary_sha256 and args.source_sha256):
+        parser.error('frozen binary requires both fingerprints')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    binary = ROOT / "zig-out/bin/spica"
+    # An old export must never satisfy this run's assertions.
+    for name in ('automation.json', 'native.json'):
+        if (output / name).exists():
+            parser.error('output already contains native exports; choose a fresh output directory')
     source = source_fingerprint()
-    with (output / "build.log").open("w") as log:
-        subprocess.run(["python3", "build/driver.py"], cwd=ROOT, stdout=log,
-                       stderr=subprocess.STDOUT, check=True, timeout=180)
+    binary = args.binary.resolve() if args.binary else ROOT / 'zig-out/bin/spica'
+    if args.binary:
+        if sha(binary) != args.binary_sha256 or source != args.source_sha256:
+            raise RuntimeError('Frozen binary/source fingerprint mismatch')
+    else:
+        with (output / 'build.log').open('w') as log:
+            subprocess.run(['python3', 'build/driver.py', '-Doptimize=' + args.optimize], cwd=ROOT,
+                           stdout=log, stderr=subprocess.STDOUT, check=True, timeout=300)
     if source != source_fingerprint():
-        raise RuntimeError("Source changed during the build; stop competing writers and retry")
-    if "native workspace foundation" not in run(str(binary), "--help"):
-        raise RuntimeError("Build the new starter first: python3 build/driver.py")
-    manifest = {
-        "revision": run("git", "rev-parse", "HEAD"),
-        "status": run("git", "status", "--porcelain"),
-        "source_sha256": source,
-        "source_scope": "Git-visible src/, assets/, build/, build.zig, build.zig.zon and deps.lock.json",
-        "build_command": "python3 build/driver.py (default Debug)",
-        "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-        "zig": run("zig", "version"),
-        "resolution": [1280, 800],
-        "scenario": "native foundation rendering and real Escape input",
-        "limitations": "Functional screenshot; no frame timing, provider, SDK or physical latency evidence.",
-        "passed": False,
-    }
-    session = None
+        raise RuntimeError('Source changed during build')
+    manifest = dict(version=2, revision=run('git', 'rev-parse', 'HEAD'), status=run('git', 'status', '--porcelain'),
+                    source_sha256=source, binary_sha256=sha(binary), binary=str(binary),
+                    build_mode=args.optimize if not args.binary else 'externally frozen; see supplied binary provenance',
+                    build_command=None if args.binary else ['python3', 'build/driver.py', '-Doptimize=' + args.optimize],
+                    zig=run('zig', 'version'), scenario=args.mode, commands=COMMANDS, passed=False,
+                    input_origin='real private vd Escape and compositor resize, not SDL event injection',
+                    limitations=['Software timing, not physical latency or scanout.', 'Paced 10Hz resize is demand, not maximum render capacity.',
+                                 'GPU hardware not established by SDL renderer name.', 'Low-N p99 is weak; dropped telemetry is not a complete cohort.',
+                                 'Text ledger is final-only; repeated idle-tail cache ledger validation is not available.'])
+    session, samples, phases, actions = None, [], [], []
     try:
-        (output / "app.log").write_text("")
-        session = run("vd", "start", "--width", "1280", "--height", "800")
-        manifest["session"] = session
-        manifest["launch"] = run("vd", "run", session, "--bg", "--log", str(output / "app.log"),
-                                 "--", str(binary), "--quit-after-ms", "30000")
+        session = run('vd', 'start', '--width', '1280', '--height', '800')
+        record = json.loads((Path(session) / 'session.json').read_text())
+        manifest['private_desktop'] = record
+        duration = args.warmup + args.phase_seconds * (1 + 2 * args.cycles)
+        argv = [str(binary), '--quit-after-ms', str(math.ceil((duration + 60) * 1000)),
+                '--automation-output', str(output / 'automation.json')]
+        if not args.disable_metrics:
+            argv += ['--metrics-output', str(output / 'native.json')]
+        launch = json.loads(run('vd', 'run', session, '--bg', '--log', str(output / 'app.log'), '--', *argv))
+        manifest['launch'] = launch
+        root_identity = measure.identity(measure.stat(Path('/proc') / str(launch['pid']) / 'stat'))
+        manifest['root_identity'] = root_identity
         windows = wait_windows(session, True)
-        (output / "windows.txt").write_text(windows + "\n")
-        if "Spica — Native Foundation" not in windows:
-            raise RuntimeError("The new foundation window did not appear")
+        if 'Spica — Native Foundation' not in windows:
+            raise RuntimeError('Wrong native window')
+        manifest['windows_before'] = windows
         window_id = windows.splitlines()[0].split()[0]
-        run("vd", "shot", session, str(output / "starter.png"))
-        run("vd", "key", session, window_id, "Escape")
+        def ipc(command):
+            result = json.loads(run('swaymsg', '--socket', record['environment']['SWAYSOCK'], '--raw', command))
+            if not all(item.get('success') for item in result):
+                raise RuntimeError(result)
+        ipc(f'[con_id={window_id}] floating enable')
+        ipc(f'[con_id={window_id}] resize set width 1100 px height 740 px')
+        run('vd', 'shot', session, str(output / 'before.png'))
+        if args.mode == 'measure':
+            schedule = [('warmup', args.warmup), ('idle', args.phase_seconds)]
+            for cycle in range(1, args.cycles + 1):
+                schedule += [(f'active_{cycle}', args.phase_seconds), (f'settled_{cycle}', args.phase_seconds)]
+            for name, seconds in schedule:
+                begin = time.monotonic()
+                end, due_sample, due_action, count = begin + seconds, begin, begin, 0
+                while time.monotonic() < end:
+                    now = time.monotonic()
+                    if name.startswith('active') and now >= due_action:
+                        w, h = (1000, 680) if count % 2 == 0 else (1100, 740)
+                        action = dict(phase=name, sequence=count, due=due_action, begin=now, size=[w, h])
+                        ipc(f'[con_id={window_id}] resize set width {w} px height {h} px')
+                        action['end'] = time.monotonic()
+                        actions.append(action)
+                        count += 1
+                        due_action = begin + count * .1
+                    if time.monotonic() >= due_sample:
+                        row = measure.sample(launch['pid'], expected_root=root_identity)
+                        row.update(phase=name, scheduled_monotonic_seconds=due_sample,
+                                   lateness_seconds=max(0, row['monotonic_seconds'] - due_sample))
+                        samples.append(row)
+                        if row['root_exited']:
+                            raise RuntimeError('Native root exited/reused during phase')
+                        due_sample += args.interval
+                        row['missed_intervals'] = max(0, math.floor((time.monotonic() - due_sample) / args.interval))
+                        due_sample += row['missed_intervals'] * args.interval
+                    time.sleep(max(0, min(end, due_sample, due_action if name.startswith('active') else end) - time.monotonic()))
+                phases.append(dict(name=name, begin=begin, end=time.monotonic(), requested_seconds=seconds,
+                                   demanded_resize_hz=10 if name.startswith('active') else 0,
+                                   requested_actions=math.ceil(seconds * 10) if name.startswith('active') else 0, delivered_actions=count))
+        # Captures and export follow all resource phase boundaries.
+        run('vd', 'shot', session, str(output / 'after.png'))
+        run('vd', 'key', session, window_id, 'Escape')
         wait_windows(session, False)
-        if source != source_fingerprint() or manifest["binary_sha256"] != hashlib.sha256(binary.read_bytes()).hexdigest():
-            raise RuntimeError("Source or binary changed during capture; evidence candidate is not stable")
-        manifest["passed"] = True
-        manifest["screenshot"] = str(output / "starter.png")
-    except Exception as error:
-        manifest["error"] = str(error)
+        deadline = time.monotonic() + 10
+        while not (output / 'automation.json').exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Missing native export')
+            time.sleep(.05)
+        snapshot = json.loads((output / 'automation.json').read_text())
+        if snapshot['close_reason'] != 'escape' or snapshot['running']:
+            raise RuntimeError('Real Escape not observed through native dispatch')
+        manifest['snapshot'] = snapshot
+        if not args.disable_metrics:
+            # Both exports are written before process exit, but separately.
+            while True:
+                try:
+                    native = json.loads((output / 'native.json').read_text())
+                    break
+                except (FileNotFoundError, json.JSONDecodeError):
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(.05)
+            if native['failures'] or native['run_error'] or native['attempts'] != len(native['frames']) + native['dropped']:
+                raise RuntimeError('Native failure or sample accounting mismatch')
+            if any(not f['paint_begin_ns'] <= f['present_begin_ns'] <= f['present_end_ns'] for f in native['frames']):
+                raise RuntimeError('Nonmonotonic frame timestamps')
+            manifest['frame_phases'] = [dict(phase=p['name'], **frame_summary(native, p)) for p in phases]
+            manifest['renderer'] = native['renderer']
+            manifest['video'] = native['video']
+            manifest['text_stats'] = native['text_stats']
+            stats = native['text_stats']
+            manifest['final_cache_bounds'] = None if stats is None else (stats['glyph_count'] <= 512 and stats['glyph_bytes'] <= 2097152 and stats['layout_bytes'] <= 2097152 and stats['font_bytes'] <= 4194304 and stats['face_count'] <= 12)
+        manifest['resource_phases'] = [dict(phase=p['name'], **measure.summarize([s for s in samples if s['phase'] == p['name']])) for p in phases]
+        tails = []
+        for phase in phases:
+            if phase['name'].startswith('settled'):
+                rows = [s for s in samples if s['phase'] == phase['name'] and s['monotonic_seconds'] >= phase['end'] - 5]
+                tails.append(dict(phase=phase['name'], **measure.summarize(rows)))
+        manifest['settled_tails'] = tails
+        manifest['settled_growth'] = {key: (tails[-1][key]['p50'] - tails[0][key]['p50']) if tails and tails[-1][key]['p50'] is not None and tails[0][key]['p50'] is not None else None for key in ('rss_bytes', 'pss_bytes')}
+        if source != source_fingerprint() or manifest['binary_sha256'] != sha(binary):
+            raise RuntimeError('Source/binary drift during evaluation')
+        manifest['passed'] = True  # lifecycle/instrumentation only; not performance acceptance
+    except BaseException as error:
+        manifest['error'] = repr(error)
         raise
     finally:
         try:
             if session:
                 try:
-                    manifest["cleanup"] = run("vd", "clean", session)
+                    manifest['cleanup'] = run('vd', 'clean', session)
+                    (output / 'compositor.log').write_text((Path(session) / 'compositor.log').read_text())
                 except Exception as error:
-                    manifest["passed"] = False
-                    manifest["cleanup_error"] = str(error)
+                    manifest.update(passed=False, cleanup_error=repr(error))
                     raise
         finally:
-            (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(output / "manifest.json")
+            manifest['phases'] = phases
+            (output / 'samples.json').write_text(json.dumps(samples, indent=2) + '\n')
+            (output / 'actions.json').write_text(json.dumps(actions, indent=2) + '\n')
+            (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    print(output / 'manifest.json')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
