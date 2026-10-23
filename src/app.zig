@@ -175,6 +175,17 @@ pub const App = struct {
         self.snapshot.draft_revision = self.view.revision;
         const editor_bounds = self.view.editor_view.bounds;
         self.snapshot.targets[1].pointer_bounds = .{ @intFromFloat(editor_bounds.x), @intFromFloat(editor_bounds.y), @intFromFloat(editor_bounds.w), @intFromFloat(editor_bounds.h) };
+        self.snapshot.connected = self.view.connected;
+        self.snapshot.run_status = self.view.status;
+        self.snapshot.visible_rich_blocks = self.view.rich_count;
+        for (self.view.controls, 0..) |bounds, index| {
+            self.snapshot.targets[index + 2].pointer_bounds = .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) };
+            self.snapshot.targets[index + 2].enabled = switch (index) {
+                0 => self.view.can_send,
+                1 => self.view.can_cancel,
+                else => self.view.can_approve,
+            };
+        }
         const present_begin = if (self.metrics != null) c.SDL_GetTicksNS() else 0;
         const succeeded = c.SDL_RenderPresent(self.renderer);
         const present_end = if (self.metrics != null) c.SDL_GetTicksNS() else 0;

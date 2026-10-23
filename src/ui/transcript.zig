@@ -247,6 +247,148 @@ pub const Transcript = struct {
     }
 };
 
+const native = @import("../native/bindings.zig").c;
+const presentation = @import("../content/presentation.zig");
+const widgets = @import("widgets.zig");
+
+/// One retained visible semantic block. Its immutable native geometry and
+/// rendered-byte selection are never confused with canonical source offsets.
+/// The root keeps only its finite visible neighborhood, releasing on eviction.
+pub const RichTile = struct {
+    key: ?presentation.Key = null,
+    block_index: u32 = 0,
+    layout: ?*native.SpicaTextLayout = null,
+    width: f32 = 0,
+    length: usize = 0,
+    rendered: [presentation.tile_bytes]u8 = undefined,
+    code: bool = false,
+    bounds: native.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    anchor: usize = 0,
+    caret: usize = 0,
+    selected: bool = false,
+    colors: [presentation.tile_runs]native.SpicaTextColorSpan = undefined,
+    color_count: usize = 0,
+
+    pub fn deinit(self: *RichTile) void {
+        if (self.layout) |layout| native.spica_text_layout_release(layout);
+        self.* = .{};
+    }
+
+    /// Transactional reflow: preserve the last valid geometry on rejection.
+    pub fn update(self: *RichTile, text: *native.SpicaText, tile: *const presentation.Tile, width: f32) !void {
+        if (tile.state != .rich) return error.DisplayBudget;
+        if (width <= 24 or !std.math.isFinite(width)) return error.InvalidWidth;
+        if (self.key) |key| {
+            if (std.meta.eql(key, tile.key) and self.block_index == tile.block.index and self.width == width) return;
+        }
+        var spans: [presentation.tile_runs]native.SpicaTextSpan = undefined;
+        var colors: [presentation.tile_runs]native.SpicaTextColorSpan = undefined;
+        var count: usize = 0;
+        var end: usize = 0;
+        for (tile.spans[0..tile.span_count]) |span| {
+            if (span.start < end or span.start >= span.end or span.end > tile.len) return error.InvalidSpans;
+            end = span.end;
+            const style: c_uint = (if (span.flags & 1 != 0) @as(c_uint, native.SPICA_TEXT_ITALIC) else 0) |
+                (if (span.flags & 2 != 0) @as(c_uint, native.SPICA_TEXT_BOLD) else 0) |
+                (if (span.kind == .code) @as(c_uint, native.SPICA_TEXT_MONOSPACE) else 0);
+            spans[count] = .{ .byte_start = span.start, .byte_end = span.end, .style = style };
+            colors[count] = .{ .byte_start = span.start, .byte_end = span.end, .rgba = if (span.kind == .code) 0xAAD9C0FF else 0xE7EBF2FF };
+            count += 1;
+        }
+        const code = tile.block.kind == .code;
+        const size: c_uint = if (tile.block.kind == .heading) switch (tile.block.heading) {
+            1 => 24,
+            2 => 21,
+            else => 18,
+        } else 16;
+        const layout = native.spica_text_layout_create_spans(text, tile.text[0..tile.len].ptr, tile.len, width - 24, size, code, &spans, count) orelse return error.TranscriptLayout;
+        self.deinit();
+        self.key = tile.key;
+        self.block_index = tile.block.index;
+        self.layout = layout;
+        self.width = width;
+        self.length = tile.len;
+        @memcpy(self.rendered[0..tile.len], tile.bytes());
+        self.code = code;
+        @memcpy(self.colors[0..count], colors[0..count]);
+        self.color_count = count;
+    }
+
+    pub fn height(self: *const RichTile) f32 {
+        return if (self.layout) |layout| native.spica_text_layout_height(layout) + 20 else 0;
+    }
+
+    pub fn selectedBytes(self: *const RichTile) []const u8 {
+        if (!self.selected) return "";
+        return self.rendered[@min(self.anchor, self.caret)..@max(self.anchor, self.caret)];
+    }
+
+    pub fn hit(self: *RichTile, x: f32, y: f32, extend: bool) bool {
+        if (!widgets.contains(self.bounds, x, y)) return false;
+        const layout = self.layout orelse return false;
+        self.caret = native.spica_text_layout_hit_test(layout, x - self.bounds.x - 12, y - self.bounds.y - 10);
+        if (!extend) self.anchor = self.caret;
+        self.selected = true;
+        return true;
+    }
+
+    pub fn draw(self: *RichTile, renderer: *native.SDL_Renderer, text: *native.SpicaText, x: f32, y: f32) !void {
+        const layout = self.layout orelse return;
+        self.bounds = .{ .x = x, .y = y, .w = self.width, .h = self.height() };
+        if (self.code) try widgets.panel(renderer, self.bounds, 6, .{ .r = 27, .g = 32, .b = 41 });
+        if (self.selected) {
+            var rects: [128]native.SDL_FRect = undefined;
+            const count = native.spica_text_layout_selection_rects(layout, @min(self.anchor, self.caret), @max(self.anchor, self.caret), &rects, rects.len);
+            if (!native.SDL_SetRenderDrawColor(renderer, 64, 84, 125, 255)) return error.SelectionDraw;
+            for (rects[0..@min(count, rects.len)]) |rect| {
+                const translated = native.SDL_FRect{ .x = x + 12 + rect.x, .y = y + 10 + rect.y, .w = rect.w, .h = rect.h };
+                if (!native.SDL_RenderFillRect(renderer, &translated)) return error.SelectionDraw;
+            }
+        }
+        if (!native.spica_text_layout_draw_colors(text, layout, x + 12, y + 10, .{ .r = 231, .g = 235, .b = 242, .a = 255 }, &self.colors, self.color_count)) return error.TranscriptDraw;
+    }
+};
+
+test "real Markdown tile draws retained native styles and rendered selection" {
+    const build_options = @import("build_options");
+    const surface = native.SDL_CreateSurface(640, 300, native.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer native.SDL_DestroySurface(surface);
+    const renderer = native.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer native.SDL_DestroyRenderer(renderer);
+    const text = native.spica_text_create(renderer, build_options.font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer native.spica_text_destroy(text);
+    try std.testing.expect(native.spica_text_set_monospace(text, build_options.font_directory ++ "/JetBrainsMono-Regular.ttf"));
+    try std.testing.expect(native.spica_text_add_fallback(text, build_options.font_directory ++ "/InterVariable-Italic.ttf", 0));
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const file = try temporary.dir.createFile(std.testing.io, "rich", .{ .read = true });
+    var projector = try presentation.Projector.init(std.testing.allocator, std.testing.io, file);
+    defer projector.deinit();
+    const key = presentation.Key{ .source = @splat(7), .revision = 3, .generation = 1 };
+    _ = try projector.project(key, "**bold** and *italic* and `code`");
+    var tile: presentation.Tile = undefined;
+    try projector.tile(key, 0, &tile);
+    var retained: RichTile = .{};
+    defer retained.deinit();
+    try retained.update(text, &tile, 500);
+    const original_layout = retained.layout;
+    try retained.draw(renderer, text, 20, 30);
+    try retained.update(text, &tile, 500);
+    try std.testing.expectEqual(original_layout, retained.layout);
+    try std.testing.expectEqualStrings("bold and italic and code\n", tile.bytes());
+    try std.testing.expect(retained.hit(35, 45, false));
+    try std.testing.expect(retained.hit(160, 45, true));
+    try std.testing.expect(retained.caret != retained.anchor);
+    try retained.draw(renderer, text, 20, 30);
+    try std.testing.expect(native.SDL_RenderPresent(renderer));
+    try std.testing.expectError(error.InvalidWidth, retained.update(text, &tile, 0));
+    try std.testing.expectEqual(original_layout, retained.layout);
+    retained.deinit();
+    var stats: native.SpicaTextStats = undefined;
+    try std.testing.expect(native.spica_text_get_stats(text, &stats));
+    try std.testing.expectEqual(@as(c_uint, 0), stats.live_layouts);
+}
+
 /// Deep-copy domain values into a fixed page arena. No JSON round trip or hidden
 /// borrowed IDs. Only scalar/optional/array/slice/struct/tagged-union values occur.
 fn copyValue(comptime T: type, allocator: std.mem.Allocator, value: T) std.mem.Allocator.Error!T {

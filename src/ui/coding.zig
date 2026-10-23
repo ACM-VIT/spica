@@ -7,6 +7,10 @@ const widgets = @import("widgets.zig");
 const clipboard = @import("clipboard.zig");
 const Layout = @import("clay.zig").Layout;
 const Color = @import("color.zig").Color;
+const transcript = @import("transcript.zig");
+const presentation = @import("../content/presentation.zig");
+
+pub const Intent = enum { send, cancel, allow, deny };
 
 /// Presentation state only. No adapter, store, execution lifetime or accepted work.
 pub const View = struct {
@@ -26,6 +30,20 @@ pub const View = struct {
     preedit_width: f32 = 0,
     notice: ?[]const u8 = null,
     revision: u64 = 0,
+    status: []const u8 = "Conversation not connected",
+    connected: bool = false,
+    can_send: bool = false,
+    can_cancel: bool = false,
+    can_approve: bool = false,
+    intent: ?Intent = null,
+    controls: [4]c.SDL_FRect = @splat(.{ .x = 0, .y = 0, .w = 0, .h = 0 }),
+    rich_tiles: [8]transcript.RichTile = @splat(.{}),
+    rich_count: usize = 0,
+    rich_next: usize = 0,
+    transcript_bounds: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    transcript_scroll: f32 = 0,
+    follow_latest: bool = true,
+    transcript_drag: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator) !View {
         var editor = try Composer.init(allocator);
@@ -34,6 +52,7 @@ pub const View = struct {
     }
 
     pub fn deinit(self: *View) void {
+        for (&self.rich_tiles) |*tile| tile.deinit();
         if (self.preedit_layout) |layout| c.spica_text_layout_release(layout);
         self.editor_view.deinit();
         self.labels.deinit();
@@ -65,7 +84,38 @@ pub const View = struct {
 
     fn releasePointer(self: *View) void {
         self.dragging = false;
+        self.transcript_drag = null;
         _ = c.SDL_CaptureMouse(false);
+    }
+
+    pub fn takeIntent(self: *View) ?Intent {
+        const value = self.intent;
+        self.intent = null;
+        return value;
+    }
+
+    fn request(self: *View, intent: Intent) void {
+        const enabled = switch (intent) {
+            .send => self.can_send and self.editor.len != 0,
+            .cancel => self.can_cancel,
+            .allow, .deny => self.can_approve,
+        };
+        if (enabled) self.intent = intent else self.notice = "Action unavailable in the current durable state";
+    }
+
+    /// Worker completions carry explicit source/revision/generation identity.
+    /// Caller discards stale generations before admission into this root.
+    pub fn admitTile(self: *View, text: *c.SpicaText, tile: *const presentation.Tile, width: f32) !void {
+        for (self.rich_tiles[0..self.rich_count]) |*slot| {
+            if (slot.key) |key| if (std.meta.eql(key, tile.key) and slot.block_index == tile.block.index) {
+                try slot.update(text, tile, width);
+                return;
+            };
+        }
+        const index = if (self.rich_count < self.rich_tiles.len) self.rich_count else self.rich_next;
+        try self.rich_tiles[index].update(text, tile, width);
+        if (self.rich_count < self.rich_tiles.len) self.rich_count += 1;
+        self.rich_next = (index + 1) % self.rich_tiles.len;
     }
 
     pub fn handle(self: *View, event: c.SDL_Event, window: *c.SDL_Window, text: *c.SpicaText) !bool {
@@ -85,6 +135,21 @@ pub const View = struct {
             },
             c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
                 if (event.button.button != c.SDL_BUTTON_LEFT) return false;
+                for (self.controls, 0..) |bounds, index| {
+                    if (widgets.contains(bounds, event.button.x, event.button.y)) {
+                        self.request(@enumFromInt(index));
+                        return true;
+                    }
+                }
+                if (widgets.contains(self.transcript_bounds, event.button.x, event.button.y)) {
+                    try self.focus(window, false);
+                    for (self.rich_tiles[0..self.rich_count], 0..) |*tile, index| {
+                        tile.selected = false;
+                        if (tile.hit(event.button.x, event.button.y, false)) self.transcript_drag = index;
+                    }
+                    if (self.transcript_drag != null) _ = c.SDL_CaptureMouse(true);
+                    return true;
+                }
                 const inside = widgets.contains(self.editor_view.bounds, event.button.x, event.button.y);
                 try self.focus(window, inside);
                 if (inside) {
@@ -97,17 +162,28 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_MOUSE_BUTTON_UP => {
-                if (event.button.button != c.SDL_BUTTON_LEFT or !self.dragging) return false;
+                if (event.button.button != c.SDL_BUTTON_LEFT or (!self.dragging and self.transcript_drag == null)) return false;
                 self.releasePointer();
                 return true;
             },
             c.SDL_EVENT_MOUSE_MOTION => {
+                if (self.transcript_drag) |index| {
+                    const tile = &self.rich_tiles[index];
+                    _ = tile.hit(std.math.clamp(event.motion.x, tile.bounds.x, tile.bounds.x + tile.bounds.w - 1), std.math.clamp(event.motion.y, tile.bounds.y, tile.bounds.y + tile.bounds.h - 1), true);
+                    return true;
+                }
                 if (!self.dragging) return false;
                 if (self.editor_view.offsetAt(event.motion.x, event.motion.y)) |at| self.editor.setCaret(at, true);
                 self.reveal_caret = true;
                 return true;
             },
             c.SDL_EVENT_MOUSE_WHEEL => {
+                if (widgets.contains(self.transcript_bounds, event.wheel.mouse_x, event.wheel.mouse_y)) {
+                    const direction: f32 = if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) -1 else 1;
+                    self.transcript_scroll = @max(0, self.transcript_scroll - event.wheel.y * direction * 44);
+                    self.follow_latest = false;
+                    return true;
+                }
                 if (!widgets.contains(self.editor_view.bounds, event.wheel.mouse_x, event.wheel.mouse_y)) return false;
                 const direction: f32 = if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) -1 else 1;
                 self.editor_view.scroll = @max(0, self.editor_view.scroll - event.wheel.y * direction * 44);
@@ -140,6 +216,27 @@ pub const View = struct {
                 const mods = event.key.mod;
                 const ctrl = mods & c.SDL_KMOD_CTRL != 0;
                 const shift = mods & c.SDL_KMOD_SHIFT != 0;
+                switch (key) {
+                    c.SDLK_F6 => {
+                        self.request(.cancel);
+                        return true;
+                    },
+                    c.SDLK_F7 => {
+                        self.request(.allow);
+                        return true;
+                    },
+                    c.SDLK_F8 => {
+                        self.request(.deny);
+                        return true;
+                    },
+                    else => {},
+                }
+                if (ctrl and key == c.SDLK_C and !self.focused and self.window_active) {
+                    for (self.rich_tiles[0..self.rich_count]) |*tile| {
+                        if (tile.selected) try clipboard.copyBytes(tile.selectedBytes(), self.scratch);
+                    }
+                    return true;
+                }
                 if (key == c.SDLK_TAB) {
                     try self.focus(window, !self.focused);
                     return true;
@@ -197,7 +294,7 @@ pub const View = struct {
                         self.changed();
                     },
                     c.SDLK_RETURN, c.SDLK_KP_ENTER => {
-                        if (shift) try self.insert("\n", .typing) else self.notice = "No conversation connected; draft retained";
+                        if (shift) try self.insert("\n", .typing) else self.request(.send);
                     },
                     else => {},
                 }
@@ -223,8 +320,24 @@ pub const View = struct {
         const muted = Color{ .r = 157, .g = 168, .b = 186 };
         if (!c.SDL_SetRenderDrawColor(renderer, 19, 22, 28, 255) or !c.SDL_RenderClear(renderer)) return error.CanvasDraw;
         try self.labels.draw(text, "SPICA", 24, 18, 18, foreground);
-        try self.labels.drawFitted(renderer, text, "Conversation not connected", 110, 22, bounds.header.width - 140, 13, muted);
-        try self.labels.draw(text, "Compose a draft below. No provider is running.", bounds.transcript.x, bounds.transcript.y + 20, 16, muted);
+        try self.labels.drawFitted(renderer, text, self.status, 110, 22, bounds.header.width - 140, 13, muted);
+        self.transcript_bounds = .{ .x = bounds.transcript.x, .y = bounds.transcript.y, .w = bounds.transcript.width, .h = bounds.transcript.height };
+        var transcript_clip = widgets.Clip.push(renderer, self.transcript_bounds);
+        var total_height: f32 = 0;
+        for (self.rich_tiles[0..self.rich_count]) |*tile| total_height += tile.height() + 8;
+        const max_scroll = @max(0, total_height - bounds.transcript.height);
+        self.transcript_scroll = if (self.follow_latest) max_scroll else @min(max_scroll, self.transcript_scroll);
+        var tile_y = bounds.transcript.y - self.transcript_scroll;
+        for (0..self.rich_count) |offset| {
+            const index = if (self.rich_count == self.rich_tiles.len) (self.rich_next + offset) % self.rich_tiles.len else offset;
+            const tile = &self.rich_tiles[index];
+            if (tile_y + tile.height() >= bounds.transcript.y and tile_y < bounds.transcript.y + bounds.transcript.height) {
+                try tile.draw(renderer, text, bounds.transcript.x, tile_y);
+            } else tile.bounds = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+            tile_y += tile.height() + 8;
+        }
+        if (self.rich_count == 0) try self.labels.draw(text, if (self.connected) "Send a prompt to begin." else "Compose a draft below. No provider is running.", bounds.transcript.x, bounds.transcript.y + 20, 16, muted);
+        transcript_clip.restore(renderer);
         const panel = c.SDL_FRect{ .x = bounds.composer.x, .y = bounds.composer.y, .w = bounds.composer.width, .h = bounds.composer.height };
         try widgets.panel(renderer, panel, 10, if (self.focused) .{ .r = 103, .g = 129, .b = 210 } else .{ .r = 57, .g = 64, .b = 79 });
         try widgets.panel(renderer, .{ .x = panel.x + 1, .y = panel.y + 1, .w = panel.w - 2, .h = panel.h - 2 }, 9, .{ .r = 27, .g = 32, .b = 41 });
@@ -270,9 +383,41 @@ pub const View = struct {
             }
         }
         clip.restore(renderer);
-        try self.labels.drawFitted(renderer, text, self.notice orelse "Enter send (unavailable)  /  Shift+Enter newline  /  Ctrl+Q close", panel.x + 12, panel.y + panel.h - 28, panel.w - 24, 12, muted);
+        const names = [_][]const u8{ "Send", "Cancel F6", "Allow F7", "Deny F8" };
+        for (&self.controls, 0..) |*control, index| {
+            control.* = .{ .x = panel.x + 12 + @as(f32, @floatFromInt(index)) * 112, .y = panel.y + panel.h - 34, .w = 104, .h = 26 };
+            const enabled = switch (@as(Intent, @enumFromInt(index))) {
+                .send => self.can_send,
+                .cancel => self.can_cancel,
+                .allow, .deny => self.can_approve,
+            };
+            try widgets.panel(renderer, control.*, 4, if (enabled) .{ .r = 51, .g = 69, .b = 105 } else .{ .r = 35, .g = 40, .b = 49 });
+            try self.labels.draw(text, names[index], control.x + 8, control.y + 5, 12, if (enabled) foreground else muted);
+        }
+        if (self.notice) |notice| try self.labels.drawFitted(renderer, text, notice, bounds.transcript.x, bounds.transcript.y, bounds.transcript.width, 12, muted);
     }
 };
+
+test "root emits only enabled explicit intents and preserves draft until receipt" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.insert("retained prompt", .typing);
+    view.request(.send);
+    try std.testing.expect(view.takeIntent() == null);
+    view.can_send = true;
+    view.request(.send);
+    try std.testing.expectEqual(Intent.send, view.takeIntent().?);
+    try std.testing.expect(view.takeIntent() == null);
+    try std.testing.expectEqualStrings("retained prompt", view.editor.textBytes());
+    view.request(.allow);
+    try std.testing.expect(view.takeIntent() == null);
+    view.can_approve = true;
+    view.request(.deny);
+    try std.testing.expectEqual(Intent.deny, view.takeIntent().?);
+    view.can_cancel = true;
+    view.request(.cancel);
+    try std.testing.expectEqual(Intent.cancel, view.takeIntent().?);
+}
 
 test "presentation edits retain exact Unicode and rejected insertion state" {
     var view = try View.init(std.testing.allocator);

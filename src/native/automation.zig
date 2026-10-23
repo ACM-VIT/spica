@@ -22,13 +22,17 @@ pub const Snapshot = struct {
     draft_revision: u64 = 0,
     admission_errors: u64 = 0,
     last_admission_error: ?[]const u8 = null,
-    targets: [2]Target = .{ .{}, .{ .id = "composer.input", .role = "textbox", .key = "Tab" } },
+    connected: bool = false,
+    run_status: []const u8 = "not_connected",
+    visible_rich_blocks: usize = 0,
+    targets: [6]Target = .{ .{}, .{ .id = "composer.input", .role = "textbox", .key = "Tab" }, .{ .id = "command.send", .role = "button", .key = "Enter" }, .{ .id = "run.cancel", .role = "button", .key = "F6" }, .{ .id = "approval.allow", .role = "button", .key = "F7" }, .{ .id = "approval.deny", .role = "button", .key = "F8" } },
 };
 
 pub const Target = struct {
     id: []const u8 = "window.close",
     role: []const u8 = "window_lifecycle",
     key: []const u8 = "Ctrl+Q",
+    enabled: bool = true,
     // This is a lifecycle target, not a fabricated clickable title-bar rectangle.
     pointer_bounds: ?[4]i32 = null,
 };
