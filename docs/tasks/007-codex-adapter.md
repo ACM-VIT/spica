@@ -127,3 +127,9 @@ without disabling fortify (`4dabfc3`). The affected ReleaseSafe native build,
 same 124/126 Zig tests, Python tests and CLI smoke then all exited 0. Raw gate
 and repair provenance: `.artifacts/provider-factory/final-check.log`,
 `final-check-failure.json`, `release-check.log`, `release-check.json`.
+
+Final allocation coverage also injects every allocator failure through successful
+owned process spawn and subsequent runtime initialization, rather than stopping
+at missing-executable failure. Both concrete factories clean partial transport/
+runtime allocations and process ownership. Focused factory consumer: 9/9 passed
+with the leak-aware allocator; no real provider inference in this fixture.

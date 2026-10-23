@@ -90,6 +90,29 @@ test "factory cleans every partial allocation failure for both providers" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, failedCreation, .{});
 }
 
+fn spawnedCreation(a: std.mem.Allocator, executable: [:0]const u8) !void {
+    for ([_][]const u8{ "codex", "opencode" }) |kind| {
+        var chosen = selection;
+        chosen.runtime_kind = kind;
+        chosen.required_runtime_version = if (std.mem.eql(u8, kind, "codex")) "0.163.0" else "2.1.4";
+        var config: native.NativeFactory = .{ .configs = &.{.{ .selection = chosen, .executable = executable, .environment = &.{} }} };
+        const factory = config.asFactory();
+        const adapter = try factory.create(a, chosen, "/tmp", .{ .value = "post-spawn-allocation" }, .{ .url = "http://127.0.0.1/mcp/session", .token = "isolated-fixture" });
+        defer factory.destroy(a, adapter);
+        defer adapter.shutdown();
+    }
+}
+
+test "factory cleans allocation failure after successful owned process spawn" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    const path = try std.Io.Dir.cwd().realPathFileAlloc(threaded.io(), fixture, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const executable = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(executable);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, spawnedCreation, .{executable});
+}
+
 test "mixed factory authorizes runtime account provider and retains explicit child model effort" {
     var secondary = selection;
     secondary.runtime_kind = "opencode";
