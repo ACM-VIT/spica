@@ -6,10 +6,10 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | 007/008/012 milestone | Main / RuntimeFactoryLead (slot2; sole shared Git/integration owner) | implementation review | `rewrite/native-agent-workspace` / shared checkout | `5b6cfb3` | Authenticated Codex inference/mixed delegation requires Codex authentication; not a blocker for independent work | `5b6cfb3` (current integrated milestone) |
 | 012 producer | RuntimeFactoryLead / completed private producer | source already integrated | `task/012-orchestration` / `.artifacts/worktrees/012-orchestration` | `58fe1a1` | none for landed source | source integrated through `5b6cfb3` |
-| lead workflow policy | RuntimeFactoryLead / RuntimeFactoryLead.LeadWorkflowPolicy (slot1) | review; frozen private policy candidate | `task/lead-workflow-policy` / `.artifacts/worktrees/lead-workflow-policy` | base `5b6cfb3`; actual checkpoint in worker receipt | none | pending lead review/no-ff merge |
-| 010 bounded history | RuntimeFactoryLead / RuntimeFactoryLead.BoundedHistory010 (slot3) | running | `task/010-bounded-history` / `.artifacts/worktrees/010-bounded-history` | initial `5b6cfb3` | none; ownership-foundations 4–6 eligible without Codex auth | pending |
+| lead workflow policy | RuntimeFactoryLead / completed LeadWorkflowPolicy | reviewed, no-ff integrated | `task/lead-workflow-policy` / `.artifacts/worktrees/lead-workflow-policy` | `3371025` | none; offline policy/launcher checks passed | `7a73d9d` |
+| 010 bounded history | RuntimeFactoryLead / RuntimeFactoryLead.BoundedHistory010 (slot3) | running | `task/010-bounded-history` / `.artifacts/worktrees/010-bounded-history` | `5b6cfb3` (recorded base/current committed HEAD) | original retained 523183-byte fixture not yet located; implementation independent of Codex auth | not integrated |
 
-Snapshot at dispatch from committed `5b6cfb3`; checkpoint receipts identify later private heads. The lead updates this table after each reviewed merge; no future SHA is predicted. Historical ownership below is not a current slot reservation or Git/publication grant.
+Dispatch bases are committed `5b6cfb3`; workflow policy was reviewed and merged with `--no-ff` as `7a73d9d`. Actual source review, six-file policy/model/budget assertions and offline `./tools/agents --help` passed; no repeated live nested smoke or code build for this policy-only integration. Task010 is already implementing the next independently eligible feature in its recorded private branch; later checkpoints update the actual HEAD, never predict a future SHA. Historical ownership below is not a current slot reservation or Git/publication grant.
 
 ## Operating contract
 
