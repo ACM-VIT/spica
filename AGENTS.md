@@ -6,6 +6,7 @@ Read README.md, docs/ROADMAP.md and your task record before working. This branch
 
 - Linux first; Zig 0.16, SDL3, Clay and the retained native text/content libraries. Keep OS mechanics behind platform boundaries.
 - One useful default coding interface, composed through public primitives. Users can replace the root, renderers, commands, input and styling. Do not add built-in kanban boards or alternate workspace presets.
+- Product scope includes Codex with supported ChatGPT sign-in, OpenCode v2 and app-owned coordinator/worker orchestration. Define the shared contracts early; implement adapters and orchestration in ROADMAP order. See docs/PROVIDERS_AND_ORCHESTRATION.md.
 - Domain execution owns projects, threads, runs and durable commands/events. UI state and configuration reload must not own provider lifetimes.
 - Keep scripting contracts independent of runtime choice; select one runtime with a small proof before adding bindings. Lua and QuickJS are candidates, not commitments.
 - GPU rendering is the starting path. SHM investigation is deferred and is not a task or acceptance gate.

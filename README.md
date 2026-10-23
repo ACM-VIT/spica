@@ -22,9 +22,9 @@ For a clean machine, run `python3 build/bootstrap.py` first. Dependencies are pi
 
 ## What to build next
 
-[ROADMAP.md](docs/ROADMAP.md) is the ordered backlog. Begin with core contracts and the deterministic fake-provider/evaluation harness. The first feature milestone is a persisted conversation with streaming, approval/cancel, restart and one minimal custom root. Add one real provider after that gate.
+[ROADMAP.md](docs/ROADMAP.md) is the ordered backlog. Begin with core contracts and the deterministic fake-provider/evaluation harness. The first feature milestone is a persisted conversation with streaming, approval/cancel, restart and one minimal custom root. After that gate, add Codex with ChatGPT sign-in, then OpenCode v2; build app-owned delegation/review orchestration after runtime and workspace gates. These integrations are planned and are not connected by this scaffold.
 
-The API should expose commands, queries, subscriptions and composable native UI/input primitives so people can share their own configuration. A full replacement root and custom renderers are required; built-in boards and other alternative interfaces are not deliverables. Runtime selection and API details remain open until the proof. See [ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The API should expose commands, queries, subscriptions and composable native UI/input primitives so people can share their own configuration. A full replacement root and custom renderers are required; built-in boards and other alternative interfaces are not deliverables. Runtime selection and API details remain open until the proof. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) and [provider/orchestration design](docs/PROVIDERS_AND_ORCHESTRATION.md).
 
 [Task records](docs/tasks/README.md) retain decisions, ownership, attempts and evidence between sessions. [EVALUATION.md](docs/EVALUATION.md) defines verification and human checkpoints.
 

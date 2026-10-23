@@ -10,4 +10,5 @@ Workers own only assigned paths. Astra directs integration and owns this ledger;
 
 - 000-bootstrap.md: branch/scaffold/OMP preparation.
 - 001-contracts.md: first feature task; core IDs and versioned command/event/capability contracts, T3 reference pin and acceptance scenarios.
+- 007-codex-adapter.md, 008-opencode-adapter.md and 012-app-orchestration.md are explicit future task packets; their prerequisites are unmet, so do not dispatch them yet.
 - Subsequent records follow ROADMAP order with explicit dependencies; run independent infrastructure/UI groundwork beside contracts only when they do not invent competing interfaces.
