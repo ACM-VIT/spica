@@ -474,7 +474,7 @@ const LuaBridge = struct {
         switch (result.intent.kind) {
             1 => try conversation.submitIdentified(.send, .{ .thread = .{ .value = context.thread_id.bytes[0..context.thread_id.len] } }, .{ .revision = pending.thread_revision }, .{ .thread_send = .{
                 .text = result.intent.text.bytes[0..result.intent.text.len],
-                .selection = .{ .model_provider = "fake", .model_id = "fixture", .effort = "none", .account_ref = "fixture", .workspace = .{ .value = pending.workspace.slice() } },
+                .selection = conversation.host.selectionFor(.{ .value = pending.workspace.slice() }),
             } }, pending.draft_revision, pending.command_id),
             2 => try conversation.submitIdentified(.cancel, .{ .run = .{ .value = context.run_id.bytes[0..context.run_id.len] } }, .{ .revision = pending.run_revision }, .{ .run_cancel = .{ .reason = "Custom root cancellation" } }, 0, pending.command_id),
             3, 4 => try conversation.submitIdentified(.approval, .{ .approval = .{ .value = context.approval_id.bytes[0..context.approval_id.len] } }, .{ .revision = pending.approval_revision }, .{ .approval_respond = .{ .decision = if (result.intent.kind == 3) .allow else .deny, .action_digest = context.action_digest.bytes[0..context.action_digest.len] } }, 0, pending.command_id),
@@ -627,7 +627,7 @@ const Conversation = struct {
 
     fn act(self: *Conversation, app: *App, intent: @import("ui/coding.zig").Intent) !void {
         switch (intent) {
-            .send => try self.submit(.send, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .thread_send = .{ .text = app.view.editor.textBytes(), .selection = .{ .model_provider = "fake", .model_id = "fixture", .effort = "none", .account_ref = "fixture", .workspace = .{ .value = self.workspace.slice() } } } }, app.view.revision),
+            .send => try self.submit(.send, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .thread_send = .{ .text = app.view.editor.textBytes(), .selection = self.host.selectionFor(.{ .value = self.workspace.slice() }) } }, app.view.revision),
             .cancel => try self.submit(.cancel, .{ .run = .{ .value = self.run.slice() } }, .{ .revision = self.run_revision }, .{ .run_cancel = .{ .reason = "Native user cancellation" } }, 0),
             .allow, .deny => {
                 if (!self.approval_live) return error.ApprovalNotLive;
@@ -828,7 +828,7 @@ const Conversation = struct {
                     self.run_state = row.run.state;
                     app.view.status = @tagName(row.run.state);
                 }
-                if (self.run_state == null) app.view.status = "Ready — fake/fixture";
+                if (self.run_state == null) app.view.status = "Ready";
                 if (value.next_cursor) |cursor| {
                     self.runs_cursor = try Id.init(cursor);
                     self.runs_snapshot = value.snapshot_id;

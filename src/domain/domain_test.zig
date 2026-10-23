@@ -41,7 +41,7 @@ test "store identity is independent and second owner fails without truncating lo
     var f = try Fixture.init();
     defer f.deinit();
     try std.testing.expectEqual(storage.application_id, try f.store.scalar("PRAGMA application_id"));
-    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, storage.schema_version), try f.store.scalar("PRAGMA user_version"));
     var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
     try std.testing.expectError(error.WouldBlock, storage.Store.open(std.testing.io, try f.path(&path)));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("PRAGMA foreign_keys"));
@@ -566,4 +566,89 @@ test "transaction journal rolls back rejected mutations and publishes each chang
     try f.store.execute("UPDATE runs SET revision=revision+1 WHERE id=?", &.{.{ .text = sent.entity_ids.run.?.value }});
     try f.store.rollback();
     try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM aggregate_changes"));
+}
+
+const AsyncAdapter = struct {
+    const adapter = @import("../runtime/adapter.zig");
+    fn discover(_: *anyopaque) t.adapter.Discovery {
+        return .{ .capabilities = @splat(.{ .status = .supported }), .limits = .{} };
+    }
+    fn account(_: *anyopaque) t.adapter.Account {
+        return .{ .reference = "local", .readiness = .ready };
+    }
+    fn selection(_: *anyopaque, requested: t.adapter.Selection) t.adapter.SelectionResult {
+        return .{ .requested = requested, .effective = null, .readiness = .ready };
+    }
+    fn dispatch(_: *anyopaque, _: std.mem.Allocator, _: t.adapter.Request) !t.adapter.Receipt {
+        return .{ .outcome = .acknowledged };
+    }
+    fn pump(_: *anyopaque) !void {}
+    fn poll(_: *anyopaque, _: std.mem.Allocator) !?t.adapter.Observation {
+        return null;
+    }
+    fn shutdown(_: *anyopaque) void {}
+    const vtable: adapter.Adapter.VTable = .{
+        .discover = discover,
+        .accountStatus = account,
+        .resolveSelection = selection,
+        .dispatch = dispatch,
+        .pump = pump,
+        .poll = poll,
+        .shutdown = shutdown,
+    };
+    fn handle(self: *AsyncAdapter) adapter.Adapter {
+        return .{ .context = self, .vtable = &vtable };
+    }
+};
+
+test "async session evidence unlocks start and upstream chunks retain durable identity" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var runtime: AsyncAdapter = .{};
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "async", .utc_ms = 1000, .adapter = runtime.handle() };
+    const conversation = try Conversation.create(&owner, allocator);
+    const sent = try owner.command(allocator, conversation.send("async-send", "hello", 1));
+    try std.testing.expectEqual(.accepted, sent.outcome);
+    const open = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, open.id, .{ .outcome = .acknowledged });
+    try std.testing.expectEqual(@as(?domain.Owner.Claimed, null), try owner.claimNext(allocator));
+    const session = sent.entity_ids.session.?;
+    const opened: t.adapter.Observation = .{
+        .correlation = .{ .session = session, .effect = open.id },
+        .upstream_event = "instance:1:session",
+        .body = .{ .session = .{ .id = session, .instance = .{ .value = "instance" }, .upstream = .{ .value = "upstream-session" } } },
+    };
+    try owner.observe(allocator, opened);
+    try owner.observe(allocator, opened);
+    const start = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, start.id, .{ .outcome = .acknowledged });
+    const chunk: t.adapter.Observation = .{
+        .correlation = .{ .session = session, .run = sent.entity_ids.run, .effect = start.id },
+        .upstream_event = "instance:2:text",
+        .body = .{ .chunk = .{ .message = .{ .value = "upstream-message" }, .block = .{ .value = "upstream-block" }, .offset = 0, .text = "世界" } },
+    };
+    try owner.observe(allocator, chunk);
+    try owner.observe(allocator, chunk);
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runtime_blocks"));
+    try std.testing.expectEqual(@as(i64, 6), try f.store.scalar("SELECT committed_bytes FROM blocks WHERE id=(SELECT block_id FROM runtime_blocks)"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runtime_blocks rb JOIN blocks b ON b.id=rb.block_id JOIN messages m ON m.id=b.message_id WHERE m.role='assistant'"));
+    try owner.recover();
+    try std.testing.expectEqual(@as(?domain.Owner.Claimed, null), try owner.claimNext(allocator));
+}
+
+test "schema one conversation migrates runtime mapping without rewriting history" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try seed(&f.store);
+    try f.store.exec("DROP TABLE runtime_blocks; UPDATE meta SET schema_version=1; PRAGMA user_version=1");
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try f.path(&buffer);
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, path);
+    try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM messages WHERE id='m'"));
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM runtime_blocks"));
 }

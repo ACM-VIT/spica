@@ -5,6 +5,7 @@ pub const store = @import("domain/store.zig");
 const t = types;
 const a = t.adapter;
 const V = store.Value;
+const Adapter = @import("runtime/adapter.zig").Adapter;
 
 /// Internal single-thread reducer. Every returned slice belongs to the operation
 /// allocator; callers must copy before resetting it. Never call from the UI.
@@ -13,6 +14,7 @@ pub const Owner = struct {
     io: std.Io,
     epoch: []const u8,
     utc_ms: ?u64,
+    adapter: ?Adapter = null,
 
     fn id(self: *Owner, allocator: std.mem.Allocator) ![]const u8 {
         var random: [16]u8 = undefined;
@@ -165,7 +167,20 @@ pub const Owner = struct {
                 const thread = e.target.thread.value;
                 const workspace = try self.field(allocator, "SELECT workspace_id FROM threads WHERE id=?", &.{.{ .text = thread }}) orelse return .not_found;
                 if (!std.mem.eql(u8, workspace, p.selection.workspace.value)) return .workspace_mismatch;
-                if (!std.mem.eql(u8, p.selection.runtime_kind, "fake") or !std.mem.eql(u8, p.selection.required_runtime_version, "1") or p.selection.capability_revision != 1 or p.selection.account_ref.len == 0 or p.selection.model_id.len == 0 or p.selection.model_provider.len == 0) return .capability_unavailable;
+                if (p.selection.account_ref.len == 0 or p.selection.model_id.len == 0 or p.selection.model_provider.len == 0) return .capability_unavailable;
+                if (self.adapter) |runtime| {
+                    const discovery = runtime.discover();
+                    const account = runtime.accountStatus();
+                    const resolved = runtime.resolveSelection(p.selection);
+                    if (!std.mem.eql(u8, discovery.runtime_kind, p.selection.runtime_kind) or
+                        !std.mem.eql(u8, discovery.runtime_version, p.selection.required_runtime_version) or
+                        discovery.capability_revision != p.selection.capability_revision or
+                        account.readiness != .ready or !std.mem.eql(u8, account.reference, p.selection.account_ref) or
+                        resolved.readiness != .ready or !a.equal(resolved.requested, p.selection))
+                        return .capability_unavailable;
+                    for ([_]a.Capability{ .create, .start, .stream }) |capability|
+                        if (discovery.capabilities[@intFromEnum(capability)].status != .supported) return .capability_unavailable;
+                } else if (!std.mem.eql(u8, p.selection.runtime_kind, "fake") or !std.mem.eql(u8, p.selection.required_runtime_version, "1") or p.selection.capability_revision != 1) return .capability_unavailable;
                 if (try self.field(allocator, "SELECT id FROM runs WHERE thread_id=? AND (state IN('queued','starting','streaming','awaiting_approval','cancel_requested','unknown','interrupted') OR EXISTS(SELECT 1 FROM effects WHERE run_id=runs.id AND state IN('unknown','in_flight')))", &.{.{ .text = thread }}) != null) return .unresolved_effects;
                 const run = try self.id(allocator);
                 const session = try self.id(allocator);
@@ -313,7 +328,8 @@ pub const Owner = struct {
         try self.guardRunRevisions(run);
         const sequence = try db.nextSequence();
         const missing_session = std.mem.eql(u8, kind, "create_session") and receipt.outcome == .acknowledged and receipt.session == null;
-        const state = if (missing_session) "unknown" else switch (receipt.outcome) {
+        const pending_session = missing_session and self.adapter != null;
+        const state = if (pending_session) "in_flight" else if (missing_session) "unknown" else switch (receipt.outcome) {
             .acknowledged => "confirmed",
             .rejected => "failed",
             .unknown => "unknown",
@@ -328,7 +344,7 @@ pub const Owner = struct {
             try db.execute("UPDATE sessions SET instance_id=?,upstream_session=?,continuity=?,revision=revision+1 WHERE id=?", &.{ .{ .text = live.instance.value }, .{ .text = live.upstream.value }, .{ .text = @tagName(receipt.continuity) }, .{ .text = session } });
             try self.event(allocator, sequence, 1, .{ .session = .{ .value = session } }, @intCast(revision_statement.integer(0) + 1), "SessionEvidence", null, effect, "");
         }
-        const next_state: []const u8 = if (missing_session or receipt.outcome == .unknown) "unknown" else if (receipt.outcome == .rejected) "failed" else if (std.mem.eql(u8, kind, "create_session")) "starting" else if (std.mem.eql(u8, kind, "cancel")) "cancel_requested" else "streaming";
+        const next_state: []const u8 = if (pending_session) "starting" else if (missing_session or receipt.outcome == .unknown) "unknown" else if (receipt.outcome == .rejected) "failed" else if (std.mem.eql(u8, kind, "create_session")) "starting" else if (std.mem.eql(u8, kind, "cancel")) "cancel_requested" else "streaming";
         const revision_statement = try db.prepare("SELECT revision,state FROM runs WHERE id=?", &.{.{ .text = run }});
         defer revision_statement.deinit();
         if (!try revision_statement.step()) return error.Corrupt;
@@ -345,12 +361,15 @@ pub const Owner = struct {
 
     /// A complete bounded observation is retained by the caller until this
     /// transaction succeeds. Duplicate identity requires byte-equal evidence.
-    pub fn observe(self: *Owner, allocator: std.mem.Allocator, observation: a.Observation) !void {
-        if (a.frameBytes(observation) > 4096 or observation.upstream_event.len == 0) return error.Limit;
-        const run = observation.correlation.run orelse return error.Conflict;
+    pub fn observe(self: *Owner, allocator: std.mem.Allocator, input: a.Observation) !void {
+        if (a.frameBytes(input) > 4096 or input.upstream_event.len == 0) return error.Limit;
+        var observation = input;
+        const run = observation.correlation.run orelse if (self.adapter != null) a.RunId{
+            .value = try self.field(allocator, "SELECT id FROM runs WHERE session_id=?", &.{.{ .text = observation.correlation.session.value }}) orelse return error.Conflict,
+        } else return error.Conflict;
         const session = observation.correlation.session;
         const db = self.database;
-        const canonical = try encoded(allocator, observation);
+        const canonical = try encoded(allocator, input);
         const digest = t.digest(canonical);
         try db.begin();
         errdefer db.rollback() catch {};
@@ -361,6 +380,34 @@ pub const Owner = struct {
                 if (!std.mem.eql(u8, try duplicate.bytes(0), &digest)) return error.Conflict;
                 try db.rollback();
                 return;
+            }
+        }
+        if (self.adapter != null) {
+            observation.correlation.run = run;
+            if (observation.correlation.effect) |effect_id| {
+                if (try self.field(allocator, "SELECT id FROM effects WHERE id=? AND session_id=? AND run_id=?", &.{ .{ .text = effect_id.value }, .{ .text = session.value }, .{ .text = run.value } }) == null) return error.Conflict;
+            }
+            if (observation.body == .approval) {
+                if (!a.equal(input.body.approval.correlation, input.correlation)) return error.Conflict;
+                observation.body.approval.correlation = observation.correlation;
+            }
+            if (observation.body == .chunk) {
+                const chunk = &observation.body.chunk;
+                const message = try self.field(allocator, "SELECT id FROM messages WHERE run_id=? AND role='assistant'", &.{.{ .text = run.value }}) orelse return error.Corrupt;
+                const mapped = try self.field(allocator, "SELECT block_id FROM runtime_blocks WHERE session_id=? AND upstream_message=? AND upstream_block=?", &.{ .{ .text = session.value }, .{ .text = chunk.message.value }, .{ .text = chunk.block.value } });
+                const block = mapped orelse blk: {
+                    var key: ?[]const u8 = null;
+                    if (observation.correlation.tool) |tool| {
+                        key = try self.resultBlock(allocator, run.value, tool.value);
+                    } else {
+                        key = try self.field(allocator, "SELECT id FROM blocks WHERE message_id=? AND ordinal=0 AND kind='text' AND NOT EXISTS(SELECT 1 FROM runtime_blocks WHERE block_id=blocks.id)", &.{.{ .text = message }});
+                        if (key == null) key = try self.newBlock(allocator, message, null);
+                    }
+                    try db.execute("INSERT INTO runtime_blocks VALUES(?,?,?,?)", &.{ .{ .text = session.value }, .{ .text = chunk.message.value }, .{ .text = chunk.block.value }, .{ .text = key.? } });
+                    break :blk key.?;
+                };
+                chunk.message = .{ .value = message };
+                chunk.block = .{ .value = block };
             }
         }
         const state_statement = try db.prepare("SELECT state,revision FROM runs WHERE id=? AND session_id=?", &.{ .{ .text = run.value }, .{ .text = session.value } });
@@ -389,10 +436,20 @@ pub const Owner = struct {
                 const upstream = observation.correlation.upstream_tool orelse return error.Conflict;
                 if (terminal) return error.Conflict;
                 const existing = try self.field(allocator, "SELECT id FROM tools WHERE session_id=? AND upstream_tool=?", &.{ .{ .text = session.value }, .{ .text = upstream } });
-                if (existing != null) return error.Conflict;
-                try db.execute("INSERT INTO tools(id,revision,run_id,session_id,upstream_tool,name,action_digest,outcome) VALUES(?,1,?,?,?,?,?,'pending')", &.{ .{ .text = tool_id.value }, .{ .text = run.value }, .{ .text = session.value }, .{ .text = upstream }, .{ .blob = tool.name }, .{ .blob = tool.action_digest } });
-                try db.execute("UPDATE runs SET unresolved_tools=unresolved_tools+1 WHERE id=?", &.{.{ .text = run.value }});
-                try self.event(allocator, sequence, index, .{ .tool = tool_id }, 1, "ToolStarted", null, observation.correlation.effect, "");
+                if (existing) |key| {
+                    if (self.adapter == null or !std.mem.eql(u8, key, tool_id.value)) return error.Conflict;
+                    const old = try db.prepare("SELECT revision,action_digest FROM tools WHERE id=? AND run_id=? AND outcome='pending'", &.{ .{ .text = key }, .{ .text = run.value } });
+                    defer old.deinit();
+                    if (!try old.step() or old.integer(0) == std.math.maxInt(i64)) return error.Conflict;
+                    if (!std.mem.eql(u8, try old.bytes(1), tool.action_digest))
+                        try self.refineTool(key, tool.action_digest);
+                    try db.execute("UPDATE tools SET name=?,revision=revision+1 WHERE id=?", &.{ .{ .blob = tool.name }, .{ .text = key } });
+                    try self.event(allocator, sequence, index, .{ .tool = tool_id }, @intCast(old.integer(0) + 1), "ToolUpdated", null, observation.correlation.effect, "");
+                } else {
+                    try db.execute("INSERT INTO tools(id,revision,run_id,session_id,upstream_tool,name,action_digest,outcome) VALUES(?,1,?,?,?,?,?,'pending')", &.{ .{ .text = tool_id.value }, .{ .text = run.value }, .{ .text = session.value }, .{ .text = upstream }, .{ .blob = tool.name }, .{ .blob = tool.action_digest } });
+                    try db.execute("UPDATE runs SET unresolved_tools=unresolved_tools+1 WHERE id=?", &.{.{ .text = run.value }});
+                    try self.event(allocator, sequence, index, .{ .tool = tool_id }, 1, "ToolStarted", null, observation.correlation.effect, "");
+                }
                 index += 1;
             },
             .tool_completed => |result| {
@@ -402,13 +459,7 @@ pub const Owner = struct {
                 if (!try found.step() or found.integer(0) == std.math.maxInt(i64)) return error.Conflict;
                 if (!std.mem.eql(u8, try found.bytes(1), "pending")) return error.Conflict;
                 // Tool results are bounded canonical content, not UI-only text.
-                const block = try self.id(allocator);
-                const message = try self.field(allocator, "SELECT id FROM messages WHERE run_id=? AND role='assistant'", &.{.{ .text = run.value }}) orelse return error.Corrupt;
-                const ordinal = try db.prepare("SELECT coalesce(max(ordinal),-1)+1 FROM blocks WHERE message_id=?", &.{.{ .text = message }});
-                defer ordinal.deinit();
-                if (!try ordinal.step()) return error.Corrupt;
-                try db.execute("INSERT INTO blocks(id,revision,message_id,ordinal,kind,tool_id) VALUES(?,1,?,?,'tool_result',?)", &.{ .{ .text = block }, .{ .text = message }, .{ .integer = ordinal.integer(0) }, .{ .text = tool.value } });
-                try self.touchMessage(message);
+                const block = try self.resultBlock(allocator, run.value, tool.value);
                 var offset: usize = 0;
                 while (offset < result.result.len) {
                     const end = @min(offset + 2048, result.result.len);
@@ -427,7 +478,10 @@ pub const Owner = struct {
                 const request = approval.correlation.upstream_request orelse return error.Conflict;
                 const tool_digest = try self.field(allocator, "SELECT action_digest FROM tools WHERE id=? AND run_id=? AND session_id=?", &.{ .{ .text = tool_id.value }, .{ .text = run.value }, .{ .text = session.value } }) orelse return error.Conflict;
                 const workspace = try self.field(allocator, "SELECT workspace_id FROM sessions WHERE id=?", &.{.{ .text = session.value }}) orelse return error.Corrupt;
-                if (!std.mem.eql(u8, tool_digest, approval.action_digest) or !std.mem.eql(u8, workspace, approval.workspace.value)) return error.Conflict;
+                if (self.adapter != null and !std.mem.eql(u8, tool_digest, approval.action_digest)) {
+                    try self.refineTool(tool_id.value, approval.action_digest);
+                } else if (!std.mem.eql(u8, tool_digest, approval.action_digest)) return error.Conflict;
+                if (!std.mem.eql(u8, workspace, approval.workspace.value)) return error.Conflict;
                 if (approval.expires_at) |expiry| if (expiry > std.math.maxInt(i64)) return error.Limit;
                 try db.execute("INSERT INTO approvals(id,revision,run_id,session_id,tool_id,workspace_id,upstream_request,action_digest,scope,expires_at,state,live_epoch) VALUES(?,1,?,?,?,?,?,?,?,?,'pending',?)", &.{ .{ .text = approval_id.value }, .{ .text = run.value }, .{ .text = session.value }, .{ .text = tool_id.value }, .{ .text = workspace }, .{ .text = request }, .{ .blob = approval.action_digest }, .{ .blob = approval.scope }, if (approval.expires_at) |v| .{ .integer = @intCast(v) } else .null, .{ .text = self.epoch } });
                 next_state = "awaiting_approval";
@@ -453,7 +507,18 @@ pub const Owner = struct {
                 if (!a.equal(requested, selection.requested) or selection.effective == null or !a.equal(requested, selection.effective.?)) return error.Conflict;
                 try db.execute("UPDATE runs SET effective=? WHERE id=?", &.{ .{ .blob = try encoded(allocator, selection.effective.?) }, .{ .text = run.value } });
             },
-            .session => return error.Conflict,
+            .session => |live| {
+                if (self.adapter == null or terminal or !std.mem.eql(u8, live.id.value, session.value)) return error.Conflict;
+                const effect_id = observation.correlation.effect orelse return error.Conflict;
+                const pending = try db.prepare("SELECT revision FROM effects WHERE id=? AND session_id=? AND kind='create_session' AND state='in_flight'", &.{ .{ .text = effect_id.value }, .{ .text = session.value } });
+                defer pending.deinit();
+                if (!try pending.step()) return error.Conflict;
+                try db.execute("UPDATE sessions SET instance_id=?,upstream_session=?,revision=revision+1 WHERE id=? AND (upstream_session IS NULL OR upstream_session=?)", &.{ .{ .text = live.instance.value }, .{ .text = live.upstream.value }, .{ .text = session.value }, .{ .text = live.upstream.value } });
+                try db.execute("UPDATE effects SET state='confirmed',revision=revision+1 WHERE id=?", &.{.{ .text = effect_id.value }});
+                try self.event(allocator, sequence, index, .{ .effect = effect_id }, @intCast(pending.integer(0) + 1), "SessionOpened", null, effect_id, "");
+                index += 1;
+                if (!std.mem.eql(u8, current_state, "cancel_requested")) next_state = "starting";
+            },
         }
         try db.execute("INSERT INTO observations(session_id,upstream_event,runtime_version,correlation,digest,cursor,commit_sequence) VALUES(?,?,?,?,?,?,?)", &.{ .{ .text = session.value }, .{ .text = observation.upstream_event }, .{ .text = observation.runtime_version }, .{ .blob = try encoded(allocator, observation.correlation) }, .{ .blob = &digest }, if (observation.cursor) |v| .{ .blob = v.value } else .null, .{ .integer = @intCast(sequence) } });
         // Cursor advances only in the transaction containing the canonical bytes.
@@ -470,6 +535,31 @@ pub const Owner = struct {
         try self.finalizeMessages(run.value);
         try db.publishChanges(sequence, null);
         try db.commit();
+    }
+    fn newBlock(self: *Owner, allocator: std.mem.Allocator, message: []const u8, tool: ?[]const u8) ![]const u8 {
+        const key = try self.id(allocator);
+        try self.database.execute("INSERT INTO blocks(id,revision,message_id,ordinal,kind,tool_id) SELECT ?,1,?,coalesce(max(ordinal),-1)+1,?,? FROM blocks WHERE message_id=?", &.{
+            .{ .text = key }, .{ .text = message }, .{ .text = if (tool != null) "tool_result" else "text" }, if (tool) |v| .{ .text = v } else .null, .{ .text = message },
+        });
+        try self.touchMessage(message);
+        return key;
+    }
+    fn resultBlock(self: *Owner, allocator: std.mem.Allocator, run: []const u8, tool: []const u8) ![]const u8 {
+        const statement = try self.database.prepare("SELECT result_block FROM tools WHERE id=? AND run_id=? AND outcome='pending'", &.{ .{ .text = tool }, .{ .text = run } });
+        defer statement.deinit();
+        if (!try statement.step()) return error.Conflict;
+        if (!statement.isNull(0)) return allocator.dupe(u8, try statement.bytes(0));
+        const message = try self.field(allocator, "SELECT id FROM messages WHERE run_id=? AND role='assistant'", &.{.{ .text = run }}) orelse return error.Corrupt;
+        const block = try self.newBlock(allocator, message, tool);
+        try self.database.execute("UPDATE tools SET result_block=? WHERE id=?", &.{ .{ .text = block }, .{ .text = tool } });
+        return block;
+    }
+    fn refineTool(self: *Owner, tool: []const u8, digest: []const u8) !void {
+        const resolved = try self.database.prepare("SELECT 1 FROM approvals WHERE tool_id=? AND state='resolved' LIMIT 1", &.{.{ .text = tool }});
+        defer resolved.deinit();
+        if (try resolved.step()) return error.Conflict;
+        try self.database.execute("UPDATE approvals SET state='invalidated',live_epoch=NULL,revision=revision+1 WHERE tool_id=? AND state='pending'", &.{.{ .text = tool }});
+        try self.database.execute("UPDATE tools SET action_digest=? WHERE id=? AND outcome='pending'", &.{ .{ .blob = digest }, .{ .text = tool } });
     }
 
     pub fn recover(self: *Owner) !void {
@@ -491,6 +581,10 @@ pub const Host = struct {
         limits: t.Limits = .{},
         wake: ?*const fn (?*anyopaque) void = null,
         wake_context: ?*anyopaque = null,
+        /// Main retains the instance until Host.destroy returns. The Host
+        /// worker exclusively calls it and shuts it down on exit.
+        adapter: ?Adapter = null,
+        selection: ?a.Selection = null,
     };
     const Request = union(enum) { command: t.CommandEnvelope, query: t.Query, subscribe: t.Subscribe, unsubscribe: t.SubscriptionId };
     const Frame = struct { ticket: t.Ticket = .{ .value = 0 }, len: usize = 0, bytes: [65536]u8 = undefined };
@@ -504,6 +598,7 @@ pub const Host = struct {
     thread: ?std.Thread = null,
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
+    runtime_wake: std.Io.Event = .unset,
     closed: bool = false,
     next_ticket: u64 = 1,
     requests: [8]Frame = undefined,
@@ -544,6 +639,7 @@ pub const Host = struct {
         self.mutex.lockUncancelable(self.io);
         self.closed = true;
         self.changed.broadcast(self.io);
+        self.runtime_wake.set(self.io);
         self.mutex.unlock(self.io);
         if (self.thread) |thread| thread.join();
         for (&self.snapshots) |*snapshot| self.closeSnapshot(snapshot);
@@ -551,6 +647,17 @@ pub const Host = struct {
         self.database.close() catch {};
         self.allocator.free(self.path);
         self.allocator.destroy(self);
+    }
+    pub fn selectionFor(self: *const Host, workspace: a.WorkspaceId) a.Selection {
+        var selection = self.options.selection orelse a.Selection{
+            .model_provider = "fake",
+            .model_id = "fixture",
+            .effort = "none",
+            .account_ref = "fixture",
+            .workspace = workspace,
+        };
+        selection.workspace = workspace;
+        return selection;
     }
     pub fn submit(self: *Host, command: t.CommandEnvelope) t.AdmissionError!t.Ticket {
         return self.admit(.{ .command = command });
@@ -576,6 +683,7 @@ pub const Host = struct {
         self.next_ticket += 1;
         self.request_count += 1;
         self.changed.signal(self.io);
+        self.runtime_wake.set(self.io);
         return frame.ticket;
     }
     pub fn drain(self: *Host, outputs: []t.Output, storage_bytes: []u8) t.DrainResult {
@@ -624,20 +732,25 @@ pub const Host = struct {
         snapshot.database = null;
     }
     fn run(self: *Host) void {
-        var owner: Owner = .{ .database = &self.database, .io = self.io, .epoch = &self.epoch, .utc_ms = null };
+        var owner: Owner = .{ .database = &self.database, .io = self.io, .epoch = &self.epoch, .utc_ms = null, .adapter = self.options.adapter };
+        defer if (self.options.adapter) |runtime| runtime.shutdown();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         var operation_memory: [2 * 1024 * 1024]u8 = undefined;
         while (true) {
             self.mutex.lockUncancelable(self.io);
-            while (!self.closed and self.request_count == 0) self.changed.waitUncancelable(self.io, &self.mutex);
+            while (!self.closed and self.request_count == 0 and self.options.adapter == null) self.changed.waitUncancelable(self.io, &self.mutex);
             if (self.closed) {
                 self.mutex.unlock(self.io);
                 return;
             }
-            const frame = self.requests[self.request_head];
-            self.request_head = (self.request_head + 1) % 8;
-            self.request_count -= 1;
+            const frame: ?Frame = if (self.request_count != 0) blk: {
+                const value = self.requests[self.request_head];
+                self.request_head = (self.request_head + 1) % 8;
+                self.request_count -= 1;
+                break :blk value;
+            } else null;
+            self.runtime_wake.reset();
             self.mutex.unlock(self.io);
             var fixed = std.heap.FixedBufferAllocator.init(&operation_memory);
             const allocator = fixed.allocator();
@@ -645,20 +758,22 @@ pub const Host = struct {
             for (&self.snapshots) |*snapshot| if (snapshot.database != null and self.now() >= snapshot.deadline) {
                 self.closeSnapshot(snapshot);
             };
-            const request = t.decode(Request, frame.bytes[0..frame.len], allocator) catch {
-                self.fail(frame.ticket, .admission_limit);
-                continue;
-            };
-            self.handle(&owner, allocator, frame.ticket, request) catch |err| {
-                self.database.rollback() catch {};
-                self.fail(frame.ticket, switch (err) {
-                    error.CursorInvalid => .cursor_invalid,
-                    error.NotFound => .not_found,
-                    error.InvalidQuery => .invalid_query,
-                    error.Limit, error.OutOfMemory, error.TooLarge => .admission_limit,
-                    else => .storage_unavailable,
-                });
-            };
+            if (frame) |input| {
+                const request = t.decode(Request, input.bytes[0..input.len], allocator) catch {
+                    self.fail(input.ticket, .admission_limit);
+                    continue;
+                };
+                self.handle(&owner, allocator, input.ticket, request) catch |err| {
+                    self.database.rollback() catch {};
+                    self.fail(input.ticket, switch (err) {
+                        error.CursorInvalid => .cursor_invalid,
+                        error.NotFound => .not_found,
+                        error.InvalidQuery => .invalid_query,
+                        error.Limit, error.OutOfMemory, error.TooLarge => .admission_limit,
+                        else => .storage_unavailable,
+                    });
+                };
+            }
             // Each adapter call follows a committed claim. A failed delivery is
             // left in_flight and recovery will mark it unknown, never retry it.
             var steps: usize = 0;
@@ -668,7 +783,23 @@ pub const Host = struct {
                 const effect = claimed orelse break;
                 self.dispatch(&owner, arena.allocator(), effect) catch break;
             }
+            if (self.options.adapter) |runtime| {
+                runtime.pump() catch {};
+                var observations: usize = 0;
+                while (observations < 32) : (observations += 1) {
+                    _ = arena.reset(.retain_capacity);
+                    const observation = (runtime.poll(arena.allocator()) catch break) orelse break;
+                    owner.observe(arena.allocator(), observation) catch {
+                        // Invalid evidence never authorizes replaying work.
+                        self.database.rollback() catch {};
+                    };
+                }
+            }
             self.deliverSubscriptions(allocator) catch {};
+            // Admission and shutdown wake immediately; absent transport wake
+            // support, pending protocol frames are sampled at a bounded 10ms.
+            if (frame == null and self.options.adapter != null)
+                self.runtime_wake.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch {};
         }
     }
     fn fail(self: *Host, ticket: t.Ticket, reason: @FieldType(t.Failure, "reason")) void {
@@ -718,6 +849,10 @@ pub const Host = struct {
     /// Each call is exercised through the accepted bounded fake adapter, with no
     /// external provider or script owning lifecycle. No recovered run is started.
     fn dispatch(self: *Host, owner: *Owner, allocator: std.mem.Allocator, effect: Owner.Claimed) !void {
+        if (self.options.adapter) |runtime| {
+            try owner.delivered(allocator, effect.id, try runtime.dispatch(allocator, effect.request));
+            return;
+        }
         const request = effect.request;
         const s = try self.database.prepare("SELECT e.run_id,e.session_id,r.requested,m.id,b.id FROM effects e JOIN runs r ON r.id=e.run_id JOIN messages m ON m.run_id=r.id AND m.role='assistant' JOIN blocks b ON b.message_id=m.id AND b.ordinal=0 WHERE e.id=?", &.{.{ .text = effect.id.value }});
         defer s.deinit();
@@ -857,7 +992,7 @@ pub const Host = struct {
         var n: usize = 0;
         switch (q) {
             .capabilities => {
-                rows[0] = .{ .capabilities = .{ .capabilities = fake.defaultCapabilities(), .limits = .{} } };
+                rows[0] = .{ .capabilities = if (self.options.adapter) |runtime| runtime.discover() else .{ .capabilities = fake.defaultCapabilities(), .limits = .{} } };
                 result.items = rows[0..1];
                 return result;
             },

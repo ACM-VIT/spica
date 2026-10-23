@@ -10,7 +10,7 @@ extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, Closed };
 pub const application_id = 0x53504334;
-pub const schema_version = 1;
+pub const schema_version = 2;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
 
 pub const Statement = struct {
@@ -79,9 +79,9 @@ pub const Store = struct {
         const tables = try result.scalar("SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'");
         const fresh = identity == 0 and version == 0 and tables == 0;
         // Do not mutate unknown/legacy databases, including user_version=6.
-        if (!fresh and (identity != application_id or version != schema_version)) return error.UnsupportedStore;
+        if (!fresh and (identity != application_id or (version != 1 and version != schema_version))) return error.UnsupportedStore;
         if (!fresh) {
-            if (try result.scalar("SELECT count(*) FROM meta WHERE singleton=1 AND schema_version=1") != 1) return error.Corrupt;
+            if (try result.scalar("SELECT schema_version FROM meta WHERE singleton=1") != version) return error.Corrupt;
             if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN('meta','commands','projects','workspaces','sessions','threads','runs','messages','blocks','chunks','tools','approvals','effects','observations','events')") != 15) return error.Corrupt;
         }
         // WAL initialization precedes readers and the writer's first transaction.
@@ -101,6 +101,12 @@ pub const Store = struct {
             if (try result.scalar("PRAGMA application_id") != application_id) return error.Corrupt;
             try result.exec("COMMIT");
         }
+        if (fresh or version == 1) {
+            try result.exec("BEGIN IMMEDIATE");
+            errdefer result.exec("ROLLBACK") catch {};
+            try result.exec("CREATE TABLE runtime_blocks(session_id TEXT NOT NULL REFERENCES sessions(id),upstream_message TEXT NOT NULL,upstream_block TEXT NOT NULL,block_id TEXT NOT NULL UNIQUE REFERENCES blocks(id),PRIMARY KEY(session_id,upstream_message,upstream_block)); UPDATE meta SET schema_version=2 WHERE singleton=1; PRAGMA user_version=2");
+            try result.exec("COMMIT");
+        } else if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='runtime_blocks'") != 1) return error.Corrupt;
         const dir_z = try std.fmt.bufPrintZ(&path_buffer, "{s}", .{directory[0..n]});
         if (spica_store_sync_ancestry(dir_z.ptr) != 0) return error.Storage;
         // Bounds per row and SQL statement, not a claimed total C/RSS/disk ceiling.
