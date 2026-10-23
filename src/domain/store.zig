@@ -100,9 +100,9 @@ pub const Store = struct {
             // Keep the constant and on-disk application identity in lockstep.
             if (try result.scalar("PRAGMA application_id") != application_id) return error.Corrupt;
             try result.exec("COMMIT");
-            const dir_z = try std.fmt.bufPrintZ(&path_buffer, "{s}", .{directory[0..n]});
-            if (spica_store_sync_ancestry(dir_z.ptr) != 0) return error.Storage;
         }
+        const dir_z = try std.fmt.bufPrintZ(&path_buffer, "{s}", .{directory[0..n]});
+        if (spica_store_sync_ancestry(dir_z.ptr) != 0) return error.Storage;
         // Bounds per row and SQL statement, not a claimed total C/RSS/disk ceiling.
         _ = c.sqlite3_limit(database, c.SQLITE_LIMIT_LENGTH, 1024 * 1024);
         _ = c.sqlite3_limit(database, c.SQLITE_LIMIT_SQL_LENGTH, 64 * 1024);
@@ -239,6 +239,7 @@ pub const Store = struct {
             while (try range.step()) {
                 const chunk_start: u64 = @intCast(range.integer(0));
                 const chunk = try range.bytes(1);
+                if (chunk_start > offset + matched) return error.Corrupt;
                 const skip: usize = @intCast(offset + matched - chunk_start);
                 if (skip > chunk.len) return error.Corrupt;
                 const count = @min(chunk.len - skip, bytes.len - matched);

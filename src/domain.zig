@@ -65,8 +65,10 @@ pub const Owner = struct {
         errdefer self.database.rollback() catch {};
         if (self.database.lookupCommand(envelope.command_id.value, canonical, output) catch |err| switch (err) {
             error.Conflict => {
+                const stored = try self.field(allocator, "SELECT receipt FROM commands WHERE command_id=?", &.{.{ .text = envelope.command_id.value }}) orelse return error.Corrupt;
+                const original = try t.decode(t.Receipt, stored, allocator);
                 try self.database.rollback();
-                return .{ .command_id = envelope.command_id, .outcome = .rejected, .reason = .command_id_conflict, .commit_sequence = 0 };
+                return .{ .command_id = envelope.command_id, .outcome = .rejected, .reason = .command_id_conflict, .commit_sequence = original.commit_sequence };
             },
             else => return err,
         }) |previous| {
@@ -79,8 +81,14 @@ pub const Owner = struct {
         var receipt: t.Receipt = .{ .command_id = envelope.command_id, .outcome = .rejected, .commit_sequence = sequence, .current_revision = current };
         var reason: ?t.Reason = if (envelope.contract_version != 1) .unsupported_version else null;
         if (reason == null) switch (envelope.expected_revision) {
-            .absent => if (current != null) { reason = .revision_conflict; },
-            .revision => |expected| if (current == null) { reason = .not_found; } else if (current.? != expected or expected >= std.math.maxInt(i64)) { reason = .revision_conflict; },
+            .absent => if (current != null) {
+                reason = .revision_conflict;
+            },
+            .revision => |expected| if (current == null) {
+                reason = .not_found;
+            } else if (current.? != expected or expected >= std.math.maxInt(i64)) {
+                reason = .revision_conflict;
+            },
         };
         try self.database.exec("SAVEPOINT mutation");
         if (reason == null) reason = try self.reduce(allocator, envelope, &receipt);
@@ -232,7 +240,8 @@ pub const Owner = struct {
                 const session = try self.field(allocator, "SELECT session_id FROM runs WHERE id=?", &.{.{ .text = e.target.run.value }}) orelse return .not_found;
                 if (!std.mem.eql(u8, session, p.session.value)) return .invalid_command;
                 try self.guardRunRevisions(e.target.run.value);
-                for (p.effects) |effect_id| {
+                for (p.effects, 0..) |effect_id, i| {
+                    for (p.effects[0..i]) |previous| if (std.mem.eql(u8, previous.value, effect_id.value)) return .invalid_command;
                     const found = try self.field(allocator, "SELECT state FROM effects WHERE id=? AND run_id=? AND session_id=?", &.{ .{ .text = effect_id.value }, .{ .text = e.target.run.value }, .{ .text = session } }) orelse return .not_found;
                     if (!std.mem.eql(u8, found, "unknown")) return .invalid_command;
                 }
@@ -272,6 +281,175 @@ pub const Owner = struct {
         try self.database.commit();
         return result;
     }
+    /// Persist adapter delivery evidence without interpreting acknowledgement as
+    /// run completion. An ambiguous call is never changed back to planned.
+    pub fn delivered(self: *Owner, allocator: std.mem.Allocator, effect: a.EffectId, receipt: a.Receipt) !void {
+        const db = self.database;
+        try db.begin();
+        errdefer db.rollback() catch {};
+        const s = try db.prepare("SELECT run_id,session_id,kind,revision,state FROM effects WHERE id=?", &.{.{ .text = effect.value }});
+        defer s.deinit();
+        if (!try s.step() or !std.mem.eql(u8, try s.bytes(4), "in_flight")) return error.Conflict;
+        if (s.integer(3) == std.math.maxInt(i64)) return error.Limit;
+        const run = try allocator.dupe(u8, try s.bytes(0));
+        const session = try allocator.dupe(u8, try s.bytes(1));
+        const kind = try allocator.dupe(u8, try s.bytes(2));
+        try self.guardRunRevisions(run);
+        const sequence = try db.nextSequence();
+        const missing_session = std.mem.eql(u8, kind, "create_session") and receipt.outcome == .acknowledged and receipt.session == null;
+        const state = if (missing_session) "unknown" else switch (receipt.outcome) {
+            .acknowledged => "confirmed",
+            .rejected => "failed",
+            .unknown => "unknown",
+        };
+        try db.execute("UPDATE effects SET state=?,outcome=?,evidence=?,revision=revision+1 WHERE id=?", &.{ .{ .text = state }, .{ .blob = receipt.detail }, .{ .blob = try encoded(allocator, receipt) }, .{ .text = effect.value } });
+        try self.event(allocator, sequence, 0, .{ .effect = effect }, @intCast(s.integer(3) + 1), "EffectDelivery", null, effect, "");
+        if (receipt.session) |live| {
+            if (!std.mem.eql(u8, live.id.value, session)) return error.Conflict;
+            const revision_statement = try db.prepare("SELECT revision FROM sessions WHERE id=?", &.{.{ .text = session }});
+            defer revision_statement.deinit();
+            if (!try revision_statement.step() or revision_statement.integer(0) == std.math.maxInt(i64)) return error.Limit;
+            try db.execute("UPDATE sessions SET instance_id=?,upstream_session=?,continuity=?,revision=revision+1 WHERE id=?", &.{ .{ .text = live.instance.value }, .{ .text = live.upstream.value }, .{ .text = @tagName(receipt.continuity) }, .{ .text = session } });
+            try self.event(allocator, sequence, 1, .{ .session = .{ .value = session } }, @intCast(revision_statement.integer(0) + 1), "SessionEvidence", null, effect, "");
+        }
+        const next_state: []const u8 = if (missing_session or receipt.outcome == .unknown) "unknown" else if (receipt.outcome == .rejected) "failed" else if (std.mem.eql(u8, kind, "create_session")) "starting" else if (std.mem.eql(u8, kind, "cancel")) "cancel_requested" else "streaming";
+        const revision_statement = try db.prepare("SELECT revision,state FROM runs WHERE id=?", &.{.{ .text = run }});
+        defer revision_statement.deinit();
+        if (!try revision_statement.step()) return error.Corrupt;
+        const current = try revision_statement.bytes(1);
+        // Delivery after terminal evidence never revives the lifecycle.
+        if (!(std.mem.eql(u8, current, "completed") or std.mem.eql(u8, current, "cancelled") or std.mem.eql(u8, current, "failed"))) {
+            try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = next_state }, .{ .text = run } });
+            try self.event(allocator, sequence, 2, .{ .run = .{ .value = run } }, @intCast(revision_statement.integer(0) + 1), "RunDelivery", null, effect, "");
+        }
+        try db.commit();
+    }
+
+    /// A complete bounded observation is retained by the caller until this
+    /// transaction succeeds. Duplicate identity requires byte-equal evidence.
+    pub fn observe(self: *Owner, allocator: std.mem.Allocator, observation: a.Observation) !void {
+        if (a.frameBytes(observation) > 4096 or observation.upstream_event.len == 0) return error.Limit;
+        const run = observation.correlation.run orelse return error.Conflict;
+        const session = observation.correlation.session;
+        const db = self.database;
+        const canonical = try encoded(allocator, observation);
+        const digest = t.digest(canonical);
+        try db.begin();
+        errdefer db.rollback() catch {};
+        {
+            const duplicate = try db.prepare("SELECT digest FROM observations WHERE session_id=? AND upstream_event=?", &.{ .{ .text = session.value }, .{ .text = observation.upstream_event } });
+            defer duplicate.deinit();
+            if (try duplicate.step()) {
+                if (!std.mem.eql(u8, try duplicate.bytes(0), &digest)) return error.Conflict;
+                try db.rollback();
+                return;
+            }
+        }
+        const state_statement = try db.prepare("SELECT state,revision FROM runs WHERE id=? AND session_id=?", &.{ .{ .text = run.value }, .{ .text = session.value } });
+        defer state_statement.deinit();
+        if (!try state_statement.step()) return error.Conflict;
+        try self.guardRunRevisions(run.value);
+        const current_state = try allocator.dupe(u8, try state_statement.bytes(0));
+        const terminal = std.mem.eql(u8, current_state, "completed") or std.mem.eql(u8, current_state, "cancelled") or std.mem.eql(u8, current_state, "failed") or std.mem.eql(u8, current_state, "unknown") or std.mem.eql(u8, current_state, "interrupted");
+        var next_state: []const u8 = current_state;
+        const sequence = try db.nextSequence();
+        var index: u32 = 0;
+        switch (observation.body) {
+            .chunk => |chunk| {
+                const block = try db.prepare("SELECT b.revision FROM blocks b JOIN messages m ON m.id=b.message_id WHERE b.id=? AND m.id=? AND m.run_id=? AND m.role='assistant'", &.{ .{ .text = chunk.block.value }, .{ .text = chunk.message.value }, .{ .text = run.value } });
+                defer block.deinit();
+                if (!try block.step()) return error.Conflict;
+                if (try db.appendChunk(chunk.block.value, chunk.offset, chunk.text) == .appended) {
+                    try self.event(allocator, sequence, index, .{ .block = chunk.block }, @intCast(block.integer(0) + 1), "ContentAppended", null, observation.correlation.effect, try encoded(allocator, .{ .start_byte = chunk.offset, .end_byte = chunk.offset + chunk.text.len }));
+                    index += 1;
+                }
+                if (!terminal and !std.mem.eql(u8, current_state, "cancel_requested")) next_state = "streaming";
+            },
+            .tool_started => |tool| {
+                const tool_id = observation.correlation.tool orelse return error.Conflict;
+                const upstream = observation.correlation.upstream_tool orelse return error.Conflict;
+                if (terminal) return error.Conflict;
+                const existing = try self.field(allocator, "SELECT id FROM tools WHERE session_id=? AND upstream_tool=?", &.{ .{ .text = session.value }, .{ .text = upstream } });
+                if (existing != null) return error.Conflict;
+                try db.execute("INSERT INTO tools(id,revision,run_id,session_id,upstream_tool,name,action_digest,outcome) VALUES(?,1,?,?,?,?,?,'pending')", &.{ .{ .text = tool_id.value }, .{ .text = run.value }, .{ .text = session.value }, .{ .text = upstream }, .{ .blob = tool.name }, .{ .blob = tool.action_digest } });
+                try db.execute("UPDATE runs SET unresolved_tools=unresolved_tools+1 WHERE id=?", &.{.{ .text = run.value }});
+                try self.event(allocator, sequence, index, .{ .tool = tool_id }, 1, "ToolStarted", null, observation.correlation.effect, "");
+                index += 1;
+            },
+            .tool_completed => |result| {
+                const tool = observation.correlation.tool orelse return error.Conflict;
+                const found = try db.prepare("SELECT revision,outcome FROM tools WHERE id=? AND run_id=? AND session_id=? AND upstream_tool=?", &.{ .{ .text = tool.value }, .{ .text = run.value }, .{ .text = session.value }, if (observation.correlation.upstream_tool) |v| .{ .text = v } else .null });
+                defer found.deinit();
+                if (!try found.step() or found.integer(0) == std.math.maxInt(i64)) return error.Conflict;
+                if (!std.mem.eql(u8, try found.bytes(1), "pending")) return error.Conflict;
+                // Tool results are bounded canonical content, not UI-only text.
+                const block = try self.id(allocator);
+                const message = try self.field(allocator, "SELECT id FROM messages WHERE run_id=? AND role='assistant'", &.{.{ .text = run.value }}) orelse return error.Corrupt;
+                const ordinal = try db.prepare("SELECT coalesce(max(ordinal),-1)+1 FROM blocks WHERE message_id=?", &.{.{ .text = message }});
+                defer ordinal.deinit();
+                if (!try ordinal.step()) return error.Corrupt;
+                try db.execute("INSERT INTO blocks(id,revision,message_id,ordinal,kind,tool_id) VALUES(?,1,?,?,'tool_result',?)", &.{ .{ .text = block }, .{ .text = message }, .{ .integer = ordinal.integer(0) }, .{ .text = tool.value } });
+                var offset: usize = 0;
+                while (offset < result.result.len) {
+                    const end = @min(offset + 2048, result.result.len);
+                    _ = try db.appendChunk(block, offset, result.result[offset..end]);
+                    offset = end;
+                }
+                try db.execute("UPDATE tools SET outcome=?,result_block=?,revision=revision+1 WHERE id=?", &.{ .{ .text = @tagName(result.outcome) }, .{ .text = block }, .{ .text = tool.value } });
+                try db.execute("UPDATE runs SET unresolved_tools=unresolved_tools-1 WHERE id=? AND unresolved_tools>0", &.{.{ .text = run.value }});
+                try self.event(allocator, sequence, index, .{ .tool = tool }, @intCast(found.integer(0) + 1), "ToolCompleted", null, observation.correlation.effect, "");
+                index += 1;
+            },
+            .approval => |approval| {
+                if (terminal or std.mem.eql(u8, current_state, "cancel_requested") or !a.equal(approval.correlation, observation.correlation)) return error.Conflict;
+                const approval_id = approval.correlation.approval orelse return error.Conflict;
+                const tool_id = approval.correlation.tool orelse return error.Conflict;
+                const request = approval.correlation.upstream_request orelse return error.Conflict;
+                const tool_digest = try self.field(allocator, "SELECT action_digest FROM tools WHERE id=? AND run_id=? AND session_id=?", &.{ .{ .text = tool_id.value }, .{ .text = run.value }, .{ .text = session.value } }) orelse return error.Conflict;
+                const workspace = try self.field(allocator, "SELECT workspace_id FROM sessions WHERE id=?", &.{.{ .text = session.value }}) orelse return error.Corrupt;
+                if (!std.mem.eql(u8, tool_digest, approval.action_digest) or !std.mem.eql(u8, workspace, approval.workspace.value)) return error.Conflict;
+                if (approval.expires_at) |expiry| if (expiry > std.math.maxInt(i64)) return error.Limit;
+                try db.execute("INSERT INTO approvals(id,revision,run_id,session_id,tool_id,workspace_id,upstream_request,action_digest,scope,expires_at,state,live_epoch) VALUES(?,1,?,?,?,?,?,?,?,?,'pending',?)", &.{ .{ .text = approval_id.value }, .{ .text = run.value }, .{ .text = session.value }, .{ .text = tool_id.value }, .{ .text = workspace }, .{ .text = request }, .{ .blob = approval.action_digest }, .{ .blob = approval.scope }, if (approval.expires_at) |v| .{ .integer = @intCast(v) } else .null, .{ .text = self.epoch } });
+                next_state = "awaiting_approval";
+                try self.event(allocator, sequence, index, .{ .approval = approval_id }, 1, "ApprovalPending", null, observation.correlation.effect, "");
+                index += 1;
+            },
+            .completed => {
+                const pending = try self.field(allocator, "SELECT id FROM tools WHERE run_id=? AND outcome IN('pending','unknown') LIMIT 1", &.{.{ .text = run.value }});
+                if (!terminal) next_state = if (pending == null) "completed" else "unknown";
+            },
+            .cancelled => |cancelled| if (!terminal) {
+                next_state = if (cancelled.tools_stopped) "cancelled" else "unknown";
+            },
+            .failure => if (!terminal) {
+                next_state = "failed";
+            },
+            .disconnect, .ambiguous => if (!terminal) {
+                next_state = "unknown";
+            },
+            .selection => |selection| {
+                const bytes = try self.field(allocator, "SELECT requested FROM runs WHERE id=?", &.{.{ .text = run.value }}) orelse return error.Corrupt;
+                const requested = try t.decode(a.Selection, bytes, allocator);
+                if (!a.equal(requested, selection.requested) or selection.effective == null or !a.equal(requested, selection.effective.?)) return error.Conflict;
+                try db.execute("UPDATE runs SET effective=? WHERE id=?", &.{ .{ .blob = try encoded(allocator, selection.effective.?) }, .{ .text = run.value } });
+            },
+            .session => return error.Conflict,
+        }
+        try db.execute("INSERT INTO observations(session_id,upstream_event,runtime_version,correlation,digest,cursor,commit_sequence) VALUES(?,?,?,?,?,?,?)", &.{ .{ .text = session.value }, .{ .text = observation.upstream_event }, .{ .text = observation.runtime_version }, .{ .blob = try encoded(allocator, observation.correlation) }, .{ .blob = &digest }, if (observation.cursor) |v| .{ .blob = v.value } else .null, .{ .integer = @intCast(sequence) } });
+        // Cursor advances only in the transaction containing the canonical bytes.
+        if (observation.cursor) |cursor| {
+            const session_revision = try db.prepare("SELECT revision FROM sessions WHERE id=?", &.{.{ .text = session.value }});
+            defer session_revision.deinit();
+            if (!try session_revision.step() or session_revision.integer(0) == std.math.maxInt(i64)) return error.Limit;
+            try db.execute("UPDATE sessions SET cursor=?,revision=revision+1 WHERE id=?", &.{ .{ .blob = cursor.value }, .{ .text = session.value } });
+            try self.event(allocator, sequence, index, .{ .session = session }, @intCast(session_revision.integer(0) + 1), "CursorCommitted", null, observation.correlation.effect, "");
+            index += 1;
+        }
+        try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = next_state }, .{ .text = run.value } });
+        try self.event(allocator, sequence, index, .{ .run = run }, @intCast(state_statement.integer(1) + 1), "ObservationCommitted", null, observation.correlation.effect, "");
+        try db.commit();
+    }
+
     pub fn recover(self: *Owner) !void {
         try self.database.begin();
         errdefer self.database.rollback() catch {};
