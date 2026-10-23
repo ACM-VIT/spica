@@ -118,3 +118,12 @@ and `device.log`. The same mixed factory also ran installed Codex initialize/
 account-read and real OpenCode inference simultaneously with distinct account
 roots and verified `/proc` cwd identities; see consumer `mixed-manifest-2.json`
 and `mixed-run-2.log`. Codex remained signed out and performed no inference.
+
+Assembled integration gate: formatting checked 89 sources; Debug native build,
+124/126 Zig tests (2 intentionally skipped), Python 35 tests (2 skipped) and
+native CLI smoke passed. ReleaseSafe initially exposed the MCP fortified-header
+C-import failure; the owner replaced the unnecessary header with `std.c.fcntl`
+without disabling fortify (`4dabfc3`). The affected ReleaseSafe native build,
+same 124/126 Zig tests, Python tests and CLI smoke then all exited 0. Raw gate
+and repair provenance: `.artifacts/provider-factory/final-check.log`,
+`final-check-failure.json`, `release-check.log`, `release-check.json`.
