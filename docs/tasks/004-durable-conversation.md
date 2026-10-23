@@ -28,3 +28,26 @@ Use cohesive checkpoints: storage identity/transactions first, durable command/e
 Native UI seam refinement: include `query.tools(run_id)`, bounded block descriptors on message rows with `next_block_cursor`, and `query.blocks(message_id,cursor)` continuation. Message paging specifies `older|newer` relative to stable ordinal/ID anchor within the same pinned snapshot. Nested descriptor bytes/rows count against page limits; source content is still fetched by explicit byte range. DomainPrep004 owns these projections/types; no second UI data/lifecycle owner.
 
 Storage handoff: preserved types checkpoints42263bf/f3c986f and SQLite storagef32c5181 plus receipts47e07188/c0d7fb27. Actual isolated Debug/ReleaseSafe13/13 and storage consumer/reopen/abrupt before-after-COMMIT smoke passed, not public Host acceptance. Astra reviewed immutable storage diff and returned committed-range chunk dedup, recovery event/revision publication, newly created directory durability and integer-exhaustion findings to DomainRuntime004. Remaining reducers/async Host/query/subscription implementation stays authorized; no discarded work or repeated confirmation-only checks.
+
+## Resumed shipping integration
+
+ScriptShip006 is the serialized shared Git/integration owner for tasks004–006,
+with Main retaining material contract decisions and final acceptance.
+RuntimeShip004's immutable Host chain through `50b65b6` is integrated through
+`690b96b`; its real recovery/consumer follow-up `f3e964a` is integrated as
+`b39981d`. Source review covered real Host copied admission/drain ownership,
+worker shutdown/backpressure, public projections, committed claims before fake
+dispatch, and conservative recovery. No mutable sibling source was copied.
+
+Raw public Host evidence is
+`.artifacts/worktrees/004-domain/.artifacts/domain004/host-checks.json` and
+`host-final-{Debug,ReleaseSafe}.log`: 19/19 tests per mode and real flow/abrupt
+approval crash/recovery consumer output. Recovered runs are interrupted, pending
+approval invalidated, exactly two effects retained without replay. Native App
+proof remains a separate gate, not implied by headless checks.
+
+Slot1 was explicitly re-reserved to RuntimeShip004 for concrete review closure:
+terminal message incomplete finalization and changed-aggregate revision/event
+coverage, plus its owned narrow Lua/native build/test-root integration. Preserve
+same-candidate follow-up checkpoints and add focused actual Host/subscription
+coverage; do not rerun old passing cohorts just to reconfirm them. No descendants.

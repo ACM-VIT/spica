@@ -61,3 +61,17 @@ Slot accounting: RuntimeShip004 remains slot1; UIShip005's yielded slot2 was
 explicitly re-reserved to the same worker for preserving/checkpointing its
 verified native candidate and continuing actual Host integration; ScriptShip006
 holds slot3 and shared Git. No descendants or fourth active worker authorized.
+
+Reviewed domain chain through `50b65b6` integrated through `690b96b`; verified
+Host recovery/public consumer follow-up `f3e964a` integrated as `b39981d`.
+Preserved UI sequence through `d5838e3` integrated through `134b622`; see the
+task004/task005 records for source-to-integrated SHAs and scoped evidence.
+Native default/custom Host milestone remains in progress, not accepted.
+
+RuntimeShip004's yielded slot1 was explicitly re-reserved to the same session
+for terminal message finalization, changed-aggregate event coverage and narrow
+build/test integration. Slot2 UIShip005 is wiring actual Host to the native App;
+slot3 ScriptShip006 remains sole shared Git owner/coordinator. No fourth worker
+or descendants are active. Isolated private correctness builds may run
+concurrently; only performance excludes all builds/recordings/profilers.
+Shared dependency-prefix mutation requires explicit exclusive ownership.
