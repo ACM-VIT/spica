@@ -16,6 +16,15 @@ python3 tools/format.py
 
 bootstrap.py acquires checksum-locked sources and fonts from deps.lock.json into ignored .deps/. It may need network access on first use. Keep lockfile and build logic in sync. driver.py supplies macOS SDK handling; on Linux it invokes Zig directly. Build/test use the existing cache without reinstalling system packages. Optional Lefthook hooks in lefthook.yml run the same formatting/build/regression checks before push.
 
+The scripting runtime is source-locked Lua **5.4.9**, built as
+`lib/libspica-lua54.a` with headers in `include/lua54` and the upstream MIT
+notice in `share/licenses/lua-5.4.9.txt` under the platform dependency prefix.
+No system Lua, interpreter, package loader, readline or default upstream install
+is used. `docs/licenses/lua-5.4.9.txt` preserves the selected source notice.
+For isolated runtime checks, import `build/bootstrap.py`, set `CACHE` to a
+private writable directory, then call `build_lua(prefix, build_root)`; do not
+write through a private worktree's shared `.deps` symlink.
+
 For the fast, isolated editor/core regression loop, use
 `python3 build/driver.py test-core -Doptimize=Debug --summary all`
 and repeat with `-Doptimize=ReleaseSafe`. This target links only libc and the

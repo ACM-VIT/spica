@@ -223,6 +223,49 @@ def build_highlighting(prefix, fingerprint):
         stamp.write_text(fingerprint)
 
 
+LUA_FLAGS = ['-std=c11', '-O2', '-g', '-fPIC']
+
+
+def build_lua(prefix, build_root):
+    """Build only the selected embedded static library, never Lua CLI/install."""
+    source = acquire('Lua')
+    config = json.dumps({
+        'source': SOURCES['Lua'], 'flags': LUA_FLAGS,
+        'cc': os.environ.get('CC', 'cc'), 'ar': os.environ.get('AR', 'ar'),
+        'platform': platform.system() + '-' + platform.machine(),
+        'sdk': os.environ.get('SDKROOT', ''),
+        'bootstrap': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    }, sort_keys=True)
+    library = prefix / 'lib/libspica-lua54.a'
+    stamp = prefix / '.lua54-config'
+    headers = ['lua.h', 'luaconf.h', 'lauxlib.h', 'lualib.h']
+    notice = prefix / 'share/licenses/lua-5.4.9.txt'
+    if (build_is_current(library, stamp, config) and notice.exists()
+            and all((prefix / 'include/lua54' / name).exists() for name in headers)):
+        return
+    build = build_root / ('lua-' + SOURCES['Lua']['version'])
+    # Never reuse old object files after a toolchain/flag change.
+    if build.exists():
+        shutil.rmtree(build)
+    shutil.copytree(source / 'src', build)
+    flags = list(LUA_FLAGS)
+    if platform.system() == 'Darwin' and os.environ.get('SDKROOT'):
+        flags += ['-isysroot', os.environ['SDKROOT']]
+    subprocess.run(['make', 'liblua.a', 'CC=' + os.environ.get('CC', 'cc'),
+                    'AR=' + os.environ.get('AR', 'ar') + ' rcu',
+                    'CFLAGS=' + ' '.join(flags), 'MYCFLAGS=', 'MYLDFLAGS=',
+                    'MYLIBS='], cwd=build, check=True)
+    library.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(build / 'liblua.a', library)
+    destination = prefix / 'include/lua54'
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in headers:
+        shutil.copyfile(source / 'src' / name, destination / name)
+    notice.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(ROOT / 'docs/licenses/lua-5.4.9.txt', notice)
+    stamp.write_text(config)
+
+
 def main():
     sdl = acquire('SDL')
     acquire('clay')
@@ -249,6 +292,7 @@ def main():
     system = {'darwin': 'macos', 'windows': 'windows'}.get(platform.system().lower(), platform.system().lower())
     prefix = CACHE / 'install' / (system + '-' + machine)
     build_root = CACHE / 'build' / (system + '-' + machine)
+    build_lua(prefix, build_root)
     build_highlighting(prefix, fingerprint)
     library = prefix / 'lib' / ('libSDL3.dylib' if system == 'macos' else 'libSDL3.so')
     sdl_stamp = prefix / '.sdl-allocator-config'

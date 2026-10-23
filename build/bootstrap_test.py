@@ -34,6 +34,7 @@ class BootstrapTests(unittest.TestCase):
                 ('acquire', lambda name: self.cache / 'src' / name),
                 ('acquire_font', lambda *args: None),
                 ('configure_image_allocators', lambda *args: None),
+                ('build_lua', lambda *args: None),
                 ('build_highlighting', lambda *args: None), ('log', lambda *args: None)):
             patcher = patch.object(bootstrap, target, replacement)
             patcher.start()
@@ -207,6 +208,57 @@ class BootstrapTests(unittest.TestCase):
                 self.commands.clear()
                 bootstrap.main()
                 self.assertEqual(self.commands, [])
+
+
+class LuaBootstrapTests(unittest.TestCase):
+    def test_static_build_cache_inputs_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'source'
+            (source / 'src').mkdir(parents=True)
+            for header in ('lua.h', 'luaconf.h', 'lauxlib.h', 'lualib.h'):
+                (source / 'src' / header).write_text(header)
+            prefix, build = root / 'prefix', root / 'build'
+            calls = []
+
+            def run(command, **kwargs):
+                calls.append(command)
+                self.assertEqual(command[1], 'liblua.a')
+                self.assertNotIn('install', command)
+                self.assertNotIn('LUA_USE_LINUX', ' '.join(command))
+                (kwargs['cwd'] / 'liblua.a').write_bytes(b'archive')
+
+            with patch.object(bootstrap, 'acquire', return_value=source), \
+                    patch.object(bootstrap.subprocess, 'run', side_effect=run):
+                bootstrap.build_lua(prefix, build)
+                self.assertEqual(len(calls), 1)
+                self.assertTrue((prefix / 'lib/libspica-lua54.a').exists())
+                self.assertIn('Copyright (C) 1994-2026', (prefix / 'share/licenses/lua-5.4.9.txt').read_text())
+                bootstrap.build_lua(prefix, build)
+                self.assertEqual(len(calls), 1)
+                for artifact in ('include/lua54/lua.h', 'share/licenses/lua-5.4.9.txt',
+                                 'lib/libspica-lua54.a'):
+                    (prefix / artifact).unlink()
+                    bootstrap.build_lua(prefix, build)
+                self.assertEqual(len(calls), 4)
+                with patch.object(bootstrap, 'LUA_FLAGS', bootstrap.LUA_FLAGS + ['-DNDEBUG']):
+                    bootstrap.build_lua(prefix, build)
+                with patch.dict(bootstrap.os.environ, {'SDKROOT': '/changed.sdk'}):
+                    bootstrap.build_lua(prefix, build)
+                with patch.dict(bootstrap.SOURCES, {'Lua': dict(bootstrap.SOURCES['Lua'], version='changed')}):
+                    bootstrap.build_lua(prefix, build)
+                self.assertEqual(len(calls), 7)
+
+    def test_cached_archive_is_verified_before_use(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            archive = cache / 'archives/lua-5.4.9.tar.gz'
+            archive.parent.mkdir()
+            archive.write_bytes(b'not the pinned source')
+            with patch.object(bootstrap, 'CACHE', cache):
+                with self.assertRaisesRegex(RuntimeError, 'locked SHA-256 mismatch'):
+                    bootstrap.acquire('Lua')
+            self.assertFalse((cache / 'src/lua-5.4.9').exists())
 
 
 if __name__ == '__main__':

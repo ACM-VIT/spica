@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "sources": {
+    "Lua": {"version": "5.4.9", "url": "https://www.lua.org/ftp/lua-5.4.9.tar.gz", "sha256": "2335b6c582a52654f94612bf10d2f4672805d05329aa6568b1d8cd9e5c6fb8e6"},
     "SDL": {"version": "release-3.4.16", "url": "https://codeload.github.com/libsdl-org/SDL/tar.gz/refs/tags/release-3.4.16", "sha256": "c2ee715e42ec520c4d11fd8d249ef1d2b2baf4ad31148b72b3b000276c0b3633"},
     "clay": {"version": "b25a31c1a152915cd7dd6796e6592273e5a10aac", "url": "https://codeload.github.com/nicbarker/clay/tar.gz/b25a31c1a152915cd7dd6796e6592273e5a10aac", "sha256": "1cba69296adf4efb57dbabc46076f0d50912319ed703d372c655e6a45c47129d"},
     "RapidFuzz": {"version": "v3.3.4", "url": "https://codeload.github.com/rapidfuzz/rapidfuzz-cpp/tar.gz/refs/tags/v3.3.4", "sha256": "a0dd2ef361cac165e12076696e7c7e8d069a2908abd9599ad4bd190de33f9881"},
