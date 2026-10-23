@@ -15,6 +15,7 @@ pub const Owner = struct {
     epoch: []const u8,
     utc_ms: ?u64,
     adapter: ?Adapter = null,
+    workspace_root: ?[]const u8 = null,
 
     fn id(self: *Owner, allocator: std.mem.Allocator) ![]const u8 {
         var random: [16]u8 = undefined;
@@ -167,6 +168,11 @@ pub const Owner = struct {
                 const thread = e.target.thread.value;
                 const workspace = try self.field(allocator, "SELECT workspace_id FROM threads WHERE id=?", &.{.{ .text = thread }}) orelse return .not_found;
                 if (!std.mem.eql(u8, workspace, p.selection.workspace.value)) return .workspace_mismatch;
+                if (self.workspace_root) |root| {
+                    const binding_bytes = try self.field(allocator, "SELECT binding FROM workspaces WHERE id=?", &.{.{ .text = workspace }}) orelse return .workspace_mismatch;
+                    const binding = try t.decode(t.WorkspaceBinding, binding_bytes, allocator);
+                    if (!std.mem.eql(u8, binding.canonical_root, root)) return .workspace_mismatch;
+                }
                 if (p.selection.account_ref.len == 0 or p.selection.model_id.len == 0 or p.selection.model_provider.len == 0) return .capability_unavailable;
                 if (self.adapter) |runtime| {
                     const discovery = runtime.discover();
@@ -175,8 +181,8 @@ pub const Owner = struct {
                     if (!std.mem.eql(u8, discovery.runtime_kind, p.selection.runtime_kind) or
                         !std.mem.eql(u8, discovery.runtime_version, p.selection.required_runtime_version) or
                         discovery.capability_revision != p.selection.capability_revision or
-                        account.readiness != .ready or !std.mem.eql(u8, account.reference, p.selection.account_ref) or
-                        resolved.readiness != .ready or !a.equal(resolved.requested, p.selection))
+                        account.readiness == .unavailable or !std.mem.eql(u8, account.reference, p.selection.account_ref) or
+                        resolved.readiness == .unavailable or !a.equal(resolved.requested, p.selection))
                         return .capability_unavailable;
                     for ([_]a.Capability{ .create, .start, .stream }) |capability|
                         if (discovery.capabilities[@intFromEnum(capability)].status != .supported) return .capability_unavailable;
@@ -585,6 +591,7 @@ pub const Host = struct {
         /// worker exclusively calls it and shuts it down on exit.
         adapter: ?Adapter = null,
         selection: ?a.Selection = null,
+        workspace_root: ?[]const u8 = null,
     };
     const Request = union(enum) { command: t.CommandEnvelope, query: t.Query, subscribe: t.Subscribe, unsubscribe: t.SubscriptionId };
     const Frame = struct { ticket: t.Ticket = .{ .value = 0 }, len: usize = 0, bytes: [65536]u8 = undefined };
@@ -732,7 +739,7 @@ pub const Host = struct {
         snapshot.database = null;
     }
     fn run(self: *Host) void {
-        var owner: Owner = .{ .database = &self.database, .io = self.io, .epoch = &self.epoch, .utc_ms = null, .adapter = self.options.adapter };
+        var owner: Owner = .{ .database = &self.database, .io = self.io, .epoch = &self.epoch, .utc_ms = null, .adapter = self.options.adapter, .workspace_root = self.options.workspace_root };
         defer if (self.options.adapter) |runtime| runtime.shutdown();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
