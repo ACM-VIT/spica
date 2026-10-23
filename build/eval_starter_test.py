@@ -61,6 +61,29 @@ def run_smoke_fixture(value):
 
 
 class RunnerBoundaries(unittest.TestCase):
+    def test_event_boundary_cache_change_is_carried_through_idle(self):
+        row = native()
+        before = copy.deepcopy(row['text_stats'])
+        after = dict(before, layout_bytes=1234)
+        row.update(version=2, cache_observations_dropped=0, cache_observation_failures=0,
+                   cache_observations=[dict(time_ns=4000000000, before=before, after=after)])
+        m.validate_native(row)
+        report = m.cache_tail_summary(row, dict(name='settled_1', begin=1, end=7))
+        self.assertEqual(report['last']['layout_bytes'], 1234)
+        row['cache_observations_dropped'] = 1
+        with self.assertRaisesRegex(RuntimeError, 'Incomplete event-boundary'):
+            m.cache_tail_summary(row, dict(name='settled_1', begin=1, end=7))
+        row['cache_observations_dropped'] = 0
+        row['cache_observations'][0]['before']['glyph_count'] = 513
+        with self.assertRaisesRegex(RuntimeError, 'cache ledger'):
+            m.validate_native(row)
+
+    def test_v2_requires_cache_boundary_accounting(self):
+        row = native()
+        row['version'] = 2
+        with self.assertRaisesRegex(RuntimeError, 'Missing event-boundary'):
+            m.validate_native(row)
+
     def test_key_chords_hold_and_release_real_wtype_modifiers(self):
         self.assertEqual(m.key_command('session', '5', 'Escape'), ('vd', 'key', 'session', '5', 'Escape'))
         self.assertEqual(m.key_command('session', '5', 'ctrl+shift+z'),

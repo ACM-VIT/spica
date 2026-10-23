@@ -49,7 +49,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     else
         &.{};
     defer if (options.metrics_output != null) std.heap.page_allocator.free(storage);
-    if (options.metrics_output != null) app.metrics = .{ .storage = storage };
+    const cache_storage: []telemetry.CacheChange = if (options.metrics_output != null)
+        try std.heap.page_allocator.alloc(telemetry.CacheChange, @min(options.metrics_capacity, 256))
+    else
+        &.{};
+    defer if (options.metrics_output != null) std.heap.page_allocator.free(cache_storage);
+    if (options.metrics_output != null) app.metrics = .{ .storage = storage, .cache_storage = cache_storage };
     const mapping = if (options.metrics_output != null) telemetry.mapClock(c.SDL_GetTicksNS) else null;
     const run_result = app.run(options.quit_after_ms);
     if (run_result) |_| {} else |err| std.log.err("Native run failed before export: {s}", .{@errorName(err)});
@@ -60,7 +65,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const stats_ok = c.spica_text_get_stats(app.text, &stats);
         const metrics = &app.metrics.?;
         try exportJson(threaded.io(), path, .{
-            .version = 1,
+            .version = 2,
             .clock = "SDL_GetTicksNS monotonic nanoseconds",
             .clock_mapping = mapping,
             .begin_ns = metrics.begin_ns,
@@ -71,12 +76,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .dropped = metrics.dropped,
             .successful_presents = app.frames,
             .frames = metrics.samples(),
+            .cache_observations = metrics.cacheSamples(),
+            .cache_observations_dropped = metrics.cache_dropped,
+            .cache_observation_failures = metrics.cache_observation_failures,
             .snapshot = app.snapshot,
             .renderer = std.mem.span(c.SDL_GetRendererName(app.renderer)),
             .video = std.mem.span(c.SDL_GetCurrentVideoDriver()),
             .hardware_acceleration = "not established by renderer name",
             .text_stats = if (stats_ok) @as(?c.SpicaTextStats, stats) else null,
-            .text_stats_scope = "per-present ledger plus final ledger; cache changes only during paint in this native shell; excludes external metadata and driver memory; no eviction or miss counters",
+            .text_stats_scope = "per-present and changed event-boundary ledgers plus final ledger; excludes transient between-boundary peaks, external metadata and driver memory",
             .run_error = if (run_result) |_| @as(?[]const u8, null) else |err| @errorName(err),
         });
     }

@@ -80,6 +80,15 @@ def cache_bounds(stats):
     return True
 
 
+def cache_changes(native):
+    required = ('cache_observations', 'cache_observations_dropped', 'cache_observation_failures')
+    if native.get('version', 1) >= 2 and any(key not in native for key in required):
+        raise RuntimeError('Missing event-boundary cache telemetry')
+    if native.get('cache_observations_dropped', 0) or native.get('cache_observation_failures', 0):
+        raise RuntimeError('Incomplete event-boundary cache telemetry')
+    return native.get('cache_observations', [])
+
+
 def cache_tail_summary(native, phase):
     offset = clock_offset(native)
     if native['dropped']:
@@ -87,18 +96,20 @@ def cache_tail_summary(native, phase):
     begin = max(phase['begin'], phase['end'] - 5) * 1e9
     end = phase['end'] * 1e9
     frames = [f for f in native['frames'] if f['succeeded']]
+    frames += [dict(present_end_ns=c['time_ns'], text_stats=c['after']) for c in cache_changes(native)]
+    frames.sort(key=lambda state: state['present_end_ns'])
     preceding = [f for f in frames if f['present_end_ns'] + offset <= begin]
     if not preceding:
         raise RuntimeError('No cache state available at settled-tail boundary')
-    # This shell mutates its text cache only in paint. Carry the last observed
-    # state through idle, and validate every subsequent state in the tail.
+    # Carry the latest actual paint/event-boundary observation through idle.
+    # Background rich-parser memory is separate from this native text ledger.
     states = [preceding[-1]] + [f for f in frames if begin < f['present_end_ns'] + offset < end]
     for frame in states:
         cache_bounds(frame.get('text_stats'))
     return dict(phase=phase['name'], begin=begin / 1e9, end=phase['end'],
                 states=len(states), last=states[-1]['text_stats'], bounds_passed=True,
                 maximum={key: max(frame['text_stats'][key] for frame in states) for key in states[0]['text_stats']},
-                observation='per-present ledger carried through event-driven idle; no cache mutation outside paint')
+                observation='per-present and changed event-boundary text ledgers carried through idle')
 
 
 def validate_native(native):
@@ -110,6 +121,9 @@ def validate_native(native):
     cache_bounds(native.get('text_stats'))
     for frame in native['frames']:
         cache_bounds(frame.get('text_stats'))
+    for change in cache_changes(native):
+        cache_bounds(change.get('before'))
+        cache_bounds(change.get('after'))
 
 
 def frame_summary(native, phase):

@@ -31,6 +31,13 @@ pub const TextStats = struct {
     face_count: u32,
 };
 
+pub const CacheChange = struct {
+    event_sequence: u64,
+    time_ns: u64,
+    before: TextStats,
+    after: TextStats,
+};
+
 pub const Frame = struct {
     frame_id: u64,
     event_sequence: u64,
@@ -51,6 +58,28 @@ pub const Metrics = struct {
     dropped: u64 = 0,
     begin_ns: u64 = 0,
     end_ns: u64 = 0,
+    cache_storage: []CacheChange = &.{},
+    cache_count: usize = 0,
+    cache_dropped: u64 = 0,
+    cache_observation_failures: u64 = 0,
+
+    pub fn observeCache(self: *Metrics, sequence: u64, time_ns: u64, before: ?TextStats, after: ?TextStats) void {
+        if (before == null or after == null) {
+            self.cache_observation_failures += 1;
+            return;
+        }
+        if (std.meta.eql(before.?, after.?)) return;
+        if (self.cache_count == self.cache_storage.len) {
+            self.cache_dropped += 1;
+            return;
+        }
+        self.cache_storage[self.cache_count] = .{ .event_sequence = sequence, .time_ns = time_ns, .before = before.?, .after = after.? };
+        self.cache_count += 1;
+    }
+
+    pub fn cacheSamples(self: *const Metrics) []const CacheChange {
+        return self.cache_storage[0..self.cache_count];
+    }
 
     pub fn record(self: *Metrics, frame: Frame) void {
         self.attempts += 1;
@@ -82,4 +111,21 @@ test "empty one sample failed present and bounded drop accounting" {
     try std.testing.expectEqual(@as(u64, 1), metrics.failures);
     try std.testing.expectEqual(@as(u64, 1), metrics.dropped);
     try std.testing.expectEqual(frame, metrics.samples()[0]);
+}
+
+test "event-boundary cache changes retain exact before after and explicit loss" {
+    var changes: [1]CacheChange = undefined;
+    var metrics: Metrics = .{ .storage = &.{}, .cache_storage = &changes };
+    const before: TextStats = .{ .fixed_cpu_bytes = 1, .font_bytes = 2, .layout_bytes = 3, .glyph_bytes = 4, .live_layouts = 1, .glyph_count = 1, .face_count = 1 };
+    metrics.observeCache(1, 10, before, before);
+    try std.testing.expectEqual(@as(usize, 0), metrics.cacheSamples().len);
+    var after = before;
+    after.layout_bytes += 100;
+    metrics.observeCache(2, 20, before, after);
+    try std.testing.expectEqual(@as(usize, 1), metrics.cacheSamples().len);
+    try std.testing.expectEqual(after.layout_bytes, metrics.cacheSamples()[0].after.layout_bytes);
+    metrics.observeCache(3, 30, after, before);
+    try std.testing.expectEqual(@as(u64, 1), metrics.cache_dropped);
+    metrics.observeCache(4, 40, null, before);
+    try std.testing.expectEqual(@as(u64, 1), metrics.cache_observation_failures);
 }

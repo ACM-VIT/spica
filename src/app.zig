@@ -98,6 +98,8 @@ pub const App = struct {
 
     fn handle(self: *App, event: c.SDL_Event) !void {
         self.snapshot.event_sequence += 1;
+        const before = if (self.metrics != null) self.textStats() else null;
+        defer if (self.metrics) |*metrics| metrics.observeCache(self.snapshot.event_sequence, c.SDL_GetTicksNS(), before, self.textStats());
         switch (event.type) {
             c.SDL_EVENT_QUIT, c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
                 self.snapshot.close_reason = "window_close";
@@ -130,6 +132,20 @@ pub const App = struct {
             else => return err,
         };
         self.dirty = self.dirty or changed;
+    }
+
+    fn textStats(self: *const App) ?telemetry.TextStats {
+        var stats: c.SpicaTextStats = undefined;
+        if (!c.spica_text_get_stats(self.text, &stats)) return null;
+        return .{
+            .fixed_cpu_bytes = stats.fixed_cpu_bytes,
+            .font_bytes = stats.font_bytes,
+            .layout_bytes = stats.layout_bytes,
+            .glyph_bytes = stats.glyph_bytes,
+            .live_layouts = stats.live_layouts,
+            .glyph_count = stats.glyph_count,
+            .face_count = stats.face_count,
+        };
     }
 
     fn paint(self: *App) !void {
@@ -197,6 +213,7 @@ test "ordinary text admission failure stays local and preserves draft and undo" 
     defer app.view.deinit();
     app.snapshot = .{};
     app.dirty = false;
+    app.metrics = null;
     var full: [64 * 1024]u8 = @splat('x');
     try app.view.editor.setText(&full);
     app.view.editor.selectAll();
@@ -211,4 +228,30 @@ test "ordinary text admission failure stays local and preserves draft and undo" 
     try std.testing.expectEqualSlices(u8, &full, app.view.editor.textBytes());
     try std.testing.expect(app.view.editor.redo());
     try std.testing.expectEqualStrings("retained", app.view.editor.textBytes());
+}
+
+test "native re-layout during ordinary key dispatch emits event-boundary cache state" {
+    const surface = c.SDL_CreateSurface(200, 100, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const text = c.spica_text_create(renderer, build_options.font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(text);
+    var changes: [1]telemetry.CacheChange = undefined;
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    app.text = text;
+    app.snapshot = .{};
+    app.dirty = false;
+    app.metrics = .{ .storage = &.{}, .cache_storage = &changes };
+    app.view.editor_view.width = 200;
+    try app.view.insert("hello\nworld", .typing);
+    var event: c.SDL_Event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_DOWN;
+    try app.handle(event);
+    try std.testing.expectEqual(@as(usize, 1), app.metrics.?.cacheSamples().len);
+    try std.testing.expectEqual(@as(u32, 0), app.metrics.?.cacheSamples()[0].before.live_layouts);
+    try std.testing.expectEqual(@as(u32, 1), app.metrics.?.cacheSamples()[0].after.live_layouts);
 }
