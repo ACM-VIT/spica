@@ -68,3 +68,25 @@ This is explicit-state native proof, not yet the assembled custom-root gate.
 UIShip005 continues independent XDG default/disconnect, followed by actual Lua
 root/renderer/current-generation action integration and last-good retention.
 Previously passing smoke is preserved, not rerun for confirmation.
+
+Default startup/shutdown checkpoint `da6719e` is integrated as `2ff3985`.
+Absolute XDG data home, or the independent HOME fallback, selects
+`spica-native/conversation`; explicit state override remains available and no
+legacy history is discovered. Presentation is joined before Host, while SDL
+and its wake context remain alive. Producer options tests passed 3/3 and the
+new actual `--mode conversation --default-state` cohort passed with isolated
+XDG data in `.artifacts/ui005/native-default-state/manifest.json`.
+
+Successor also exercised the previously unexecuted
+`.artifacts/ui005/approval-lifetime-smoke.py` on frozen `b393a5c` binary:
+real deny, 720×480 resize, close with live approval, reopen interrupted,
+disabled F7 and further Unicode editing all passed. Manifest and inspected
+screenshots are in `.artifacts/ui005/approval-lifetime/`. This is additional
+explicit-state boundary evidence, not a claim about the future Lua candidate.
+
+UIShip005 subsequently hit its runtime cap, leaving clean private HEAD
+`a04c1c32aec969bc8f7edd49e25a26e5a2108283` after immutable script/domain
+dependency consumption. Main explicitly transferred slot2 and the exact private
+UI allowlist to `ShipLeadContinue.NativeLuaBridge` (sol-repair); old writer is
+stopped. Slot1 is now `ShipLeadContinue.NativeMeasure`, evidence-only, with
+performance sampling barred until the assembled candidate and exclusive lease.

@@ -80,3 +80,12 @@ Host+Lua consumer only; that evidence cannot replace the required frontend proof
 No fourth worker or duplicate native writer is authorized. Combined
 `./tools/check`, actual assembled default/custom private-desktop interaction and
 exclusive independent profiling follow the concrete native integration.
+
+The stopped standalone consumer child released slot1 with only uncompiled,
+unexercised evidence at `.artifacts/script006/host-consumer/`; no A01–A09
+assertion is claimed passing. Main authorized successor slot reassignment.
+`ShipLeadContinue.NativeMeasure` now owns evidence-only slot1, including optional
+completion of that real consumer and later exclusive native measurements.
+After UIShip005's runtime cap, Main explicitly transferred its existing private
+native allowlist/slot2 to `ShipLeadContinue.NativeLuaBridge`; no additional
+public API or runtime implementation is authorized.

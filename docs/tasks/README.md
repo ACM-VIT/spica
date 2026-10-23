@@ -88,3 +88,13 @@ disconnect and Lua bridge; existing HostScriptMeasure retains slot1 for its
 standalone actual Host/Lua evidence. Successor occupies slot3; no duplicate
 workers. Default native conversation passed real private-desktop interaction and
 restart; actual custom-root integration and combined checks remain outstanding.
+
+Next verified default checkpoint `da6719e` integrated as `2ff3985`, with actual
+isolated-XDG native default flow/reopen evidence; additional explicit-state
+deny/resize/approval-revocation smoke passed. UIShip005 then runtime-capped after
+clean private `a04c1c3` dependency consumption. Main explicitly reassigned its
+exact native private allowlist/slot2 to `ShipLeadContinue.NativeLuaBridge`.
+Stopped HostScriptMeasure released slot1 without compiling its consumer;
+`ShipLeadContinue.NativeMeasure` now owns evidence-only slot1 and waits for an
+exclusive assembled-candidate measurement lease. Successor remains slot3/shared
+Git owner. No fourth active worker, pushes or competing production writers.
