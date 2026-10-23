@@ -68,6 +68,24 @@ Drops invalidate a full-cohort percentile/FPS claim: achieved_fps and distributi
 
 SpicaTextStats exports fixed_cpu_bytes, font_bytes, layout_bytes, glyph_bytes, live_layouts, glyph_count and face_count after every present and at shutdown. Schema v2 also observes text-ledger changes across ordinary SDL dispatch (such as editor re-layout before paint), storing exact before/after states with event sequence and SDL timestamp in a separately preallocated buffer of at most256changes. Unchanged events produce no record; missing accessor results and overflow have explicit counters. Tail summaries merge successful-present and changed-event observations in timestamp order, carrying the latest actual state through idle; missing/dropped boundary accounting invalidates the claim. No periodic sample/redraw is added. Bounds remain4MiB font tables,2MiB retained layouts,512glyph entries/2MiB glyph pixels and12faces. These boundary observations exclude between-boundary transient peaks, external metadata, driver memory and full VRAM. Background rich-worker memory has a separate ledger/lifetime; it is not inferred from the native text cache.
 
+### Projection memory ownership
+
+The presentation worker's rendered Markdown document uses a demand-backed
+arena capped at 16 MiB of backing storage (including metadata and overlapping
+growth allocations). It resets after serialization and reuses demanded capacity
+on subsequent jobs, instead of eagerly retaining a fully allocated 16 MiB buffer.
+Parser C arenas, source slots, tile storage, text caches and driver allocations remain
+separate budgets; the projection cap is not a whole-process memory ceiling.
+Allocation failure invalidates the pending header, never publishes stale output,
+and leaves subsequent projection jobs usable. Debug symbols and allocation
+diagnostics remain enabled according to the selected build mode.
+
+For footprint attribution, keep disk/cache size separate from runtime RSS/PSS.
+Save `/proc/PID/smaps` alongside ordinary whole-tree samples: anonymous/private
+pages, shared library residency and reserved virtual address space are distinct.
+In particular, renderer/LLVM shared RSS is not private application heap, and
+neither smaps nor the native glyph ledger measures GPU allocation.
+
 ## Process-tree schema v2
 
 ```bash

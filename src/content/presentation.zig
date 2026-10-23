@@ -56,6 +56,43 @@ pub const Tile = struct {
     }
 };
 
+// Bounds backing storage, including arena metadata and allocation overlap.
+// This wrapper lives for one job; only the allocator-neutral State is retained.
+const ProjectionAllocator = struct {
+    parent: std.mem.Allocator,
+    used: *usize,
+
+    fn allocator(self: *ProjectionAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *ProjectionAllocator = @ptrCast(@alignCast(context));
+        if (len > scratch_bytes - self.used.*) return null;
+        const result = self.parent.rawAlloc(len, alignment, ra) orelse return null;
+        self.used.* += len;
+        return result;
+    }
+    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *ProjectionAllocator = @ptrCast(@alignCast(context));
+        if (len > scratch_bytes - (self.used.* - memory.len)) return false;
+        if (!self.parent.rawResize(memory, alignment, len, ra)) return false;
+        self.used.* = self.used.* - memory.len + len;
+        return true;
+    }
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *ProjectionAllocator = @ptrCast(@alignCast(context));
+        if (len > scratch_bytes - (self.used.* - memory.len)) return null;
+        const result = self.parent.rawRemap(memory, alignment, len, ra) orelse return null;
+        self.used.* = self.used.* - memory.len + len;
+        return result;
+    }
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *ProjectionAllocator = @ptrCast(@alignCast(context));
+        self.parent.rawFree(memory, alignment, ra);
+        self.used.* -= memory.len;
+    }
+};
+
 /// Worker-only derived file. The file is disposable presentation data, never
 /// canonical content. Caller supplies an already-open private temporary file.
 /// All parse/C work and disk reads remain off the renderer thread.
@@ -63,15 +100,16 @@ pub const Projector = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     file: std.Io.File,
-    scratch: []u8,
+    scratch: std.heap.ArenaAllocator.State = .init,
+    scratch_reserved: usize = 0,
     header: ?Header = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) !Projector {
-        return .{ .allocator = allocator, .io = io, .file = file, .scratch = try allocator.alloc(u8, scratch_bytes) };
+        return .{ .allocator = allocator, .io = io, .file = file };
     }
 
     pub fn deinit(self: *Projector) void {
-        self.allocator.free(self.scratch);
+        self.scratch.promote(self.allocator).deinit();
         self.file.close(self.io);
     }
 
@@ -79,11 +117,18 @@ pub const Projector = struct {
         // Stale file bytes are never published as the new revision on failure.
         self.header = null;
         if (source.len > source_limit) return error.SourceBudget;
-        var fixed = std.heap.FixedBufferAllocator.init(self.scratch);
+        var budget = ProjectionAllocator{ .parent = self.allocator, .used = &self.scratch_reserved };
+        var arena = self.scratch.promote(budget.allocator());
+        defer {
+            // Retain only capacity actually demanded by preceding jobs. All
+            // Document/C pointers are gone before the arena is reset.
+            _ = arena.reset(.retain_capacity);
+            self.scratch = arena.state;
+        }
         var doc = blk: {
             parse_mutex.lockUncancelable(self.io);
             defer parse_mutex.unlock(self.io);
-            break :blk try markdown.parse(fixed.allocator(), key.source, source);
+            break :blk try markdown.parse(arena.allocator(), key.source, source);
         };
         defer doc.deinit();
         var sink = Sink{ .io = self.io, .file = self.file };
@@ -253,7 +298,6 @@ pub const Worker = struct {
         const storage = try allocator.create(WorkerStorage);
         errdefer allocator.destroy(storage);
         const projector = try Projector.init(allocator, io, file);
-        errdefer allocator.free(projector.scratch);
         self.* = .{ .allocator = allocator, .io = io, .projector = projector, .storage = storage, .wake = wake };
         self.thread = try std.Thread.spawn(.{ .allocator = allocator, .stack_size = 1024 * 1024 }, run, .{self});
         return self;
@@ -477,4 +521,64 @@ fn allocationProbe(allocator: std.mem.Allocator) !void {
 
 test "worker initialization allocation failures release scratch file and thread ownership" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationProbe, .{});
+}
+
+test "projection arena is demand backed and reuses warmed capacity" {
+    var projector = try tempProjector();
+    defer projector.deinit();
+    try std.testing.expectEqual(@as(usize, 0), projector.scratch_reserved);
+    const key = Key{ .source = @splat(3), .revision = 1, .generation = 1 };
+    _ = try projector.project(key, "**healthy** and `code`\n");
+    const warmed = projector.scratch_reserved;
+    try std.testing.expect(warmed > 0 and warmed < 64 * 1024);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    projector.allocator = failing.allocator();
+    for (0..10) |_| _ = try projector.project(key, "**healthy** and `code`\n");
+    try std.testing.expectEqual(warmed, projector.scratch_reserved);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "projection backing cap charges overlap and releases rejected allocations" {
+    var used: usize = 0;
+    var budget = ProjectionAllocator{ .parent = std.testing.allocator, .used = &used };
+    const allocator = budget.allocator();
+    const first = try allocator.alloc(u8, scratch_bytes);
+    try std.testing.expectEqual(scratch_bytes, used);
+    try std.testing.expectError(error.OutOfMemory, allocator.alloc(u8, 1));
+    try std.testing.expect(!allocator.resize(first, scratch_bytes + 1));
+    allocator.free(first);
+    try std.testing.expectEqual(@as(usize, 0), used);
+    const next = try allocator.alloc(u8, 32);
+    allocator.free(next);
+    try std.testing.expectEqual(@as(usize, 0), used);
+}
+
+fn projectAllocationProbe(allocator: std.mem.Allocator) !void {
+    var projector = try tempProjector();
+    projector.allocator = allocator;
+    defer projector.deinit();
+    const key = Key{ .source = @splat(4), .revision = 1, .generation = 1 };
+    _ = projector.project(key, "# heading\n\n**bold** and *soft* with `code`\n") catch |err| {
+        try std.testing.expect(projector.header == null);
+        return err;
+    };
+}
+
+test "projection allocation failure invalidates header and frees demanded arena" {
+    var failures: usize = 0;
+    var successes: usize = 0;
+    for (0..16) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        projectAllocationProbe(failing.allocator()) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            failures += 1;
+            continue;
+        };
+        // Arena reset is explicitly best-effort: its preheat allocation may
+        // fail after the valid document is serialized. That is not job failure.
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        successes += 1;
+    }
+    try std.testing.expect(failures > 0 and successes > 0);
 }
