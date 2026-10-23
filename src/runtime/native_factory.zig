@@ -24,10 +24,14 @@ pub const NativeFactory = struct {
     }
     fn discovery(p: *anyopaque, selection: c.Selection) c.Discovery {
         const self = cast(p);
-        var caps = [_]c.CapabilityInfo{.{ .status = .unknown, .evidence = "Instance handshake has not run" }} ** @typeInfo(c.Capability).@"enum".fields.len;
-        if (!self.compatible(selection)) for (&caps) |*cap| {
-            cap.status = .unsupported;
-        };
+        var caps = [_]c.CapabilityInfo{.{ .status = .unsupported, .evidence = "Not implemented by the selected concrete adapter" }} ** @typeInfo(c.Capability).@"enum".fields.len;
+        if (self.compatible(selection)) {
+            for ([_]c.Capability{ .create, .start, .stream, .tools, .approval, .cancel, .selection, .workspace }) |cap| {
+                caps[@intFromEnum(cap)] = .{ .status = .supported, .evidence = "Compiled adapter protocol support; installed version and effective selection require instance handshake" };
+            }
+            if (std.mem.eql(u8, selection.runtime_kind, "codex")) caps[@intFromEnum(c.Capability.attach)] = .{ .status = .supported, .evidence = "Codex thread/resume protocol; instance handshake required" };
+            caps[@intFromEnum(c.Capability.coordinator_bridge)] = .{ .status = .unknown, .evidence = "Host endpoint and actual provider tool callback require consumer verification" };
+        }
         return .{ .runtime_kind = self.selection.runtime_kind, .runtime_version = self.selection.required_runtime_version, .capabilities = caps, .limits = .{} };
     }
     fn account(p: *anyopaque, selection: c.Selection) c.Account {

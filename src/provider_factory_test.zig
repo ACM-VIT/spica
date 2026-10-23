@@ -9,6 +9,8 @@ test "factory metadata is side effect free and exact" {
     const factory = config.asFactory();
     try std.testing.expectEqual(.unknown, factory.accountStatus(selection).readiness);
     try std.testing.expectEqual(.unknown, factory.resolveSelection(selection).readiness);
+    try std.testing.expectEqual(.supported, factory.discover(selection).capabilities[@intFromEnum(c.Capability.create)].status);
+    try std.testing.expectEqual(.unsupported, factory.discover(selection).capabilities[@intFromEnum(c.Capability.message)].status);
     var other = selection;
     other.account_ref = "/another/account";
     try std.testing.expectEqual(.unavailable, factory.accountStatus(other).readiness);

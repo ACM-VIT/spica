@@ -75,3 +75,9 @@ after stopping its peer and exhaustive allocation-failure injection for both
 Codex and OpenCode creation with tool/endpoint metadata. Same focused command:
 7/7 passed with the leak-aware allocator. This still does not substitute for a
 provider turn cancellation or authenticated native workflow.
+
+Pre-open discovery distinguishes compiled protocol support from negotiated
+readiness: implemented create/start/stream operations are supported metadata
+without process IO; account/effective selection remain unknown until handshake.
+Unsupported messaging is not advertised. A focused metadata regression confirms
+this admission contract; the same 7-test consumer command passed.
