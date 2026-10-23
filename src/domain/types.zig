@@ -33,6 +33,21 @@ pub const Target = union(enum) {
     run: adapter.RunId,
     approval: adapter.ApprovalId,
 };
+
+/// Mutations target command aggregates; events/receipts also identify content,
+/// session and journal aggregates without relabeling them as runs or threads.
+pub const AggregateRef = union(enum) {
+    project: ProjectId,
+    workspace: adapter.WorkspaceId,
+    thread: ThreadId,
+    run: adapter.RunId,
+    approval: adapter.ApprovalId,
+    message: adapter.MessageId,
+    block: adapter.BlockId,
+    session: adapter.RuntimeSessionId,
+    effect: adapter.EffectId,
+    tool: adapter.ToolCallId,
+};
 pub const WorkspaceBinding = struct {
     canonical_root: []const u8,
     filesystem_identity: []const u8,
@@ -90,7 +105,7 @@ pub const EntityIds = struct {
     assistant_block: ?adapter.BlockId = null,
     session: ?adapter.RuntimeSessionId = null,
 };
-pub const CommittedRevision = struct { target: Target, revision: Revision };
+pub const CommittedRevision = struct { target: AggregateRef, revision: Revision };
 pub const Receipt = struct {
     command_id: CommandId,
     outcome: enum { accepted, rejected },
@@ -162,13 +177,15 @@ pub const QueryPage = struct {
     snapshot_position: EventPosition,
     items: []const Row,
     next_cursor: ?[]const u8 = null,
+    /// Ephemeral snapshot deadline in host-monotonic milliseconds. Not UTC and
+    /// never comparable to ApprovalEvidence.expires_at (Unix epoch UTC ms).
     expires_at: u64,
 };
 pub const Event = struct {
     contract_version: u32 = 1,
     event_id: EventId,
     position: EventPosition,
-    aggregate: Target,
+    aggregate: AggregateRef,
     aggregate_revision: Revision,
     kind: []const u8,
     causation_command_id: ?CommandId = null,
@@ -239,4 +256,34 @@ test "canonical envelope includes target precondition and byte contents" {
 test "event ordering retains unseen equal revision transaction members" {
     try std.testing.expectEqual(std.math.Order.lt, EventPosition.order(.{ .commit_sequence = 3, .event_index = 0 }, .{ .commit_sequence = 3, .event_index = 1 }));
     try std.testing.expectEqual(std.math.Order.gt, EventPosition.order(.{ .commit_sequence = 4 }, .{ .commit_sequence = 3, .event_index = 99 }));
+}
+
+/// Caller supplies a bounded allocator whose lifetime owns every returned slice.
+/// Both JSON strings and numeric byte arrays decode to the original u8 slices.
+pub fn decode(comptime T: type, bytes: []const u8, allocator: std.mem.Allocator) !T {
+    return std.json.parseFromSliceLeaky(T, allocator, bytes, .{ .allocate = .alloc_always, .max_value_len = bytes.len });
+}
+
+test "arbitrary content range bytes roundtrip without UTF-8 normalization" {
+    const Content = struct { bytes: []const u8 };
+    const samples = [_][]const u8{ "é\x00世界", "\xc3", "\xa9", "\xf0\x9f", "\x91\xa9", "\xff\x00" };
+    for (samples) |sample| {
+        var encoded: [1024]u8 = undefined;
+        const source = try encode(Content{ .bytes = sample }, &encoded);
+        var backing: [4096]u8 = undefined;
+        var allocator = std.heap.FixedBufferAllocator.init(&backing);
+        const restored = try decode(Content, source, allocator.allocator());
+        try std.testing.expectEqualSlices(u8, sample, restored.bytes);
+    }
+    var first: [1024]u8 = undefined;
+    var second: [1024]u8 = undefined;
+    try std.testing.expect(!std.mem.eql(u8, try encode(Content{ .bytes = "\xc3" }, &first), try encode(Content{ .bytes = "\xa9" }, &second)));
+}
+
+test "block and effect aggregates retain distinct canonical identities" {
+    var first: [1024]u8 = undefined;
+    var second: [1024]u8 = undefined;
+    const block: AggregateRef = .{ .block = .{ .value = "same-id" } };
+    const effect: AggregateRef = .{ .effect = .{ .value = "same-id" } };
+    try std.testing.expect(!std.mem.eql(u8, try encode(block, &first), try encode(effect, &second)));
 }
