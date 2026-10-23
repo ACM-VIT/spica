@@ -47,6 +47,8 @@ pub const View = struct {
     transcript_bounds: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     transcript_scroll: f32 = 0,
     follow_latest: bool = true,
+    history_move: ?HistoryMove = null,
+    history_height: f32 = 0,
     transcript_drag: ?usize = null,
     custom_root: ?*const @import("../script.zig").Root = null,
     custom_render: ?*const @import("../script.zig").Render = null,
@@ -55,6 +57,7 @@ pub const View = struct {
     custom_tile: transcript.RichTile = .{},
     custom_render_sequence: u64 = 0,
     custom_tile_sequence: u64 = std.math.maxInt(u64),
+    pub const HistoryMove = enum { previous, next, first, latest };
     pub const TaskCancel = struct { id: [32]u8, revision: u64 };
     pub const TaskLine = struct {
         bytes: [320]u8 = undefined,
@@ -131,7 +134,7 @@ pub const View = struct {
     /// Caller discards stale generations before admission into this root.
     pub fn admitTile(self: *View, text: *c.SpicaText, tile: *const presentation.Tile, width: f32) !void {
         for (self.rich_tiles[0..self.rich_count]) |*slot| {
-            if (slot.key) |key| if (std.meta.eql(key, tile.key) and slot.block_index == tile.block.index) {
+            if (slot.key) |key| if (std.meta.eql(key, tile.key) and slot.block_index == tile.block.index and slot.start_byte == tile.start_byte) {
                 try slot.update(text, tile, width);
                 return;
             };
@@ -140,6 +143,14 @@ pub const View = struct {
         try self.rich_tiles[index].update(text, tile, width);
         if (self.rich_count < self.rich_tiles.len) self.rich_count += 1;
         self.rich_next = (index + 1) % self.rich_tiles.len;
+    }
+
+    pub fn clearHistory(self: *View) void {
+        for (&self.rich_tiles) |*tile| tile.deinit();
+        self.rich_count = 0;
+        self.rich_next = 0;
+        self.transcript_drag = null;
+        self.transcript_scroll = 0;
     }
 
     fn hasComposer(self: *const View) bool {
@@ -225,6 +236,8 @@ pub const View = struct {
             c.SDL_EVENT_MOUSE_WHEEL => {
                 if (widgets.contains(self.transcript_bounds, event.wheel.mouse_x, event.wheel.mouse_y)) {
                     const direction: f32 = if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) -1 else 1;
+                    if (event.wheel.y * direction > 0 and self.transcript_scroll == 0) self.history_move = .previous;
+                    if (event.wheel.y * direction < 0 and self.transcript_scroll >= @max(0, self.history_height - self.transcript_bounds.h)) self.history_move = .next;
                     self.transcript_scroll = @max(0, self.transcript_scroll - event.wheel.y * direction * 44);
                     self.follow_latest = false;
                     return true;
@@ -261,6 +274,16 @@ pub const View = struct {
                 const mods = event.key.mod;
                 const ctrl = mods & c.SDL_KMOD_CTRL != 0;
                 const shift = mods & c.SDL_KMOD_SHIFT != 0;
+                if (ctrl) {
+                    self.history_move = switch (key) {
+                        c.SDLK_PAGEUP => .previous,
+                        c.SDLK_PAGEDOWN => .next,
+                        c.SDLK_HOME => .first,
+                        c.SDLK_END => .latest,
+                        else => null,
+                    };
+                    if (self.history_move != null) return true;
+                }
                 switch (key) {
                     c.SDLK_F6 => {
                         self.request(.cancel);
@@ -401,13 +424,31 @@ pub const View = struct {
             try self.custom_tile.reflow(text, @max(25, bounds.transcript.width));
             try self.custom_tile.draw(renderer, text, bounds.transcript.x, bounds.transcript.y);
         } else {
+            var anchor_index: ?usize = null;
+            var anchor_point: transcript.RichTile.ScrollPoint = .{ .byte = 0, .offset = 0 };
+            var old_y: f32 = 0;
+            if (!self.follow_latest) for (0..self.rich_count) |offset| {
+                const index = if (self.rich_count == self.rich_tiles.len) (self.rich_next + offset) % self.rich_tiles.len else offset;
+                const tile = &self.rich_tiles[index];
+                if (old_y + tile.height() + 8 > self.transcript_scroll) {
+                    anchor_index = index;
+                    anchor_point = tile.capture(self.transcript_scroll - old_y);
+                    break;
+                }
+                old_y += tile.height() + 8;
+            };
             var total_height: f32 = 0;
-            for (self.rich_tiles[0..self.rich_count]) |*tile| {
+            var restored: ?f32 = null;
+            for (0..self.rich_count) |offset| {
+                const index = if (self.rich_count == self.rich_tiles.len) (self.rich_next + offset) % self.rich_tiles.len else offset;
+                const tile = &self.rich_tiles[index];
                 try tile.reflow(text, bounds.transcript.width);
+                if (anchor_index == index) restored = total_height + tile.restore(anchor_point);
                 total_height += tile.height() + 8;
             }
+            self.history_height = total_height;
             const max_scroll = @max(0, total_height - self.transcript_bounds.h);
-            self.transcript_scroll = if (self.follow_latest) max_scroll else @min(max_scroll, self.transcript_scroll);
+            self.transcript_scroll = if (self.follow_latest) max_scroll else @min(max_scroll, restored orelse self.transcript_scroll);
             var tile_y = self.transcript_bounds.y - self.transcript_scroll;
             for (0..self.rich_count) |offset| {
                 const index = if (self.rich_count == self.rich_tiles.len) (self.rich_next + offset) % self.rich_tiles.len else offset;

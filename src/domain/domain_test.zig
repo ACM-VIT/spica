@@ -731,3 +731,46 @@ test "durable app task delegation deduplicates bounds and correlates out of orde
     try std.testing.expectEqual(@as(?domain.Owner.Claimed, null), try owner.claimNext(allocator));
     try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM tasks"));
 }
+
+test "indexed distant history pages retain boundaries cursors and exact source ranges" {
+    const Host = @import("../domain.zig").Host;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    {
+        var database = try storage.Store.open(std.testing.io, path_buffer[0..n]);
+        defer database.close() catch @panic("close");
+        try seed(&database);
+        try database.exec("UPDATE runs SET state='completed'; WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<10000) INSERT INTO messages SELECT printf('message-%d',n),1,'h','r',n,'assistant',0 FROM numbers");
+        try database.begin();
+        var raw: [2048]u8 = undefined;
+        for (&raw, 0..) |*byte, index| byte.* = @truncate(index);
+        for (0..256) |index| _ = try database.appendChunk("b", index * raw.len, &raw);
+        try database.commit();
+    }
+    var consumer: Consumer = .{ .host = undefined, .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer consumer.arena.deinit();
+    consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .wake = Consumer.wake, .wake_context = &consumer });
+    defer consumer.host.destroy();
+    const latest = try consumer.query(.{ .messages = .{ .thread = .{ .value = "h" }, .direction = .older, .page = .{ .limit = 32 } } });
+    try std.testing.expectEqual(@as(u64, 10000), latest.items[0].message.ordinal);
+    try std.testing.expectEqual(@as(u64, 9969), latest.items[31].message.ordinal);
+    const continued = try consumer.query(.{ .messages = .{ .thread = .{ .value = "h" }, .direction = .older, .page = .{ .limit = 32, .snapshot = latest.snapshot_id, .cursor = latest.next_cursor.? } } });
+    try std.testing.expectEqual(@as(u64, 9968), continued.items[0].message.ordinal);
+    const distant = try consumer.query(.{ .messages = .{ .thread = .{ .value = "h" }, .anchor = .{ .value = "message-5000" }, .direction = .newer, .page = .{ .limit = 1 } } });
+    try std.testing.expectEqual(@as(u64, 5001), distant.items[0].message.ordinal);
+    const oldest = try consumer.query(.{ .messages = .{ .thread = .{ .value = "h" }, .anchor = .{ .value = "message-1" }, .direction = .older, .page = .{ .limit = 1 } } });
+    try std.testing.expectEqual(@as(u64, 0), oldest.items[0].message.ordinal);
+    try std.testing.expect(oldest.next_cursor == null);
+    const end = try consumer.query(.{ .messages = .{ .thread = .{ .value = "h" }, .anchor = .{ .value = "m" }, .direction = .older } });
+    try std.testing.expectEqual(@as(usize, 0), end.items.len);
+    const range = try consumer.query(.{ .content = .{ .block = .{ .value = "b" }, .start_byte = 500001, .end_byte = 504097 } });
+    for (range.items[0].content.bytes, 0..) |byte, index| try std.testing.expectEqual(@as(u8, @truncate(500001 + index)), byte);
+    _ = try consumer.host.query(.{ .messages = .{ .thread = .{ .value = "h" }, .anchor = .{ .value = "missing" } } });
+    const missing = try consumer.next();
+    try std.testing.expectEqual(.not_found, missing.failure.failure.reason);
+    _ = try consumer.host.query(.{ .messages = .{ .thread = .{ .value = "h" }, .page = .{ .cursor = "malformed" } } });
+    const invalid = try consumer.next();
+    try std.testing.expectEqual(.cursor_invalid, invalid.failure.failure.reason);
+}

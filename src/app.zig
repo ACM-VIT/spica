@@ -227,6 +227,12 @@ pub const App = struct {
             },
             else => return err,
         };
+        if (self.view.history_move) |move| {
+            self.view.history_move = null;
+            if (self.conversation) |conversation| conversation.navigate(self, move) catch |err| {
+                self.view.notice = @errorName(err);
+            };
+        }
         if (self.view.takeIntent()) |intent| {
             if (self.lua) |bridge| {
                 if (bridge.active and bridge.generation != 0 and intent == .send) {
@@ -570,7 +576,7 @@ const Conversation = struct {
     messages: [8]Id = undefined,
     message_count: usize = 0,
     message_index: usize = 0,
-    blocks: [8]struct { id: Id, revision: u64, bytes: u64 } = undefined,
+    blocks: [8]struct { id: Id, revision: u64, bytes: u64, ordinal: u64 } = undefined,
     block_count: usize = 0,
     block_index: usize = 0,
     worker_key: ?presentation.Key = null,
@@ -578,6 +584,71 @@ const Conversation = struct {
     tile_request: ?presentation.PageRequest = null,
     runs_cursor: ?Id = null,
     runs_snapshot: ?types.SnapshotId = null,
+    history_paused: bool = false,
+    history_first: ?struct { cursor: presentation.Cursor, ordinal: u64 } = null,
+    history_start: ?presentation.PageRequest = null,
+    desired_block: ?u64 = null,
+    block_cursor: ?Id = null,
+    block_snapshot: ?types.SnapshotId = null,
+    message_anchor: ?Id = null,
+    message_direction: types.Direction = .older,
+    message_snapshot: ?types.SnapshotId = null,
+
+    fn navigate(self: *Conversation, app: *App, move: Coding.HistoryMove) !void {
+        if (self.query != null or self.source_pending or (!self.history_paused and self.worker_key != null)) return;
+        self.message_index = 0;
+        switch (move) {
+            .first, .latest => {
+                self.message_anchor = null;
+                self.message_snapshot = null;
+                self.message_direction = if (move == .first) .newer else .older;
+                app.view.follow_latest = move == .latest;
+                self.history_paused = false;
+                self.worker_key = null;
+                self.tile_request = null;
+                try self.askMessages();
+            },
+            .next => {
+                app.view.follow_latest = false;
+                if (self.history_paused and self.worker_key != null) {
+                    self.history_paused = false;
+                    app.view.clearHistory();
+                    self.history_first = null;
+                    if (self.tile_request == null) try self.nextBlock(app);
+                } else {
+                    self.message_anchor = self.messages[0];
+                    self.message_direction = .newer;
+                    self.message_snapshot = null;
+                    try self.askMessages();
+                }
+            },
+            .previous => {
+                const first = self.history_first orelse return;
+                app.view.follow_latest = false;
+                self.history_paused = false;
+                self.tile_request = null;
+                self.worker_key = null;
+                if (first.cursor.block != 0 or first.cursor.byte != 0) {
+                    self.desired_block = first.ordinal;
+                    self.history_start = .{ .key = undefined, .first_block = first.cursor.block, .start_byte = first.cursor.byte, .backward = true };
+                    self.block_cursor = null;
+                    self.block_snapshot = null;
+                    try self.askBlocks();
+                } else if (first.ordinal != 0) {
+                    self.desired_block = first.ordinal - 1;
+                    self.history_start = .{ .key = undefined, .first_block = 0, .last = true };
+                    self.block_cursor = null;
+                    self.block_snapshot = null;
+                    try self.askBlocks();
+                } else {
+                    self.message_anchor = self.messages[0];
+                    self.message_direction = .older;
+                    self.message_snapshot = null;
+                    try self.askMessages();
+                }
+            },
+        }
+    }
 
     const QueryKind = enum { projects, workspaces, threads, thread, runs, approvals, tasks, messages, blocks, content };
     const CommandKind = enum { project, workspace, thread, send, cancel, approval };
@@ -697,18 +768,27 @@ const Conversation = struct {
             switch (self.completion) {
                 .projected => |header| if (self.worker_key) |key| {
                     if (std.meta.eql(header.key, key)) {
-                        if (header.state == .rich and header.block_count != 0) self.tile_request = .{ .key = key, .first_block = 0 } else try self.nextBlock(app);
+                        if (header.state == .rich and header.block_count != 0) {
+                            var request = self.history_start orelse presentation.PageRequest{ .key = key, .first_block = 0, .last = app.view.follow_latest and self.blocks[self.block_index].bytes > presentation.page_text_bytes };
+                            request.key = key;
+                            self.history_start = null;
+                            self.tile_request = request;
+                        } else try self.nextBlock(app);
                     }
                 },
                 .tile => |*tile| if (self.worker_key) |key| {
                     if (std.meta.eql(tile.key, key)) {
+                        if (self.history_first == null) self.history_first = .{ .cursor = .{ .block = tile.block.index, .byte = tile.start_byte }, .ordinal = self.blocks[self.block_index].ordinal };
                         var width: c_int = 0;
                         _ = c.SDL_GetWindowSize(app.window, &width, null);
                         app.view.admitTile(app.text, tile, @min(960, @as(f32, @floatFromInt(width)) - 48)) catch |err| {
                             app.view.notice = @errorName(err);
                         };
                         app.dirty = true;
-                        if (tile.next_block) |index| self.tile_request = .{ .key = key, .first_block = index } else try self.nextBlock(app);
+                        self.tile_request = if (tile.next) |next| .{ .key = key, .first_block = next.block, .start_byte = next.byte } else null;
+                        if (app.view.rich_count == app.view.rich_tiles.len or !app.view.follow_latest) {
+                            self.history_paused = true;
+                        } else if (self.tile_request == null) try self.nextBlock(app);
                     }
                 },
                 .failure => |failure| if (self.worker_key) |key| {
@@ -729,25 +809,35 @@ const Conversation = struct {
             };
             self.source_pending = false;
         }
-        if (self.tile_request) |request| {
-            self.worker.request(request) catch |err| switch (err) {
-                error.Busy => {
-                    Wake.notify(self.wake);
-                    return;
-                },
-                else => return err,
-            };
-            self.tile_request = null;
+        if (!self.history_paused) {
+            if (self.tile_request) |request| {
+                self.worker.request(request) catch |err| switch (err) {
+                    error.Busy => {
+                        Wake.notify(self.wake);
+                        return;
+                    },
+                    else => return err,
+                };
+                self.tile_request = null;
+            }
         }
-        if (self.refresh and self.query == null and self.worker_key == null and self.thread.len != 0) {
+        if (self.refresh and self.query == null and (self.worker_key == null or self.history_paused) and self.thread.len != 0) {
             self.refresh = false;
+            if (app.view.follow_latest) {
+                self.history_paused = false;
+                self.worker_key = null;
+                self.tile_request = null;
+                self.message_snapshot = null;
+                self.message_anchor = null;
+                self.message_direction = .older;
+            }
             try self.ask(.thread, .{ .thread = .{ .value = self.thread.slice() } });
         }
         const terminal = if (self.run_state) |state| switch (state) {
             .completed, .cancelled, .failed, .interrupted, .unknown => true,
             else => false,
         } else true;
-        app.view.can_send = self.thread.len != 0 and terminal and self.command == null and self.query == null and !self.refresh and self.worker_key == null;
+        app.view.can_send = self.thread.len != 0 and terminal and self.command == null and self.query == null and !self.refresh and (self.worker_key == null or self.history_paused);
         app.view.can_cancel = self.run.len != 0 and !terminal and self.command == null;
         app.view.tasks_enabled = self.command == null and !self.refresh;
         app.view.can_approve = self.approval_live and self.command == null and !self.refresh;
@@ -900,24 +990,39 @@ const Conversation = struct {
                 }
                 if (value.next_cursor) |cursor| {
                     try self.ask(.tasks, .{ .task_list = .{ .parent = .{ .value = self.run.slice() }, .page = .{ .limit = 16, .max_bytes = 64 * 1024, .snapshot = value.snapshot_id, .cursor = cursor } } });
-                } else try self.askMessages();
+                } else if (app.view.follow_latest or self.message_count == 0) try self.askMessages();
             },
             .messages => {
-                self.message_count = value.items.len;
+                if (value.items.len == 0) {
+                    self.history_paused = true;
+                    app.view.notice = "History boundary";
+                    return;
+                }
+                self.message_snapshot = value.snapshot_id;
+                self.message_count = 1;
                 self.message_index = 0;
-                for (value.items, 0..) |row, index| self.messages[value.items.len - 1 - index] = try Id.init(row.message.message_id.value);
+                self.messages[0] = try Id.init(value.items[0].message.message_id.value);
                 self.generation += 1;
-                for (&app.view.rich_tiles) |*tile| tile.deinit();
-                app.view.rich_count = 0;
-                app.view.rich_next = 0;
-                if (self.message_count != 0) try self.askBlocks();
+                app.view.clearHistory();
+                self.history_first = null;
+                self.block_cursor = null;
+                self.block_snapshot = null;
+                try self.askBlocks();
             },
             .blocks => {
+                self.block_snapshot = value.snapshot_id;
+                self.block_cursor = if (value.next_cursor) |cursor| try Id.init(cursor) else null;
                 self.block_count = value.items.len;
                 self.block_index = 0;
-                for (value.items, 0..) |row, index| self.blocks[index] = .{ .id = try Id.init(row.block.block_id.value), .revision = row.block.revision, .bytes = row.block.committed_bytes };
-                if (value.next_cursor != null) app.view.notice = "Message block neighborhood exceeds eight-block display budget";
-                if (self.block_count != 0) try self.startBlock(app) else try self.nextMessage();
+                for (value.items, 0..) |row, index| self.blocks[index] = .{ .id = try Id.init(row.block.block_id.value), .revision = row.block.revision, .bytes = row.block.committed_bytes, .ordinal = row.block.ordinal };
+                if (self.desired_block) |ordinal| {
+                    while (self.block_index < self.block_count and self.blocks[self.block_index].ordinal < ordinal) self.block_index += 1;
+                    if (self.block_index == self.block_count and self.block_cursor != null) return self.askBlocks();
+                    self.desired_block = null;
+                    app.view.clearHistory();
+                    self.history_first = null;
+                }
+                if (self.block_index < self.block_count) try self.startBlock(app) else try self.nextMessage();
             },
             .content => {
                 if (value.items.len != 1) return error.MissingContent;
@@ -944,10 +1049,17 @@ const Conversation = struct {
         try self.ask(.runs, .{ .runs = .{ .thread = .{ .value = self.thread.slice() }, .page = bounds } });
     }
     fn askMessages(self: *Conversation) !void {
-        try self.ask(.messages, .{ .messages = .{ .thread = .{ .value = self.thread.slice() }, .direction = .older, .page = page } });
+        var bounds = page;
+        bounds.limit = 1;
+        bounds.snapshot = self.message_snapshot;
+        try self.ask(.messages, .{ .messages = .{ .thread = .{ .value = self.thread.slice() }, .anchor = if (self.message_anchor) |*anchor| .{ .value = anchor.slice() } else null, .direction = self.message_direction, .page = bounds } });
+        self.history_paused = false;
     }
     fn askBlocks(self: *Conversation) !void {
-        try self.ask(.blocks, .{ .blocks = .{ .message = .{ .value = self.messages[self.message_index].slice() }, .page = page } });
+        var bounds = page;
+        bounds.snapshot = self.block_snapshot;
+        bounds.cursor = if (self.block_cursor) |*cursor| cursor.slice() else null;
+        try self.ask(.blocks, .{ .blocks = .{ .message = .{ .value = self.messages[self.message_index].slice() }, .page = bounds } });
     }
     fn startBlock(self: *Conversation, app: *App) !void {
         const block = &self.blocks[self.block_index];
@@ -963,16 +1075,18 @@ const Conversation = struct {
     }
     fn askContent(self: *Conversation) !void {
         const block = &self.blocks[self.block_index];
-        try self.ask(.content, .{ .content = .{ .block = .{ .value = block.id.slice() }, .start_byte = self.source_len, .end_byte = @min(block.bytes, self.source_len + 16 * 1024), .page = page } });
+        var bounds = page;
+        bounds.snapshot = self.block_snapshot;
+        try self.ask(.content, .{ .content = .{ .block = .{ .value = block.id.slice() }, .start_byte = self.source_len, .end_byte = @min(block.bytes, self.source_len + 16 * 1024), .page = bounds } });
     }
     fn nextBlock(self: *Conversation, app: *App) anyerror!void {
         self.worker_key = null;
         self.block_index += 1;
-        if (self.block_index < self.block_count) try self.startBlock(app) else try self.nextMessage();
+        if (self.block_index < self.block_count) try self.startBlock(app) else if (self.block_cursor != null) try self.askBlocks() else try self.nextMessage();
     }
     fn nextMessage(self: *Conversation) !void {
         self.message_index += 1;
-        if (self.message_index < self.message_count) try self.askBlocks();
+        if (self.message_index < self.message_count) try self.askBlocks() else self.history_paused = true;
     }
 };
 
