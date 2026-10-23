@@ -10,6 +10,8 @@ Instantiate `fake.Runtime(queue_capacity, call_capacity).init(config, script)`. 
 
 Receipts report acknowledgment, rejection or ambiguous delivery, not completed application commands. Inspect receipts can report an unknown outcome and replay continuity separately. `live_approval` is optional positive exact action/session/request evidence, including scope/workspace/expiry; null or merely `inspection=active` never establishes that an old approval callback is live. No permission is granted automatically. The domain owns expiry and cancellation races.
 
+`ApprovalEvidence.expires_at` is optional absolute Unix epoch milliseconds (UTC), never process-monotonic ticks or the script clock. Null means no advertised expiry, not proof of permission. The domain compares a trustworthy current wall time, fails closed on unknown or expired evidence, and must not extend durable authority across restart.
+
 ## Script and clock
 
 A script is a borrowed immutable array of `Step`: `expect{request,receipt}`, `emit(Observation)`, named `barrier`, absolute `at` fake-clock deadline, or explicit `native_action`. Dispatch consumes only an exact next expectation. `pump()` consumes emissions/actions until the next expectation, barrier, future deadline, error or end. `release(name)` consumes only the exact current barrier; `advance(time)` is monotonic and never pumps implicitly. Dispatch never pumps or schedules hidden work. Scripts can repeat events, reorder offsets/sequences, deny approval, cancel, fail, disconnect and retain ambiguous outcomes. The fake deliberately preserves duplicates and out-of-order data; domain reducers must decide what may append once.

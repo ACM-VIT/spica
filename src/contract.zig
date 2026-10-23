@@ -109,6 +109,9 @@ pub const ApprovalEvidence = struct {
     workspace: WorkspaceId,
     action_digest: []const u8,
     scope: []const u8,
+    /// Absolute Unix epoch milliseconds (UTC), never monotonic ticks.
+    /// Null means no advertised expiry, not permission; domain fails closed on
+    /// unknown/expired wall-time evidence without extending authority on restart.
     expires_at: ?u64 = null,
 };
 pub const Receipt = struct {
