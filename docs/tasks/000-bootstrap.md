@@ -18,3 +18,11 @@ Review: separate Sol source review found one P2 in the original smoke helper: st
 
 Setup task IDs: spica-rewrite-native-foundation-r1; spica-rewrite-native-review-r1; spica-rewrite-omp-setup-r1 and r2. All setup workers are finished; no ongoing runner is installed.
 Limitations: no domain/provider/config SDK implemented; no CI or frame telemetry yet; no model calls needed to validate the launcher; no measured performance improvement claim.
+
+## 2026-10-23: Nested Sol harness delegation
+
+User-authorized harness-only change: all three project workers explicitly grant the `task` tool and `spawns: [task, sol-measure, sol-repair]`; recursion depth is `-1`. Coordinator and worker instructions require main-coordinator slot reservations, at most three aggregate active workers including waiting parents, subset scopes/owned paths, no implicit Git-role transfer, Sol-only delegation without advisors, and completion/evidence propagation. Native same-type recursion guards remain unchanged.
+
+Main reviewed the instructions and reported a successful live chain: Main -> task `NestedSmoke` -> sol-measure `MeasureChild` -> sol-repair `RepairLeaf`. Main inspected `history://NestedSmoke.MeasureChild` for the actual nested task and `history://NestedSmoke.MeasureChild.RepairLeaf` for successful bash `printf 'SPICA_NESTED_DEPTH_3_OK\n'`; effective recursion depth `-1` was observed. This establishes three nested worker levels, not verified resolved child model identities (unavailable in the smoke evidence) or a tree-global OMP concurrency limit. Reservations enforce the aggregate ceiling by policy; OMP maxConcurrency is session-scoped.
+
+No application files changed. No builds, lint, tests or formatters rerun for this prompt/config checkpoint; the earlier native bootstrap acceptance is not renewed by this harness smoke.

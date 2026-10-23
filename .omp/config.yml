@@ -25,7 +25,7 @@ task:
   eager: always
   speculativeLaunch: false
   maxConcurrency: 3
-  maxRecursionDepth: 1
+  maxRecursionDepth: -1 # Unlimited nesting depth; concurrency remains separately bounded.
   maxRuntimeMs: 1800000
   softRequestBudget: 40
   softRequestBudgetNotice: true

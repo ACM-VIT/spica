@@ -6,9 +6,13 @@ Run `./tools/agents`: Astra (`gpt-6-astra`, high thinking) coordinates and revie
 
 ## Roles and budgets
 
-Astra owns decomposition, contracts, dependencies, decisions, shared ledger index and acceptance. Delegate all implementation, scouting, checks, interaction, measurement, repair and mechanical integration to project Sol agents: `task` (medium), `sol-measure` (medium), `sol-repair` (high). No alternative worker models, advisors or grandchildren. Inspect actual resolved identity; cancel a non-Sol worker and record the mismatch.
+Astra owns decomposition, contracts, dependencies, decisions, shared ledger index and acceptance. Delegate all implementation, scouting, checks, interaction, measurement, repair and mechanical integration to project Sol agents: `task` (medium), `sol-measure` (medium), `sol-repair` (high). No alternative worker models or advisors. Inspect actual resolved identity; cancel a non-Sol worker and record the mismatch.
 
-Default active concurrency is two when no independent third lane exists; project configuration permits at most three: implementation, an asynchronous evaluator on a pinned private candidate, and an optional high-thinking `sol-repair` worker. Ownership and dependencies, not available slots, determine dispatch. Each worker has a 30-minute hard limit and 40-request soft budget, forced yield at 60 requests; packets may be smaller. Explicit thinking avoids classification calls; worker tier is `default`. Prewalk, advisors, speculation, completion probes, warming, autolearn and automatic continuations are disabled; the launcher disables titles. Retries, compaction and global extensions can still add requests: these are not exact cost caps. Never add paid background loops or setup-test inference.
+`task.maxRecursionDepth: -1` permits unlimited delegation depth, not unlimited parallelism. Each project worker definition must explicitly include the `task` tool and a `spawns` allowlist containing only `task`, `sol-measure` and `sol-repair`. Do not bypass the native same-type self-recursion guard; delegate to another allowed Sol type when necessary.
+
+Default aggregate active concurrency is two when no independent third lane exists; the ceiling is three Sol workers across the entire tree, INCLUDING waiting parents. OMP `task.maxConcurrency: 3` is session-scoped, not a proven tree-global guarantee. Astra reserves slots before dispatch and passes explicit reservations in packets; children may delegate only within those pre-reserved slots, never independently fan out. Descendant scopes must be subsets of the delegating worker's owned paths; divide ownership to avoid concurrent writers. Shared Git ownership is not inherited: only Astra's explicitly designated single Git owner may mutate Git. Return child completion/evidence to its parent for propagation to Astra; release slots only when workers finish or are cancelled.
+
+Ownership and dependencies, not available slots, determine dispatch. Each worker has a 30-minute hard limit and 40-request soft budget, forced yield at 60 requests; packets may be smaller. Explicit thinking avoids classification calls; worker tier is `default`. Prewalk, advisors, speculation, completion probes, warming, autolearn and automatic continuations are disabled; the launcher disables titles. Retries, compaction and global extensions can still add requests: these are not exact cost caps. Never add paid background loops or setup-test inference except an explicitly user-requested live delegation smoke.
 
 ## Ownership and integration
 
@@ -22,7 +26,7 @@ Worktrees start from a recorded committed base; uncommitted work is not inherite
 
 ## Packets, repair and review
 
-Use `docs/tasks/README.md` and real records such as `docs/tasks/001-contracts.md`. States: `ready`, `running`, `review`, `accepted`, `blocked`; optionally record `repair` rounds. Reconcile existing children and checkout on resume to avoid duplicates. Before dispatch record outcome, authorized scope, dependencies, owned paths, immutable interfaces, base/branch/candidate identity, acceptance scenarios/checks, budget, attempts, commit checkpoints/Git owner and receipt/manifest paths.
+Use `docs/tasks/README.md` and real records such as `docs/tasks/001-contracts.md`. States: `ready`, `running`, `review`, `accepted`, `blocked`; optionally record `repair` rounds. Reconcile existing children and checkout on resume to avoid duplicates. Before dispatch record outcome, authorized scope, dependencies, owned paths, immutable interfaces, base/branch/candidate identity, acceptance scenarios/checks, budget, attempts, commit checkpoints/Git owner, parent and reserved slots (including any descendant allowance), and receipt/manifest paths.
 
 Minimal OMP batch syntax (example only):
 
