@@ -14,6 +14,17 @@ Read-only local `codex --version && opencode --version` returned `codex-cli 0.16
 
 T3's pinned [root LICENSE](https://github.com/pingdotgg/t3code/blob/eb1510d2493cbf28600432d5193cc22a1af8f3d8/LICENSE#L1-L21) is MIT, copyright 2026 T3 Tools Inc.; substantial copying requires preserving its notice. The tree also contains separately licensed vendored repositories/assets: root MIT is not a blanket provenance finding for those. Codex's pinned [LICENSE](https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/LICENSE) is Apache-2.0; OpenCode's pinned [LICENSE](https://github.com/anomalyco/opencode/blob/68bc26b7da1990ce10ffecfbc1e09eb13aa5d824/LICENSE#L1-L21) is MIT, copyright 2025 opencode. No implementation is copied into Spica by this task. Public source snapshots/excerpts are retained only in ignored evidence. Spica's existing missing root license remains a distribution issue, not resolved here.
 
+User-requested complete T3 working-tree Git checkout is available read-only at
+`/home/ashman/Documents/spica/.artifacts/references/t3code`. A public shallow
+exact-pin fetch checked out detached HEAD
+`eb1510d2493cbf28600432d5193cc22a1af8f3d8`; Git HEAD, source tree and checked-out
+MIT notice were verified. This is a full source checkout with shallow history,
+not merely the earlier selected snapshots/archive. Acquisition evidence:
+`.artifacts/references/t3code-acquisition.txt`. No reference packages, runtime or
+upstream tests were executed; no source was transplanted. Read the effect-ts
+skill before inspecting Effect-specific implementation. Both feature producers
+received this absolute path and immutable pin.
+
 ## T3 source observations
 
 All paths in this section refer to the T3 pin above. Observations are static source findings; tests present upstream were not executed.
