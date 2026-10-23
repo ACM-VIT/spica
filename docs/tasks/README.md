@@ -112,3 +112,13 @@ and reopened screenshots; task004–006 now await Main review rather than native
 implementation. NativeMeasure's slot1 exclusive paired-cohort lease was granted
 only after builds and smoke stopped. No performance success is implied before
 its raw results arrive; no pushes, packages or new API breadth were introduced.
+
+Final shared ReleaseSafe custom smoke passed without rebuilding. Exclusive
+paired default/custom baseline then completed and released the sampling lease;
+raw combined metrics are
+`.artifacts/ship-continue-measure/assembled-fe6a0ff-pair1-summary.json`.
+Task005 records frame counts/percentiles, covered tree CPU/RSS/PSS, identical
+settled cache tails and explicit `/proc`/sampling limitations. Both producer and
+measurement workers are finished; no builds, apps or profilers remain running.
+Tasks004–006 remain `review`, not accepted. Main reviews the actual candidate,
+final native captures and measured evidence before opening dependent gates.

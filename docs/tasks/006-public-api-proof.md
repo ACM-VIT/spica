@@ -115,3 +115,13 @@ nodes, not eight); no production runtime changed for that correction.
 Standalone evidence supplements, rather than replaces, the actual frontend.
 Independent measurement follows only under the explicit exclusive lease;
 Main retains final milestone acceptance and subsequent adapter authorization.
+
+The exclusive paired native baseline completed on the same frozen binary:
+custom active paint p50/p95/p99 4.987/5.932/7.386 ms (372 samples), versus
+5.009/6.050/7.166 ms default (370). Covered active one-core tree CPU was
+4.817% custom versus 4.869% default; both were idle event-driven with zero
+covered CPU ticks/paints in idle phases. Custom observed complete-sample PSS
+maximum was 89611264 bytes versus 87545856 default. Settled cache ledgers
+plateaued within bounds. These are finite observations, not superiority or
+performance acceptance claims; task005 records exact counts, raw JSON and
+incomplete `/proc` coverage/scheduling limits. Both worker slots are released.

@@ -119,3 +119,42 @@ NativeMeasure holds slot1's exclusive sampling lease only after all builds and
 smokes stopped; its paired default/custom measurements are recorded separately.
 No real Codex/OpenCode, physical latency, large-history or rich arbitrary custom
 renderer acceptance follows from this finite native proof.
+
+## Exclusive paired baseline
+
+NativeMeasure completed one sequential 115-second process per root on the frozen
+ReleaseSafe binary above, after all builds/smokes stopped, then released the
+lease. Both actual Host/root/render assertions passed. Raw manifests, process
+samples, screenshots and commands are under
+`.artifacts/ship-continue-measure/assembled-fe6a0ff-pair1-{default,custom}/repeat1/`;
+the combined result is
+`.artifacts/ship-continue-measure/assembled-fe6a0ff-pair1-summary.json`.
+Integrator inspected both `seeded.png` captures: completed real Host Unicode/code
+and approved tool content, default versus actual custom composition.
+
+| Measured quantity | Default | Custom |
+| --- | ---: | ---: |
+| Active paint samples | 370 | 372 |
+| Total-paint p50 / p95 / p99, ms | 5.009 / 6.050 / 7.166 | 4.987 / 5.932 / 7.386 |
+| Frame-work p50 / p95 / p99, ms | 3.306 / 4.160 / 5.285 | 3.256 / 4.205 / 5.037 |
+| Active covered tree CPU, weighted one-core % | 4.869 | 4.817 |
+| Idle covered tree CPU / idle paints | 0% / 0 | 0% / 0 |
+| Observed complete-sample tree RSS / PSS maximum, bytes | 223735808 / 87545856 | 225787904 / 89611264 |
+| Complete tree samples / total | 410 / 421 | 414 / 421 |
+
+The observed app tree had one process, including its worker-thread CPU. Native
+frame/cache telemetry had no drops or accessor failures. All three settled
+text-cache tails were identical within each root and below existing bounds.
+Settled RSS growth was zero; PSS changed +1024 bytes default and -9216 custom.
+No observed application failure or evidence-backed core repair was identified.
+
+Limits are explicit: this is one finite paired workload, not repeated-run
+confidence, large-history/cache saturation, physical latency, GPU-memory or
+maximum-FPS acceptance. All 450 resize commands were delivered per root, but
+input-helper cost stretched active phases to about 47.15/47.17 seconds; the
+sampler missed 45 requested 250-ms intervals per root. Eighteen/eleven
+`/proc/PID/stat` enumeration ENOENT errors caused eleven/seven incomplete samples;
+there were no root-exit or member-read failures. Missing PID identities prevent
+proving whether those were unrelated processes or transient descendants.
+Partial samples are excluded from complete-sample CPU/memory summaries, not
+silently promoted to complete tree peaks. Main retains final acceptance.

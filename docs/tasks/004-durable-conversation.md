@@ -88,3 +88,9 @@ Earlier actual crash/unknown-effect/no-replay evidence remains authoritative;
 the native cohort does not establish power-loss behavior or live adapters.
 ShipLeadContinue retains serialized shared Git ownership for final records;
 producer writers have stopped. Main owns acceptance.
+
+Exclusive default/custom CPU, observed process-tree RSS/PSS, frame and bounded
+cache evidence is recorded in task005's paired baseline and
+`.artifacts/ship-continue-measure/assembled-fe6a0ff-pair1-summary.json`.
+Both real Host flows completed; sampling limitations remain explicit and do not
+change conservative domain recovery or durable ownership.
