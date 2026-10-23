@@ -1,0 +1,65 @@
+# OMP v18.10.4 project overrides. Keep auth/account policy in the global config.
+autoResume: false
+modelRoles:
+  default: gpt-6-astra
+  task: gpt-6.1-sol
+  smol: gpt-6.1-sol
+plan:
+  defaultOnStartup: false
+async:
+  enabled: true
+tier:
+  subagent: default
+providers:
+  cacheWarming: off
+advisor:
+  enabled: false
+autolearn:
+  enabled: false
+compaction:
+  autoContinue: false
+goal:
+  continuationModes: []
+task:
+  batch: true
+  eager: always
+  speculativeLaunch: false
+  maxConcurrency: 2
+  maxRecursionDepth: 1
+  maxRuntimeMs: 1800000
+  softRequestBudget: 40
+  softRequestBudgetNotice: true
+  completionProbe: false
+  enableEffort: false
+  prewalk: false
+  showResolvedModelBadge: true
+  isolation:
+    enabled: false
+    apply: false
+  # Override any global per-agent settings for these project workers.
+  agentModelOverrides:
+    task: gpt-6.1-sol
+    sol-measure: gpt-6.1-sol
+    sol-repair: gpt-6.1-sol
+  agentServiceTierOverrides:
+    task: default
+    sol-measure: default
+    sol-repair: default
+  agentSoftRequestBudget:
+    task: 40
+    sol-measure: 40
+    sol-repair: 40
+  agentPrewalk:
+    task: off
+    sol-measure: off
+    sol-repair: off
+  agentAdvisor:
+    task: off
+    sol-measure: off
+    sol-repair: off
+retry:
+  fallbackChains:
+    task: []
+    default: []
+    openai-codex/gpt-6.1-sol: []
+    openai/gpt-6.1-sol: []

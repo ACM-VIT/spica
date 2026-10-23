@@ -62,7 +62,7 @@ static int discard_staging(const char *temporary) {
     return SQLITE_OK;
 }
 
-/* Bind helpers for Zig callers (store.zig, search_sql.zig). They live in C, not Zig, because
+/* Reusable SQLite bind helpers for Zig callers. They live in C, not Zig, because
  * Zig cannot pass SQLITE_TRANSIENT on aarch64.
  *
  * SQLITE_TRANSIENT tells SQLite to copy the bytes before the bind call returns, so the caller's
@@ -181,7 +181,7 @@ done:
 /* The store's worker connections (runtime, catalog) open this database concurrently, and each runs
  * PRAGMA journal_mode=WAL. Switching a database into WAL needs the only connection, and SQLite
  * returns SQLITE_BUSY for that at once, without waiting on busy_timeout. A new or migrated
- * (DELETE-mode) database therefore lost that race on first launch ("Pi: SqliteFailure"). WAL is
+ * (DELETE-mode) database therefore lost that race on first launch. WAL is
  * persistent in the file, so switch it here while nothing else has it open; the workers' pragma is
  * then a no-op. A missing destination is created empty, and the store adds the schema. */
 static int switch_to_wal(const char *destination) {

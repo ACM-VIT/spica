@@ -28,34 +28,31 @@ pub const Layout = struct {
         c.Clay_SetLayoutDimensions(.{ .width = width, .height = height });
     }
 
-    pub const Shell = struct {
-        sidebar: c.Clay_BoundingBox,
+    pub const Foundation = struct {
         header: c.Clay_BoundingBox,
-        conversation: c.Clay_BoundingBox,
-        composer: c.Clay_BoundingBox,
+        card: c.Clay_BoundingBox,
+        footer: c.Clay_BoundingBox,
     };
 
-    pub fn shell(_: *Layout, sidebar_width: f32, header_height: f32, composer_height: f32) Shell {
+    pub fn foundation(_: *Layout, width: f32) Foundation {
         c.Clay_BeginLayout();
-        open("shell", grow(), grow(), c.CLAY_LEFT_TO_RIGHT);
-        open("sidebar", fixed(sidebar_width), grow(), c.CLAY_TOP_TO_BOTTOM);
+        open("foundation", grow(), grow(), c.CLAY_TOP_TO_BOTTOM);
+        open("header", grow(), fixed(76), c.CLAY_LEFT_TO_RIGHT);
         c.Clay__CloseElement();
-        open("workspace", grow(), grow(), c.CLAY_TOP_TO_BOTTOM);
-        open("header", grow(), fixed(header_height), c.CLAY_LEFT_TO_RIGHT);
+        var body = std.mem.zeroes(c.Clay_ElementDeclaration);
+        body.id = id("body");
+        body.layout.sizing = .{ .width = grow(), .height = grow() };
+        body.layout.childAlignment = .{ .x = c.CLAY_ALIGN_X_CENTER, .y = c.CLAY_ALIGN_Y_CENTER };
+        c.Clay__OpenElement();
+        c.Clay__ConfigureOpenElement(body);
+        open("card", fixed(@min(680, @max(0, width - 64))), fixed(300), c.CLAY_TOP_TO_BOTTOM);
         c.Clay__CloseElement();
-        open("conversation", grow(), grow(), c.CLAY_TOP_TO_BOTTOM);
         c.Clay__CloseElement();
-        open("composer", grow(), fixed(composer_height), c.CLAY_TOP_TO_BOTTOM);
-        c.Clay__CloseElement();
+        open("footer", grow(), fixed(64), c.CLAY_LEFT_TO_RIGHT);
         c.Clay__CloseElement();
         c.Clay__CloseElement();
         _ = c.Clay_EndLayout();
-        return .{
-            .sidebar = bounds("sidebar"),
-            .header = bounds("header"),
-            .conversation = bounds("conversation"),
-            .composer = bounds("composer"),
-        };
+        return .{ .header = bounds("header"), .card = bounds("card"), .footer = bounds("footer") };
     }
 
     fn id(name: []const u8) c.Clay_ElementId {

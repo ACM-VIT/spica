@@ -8,14 +8,12 @@ typedef struct {
 int spica_wake_create(int fds[2]);
 void spica_wake(int fd);
 void spica_close(int fd);
-int spica_process_spawn(SpicaProcess *p, const char *node, const char *entry, const char *cwd,
-                        const char *resume, int trust);
-/* A verifier that fails while still alive remains owned in p for explicit shutdown. */
-int spica_process_version(SpicaProcess *p, const char *node, const char *entry);
-/* Bounded, five-second global npm lookup, run with the resolved Node executable.
- * A failed lookup still alive remains owned in p, just like the version verifier. */
-int spica_process_npm_root(SpicaProcess *p, const char *node, const char *npm, char *output,
-                           size_t capacity, size_t *length);
+/* Caller supplies the executable, full argv (including argv[0]), and cwd.
+ * No shell or provider protocol is implied. Initialize p with pid=0 and all
+ * descriptors=-1; never reuse an owned child before reaping and disposal.
+ * Failure may still leave an owned child in p; inspect pid before cleanup. */
+int spica_process_spawn(SpicaProcess *p, const char *executable, char *const argv[],
+                        const char *cwd);
 /* bits: wake=1 stdout=2 stderr=4 writable=8 exited=16 */
 int spica_process_poll(SpicaProcess *p, int wake, int want_write, int timeout_ms);
 long spica_process_read(int fd, void *bytes, size_t size);

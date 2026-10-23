@@ -26,11 +26,11 @@ def main():
     if zig_version != ZIG_VERSION or f"clang-format version {CLANG_FORMAT_VERSION}" not in clang_version:
         parser.error(f"requires Zig {ZIG_VERSION} and clang-format {CLANG_FORMAT_VERSION}")
 
-    names = run(["git", "ls-files", "-z"], capture_output=True).stdout.decode().split("\0")
-    sources = [name for name in names if name and (
+    names = run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], capture_output=True).stdout.decode().split("\0")
+    sources = sorted({name for name in names if name and (ROOT / name).is_file() and (
         name in {"build.zig", "build.zig.zon"}
         or (name.startswith("src/") and Path(name).suffix in NATIVE_SUFFIXES | {".zig"})
-    )]
+    )})
     failed = False
     for name in sources:
         is_zig = Path(name).suffix in {".zig", ".zon"}

@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Capture the built foundation on a private desktop and exercise Escape."""
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def run(*args):
+    return subprocess.check_output(args, cwd=ROOT, text=True, timeout=30).strip()
+
+
+def wait_windows(session, present):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        windows = run("vd", "windows", session)
+        if bool(windows) == present:
+            return windows
+        time.sleep(0.1)
+    raise RuntimeError("Timed out waiting for the starter window state")
+
+
+def source_fingerprint():
+    digest = hashlib.sha256()
+    names = run("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+    for name in sorted(set(names.split("\0")) - {""}):
+        if not (name.startswith(("src/", "assets/", "build/"))
+                or name in {"build.zig", "build.zig.zon", "deps.lock.json"}):
+            continue
+        path = ROOT / name
+        digest.update(name.encode() + b"\0")
+        digest.update(path.read_bytes() if path.is_file() else b"<deleted>")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / ".artifacts" / "starter")
+    args = parser.parse_args()
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    binary = ROOT / "zig-out/bin/spica"
+    source = source_fingerprint()
+    with (output / "build.log").open("w") as log:
+        subprocess.run(["python3", "build/driver.py"], cwd=ROOT, stdout=log,
+                       stderr=subprocess.STDOUT, check=True, timeout=180)
+    if source != source_fingerprint():
+        raise RuntimeError("Source changed during the build; stop competing writers and retry")
+    if "native workspace foundation" not in run(str(binary), "--help"):
+        raise RuntimeError("Build the new starter first: python3 build/driver.py")
+    manifest = {
+        "revision": run("git", "rev-parse", "HEAD"),
+        "status": run("git", "status", "--porcelain"),
+        "source_sha256": source,
+        "source_scope": "Git-visible src/, assets/, build/, build.zig, build.zig.zon and deps.lock.json",
+        "build_command": "python3 build/driver.py (default Debug)",
+        "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        "zig": run("zig", "version"),
+        "resolution": [1280, 800],
+        "scenario": "native foundation rendering and real Escape input",
+        "limitations": "Functional screenshot; no frame timing, provider, SDK or physical latency evidence.",
+        "passed": False,
+    }
+    session = None
+    try:
+        (output / "app.log").write_text("")
+        session = run("vd", "start", "--width", "1280", "--height", "800")
+        manifest["session"] = session
+        manifest["launch"] = run("vd", "run", session, "--bg", "--log", str(output / "app.log"),
+                                 "--", str(binary), "--quit-after-ms", "30000")
+        windows = wait_windows(session, True)
+        (output / "windows.txt").write_text(windows + "\n")
+        if "Spica — Native Foundation" not in windows:
+            raise RuntimeError("The new foundation window did not appear")
+        window_id = windows.splitlines()[0].split()[0]
+        run("vd", "shot", session, str(output / "starter.png"))
+        run("vd", "key", session, window_id, "Escape")
+        wait_windows(session, False)
+        if source != source_fingerprint() or manifest["binary_sha256"] != hashlib.sha256(binary.read_bytes()).hexdigest():
+            raise RuntimeError("Source or binary changed during capture; evidence candidate is not stable")
+        manifest["passed"] = True
+        manifest["screenshot"] = str(output / "starter.png")
+    except Exception as error:
+        manifest["error"] = str(error)
+        raise
+    finally:
+        try:
+            if session:
+                try:
+                    manifest["cleanup"] = run("vd", "clean", session)
+                except Exception as error:
+                    manifest["passed"] = False
+                    manifest["cleanup_error"] = str(error)
+                    raise
+        finally:
+            (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(output / "manifest.json")
+
+
+if __name__ == "__main__":
+    main()

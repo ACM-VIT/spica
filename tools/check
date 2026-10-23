@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+python3 tools/format.py --check
+python3 build/driver.py
+python3 build/driver.py test

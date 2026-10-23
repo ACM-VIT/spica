@@ -5,3 +5,6 @@ dist/
 .tokensave/
 build/__pycache__/
 CLAUDE.local.md
+.artifacts/
+.worktrees/
+__pycache__/

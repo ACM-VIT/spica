@@ -35,7 +35,8 @@ void spica_close(int fd) {
     if (fd >= 0)
         close(fd);
 }
-static int spawn(SpicaProcess *p, const char *node, char *const argv[], const char *cwd) {
+int spica_process_spawn(SpicaProcess *p, const char *executable, char *const argv[],
+                        const char *cwd) {
     int in[2] = {-1, -1}, out[2] = {-1, -1}, err[2] = {-1, -1};
     if (spica_process_pipe(in) || spica_process_pipe(out) || spica_process_pipe(err))
         goto fail;
@@ -54,7 +55,7 @@ static int spawn(SpicaProcess *p, const char *node, char *const argv[], const ch
     sigaddset(&defs, SIGPIPE);
     posix_spawnattr_setsigdefault(&attr, &defs);
     pid_t pid = 0;
-    int rc = posix_spawn(&pid, node, &acts, &attr, argv, environ);
+    int rc = posix_spawn(&pid, executable, &acts, &attr, argv, environ);
     posix_spawn_file_actions_destroy(&acts);
     posix_spawnattr_destroy(&attr);
     if (rc) {
@@ -93,22 +94,6 @@ fail:
     }
     return -1;
 }
-int spica_process_spawn(SpicaProcess *p, const char *node, const char *entry, const char *cwd,
-                        const char *resume, int trust) {
-    char *argv[8];
-    int n = 0;
-    argv[n++] = (char *)node;
-    argv[n++] = (char *)entry;
-    argv[n++] = "--mode";
-    argv[n++] = "rpc";
-    argv[n++] = trust ? "--approve" : "--no-approve";
-    if (resume) {
-        argv[n++] = "--session";
-        argv[n++] = (char *)resume;
-    }
-    argv[n] = 0;
-    return spawn(p, node, argv, cwd);
-}
 long spica_process_read(int fd, void *b, size_t n) {
     ssize_t r;
     do {
@@ -117,7 +102,7 @@ long spica_process_read(int fd, void *b, size_t n) {
     return r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? -2 : r;
 }
 long spica_process_write(int fd, const void *b, size_t n) {
-    /* Block SIGPIPE in this worker only; EPIPE is surfaced as a protocol failure. */
+    /* Block SIGPIPE in this worker only; EPIPE is surfaced as an I/O failure. */
     sigset_t set;
     sigemptyset(&set);
     sigaddset(&set, SIGPIPE);
@@ -189,80 +174,3 @@ static long long ms(void) {
     return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 uint64_t spica_monotonic_ms(void) { return (uint64_t)ms(); }
-static void capture_stdout(SpicaProcess *p, char *out, size_t capacity, size_t *n, int *overflow) {
-    /* Bound each drain so continuous output cannot bypass the deadline. */
-    for (int i = 0; i < 64; i++) {
-        char b[1024];
-        long r = spica_process_read(p->output, b, sizeof b);
-        if (r <= 0)
-            break;
-        size_t add = (size_t)r;
-        if (add > capacity - *n) {
-            add = capacity - *n;
-            *overflow = 1;
-        }
-        memcpy(out + *n, b, add);
-        *n += add;
-    }
-}
-static int capture(SpicaProcess *p, const char *node, char *const argv[], char *out,
-                   size_t capacity, size_t *length) {
-    if (spawn(p, node, argv, "/"))
-        return -1;
-    spica_close(p->input);
-    p->input = -1;
-    size_t n = 0;
-    int result = -1, status = 0, overflow = 0;
-    long long deadline = ms() + 5000;
-    for (;;) {
-        struct pollfd f[3] = {
-            {p->output, POLLIN, 0}, {p->error, POLLIN, 0}, {p->exit_fd, POLLIN, 0}};
-        int left = (int)(deadline - ms());
-        if (left <= 0)
-            break;
-        int rc = poll(f, 3, left);
-        if (rc < 0 && errno == EINTR)
-            continue;
-        if (rc <= 0)
-            break;
-        if (f[0].revents)
-            capture_stdout(p, out, capacity, &n, &overflow);
-        if (f[1].revents) {
-            char b[1024];
-            for (int i = 0; i < 64 && spica_process_read(p->error, b, sizeof b) > 0; i++) {
-            }
-        }
-        if (f[2].revents) {
-            int reaped = spica_process_reap(p, &status);
-            if (reaped < 0)
-                break;
-            if (reaped == 1) {
-                capture_stdout(p, out, capacity, &n, &overflow);
-                result = WIFEXITED(status) && WEXITSTATUS(status) == 0 && !overflow ? 0 : -1;
-                break;
-            }
-        }
-    }
-    /* A timed-out verifier is still owned by the runtime; only explicit Force kills it. */
-    if (p->pid == 0)
-        spica_process_dispose(p);
-    *length = n;
-    return result;
-}
-int spica_process_version(SpicaProcess *p, const char *node, const char *entry) {
-    char *argv[] = {(char *)node, (char *)entry, "--version", 0};
-    char out[256];
-    size_t n = 0;
-    if (capture(p, node, argv, out, sizeof out, &n))
-        return -1;
-    return ((n == 6 && out[5] == '\n') || (n == 7 && out[5] == '\r' && out[6] == '\n')) &&
-                   !memcmp(out, "1.0.0", 5)
-               ? 0
-               : -1;
-}
-int spica_process_npm_root(SpicaProcess *p, const char *node, const char *npm, char *output,
-                           size_t capacity, size_t *length) {
-    /* npm is its resolved JS entry, not a shell command; Finder need not expose node on PATH. */
-    char *argv[] = {(char *)node, (char *)npm, "root", "-g", "--loglevel=error", 0};
-    return capture(p, node, argv, output, capacity, length);
-}

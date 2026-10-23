@@ -1,7 +1,7 @@
 const std = @import("std");
 const c = @import("../native/bindings.zig").c;
 const widgets = @import("widgets.zig");
-const Color = @import("theme.zig").Color;
+const Color = @import("color.zig").Color;
 
 pub const max_bytes = 128;
 

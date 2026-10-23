@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep the project cwd stable so OMP discovers this checkout's .omp/config.yml.
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+resume=false
+for arg in "$@"; do
+  case "$arg" in
+    --) break ;;
+    -h|--help)
+      cat <<'HELP'
+Usage: ./tools/agents [OMP session flags] [message ...]
+
+Launch the Spica gpt-6-astra coordinator with project Sol task agents.
+  ./tools/agents                        Task 001 contracts through review/checkpoint, then stop
+  ./tools/agents "Focus task 001 scenarios"  Your message overrides/steers scope
+  ./tools/agents --continue              Continue without injecting startup text
+  ./tools/agents --resume [id]           Resume/picker without startup text
+  ./tools/agents --restore [id]          Explicit OMP crash recovery
+
+Other arguments pass through to OMP. Use `omp --help` for all flags.
+Uses existing global account/auth configuration; creates no isolated profile.
+No approval override, goal mode, scheduler or retry loop is added.
+See docs/AGENT_LOOP.md for task packets, budgets and OMP limitations.
+HELP
+      exit 0
+      ;;
+    -c|--continue|--continue=*|-r|--resume|--resume=*|-r?*|--session|--session=*|--restore|--restore=*|--fork|--fork=*|--from-claude|--from-codex)
+      resume=true
+      ;;
+  esac
+done
+
+cd -- "$root"
+# Explicit CLI choices apply to this run only. Never add --profile or approval flags.
+args=(--model gpt-6-astra --thinking high --no-prewalk --no-title
+      --append-system-prompt "$root/.omp/coordinator.md")
+if [[ "$resume" == false ]]; then
+  # @file joins the user's first message instead of creating an extra queued turn.
+  args+=("@$root/.omp/start.md")
+fi
+exec omp "${args[@]}" "$@"

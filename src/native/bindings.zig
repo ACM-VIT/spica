@@ -7,8 +7,4 @@ pub const c = @cImport({
     if (builtin.cpu.arch == .aarch64) @cDefine("CLAY_DISABLE_SIMD", "1");
     @cInclude("clay.h");
     @cInclude("text.h");
-    @cInclude("images.h");
-    @cInclude("SDL3_image/SDL_image.h");
-    @cInclude("highlight.h");
-    @cInclude("fuzzy.h");
 });
