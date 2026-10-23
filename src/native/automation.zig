@@ -25,6 +25,11 @@ pub const Snapshot = struct {
     connected: bool = false,
     run_status: []const u8 = "not_connected",
     visible_rich_blocks: usize = 0,
+    thread_id: []const u8 = "",
+    run_id: []const u8 = "",
+    approval_id: []const u8 = "",
+    pending_command: bool = false,
+    transcript: [8][]const u8 = @splat(""),
     targets: [6]Target = .{ .{}, .{ .id = "composer.input", .role = "textbox", .key = "Tab" }, .{ .id = "command.send", .role = "button", .key = "Enter" }, .{ .id = "run.cancel", .role = "button", .key = "F6" }, .{ .id = "approval.allow", .role = "button", .key = "F7" }, .{ .id = "approval.deny", .role = "button", .key = "F8" } },
 };
 

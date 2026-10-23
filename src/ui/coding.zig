@@ -324,7 +324,10 @@ pub const View = struct {
         self.transcript_bounds = .{ .x = bounds.transcript.x, .y = bounds.transcript.y, .w = bounds.transcript.width, .h = bounds.transcript.height };
         var transcript_clip = widgets.Clip.push(renderer, self.transcript_bounds);
         var total_height: f32 = 0;
-        for (self.rich_tiles[0..self.rich_count]) |*tile| total_height += tile.height() + 8;
+        for (self.rich_tiles[0..self.rich_count]) |*tile| {
+            try tile.reflow(text, bounds.transcript.width);
+            total_height += tile.height() + 8;
+        }
         const max_scroll = @max(0, total_height - bounds.transcript.height);
         self.transcript_scroll = if (self.follow_latest) max_scroll else @min(max_scroll, self.transcript_scroll);
         var tile_y = bounds.transcript.y - self.transcript_scroll;

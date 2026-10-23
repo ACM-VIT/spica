@@ -10,6 +10,17 @@ Explicit `--automation-output PATH` exports schema v2: generation, frame/event s
 
 Export paths must differ (normalized paths and parent symlink resolution checked before SDL startup). The runner retries missing/partially written JSON only until its fixed export deadline; neither file existence nor a partial parse can satisfy an assertion. `build/eval_starter_test.py` exercises missing clock, cache overflow/missing ledger, drop labeling, partial-export retry/deadline and carried idle-tail cache bounds against real summary/validation functions.
 
+`--mode conversation` uses an explicit temporary state directory and real Host:
+Unicode prompt/Enter, painted response/code/approval, geometry-derived Allow
+click, completed tool output, second prompt/Cancel click, then reopen the same
+directory and observe retained IDs/output/status. `--automation-live PATH`
+enables a bounded read-only painted snapshot (including up to eight rich tiles
+and native control rectangles/enabled flags). There is no mutation endpoint;
+the evaluator sends ordinary private-desktop input and waits on observed state.
+This opt-in adds fixed-buffer JSON/file I/O after present, so do not use it as
+uninstrumented performance evidence. New frame generations invalidate old
+geometry. Partial live-file reads must be retried, not accepted.
+
 ## Frozen binaries and finite measurement
 
 Default runner builds before launching. Alternatively explicitly pin **both** current source and binary fingerprints (from a prior manifest); no build occurs in this mode:

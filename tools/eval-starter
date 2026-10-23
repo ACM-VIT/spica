@@ -171,7 +171,7 @@ def key_command(session, window_id, value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / '.artifacts/starter')
-    parser.add_argument('--mode', choices=('smoke', 'editor', 'capacity', 'measure'), default='smoke')
+    parser.add_argument('--mode', choices=('smoke', 'editor', 'capacity', 'conversation', 'measure'), default='smoke')
     parser.add_argument('--binary', type=Path, help='Explicit frozen binary; requires --binary-sha256 and --source-sha256')
     parser.add_argument('--binary-sha256')
     parser.add_argument('--source-sha256')
@@ -211,7 +211,7 @@ def main():
                     input_origin='real private vd Ctrl+Q and compositor resize, not SDL event injection',
                     limitations=['Software timing, not physical latency or scanout.', 'Paced 10Hz resize is demand, not maximum render capacity.',
                                  'GPU hardware not established by SDL renderer name.', 'Low-N p99 is weak; dropped telemetry is not a complete cohort.',
-                                 'Cache ledger excludes external metadata/driver allocations; idle states carry forward only because this shell mutates cache during paint.'])
+                                 'Cache ledger combines present and event-boundary observations; transient, worker/parser, external metadata and driver allocations are excluded.'])
     session, samples, phases, actions = None, [], [], []
     try:
         session = run('vd', 'start', '--width', '1280', '--height', '800')
@@ -220,6 +220,9 @@ def main():
         duration = args.warmup + args.phase_seconds * (1 + 2 * args.cycles)
         argv = [str(binary), '--quit-after-ms', str(math.ceil((duration + 60) * 1000)),
                 '--automation-output', str(output / 'automation.json')]
+        if args.mode == 'conversation':
+            state = output / 'conversation-state'
+            argv += ['--state-directory', str(state), '--automation-live', str(output / 'live.json')]
         if not args.disable_metrics:
             argv += ['--metrics-output', str(output / 'native.json')]
         launch = json.loads(run('vd', 'run', session, '--bg', '--log', str(output / 'app.log'), '--', *argv))
@@ -241,6 +244,76 @@ def main():
         ipc(f'[con_id={window_id}] floating enable')
         ipc(f'[con_id={window_id}] resize set width 1100 px height 740 px')
         run('vd', 'shot', session, str(output / 'before.png'))
+        if args.mode == 'conversation':
+            def observe(predicate, label):
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    snapshot = read_export(output / 'live.json', deadline)
+                    if predicate(snapshot):
+                        actions.append(dict(observed=label, frame=snapshot['frame_id'], status=snapshot['run_status']))
+                        return snapshot
+                    time.sleep(.05)
+                raise RuntimeError('Native conversation did not reach ' + label)
+            def target(snapshot, name):
+                value = next(t for t in snapshot['targets'] if t['id'] == name)
+                if not value['enabled'] or value['pointer_bounds'] is None:
+                    raise RuntimeError('Painted control unavailable: ' + name)
+                x, y, w, h = value['pointer_bounds']
+                tree = json.loads(run('swaymsg', '--socket', record['environment']['SWAYSOCK'], '--raw', '-t', 'get_tree'))
+                def find(node):
+                    if str(node.get('id')) == window_id:
+                        return node
+                    for child in node.get('nodes', []) + node.get('floating_nodes', []):
+                        found = find(child)
+                        if found:
+                            return found
+                    return None
+                node = find(tree)
+                if not node:
+                    raise RuntimeError('Painted window disappeared')
+                rect = node['rect']
+                pointer = Path(session) / 'native-pointer'
+                # Installed vd omits its adjacent helper on this workstation.
+                # Use the actual packaged skill helper, in this private session.
+                packaged = Path.home() / '.codex/skills/virtual-desktop/scripts/virtual_pointer.c'
+                installed = Path.home() / '.local/bin/virtual_pointer.c'
+                if not pointer.exists() and not installed.exists() and packaged.exists():
+                    flags = run('pkg-config', '--cflags', '--libs', 'wayland-client').split()
+                    run('gcc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', str(packaged), '-o', str(pointer), *flags)
+                run('vd', 'click', session, window_id, str(rect['x'] + x + w // 2), str(rect['y'] + y + h // 2))
+            enabled = lambda s, name: any(t['id'] == name and t['enabled'] for t in s['targets'])
+            current = observe(lambda s: enabled(s, 'command.send'), 'ready')
+            run('vd', 'text', session, window_id, 'Inspect café 世界 👩‍💻')
+            current = observe(lambda s: s['draft'] == 'Inspect café 世界 👩‍💻', 'typed prompt')
+            key('Return')
+            current = observe(lambda s: s['run_status'] == 'awaiting_approval' and enabled(s, 'approval.allow') and any('const answer' in text for text in s['transcript']), 'rendered response and code awaiting approval')
+            run('vd', 'shot', session, str(output / 'approval.png'))
+            target(current, 'approval.allow')
+            current = observe(lambda s: s['run_status'] == 'completed' and any('Inspection approved' in text for text in s['transcript']) and enabled(s, 'command.send'), 'completed tool result')
+            run('vd', 'shot', session, str(output / 'completed.png'))
+            target(current, 'composer.input')
+            run('vd', 'text', session, window_id, 'Cancel this second request')
+            key('Return')
+            current = observe(lambda s: s['run_status'] == 'awaiting_approval' and enabled(s, 'run.cancel'), 'second run awaiting approval')
+            target(current, 'run.cancel')
+            current = observe(lambda s: s['run_status'] == 'cancelled' and enabled(s, 'command.send'), 'cancelled')
+            retained_thread, retained_run = current['thread_id'], current['run_id']
+            run('vd', 'shot', session, str(output / 'cancelled.png'))
+            key('ctrl+q')
+            wait_windows(session, False)
+            first_export = read_export(output / 'automation.json', time.monotonic() + 10)
+            manifest['conversation_before_restart'] = first_export
+            (output / 'automation.json').rename(output / 'first-automation.json')
+            if (output / 'native.json').exists():
+                (output / 'native.json').rename(output / 'first-native.json')
+            (output / 'live.json').unlink()
+            launch = json.loads(run('vd', 'run', session, '--bg', '--log', str(output / 'reopen.log'), '--', *argv))
+            windows = wait_windows(session, True)
+            window_id = windows.splitlines()[0].split()[0]
+            current = observe(lambda s: s['thread_id'] == retained_thread and s['run_id'] == retained_run and s['run_status'] == 'cancelled' and any('Inspection approved' in text for text in s['transcript']) and enabled(s, 'command.send'), 'reopened durable conversation')
+            manifest['conversation_reopened'] = current
+            manifest['conversation_limits'] = ['Fixed fake adapter publishes a bounded observation burst; no paced-token latency claim.', 'Native controls and retained output verified through real Host; no provider authentication.']
+            run('vd', 'shot', session, str(output / 'reopened.png'))
         if args.mode == 'editor':
             original = 'hello e\u0301 שלום 👩‍💻'
             editor_actions = [

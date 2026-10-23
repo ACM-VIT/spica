@@ -6,6 +6,8 @@ pub const Options = struct {
     metrics_output: ?[]const u8 = null,
     automation_output: ?[]const u8 = null,
     metrics_capacity: u32 = 8192,
+    state_directory: ?[]const u8 = null,
+    automation_live: ?[]const u8 = null,
 
     pub fn parse(args: []const [:0]const u8) !Options {
         var options: Options = .{};
@@ -18,6 +20,14 @@ pub const Options = struct {
                 index += 1;
                 if (index == args.len) return error.MissingOptionValue;
                 options.quit_after_ms = try std.fmt.parseInt(u32, args[index], 10);
+            } else if (std.mem.eql(u8, flag, "--state-directory")) {
+                index += 1;
+                if (index == args.len or args[index].len == 0) return error.MissingOptionValue;
+                options.state_directory = args[index];
+            } else if (std.mem.eql(u8, flag, "--automation-live")) {
+                index += 1;
+                if (index == args.len or args[index].len == 0) return error.MissingOptionValue;
+                options.automation_live = args[index];
             } else if (std.mem.eql(u8, flag, "--metrics-output") or std.mem.eql(u8, flag, "--automation-output")) {
                 index += 1;
                 if (index == args.len) return error.MissingOptionValue;
@@ -34,16 +44,18 @@ pub const Options = struct {
 };
 
 pub const help =
-    \\Spica — native workspace foundation
-    \\Usage: spica [--help] [--quit-after-ms MILLISECONDS]
+    \\Spica — native coding workspace
+    \\Usage: spica [--state-directory DIRECTORY] [--quit-after-ms MILLISECONDS]
     \\
-    \\A starter window built with Zig, SDL3, Clay, and the retained Unicode text stack.
-    \\Uses SDL's native GPU renderer. Escape or the window close button quits.
+    \\--state-directory opens an explicit isolated durable fake-provider conversation.
+    \\Without it, only the local Unicode draft editor is opened; no history is accessed.
+    \\Enter sends; Shift+Enter inserts newline. F6 cancels; F7 allows; F8 denies.
+    \\Escape dismisses local editing state. Ctrl+Q or window close exits.
     \\--quit-after-ms exits after a bounded smoke run (0 exits immediately).
-    \\--automation-output PATH exports the read-only final native shell snapshot.
-    \\--metrics-output PATH enables bounded frame timestamps and per-present text ledger.
+    \\--automation-output PATH exports the read-only final native snapshot.
+    \\--automation-live PATH enables bounded read-only painted snapshots (adds file I/O).
+    \\--metrics-output PATH enables bounded frame timestamps and text-cache ledger.
     \\--metrics-capacity N bounds retained attempts (default 8192; max 1048576).
-    \\The agent workspace is not implemented yet. No provider or data store is opened.
     \\Keep the checkout's .deps and assets; rebuild after moving the checkout.
     \\
 ;

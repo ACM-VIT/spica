@@ -268,6 +268,8 @@ pub const RichTile = struct {
     selected: bool = false,
     colors: [presentation.tile_runs]native.SpicaTextColorSpan = undefined,
     color_count: usize = 0,
+    styles: [presentation.tile_runs]native.SpicaTextSpan = undefined,
+    size: c_uint = 16,
 
     pub fn deinit(self: *RichTile) void {
         if (self.layout) |layout| native.spica_text_layout_release(layout);
@@ -312,6 +314,17 @@ pub const RichTile = struct {
         self.code = code;
         @memcpy(self.colors[0..count], colors[0..count]);
         self.color_count = count;
+        @memcpy(self.styles[0..count], spans[0..count]);
+        self.size = size;
+    }
+
+    pub fn reflow(self: *RichTile, text: *native.SpicaText, width: f32) !void {
+        if (self.layout == null or self.width == width) return;
+        if (width <= 24 or !std.math.isFinite(width)) return error.InvalidWidth;
+        const layout = native.spica_text_layout_create_spans(text, self.rendered[0..self.length].ptr, self.length, width - 24, self.size, self.code, &self.styles, self.color_count) orelse return error.TranscriptLayout;
+        native.spica_text_layout_release(self.layout.?);
+        self.layout = layout;
+        self.width = width;
     }
 
     pub fn height(self: *const RichTile) f32 {
@@ -383,6 +396,11 @@ test "real Markdown tile draws retained native styles and rendered selection" {
     try std.testing.expect(native.SDL_RenderPresent(renderer));
     try std.testing.expectError(error.InvalidWidth, retained.update(text, &tile, 0));
     try std.testing.expectEqual(original_layout, retained.layout);
+    const selected = retained.caret;
+    try retained.reflow(text, 260);
+    try std.testing.expectEqual(@as(f32, 260), retained.width);
+    try std.testing.expectEqual(selected, retained.caret);
+    try std.testing.expectEqualStrings("bold and italic and code\n", retained.rendered[0..retained.length]);
     retained.deinit();
     var stats: native.SpicaTextStats = undefined;
     try std.testing.expect(native.spica_text_get_stats(text, &stats));

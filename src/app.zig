@@ -6,6 +6,25 @@ const Coding = @import("ui/coding.zig").View;
 const build_options = @import("build_options");
 const telemetry = @import("native/metrics.zig");
 const automation = @import("native/automation.zig");
+const domain = @import("domain.zig");
+const types = @import("domain/types.zig");
+const presentation = @import("content/presentation.zig");
+const Id = @import("ui/transcript.zig").Id;
+
+/// Only a payload-free wake crosses worker threads. Registered after SDL init;
+/// its storage and SDL outlive both Host and presentation worker joins.
+pub const Wake = struct {
+    event_type: u32,
+    pub fn notify(context: ?*anyopaque) void {
+        const self: *Wake = @ptrCast(@alignCast(context.?));
+        var event: c.SDL_Event = std.mem.zeroes(c.SDL_Event);
+        event.type = self.event_type;
+        _ = c.SDL_PushEvent(&event);
+    }
+    pub fn presentationNotify(context: *anyopaque) void {
+        notify(context);
+    }
+};
 
 /// Native lifetime and input dispatch. Replaceable presentation owns no domain.
 pub const App = struct {
@@ -20,6 +39,23 @@ pub const App = struct {
     frames: u64 = 0,
     metrics: ?telemetry.Metrics = null,
     snapshot: automation.Snapshot = .{},
+    conversation: ?*Conversation = null,
+    live: ?*Live = null,
+
+    const Live = struct { io: std.Io, file: std.Io.File, buffer: [2 * 1024 * 1024]u8 = undefined };
+
+    pub fn enableLive(self: *App, io: std.Io, path: []const u8) !void {
+        const live = try self.view.allocator.create(Live);
+        errdefer self.view.allocator.destroy(live);
+        live.* = .{ .io = io, .file = try std.Io.Dir.cwd().createFile(io, path, .{}) };
+        self.live = live;
+    }
+
+    pub fn connect(self: *App, io: std.Io, host: *domain.Host, file: std.Io.File, wake: *Wake, workspace: []const u8) !void {
+        self.conversation = try Conversation.create(self.view.allocator, io, host, file, wake, workspace);
+        self.view.connected = true;
+        self.view.status = "Opening durable conversation";
+    }
 
     pub fn init(allocator: std.mem.Allocator) !App {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SDLInitialization;
@@ -52,6 +88,11 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.live) |live| {
+            live.file.close(live.io);
+            self.view.allocator.destroy(live);
+        }
+        if (self.conversation) |conversation| conversation.destroy();
         self.view.deinit();
         self.layout.deinit();
         c.spica_text_destroy(self.text);
@@ -72,6 +113,7 @@ pub const App = struct {
                 self.snapshot.close_reason = "deadline";
                 break;
             };
+            if (self.conversation) |conversation| try conversation.pump(self);
             if (self.dirty and !self.minimized) {
                 try self.paint();
                 self.dirty = false;
@@ -131,6 +173,11 @@ pub const App = struct {
             },
             else => return err,
         };
+        if (self.view.takeIntent()) |intent| {
+            if (self.conversation) |conversation| conversation.act(self, intent) catch |err| {
+                self.view.notice = @errorName(err);
+            };
+        }
         self.dirty = self.dirty or changed;
     }
 
@@ -215,6 +262,404 @@ pub const App = struct {
         if (!succeeded) return error.RenderPresent;
         self.frames += 1;
         self.snapshot.frame_id = self.frames;
+        self.snapshot.generation = self.frames;
+        if (self.conversation) |conversation| {
+            self.snapshot.thread_id = conversation.thread.slice();
+            self.snapshot.run_id = conversation.run.slice();
+            self.snapshot.approval_id = if (conversation.approval_live) conversation.approval.slice() else "";
+            self.snapshot.pending_command = conversation.command != null;
+        }
+        self.snapshot.transcript = @splat("");
+        for (self.view.rich_tiles[0..self.view.rich_count], 0..) |*tile, index| self.snapshot.transcript[index] = tile.rendered[0..tile.length];
+        if (self.live) |live| {
+            // Explicit automation only. Fixed storage, after measured present,
+            // no timers/input endpoints; observers may retry a partial write.
+            var writer = std.Io.Writer.fixed(&live.buffer);
+            try std.json.Stringify.value(self.snapshot, .{}, &writer);
+            try live.file.writePositionalAll(live.io, writer.buffered(), 0);
+            try live.file.setLength(live.io, writer.buffered().len);
+        }
+    }
+};
+
+/// Native public-Host consumer, independent of replaceable root lifetime.
+/// One query, one mutation, one parse and one visible-tile request at a time.
+/// Every borrowed output is consumed/copied before drain storage is reused.
+const Conversation = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    host: *domain.Host,
+    worker: *presentation.Worker,
+    wake: *Wake,
+    workspace_root: []u8,
+    drain_storage: [1024 * 1024]u8 = undefined,
+    source: [presentation.source_limit]u8 = undefined,
+    source_len: usize = 0,
+    completion: presentation.Completion = undefined,
+    project: Id = .{},
+    workspace: Id = .{},
+    thread: Id = .{},
+    thread_revision: u64 = 0,
+    run: Id = .{},
+    run_revision: u64 = 0,
+    run_state: ?types.RunState = null,
+    approval: Id = .{},
+    approval_revision: u64 = 0,
+    approval_digest: Id = .{},
+    approval_live: bool = false,
+    subscription: ?types.SubscriptionId = null,
+    subscribe_ticket: ?types.Ticket = null,
+    query: ?struct { ticket: types.Ticket, kind: QueryKind } = null,
+    command: ?struct { ticket: types.Ticket, kind: CommandKind, draft_revision: u64, id: [32]u8 } = null,
+    refresh: bool = false,
+    generation: u64 = 0,
+    messages: [8]Id = undefined,
+    message_count: usize = 0,
+    message_index: usize = 0,
+    blocks: [8]struct { id: Id, revision: u64, bytes: u64 } = undefined,
+    block_count: usize = 0,
+    block_index: usize = 0,
+    worker_key: ?presentation.Key = null,
+    source_pending: bool = false,
+    tile_request: ?presentation.PageRequest = null,
+    runs_cursor: ?Id = null,
+    runs_snapshot: ?types.SnapshotId = null,
+
+    const QueryKind = enum { projects, workspaces, threads, thread, runs, approvals, messages, blocks, content };
+    const CommandKind = enum { project, workspace, thread, send, cancel, approval };
+    const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
+
+    fn create(allocator: std.mem.Allocator, io: std.Io, host: *domain.Host, file: std.Io.File, wake: *Wake, workspace_root: []const u8) !*Conversation {
+        const self = try allocator.create(Conversation);
+        errdefer allocator.destroy(self);
+        const root = try allocator.dupe(u8, workspace_root);
+        errdefer allocator.free(root);
+        // Bootstrap admission precedes worker/file ownership transfer.
+        const ticket = try host.query(.{ .projects = page });
+        const worker = try presentation.Worker.create(allocator, io, file, .{ .context = wake, .notify = Wake.presentationNotify });
+        self.* = .{ .allocator = allocator, .io = io, .host = host, .worker = worker, .wake = wake, .workspace_root = root, .query = .{ .ticket = ticket, .kind = .projects } };
+        return self;
+    }
+
+    fn destroy(self: *Conversation) void {
+        self.worker.destroy();
+        // Main owns Host and joins it separately before SDL destruction.
+        self.allocator.free(self.workspace_root);
+        self.allocator.destroy(self);
+    }
+
+    fn ask(self: *Conversation, kind: QueryKind, value: types.Query) !void {
+        std.debug.assert(self.query == null);
+        self.query = .{ .ticket = try self.host.query(value), .kind = kind };
+    }
+
+    fn submit(self: *Conversation, kind: CommandKind, target: types.Target, revision: types.Precondition, payload: types.Payload, draft_revision: u64) !void {
+        if (self.command != null) return error.CommandPending;
+        var random: [16]u8 = undefined;
+        try self.io.randomSecure(&random);
+        const hex = "0123456789abcdef";
+        var id: [32]u8 = undefined;
+        for (random, 0..) |byte, index| {
+            id[index * 2] = hex[byte >> 4];
+            id[index * 2 + 1] = hex[byte & 15];
+        }
+        const ticket = try self.host.submit(.{ .command_id = .{ .value = &id }, .target = target, .expected_revision = revision, .payload = payload });
+        self.command = .{ .ticket = ticket, .kind = kind, .draft_revision = draft_revision, .id = id };
+    }
+
+    fn act(self: *Conversation, app: *App, intent: @import("ui/coding.zig").Intent) !void {
+        switch (intent) {
+            .send => try self.submit(.send, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .thread_send = .{ .text = app.view.editor.textBytes(), .selection = .{ .model_provider = "fake", .model_id = "fixture", .effort = "none", .account_ref = "fixture", .workspace = .{ .value = self.workspace.slice() } } } }, app.view.revision),
+            .cancel => try self.submit(.cancel, .{ .run = .{ .value = self.run.slice() } }, .{ .revision = self.run_revision }, .{ .run_cancel = .{ .reason = "Native user cancellation" } }, 0),
+            .allow, .deny => {
+                if (!self.approval_live) return error.ApprovalNotLive;
+                try self.submit(.approval, .{ .approval = .{ .value = self.approval.slice() } }, .{ .revision = self.approval_revision }, .{ .approval_respond = .{ .decision = if (intent == .allow) .allow else .deny, .action_digest = self.approval_digest.slice() } }, 0);
+            },
+        }
+        app.view.can_send = false;
+        app.view.can_cancel = false;
+        app.view.can_approve = false;
+    }
+
+    fn pump(self: *Conversation, app: *App) !void {
+        var outputs: [8]types.Output = undefined;
+        const drained = self.host.drain(&outputs, &self.drain_storage);
+        if (drained.required_bytes_for_next != 0) return error.DomainOutputBudget;
+        for (outputs[0..drained.output_count]) |output| {
+            app.dirty = true;
+            switch (output) {
+                .command_receipt => |value| try self.receipt(app, value.ticket, value.receipt),
+                .query_page => |value| {
+                    const pending = self.query orelse continue;
+                    if (pending.ticket.value != value.ticket.value) return error.UnexpectedQueryTicket;
+                    self.query = null;
+                    try self.consume(app, pending.kind, value.page);
+                },
+                .subscribed => |value| {
+                    self.subscription = value.id;
+                    self.subscribe_ticket = null;
+                },
+                .event_batch => {
+                    self.refresh = true;
+                },
+                .newer_revision => {
+                    self.refresh = true;
+                },
+                .resync_required => {
+                    if (self.subscription) |id| _ = try self.host.unsubscribe(id);
+                    self.subscription = null;
+                    self.refresh = true;
+                },
+                .unsubscribed => {},
+                .failure => |value| {
+                    if (self.query) |pending| if (pending.ticket.value == value.ticket.value) {
+                        self.query = null;
+                    };
+                    if (self.command) |pending| if (pending.ticket.value == value.ticket.value) {
+                        self.command = null;
+                    };
+                    app.view.notice = @tagName(value.failure.reason);
+                    if (value.failure.refresh_required) self.refresh = true;
+                },
+            }
+        }
+        if (drained.more_pending) Wake.notify(self.wake);
+        const ready = self.worker.drain(&self.completion) catch |err| switch (err) {
+            error.Busy => blk: {
+                Wake.notify(self.wake);
+                break :blk false;
+            },
+        };
+        if (ready) {
+            switch (self.completion) {
+                .projected => |header| if (self.worker_key) |key| {
+                    if (std.meta.eql(header.key, key)) {
+                        if (header.state == .rich and header.block_count != 0) self.tile_request = .{ .key = key, .first_block = 0 } else try self.nextBlock(app);
+                    }
+                },
+                .tile => |*tile| if (self.worker_key) |key| {
+                    if (std.meta.eql(tile.key, key)) {
+                        var width: c_int = 0;
+                        _ = c.SDL_GetWindowSize(app.window, &width, null);
+                        app.view.admitTile(app.text, tile, @min(960, @as(f32, @floatFromInt(width)) - 48)) catch |err| {
+                            app.view.notice = @errorName(err);
+                        };
+                        app.dirty = true;
+                        if (tile.next_block) |index| self.tile_request = .{ .key = key, .first_block = index } else try self.nextBlock(app);
+                    }
+                },
+                .failure => |failure| if (self.worker_key) |key| {
+                    if (std.meta.eql(failure.key, key)) {
+                        if (failure.reason != error.EndOfProjection) app.view.notice = @errorName(failure.reason);
+                        try self.nextBlock(app);
+                    }
+                },
+            }
+        }
+        if (self.source_pending) {
+            self.worker.submit(self.worker_key.?, self.source[0..self.source_len]) catch |err| switch (err) {
+                error.Busy => {
+                    Wake.notify(self.wake);
+                    return;
+                },
+                else => return err,
+            };
+            self.source_pending = false;
+        }
+        if (self.tile_request) |request| {
+            self.worker.request(request) catch |err| switch (err) {
+                error.Busy => {
+                    Wake.notify(self.wake);
+                    return;
+                },
+                else => return err,
+            };
+            self.tile_request = null;
+        }
+        if (self.refresh and self.query == null and self.worker_key == null and self.thread.len != 0) {
+            self.refresh = false;
+            try self.ask(.thread, .{ .thread = .{ .value = self.thread.slice() } });
+        }
+        const terminal = if (self.run_state) |state| switch (state) {
+            .completed, .cancelled, .failed, .interrupted, .unknown => true,
+            else => false,
+        } else true;
+        app.view.can_send = self.thread.len != 0 and terminal and self.command == null and self.query == null and !self.refresh and self.worker_key == null;
+        app.view.can_cancel = self.run.len != 0 and !terminal and self.command == null;
+        app.view.can_approve = self.approval_live and self.command == null and !self.refresh;
+    }
+
+    fn receipt(self: *Conversation, app: *App, ticket: types.Ticket, value: types.Receipt) !void {
+        const pending = self.command orelse return error.UnexpectedCommandReceipt;
+        if (pending.ticket.value != ticket.value or !std.mem.eql(u8, &pending.id, value.command_id.value)) return error.UnexpectedCommandReceipt;
+        self.command = null;
+        if (value.outcome == .rejected) {
+            app.view.notice = if (value.reason) |reason| @tagName(reason) else "Command rejected";
+            self.refresh = self.thread.len != 0;
+            return;
+        }
+        switch (pending.kind) {
+            .project => {
+                self.project = try Id.init(value.entity_ids.project.?.value);
+                try self.createWorkspace();
+            },
+            .workspace => {
+                self.workspace = try Id.init(value.entity_ids.workspace.?.value);
+                try self.createThread();
+            },
+            .thread => {
+                self.thread = try Id.init(value.entity_ids.thread.?.value);
+                self.refresh = true;
+            },
+            .send => {
+                if (app.view.revision == pending.draft_revision) {
+                    try app.view.editor.setText("");
+                    app.view.revision += 1;
+                    app.view.editor_view.changed = true;
+                }
+                self.run = try Id.init(value.entity_ids.run.?.value);
+                self.refresh = true;
+            },
+            .cancel, .approval => {
+                self.approval_live = false;
+                self.refresh = true;
+            },
+        }
+    }
+
+    fn createWorkspace(self: *Conversation) !void {
+        try self.submit(.workspace, .absent, .absent, .{ .workspace_register = .{ .project = .{ .value = self.project.slice() }, .binding = .{ .canonical_root = self.workspace_root, .filesystem_identity = self.workspace_root, .repository_identity = "", .checkout_identity = self.workspace_root, .expected_branch = "", .base_revision = "", .non_git = true } } }, 0);
+    }
+    fn createThread(self: *Conversation) !void {
+        try self.submit(.thread, .absent, .absent, .{ .thread_create = .{ .project = .{ .value = self.project.slice() }, .workspace = .{ .value = self.workspace.slice() } } }, 0);
+    }
+
+    fn consume(self: *Conversation, app: *App, kind: QueryKind, value: types.QueryPage) !void {
+        switch (kind) {
+            .projects => {
+                if (value.items.len == 0) try self.submit(.project, .absent, .absent, .{ .project_create = .{ .display_name = "Native coding workspace" } }, 0) else {
+                    self.project = try Id.init(value.items[0].project.id.value);
+                    try self.ask(.workspaces, .{ .workspaces = .{ .project = .{ .value = self.project.slice() }, .page = page } });
+                }
+            },
+            .workspaces => {
+                if (value.items.len == 0) try self.createWorkspace() else {
+                    self.workspace = try Id.init(value.items[0].workspace.id.value);
+                    try self.ask(.threads, .{ .threads = .{ .project = .{ .value = self.project.slice() }, .page = page } });
+                }
+            },
+            .threads => {
+                if (value.items.len == 0) try self.createThread() else {
+                    self.thread = try Id.init(value.items[0].thread.id.value);
+                    self.refresh = true;
+                }
+            },
+            .thread => {
+                if (value.items.len != 1) return error.MissingThread;
+                self.thread_revision = value.items[0].thread.revision;
+                self.workspace = try Id.init(value.items[0].thread.workspace.value);
+                if (self.subscription == null and self.subscribe_ticket == null) self.subscribe_ticket = try self.host.subscribe(.{ .scope = .{ .thread = .{ .value = self.thread.slice() } }, .after_position = value.snapshot_position, .max_batch_bytes = 16 * 1024 });
+                self.runs_cursor = null;
+                self.runs_snapshot = null;
+                try self.askRuns();
+            },
+            .runs => {
+                for (value.items) |row| {
+                    self.run = try Id.init(row.run.id.value);
+                    self.run_revision = row.run.revision;
+                    self.run_state = row.run.state;
+                    app.view.status = @tagName(row.run.state);
+                }
+                if (self.run_state == null) app.view.status = "Ready — fake/fixture";
+                if (value.next_cursor) |cursor| {
+                    self.runs_cursor = try Id.init(cursor);
+                    self.runs_snapshot = value.snapshot_id;
+                    try self.askRuns();
+                } else {
+                    self.approval_live = false;
+                    if (self.run.len != 0) try self.ask(.approvals, .{ .approvals = .{ .run = .{ .value = self.run.slice() }, .page = page } }) else try self.askMessages();
+                }
+            },
+            .approvals => {
+                for (value.items) |row| if (row.approval.state == .pending and row.approval.live) {
+                    self.approval = try Id.init(row.approval.id.value);
+                    self.approval_revision = row.approval.revision;
+                    self.approval_digest = try Id.init(row.approval.evidence.action_digest);
+                    self.approval_live = true;
+                };
+                try self.askMessages();
+            },
+            .messages => {
+                self.message_count = value.items.len;
+                self.message_index = 0;
+                for (value.items, 0..) |row, index| self.messages[value.items.len - 1 - index] = try Id.init(row.message.message_id.value);
+                self.generation += 1;
+                for (&app.view.rich_tiles) |*tile| tile.deinit();
+                app.view.rich_count = 0;
+                app.view.rich_next = 0;
+                if (self.message_count != 0) try self.askBlocks();
+            },
+            .blocks => {
+                self.block_count = value.items.len;
+                self.block_index = 0;
+                for (value.items, 0..) |row, index| self.blocks[index] = .{ .id = try Id.init(row.block.block_id.value), .revision = row.block.revision, .bytes = row.block.committed_bytes };
+                if (value.next_cursor != null) app.view.notice = "Message block neighborhood exceeds eight-block display budget";
+                if (self.block_count != 0) try self.startBlock(app) else try self.nextMessage();
+            },
+            .content => {
+                if (value.items.len != 1) return error.MissingContent;
+                const content = value.items[0].content;
+                const block = &self.blocks[self.block_index];
+                if (content.revision != block.revision) {
+                    self.refresh = true;
+                    try self.nextBlock(app);
+                    return;
+                }
+                if (content.start_byte != self.source_len or content.end_byte > self.source.len) return error.ContentRange;
+                @memcpy(self.source[self.source_len..@intCast(content.end_byte)], content.bytes);
+                self.source_len = @intCast(content.end_byte);
+                if (self.source_len < block.bytes) try self.askContent() else self.source_pending = true;
+            },
+        }
+    }
+
+    fn askRuns(self: *Conversation) !void {
+        var bounds = page;
+        bounds.limit = 32;
+        bounds.cursor = if (self.runs_cursor) |*cursor| cursor.slice() else null;
+        bounds.snapshot = self.runs_snapshot;
+        try self.ask(.runs, .{ .runs = .{ .thread = .{ .value = self.thread.slice() }, .page = bounds } });
+    }
+    fn askMessages(self: *Conversation) !void {
+        try self.ask(.messages, .{ .messages = .{ .thread = .{ .value = self.thread.slice() }, .direction = .older, .page = page } });
+    }
+    fn askBlocks(self: *Conversation) !void {
+        try self.ask(.blocks, .{ .blocks = .{ .message = .{ .value = self.messages[self.message_index].slice() }, .page = page } });
+    }
+    fn startBlock(self: *Conversation, app: *App) !void {
+        const block = &self.blocks[self.block_index];
+        if (block.bytes > self.source.len) {
+            app.view.notice = "Content exceeds one-MiB rich display budget; canonical source is retained";
+            return self.nextBlock(app);
+        }
+        self.source_len = 0;
+        const digest = types.digest(block.id.slice());
+        self.worker_key = .{ .source = digest[0..16].*, .revision = block.revision, .generation = self.generation };
+        if (block.bytes == 0) return self.nextBlock(app);
+        try self.askContent();
+    }
+    fn askContent(self: *Conversation) !void {
+        const block = &self.blocks[self.block_index];
+        try self.ask(.content, .{ .content = .{ .block = .{ .value = block.id.slice() }, .start_byte = self.source_len, .end_byte = @min(block.bytes, self.source_len + 16 * 1024), .page = page } });
+    }
+    fn nextBlock(self: *Conversation, app: *App) anyerror!void {
+        self.worker_key = null;
+        self.block_index += 1;
+        if (self.block_index < self.block_count) try self.startBlock(app) else try self.nextMessage();
+    }
+    fn nextMessage(self: *Conversation) !void {
+        self.message_index += 1;
+        if (self.message_index < self.message_count) try self.askBlocks();
     }
 };
 
@@ -225,6 +670,7 @@ test "ordinary text admission failure stays local and preserves draft and undo" 
     app.snapshot = .{};
     app.dirty = false;
     app.metrics = null;
+    app.conversation = null;
     var full: [64 * 1024]u8 = @splat('x');
     try app.view.editor.setText(&full);
     app.view.editor.selectAll();
@@ -256,6 +702,7 @@ test "native re-layout during ordinary key dispatch emits event-boundary cache s
     app.snapshot = .{};
     app.dirty = false;
     app.metrics = .{ .storage = &.{}, .cache_storage = &changes };
+    app.conversation = null;
     app.view.editor_view.width = 200;
     try app.view.insert("hello\nworld", .typing);
     var event: c.SDL_Event = std.mem.zeroes(c.SDL_Event);

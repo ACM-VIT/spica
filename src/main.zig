@@ -3,6 +3,8 @@ const App = @import("app.zig").App;
 const options_module = @import("options.zig");
 const c = @import("native/bindings.zig").c;
 const telemetry = @import("native/metrics.zig");
+const Host = @import("domain.zig").Host;
+const Wake = @import("app.zig").Wake;
 
 fn exportJson(io: std.Io, path: []const u8, value: anytype) !void {
     const bytes = try std.json.Stringify.valueAlloc(std.heap.page_allocator, value, .{ .whitespace = .indent_2 });
@@ -34,16 +36,38 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try std.Io.File.stdout().writeStreamingAll(threaded.io(), options_module.help);
         return;
     }
-    if (options.metrics_output) |metrics_path| if (options.automation_output) |automation_path| {
-        const metrics_resolved = try exportIdentity(threaded.io(), arena.allocator(), metrics_path);
-        const automation_resolved = try exportIdentity(threaded.io(), arena.allocator(), automation_path);
-        if (std.mem.eql(u8, metrics_resolved, automation_resolved)) return error.ExportPathsMustDiffer;
-    };
+    const exports = [_]?[]const u8{ options.metrics_output, options.automation_output, options.automation_live };
+    for (exports, 0..) |path, index| {
+        if (path) |value| {
+            const identity = try exportIdentity(threaded.io(), arena.allocator(), value);
+            for (exports[index + 1 ..]) |other| if (other) |other_value| {
+                const other_identity = try exportIdentity(threaded.io(), arena.allocator(), other_value);
+                if (std.mem.eql(u8, identity, other_identity)) return error.ExportPathsMustDiffer;
+            };
+        }
+    }
     var app = App.init(std.heap.page_allocator) catch |err| {
         std.log.err("Native foundation startup failed: {s}; SDL: {s}", .{ @errorName(err), c.SDL_GetError() });
         return err;
     };
     defer app.deinit();
+    var wake = Wake{ .event_type = c.SDL_RegisterEvents(1) };
+    if (wake.event_type == 0) return error.UserEventRegistration;
+    var host: ?*Host = null;
+    defer if (host) |value| value.destroy();
+    if (options.state_directory) |directory| {
+        host = try Host.create(std.heap.page_allocator, threaded.io(), .{ .state_directory = directory, .wake = Wake.notify, .wake_context = &wake });
+        const dir = try std.Io.Dir.cwd().openDir(threaded.io(), directory, .{});
+        defer dir.close(threaded.io());
+        var workspace_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const workspace_length = try dir.realPath(threaded.io(), &workspace_buffer);
+        const spool = try dir.createFile(threaded.io(), ".ui-projection", .{ .read = true });
+        errdefer spool.close(threaded.io());
+        // Derived content is descriptor-owned and disappears even after a crash.
+        try dir.deleteFile(threaded.io(), ".ui-projection");
+        try app.connect(threaded.io(), host.?, spool, &wake, workspace_buffer[0..workspace_length]);
+    }
+    if (options.automation_live) |path| try app.enableLive(threaded.io(), path);
     const storage: []telemetry.Frame = if (options.metrics_output != null)
         try std.heap.page_allocator.alloc(telemetry.Frame, options.metrics_capacity)
     else

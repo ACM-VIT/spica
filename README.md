@@ -19,6 +19,18 @@ python3 build/driver.py run      # native starter window
 ./tools/eval-starter --mode editor # private Unicode/clipboard/focus input scenario
 ```
 
+For the native durable fake-provider coding flow, explicitly choose separate state:
+
+```bash
+zig-out/bin/spica --state-directory /tmp/spica-disposable-conversation
+./tools/eval-starter --mode conversation --output .artifacts/conversation-NEW
+```
+
+Enter sends, Shift+Enter inserts newline, F6 cancels, F7 allows the current live
+approval, F8 denies, and Ctrl+Q closes. Reopening that directory retains committed
+output and run status. Without `--state-directory`, only the local draft editor
+opens; no existing history is discovered or migrated.
+
 For a clean machine, run `python3 build/bootstrap.py` first. Dependencies are pinned in deps.lock.json; see [CONTRIBUTING.md](CONTRIBUTING.md).
 Both check commands use local dependencies only; the core target needs the locked
 libunibreak, not SDL/fonts/a display. Linux CI bootstraps the locked sources before
