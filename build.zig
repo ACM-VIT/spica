@@ -24,6 +24,22 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run Spica").dependOn(&run.step);
 
+    // Domain checks and the storage consumer have no SDL/text/display dependency.
+    const domain_module = b.createModule(.{ .root_source_file = b.path("src/domain.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    storageDependencies(b, domain_module);
+    const domain_tests = b.addTest(.{ .name = "domain-tests", .root_module = domain_module });
+    const domain_run = b.addRunArtifact(domain_tests);
+    domain_run.has_side_effects = true;
+    b.step("test-domain", "Run isolated real-SQLite domain boundary regressions").dependOn(&domain_run.step);
+    const smoke_module = b.createModule(.{ .root_source_file = b.path("src/domain/smoke.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    smoke_module.addImport("domain", domain_module);
+    const domain_smoke = b.addExecutable(.{ .name = "domain-smoke", .root_module = smoke_module });
+    const smoke_install = b.addInstallArtifact(domain_smoke, .{});
+    b.step("build-domain-smoke", "Build the isolated storage consumer").dependOn(&smoke_install.step);
+    const smoke_run = b.addRunArtifact(domain_smoke);
+    if (b.args) |args| smoke_run.addArgs(args);
+    b.step("domain-smoke", "Exercise the actual isolated SQLite storage consumer").dependOn(&smoke_run.step);
+
     // Core editing checks need Unicode segmentation, not the renderer/content stack.
     const core_module = b.createModule(.{ .root_source_file = b.path("src/core_test.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core_module.addIncludePath(b.path(b.fmt("{s}/include", .{prefix})));
@@ -104,18 +120,23 @@ fn libraryDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const
         else => @panic("Process support requires Linux or macOS"),
     };
     module.addCSourceFile(.{ .file = b.path(process_backend), .flags = &.{ "-std=c11", "-O2" } });
-    module.addCSourceFile(.{ .file = b.path("src/platform/database.c"), .flags = &.{ "-std=c11", "-D_DEFAULT_SOURCE", "-O2" } });
+    storageDependencies(b, module);
     module.addLibraryPath(b.path(b.fmt("{s}/lib", .{prefix})));
     module.addRPath(b.path(b.fmt("{s}/lib", .{prefix})));
-    inline for (.{ "cmark-gfm-extensions", "cmark-gfm", "tree-sitter", "sqlite3" }) |name| {
+    inline for (.{ "cmark-gfm-extensions", "cmark-gfm", "tree-sitter" }) |name| {
         // Link only the locked builds in .deps. With pkg-config on (Zig's default), any library that
         // also has a system install with a .pc file (Homebrew, apt, etc.) resolves to that copy
         // instead, and its directory can land ahead of .deps in the rpath. System copies are other
         // versions and lack the allocator hooks bootstrap.py configures, which crashes the
-        // allocation-failure tests. Libraries not built into .deps (sqlite3) still resolve from the
-        // standard system library directories.
+        // allocation-failure tests. Storage separately links the system SQLite dependency.
         module.linkSystemLibrary(name, .{ .use_pkg_config = .no });
     }
     module.addIncludePath(b.path(".deps/src/cmark-gfm-0.29.0.gfm.13/src"));
     module.addIncludePath(b.path(b.fmt(".deps/build/{s}-{s}/cmark-gfm/src", .{ @tagName(module.resolved_target.?.result.os.tag), @tagName(module.resolved_target.?.result.cpu.arch) })));
+}
+
+fn storageDependencies(b: *std.Build, module: *std.Build.Module) void {
+    module.addCSourceFile(.{ .file = b.path("src/platform/database.c"), .flags = &.{ "-std=c11", "-D_DEFAULT_SOURCE", "-O2" } });
+    module.addCSourceFile(.{ .file = b.path("src/platform/store_fs.c"), .flags = &.{ "-std=c11", "-O2" } });
+    module.linkSystemLibrary("sqlite3", .{ .use_pkg_config = .no });
 }

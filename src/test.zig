@@ -1,5 +1,6 @@
 test {
     _ = @import("runtime/fake_test.zig");
+    _ = @import("domain.zig");
     _ = @import("options.zig");
     _ = @import("text/edit.zig");
     _ = @import("text/composer.zig");
