@@ -1,6 +1,6 @@
 # 006: Minimal public API proof
 
-Status: standalone production Lua runtime reviewed for integration; actual native/default-custom/durable Host acceptance remains open.
+Status: review — selected protected Lua and actual native root/renderer/action proof integrated and exercised; Main acceptance remains pending.
 Authorization: user continuation through roadmap002–017. Scope is a small replaceable root/renderer, public commands/queries, invalid-config retention and durable-work independence. No built-in alternate presets or two production scripting runtimes.
 Base: accepted task003 `3c18aac45d732f217bc9af98d466f3c569c8dd61`; task004 Host gateway pinned in its packet, task005 native UI preparation/implementation concurrent.
 Owner: Astra chooses runtime after evidence; Native003 performs bounded feasibility proof in ignored `.artifacts/api006/` only. All tracked files and other worktrees read-only; no Git mutation. Parent Git owner Infra002; DomainPrep004 owns domain gateway/types/build, NativeUI005 owns future native UI surface.
@@ -89,3 +89,29 @@ completion of that real consumer and later exclusive native measurements.
 After UIShip005's runtime cap, Main explicitly transferred its existing private
 native allowlist/slot2 to `ShipLeadContinue.NativeLuaBridge`; no additional
 public API or runtime implementation is authorized.
+
+## Actual native proof closure
+
+`d5698fd` is integrated as `fe6a0ff`; `9227180` documents the native contract.
+The real App consumes protected Lua root/renderer descriptors and explicit
+captured-context action proposals through the same public Host as the default.
+F5 stages reload; F9 switches composition without replacing Host. Native source
+review fixes preserve reload errors until valid recovery and prevent editing an
+omitted composer. Reserved action results are consumed before worker disposal.
+
+Producer actual Debug custom input/reload/restart passed at
+`.artifacts/ui005/lua-native-custom/manifest.json`. Final shared ReleaseSafe
+custom proof also passed at
+`.artifacts/ship-continue-final/native-custom-ReleaseSafe/manifest.json`; same
+accepted run survives valid reload and root switching, malformed reload retains
+last-good, later valid reload clears the error, and reopening retains tool output
+and cancelled status. Integrator inspected all four relevant final screenshots.
+The assembled `./tools/check` passed both safety modes; no repeat was needed.
+
+Additional actual standalone Host/Lua consumer assertions A01–A09 passed Debug
+at `.artifacts/ship-continue-measure/consumer-attempt2/manifest.json`.
+The copied inherited consumer needed one expectation correction (seven root
+nodes, not eight); no production runtime changed for that correction.
+Standalone evidence supplements, rather than replaces, the actual frontend.
+Independent measurement follows only under the explicit exclusive lease;
+Main retains final milestone acceptance and subsequent adapter authorization.

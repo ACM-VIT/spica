@@ -1,6 +1,6 @@
 # 004: Durable single conversation and execution state
 
-Status: running — source preparation reviewed; production implementation allocated after task003 acceptance.
+Status: review — durable Host and actual default/custom native conversation are integrated and exercised; Main acceptance remains pending.
 Authorization: user continuation through remaining roadmap, with explicit instruction to keep independent Sol lanes moving and avoid unnecessary setup/checkpoint serialization.
 Base: `3c18aac45d732f217bc9af98d466f3c569c8dd61`, tasks001–003 accepted. Assigned private worktree `.artifacts/worktrees/004-domain`, branch `task/004-domain`, must start from that exact committed base.
 Owner: Astra owns decisions/acceptance; DomainRuntime004 now owns domain types/store/owner and private Git for the allowlist below, following DomainPrep004's clean runtime-cap handoff at `c0d7fb27a64558791824f7286f637cb611bd6289`. No competing domain writer. Infra002 remains sole shared Git integrator/publisher.
@@ -69,3 +69,22 @@ retains identity until its receipt, and the coding root does not own dispatch.
 The actual private-desktop conversation/reopen evidence is recorded in task005.
 Default-state startup, root-before-Host teardown and the Lua bridge remain owned
 by UIShip005 until its next immutable checkpoints; no competing App writer.
+
+## Assembled native milestone evidence
+
+Shared native Lua checkpoint `fe6a0ff` completes the actual public Host consumer,
+including accepted-work independence from F5 reload and F9 root replacement.
+The final shared ReleaseSafe custom cohort passed at
+`.artifacts/ship-continue-final/native-custom-ReleaseSafe/manifest.json`:
+Unicode send, actual response/code, same accepted run over reload/default switch,
+last-good recovery, approval/tool completion, second-run cancel and retained
+custom-root reopen. No provider lifecycle or durable state moved into Lua/UI.
+
+One assembled `./tools/check` passed Debug and ReleaseSafe: each reports
+99/100 native tests passing (one skipped), Python 35 tests OK (two skipped),
+successful application builds and CLI smoke; formatting checked 68 files.
+Raw log: `.artifacts/ship-continue-final/tools-check.log`.
+Earlier actual crash/unknown-effect/no-replay evidence remains authoritative;
+the native cohort does not establish power-loss behavior or live adapters.
+ShipLeadContinue retains serialized shared Git ownership for final records;
+producer writers have stopped. Main owns acceptance.

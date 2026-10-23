@@ -12,7 +12,7 @@ Workers own only assigned paths. Astra directs integration and owns this ledger;
 - [001-contracts.md](001-contracts.md): accepted at 0d82092f0578310903d5ff49556acc820ed7179b; [core contract v1](../contracts/core.md), [reference scenarios](../contracts/scenarios.md) and [immutable source evidence](../contracts/references.md). Documentation only; domain/fake-adapter implementation and live runtime validation remain separate gates.
 - [002-build-checks.md](002-build-checks.md): accepted; Debug/ReleaseSafe checks, isolated core regressions, tool pins and Linux CI configuration. Remote CI/clean-host execution remain explicitly unexercised.
 - [003-fake-harness.md](003-fake-harness.md): accepted at `3c18aac45d732f217bc9af98d466f3c569c8dd61`; frozen fake/native repairs, combined Debug/ReleaseSafe checks, actual native smoke and independent asynchronous measurements reviewed.
-- [004-durable-conversation.md](004-durable-conversation.md) and [005-native-coding-ui.md](005-native-coding-ui.md): concurrent private implementation against pinned Host API/projections. [006-public-api-proof.md](006-public-api-proof.md): independent runtime feasibility proof; production bindings follow selected runtime and concrete interfaces. Shared fake-provider milestone remains unaccepted.
+- [004-durable-conversation.md](004-durable-conversation.md), [005-native-coding-ui.md](005-native-coding-ui.md) and [006-public-api-proof.md](006-public-api-proof.md): review — integrated runnable default/custom native fake-provider conversation, actual reload/restart proof and assembled Debug/ReleaseSafe checks passed. Final evidence review remains Main-owned; the shared milestone is not marked accepted.
 - [007-codex-adapter.md](007-codex-adapter.md), [008-opencode-adapter.md](008-opencode-adapter.md): blocked on their stated implementation/live gates, not lack of roadmap authorization.
 - 009 projects/threads/background runs, 010 bounded history, 011 workspace/Git identity: pending prerequisites.
 - [012-app-orchestration.md](012-app-orchestration.md): pending fake/runtime/workspace gates; 013 queueing/recovery/portability follows.
@@ -98,3 +98,17 @@ Stopped HostScriptMeasure released slot1 without compiling its consumer;
 `ShipLeadContinue.NativeMeasure` now owns evidence-only slot1 and waits for an
 exclusive assembled-candidate measurement lease. Successor remains slot3/shared
 Git owner. No fourth active worker, pushes or competing production writers.
+
+## Runnable default/custom candidate
+
+`ShipLeadContinue.NativeLuaBridge` finished private checkpoint `d5698fd`,
+integrated as shared `fe6a0ff`; slot2 released with no further source/build work.
+`9227180` records the exercised native scripting contract. One assembled
+`./tools/check` passed Debug/ReleaseSafe and the final shared ReleaseSafe actual
+custom cohort passed at
+`.artifacts/ship-continue-final/native-custom-ReleaseSafe/manifest.json`.
+The integrator inspected initial fallback, custom-render, malformed-last-good
+and reopened screenshots; task004–006 now await Main review rather than native
+implementation. NativeMeasure's slot1 exclusive paired-cohort lease was granted
+only after builds and smoke stopped. No performance success is implied before
+its raw results arrive; no pushes, packages or new API breadth were introduced.

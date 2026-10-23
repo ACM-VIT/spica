@@ -1,6 +1,6 @@
 # 005: Useful native coding UI
 
-Status: running — source preparation reviewed; native implementation allocated concurrently with task004.
+Status: review — actual default/custom native coding conversation is integrated and exercised; Main acceptance remains pending.
 Authorization: user requested remaining roadmap tasks and concurrent independent Sol work. No new preset, provider backend, scripting choice or orchestration scope.
 Owner: Astra decides interfaces/acceptance; NativeUI005 maps retained native UI primitives and owns its assigned implementation after the dependency gate.
 Base: accepted task003 `3c18aac45d732f217bc9af98d466f3c569c8dd61`. Assigned private worktree `.artifacts/worktrees/005-ui`, branch `task/005-ui`, starts at that committed base. Task004 Host gateway and bounded projection fields are pinned in its packet; DomainPrep004 publishes concrete types.
@@ -90,3 +90,32 @@ dependency consumption. Main explicitly transferred slot2 and the exact private
 UI allowlist to `ShipLeadContinue.NativeLuaBridge` (sol-repair); old writer is
 stopped. Slot1 is now `ShipLeadContinue.NativeMeasure`, evidence-only, with
 performance sampling barred until the assembled candidate and exclusive lease.
+
+## Integrated actual custom frontend
+
+Replacement checkpoint `d5698fd11399723059fe3052c13362f8d081792e` is integrated
+as `fe6a0ff`; NativeLuaBridge completed and released slot2. Source review covered
+immutable captured targets/revisions/selection and stable command identity,
+installed-generation/root-epoch rejection, staging/result sequencing, error
+recovery, absent-composer input and reserved-action shutdown. The relevant
+producer checks passed native-root 53/53, options 4/4, evaluator 10/10 and the
+additional input-guard regression 2/2; evidence is under
+`.artifacts/ui005/lua-native-check/` and `.artifacts/ui005/lua-native-custom/`.
+
+One final shared `./tools/check` passed both safety modes (99/100 native,
+one skipped; Python 35 OK/two skipped; successful builds, format and CLI smoke).
+The final shared ReleaseSafe actual custom cohort then passed without rebuilding:
+`.artifacts/ship-continue-final/native-custom-ReleaseSafe/manifest.json`.
+Its source fingerprint is
+`15dff3f0c025497f46579d6e97a8075493e81f03caa4e064b1f0e3edbf14844c`;
+binary SHA256 is
+`5188e7a353a59db6be4a400b37813628b0982fe7c1148620c9a53ba566711599`.
+Integrator inspected `initial-invalid-default.png`, `custom-render.png`,
+`malformed-last-good.png` and `reopened.png` in that directory. They show usable
+initial fallback, actual custom-rendered Host bytes, preserved last-good output
+with visible error and retained approved tool output/cancelled status.
+
+NativeMeasure holds slot1's exclusive sampling lease only after all builds and
+smokes stopped; its paired default/custom measurements are recorded separately.
+No real Codex/OpenCode, physical latency, large-history or rich arbitrary custom
+renderer acceptance follows from this finite native proof.
