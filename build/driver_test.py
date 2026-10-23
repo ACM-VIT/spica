@@ -9,6 +9,15 @@ import driver
 
 
 class DriverTests(unittest.TestCase):
+    def test_installed_zig_version_is_exact(self):
+        with patch.object(driver.subprocess, 'check_output', return_value='0.16.0\n'):
+            driver.require_zig()
+        for version in ('0.15.2', '0.16.0-dev.1', '0.17.0'):
+            with self.subTest(version=version), \
+                 patch.object(driver.subprocess, 'check_output', return_value=version):
+                with self.assertRaisesRegex(RuntimeError, 'requires Zig 0.16.0'):
+                    driver.require_zig()
+
     def test_falls_back_when_either_compiler_rejects_sdk(self):
         for failing_compiler in ('cc', 'zig'):
             with self.subTest(compiler=failing_compiler), tempfile.TemporaryDirectory() as temporary:

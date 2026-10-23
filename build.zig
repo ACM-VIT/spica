@@ -24,6 +24,16 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run Spica").dependOn(&run.step);
 
+    // Core editing checks need Unicode segmentation, not the renderer/content stack.
+    const core_module = b.createModule(.{ .root_source_file = b.path("src/core_test.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    core_module.addIncludePath(b.path(b.fmt("{s}/include", .{prefix})));
+    core_module.addLibraryPath(b.path(b.fmt("{s}/lib", .{prefix})));
+    core_module.linkSystemLibrary("unibreak", .{ .use_pkg_config = .no });
+    const core_tests = b.addTest(.{ .name = "core-tests", .root_module = core_module });
+    const core_run = b.addRunArtifact(core_tests);
+    core_run.has_side_effects = true;
+    b.step("test-core", "Run isolated core and Unicode editing regressions").dependOn(&core_run.step);
+
     const test_module = b.createModule(.{ .root_source_file = b.path("src/test.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
     test_module.addOptions("build_options", options);
     foundationDependencies(b, test_module, prefix);
@@ -31,7 +41,10 @@ pub fn build(b: *std.Build) void {
     test_module.addCSourceFile(.{ .file = b.path("src/native/parse_arena_test.c"), .flags = &.{ "-std=c11", "-O2" } });
     const tests = b.addTest(.{ .root_module = test_module });
     const test_step = b.step("test", "Run reusable native, Unicode, content, platform, and bootstrap regressions");
-    test_step.dependOn(&b.addRunArtifact(tests).step);
+    const test_run = b.addRunArtifact(tests);
+    // Reuse compiled artifacts, but exercise tests on every check invocation.
+    test_run.has_side_effects = true;
+    test_step.dependOn(&test_run.step);
     // SDL allocator hooks are process-global and must precede every SDL use.
     // Keep decoder allocation-failure probes independent of UI/text test order.
     const image_module = b.createModule(.{ .root_source_file = b.path("src/native/images_test.zig"), .target = target, .optimize = optimize, .link_libc = true });
@@ -42,7 +55,9 @@ pub fn build(b: *std.Build) void {
     image_module.addCSourceFile(.{ .file = b.path("src/native/images.c"), .flags = &.{ "-std=c11", "-O2" } });
     inline for (.{ "SDL3_image", "SDL3" }) |name| image_module.linkSystemLibrary(name, .{ .use_pkg_config = .no });
     const image_tests = b.addTest(.{ .name = "image-tests", .root_module = image_module });
-    test_step.dependOn(&b.addRunArtifact(image_tests).step);
+    const image_run = b.addRunArtifact(image_tests);
+    image_run.has_side_effects = true;
+    test_step.dependOn(&image_run.step);
 
     const bootstrap_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "build", "-p", "*_test.py" });
     bootstrap_tests.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");

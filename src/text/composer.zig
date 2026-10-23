@@ -692,3 +692,28 @@ test "fragmentation failure is atomic and retained undo remains usable" {
     try std.testing.expect(composer.redo());
     try expectText(&composer, expected);
 }
+
+fn allocationProbe(allocator: std.mem.Allocator) !void {
+    var composer = try Composer.init(allocator);
+    defer composer.deinit();
+    try composer.setText("e\u{301}🇺🇸👩‍💻");
+    try composer.backspace();
+    try expectText(&composer, "e\u{301}🇺🇸");
+    try std.testing.expect(composer.undo());
+    try expectText(&composer, "e\u{301}🇺🇸👩‍💻");
+    composer.selectAll();
+    try composer.insert("שלום\n世界", .ime);
+    try expectText(&composer, "שלום\n世界");
+    try std.testing.expect(composer.undo());
+    try std.testing.expect(composer.redo());
+    try expectText(&composer, "שלום\n世界");
+}
+
+test "initial allocation failure leaks nothing and editing allocates only at init" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationProbe, .{});
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1, .resize_fail_index = 0 });
+    try allocationProbe(failing.allocator());
+    try std.testing.expectEqual(@as(usize, 1), failing.allocations);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try std.testing.expect(!failing.has_induced_failure);
+}

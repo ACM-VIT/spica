@@ -16,6 +16,16 @@ python3 tools/format.py
 
 bootstrap.py acquires checksum-locked sources and fonts from deps.lock.json into ignored .deps/. It may need network access on first use. Keep lockfile and build logic in sync. driver.py supplies macOS SDK handling; on Linux it invokes Zig directly. Build/test use the existing cache without reinstalling system packages. Optional Lefthook hooks in lefthook.yml run the same formatting/build/regression checks before push.
 
+For the fast, isolated editor/core regression loop, use
+`python3 build/driver.py test-core -Doptimize=Debug --summary all`
+and repeat with `-Doptimize=ReleaseSafe`. This target links only libc and the
+locked libunibreak from `.deps` (it does not require SDL, fonts or a display).
+It exercises the retained Unicode editing, bounded input and allocation-failure
+checks with Zig's leak-aware test allocator. The full `test` target retains
+native parser/image/text and platform regressions. Test executables run on every
+invocation; compilation may be cached, and `--summary all` distinguishes the two.
+Direct driver invocations reject any Zig version other than 0.16.0.
+
 Formatting includes existing and new project-owned sources, and excludes dependencies/build output. It deliberately skips deleted files during rewrite work. Do not format vendored dependencies.
 
 ## Working in parallel

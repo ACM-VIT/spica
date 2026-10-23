@@ -9,6 +9,13 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
+ZIG_VERSION = '0.16.0'
+
+
+def require_zig():
+    actual = subprocess.check_output(['zig', 'version'], text=True).strip()
+    if actual != ZIG_VERSION:
+        raise RuntimeError(f'requires Zig {ZIG_VERSION}; found {actual}')
 
 
 def sdk_candidates(environment):
@@ -64,6 +71,7 @@ def select_sdk(environment, directory):
 
 
 def main():
+    require_zig()
     environment = os.environ.copy()
     # Keep the libc file alive throughout the build and any bootstrap subprocesses.
     with tempfile.TemporaryDirectory(prefix='spica-sdk-') as temporary:
