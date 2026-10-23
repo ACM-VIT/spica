@@ -1,6 +1,7 @@
 //! Domain values only. Adapter observations/receipts are never public domain results.
 const std = @import("std");
 pub const adapter = @import("../contract.zig");
+pub const orchestration = @import("../orchestration.zig");
 
 fn Id(comptime name: []const u8) type {
     return struct {
@@ -69,6 +70,11 @@ pub const Payload = union(enum) {
         effects: []const adapter.EffectId,
         resolution: ?struct { actor: []const u8, evidence: []const u8, no_execution: bool } = null,
     },
+    task_delegate: orchestration.Packet,
+    task_send: struct { content: []const u8 },
+    task_cancel: struct { reason: []const u8 },
+    task_result: orchestration.Result,
+    task_review: struct { candidate: []const u8, evidence: []const u8, disposition: orchestration.Disposition },
     unsupported: struct { kind: []const u8, payload: []const u8 },
 };
 pub const CommandEnvelope = struct {
@@ -118,7 +124,7 @@ pub const Receipt = struct {
 };
 pub const RunState = enum { queued, starting, streaming, awaiting_approval, cancel_requested, completed, cancelled, failed, interrupted, unknown };
 pub const EffectState = enum { planned, in_flight, withdrawn, confirmed, failed, unknown };
-pub const EffectKind = enum { create_session, start, approval_reply, cancel, inspect, attach };
+pub const EffectKind = enum { create_session, start, approval_reply, cancel, inspect, attach, message };
 pub const ApprovalState = enum { pending, resolved, invalidated };
 pub const ToolOutcome = enum { pending, succeeded, failed, unknown };
 pub const Direction = enum { older, newer };
@@ -141,6 +147,8 @@ pub const Query = union(enum) {
     tools: struct { run: adapter.RunId, page: Page = .{} },
     approvals: struct { run: adapter.RunId, page: Page = .{} },
     capabilities: void,
+    task_list: struct { parent: adapter.RunId, page: Page = .{} },
+    task_wait: adapter.RunId,
 };
 pub const BlockDescriptor = struct {
     block_id: adapter.BlockId,
@@ -171,6 +179,7 @@ pub const Row = union(enum) {
     tool: struct { id: adapter.ToolCallId, revision: Revision, run: adapter.RunId, name: []const u8, action_digest: []const u8, outcome: ToolOutcome, result_block: ?adapter.BlockId },
     approval: struct { id: adapter.ApprovalId, revision: Revision, run: adapter.RunId, state: ApprovalState, evidence: adapter.ApprovalEvidence, live: bool },
     capabilities: adapter.Discovery,
+    task: struct { task: orchestration.Task, state: RunState, revision: Revision },
 };
 pub const QueryPage = struct {
     snapshot_id: SnapshotId,

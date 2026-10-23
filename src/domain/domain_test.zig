@@ -436,7 +436,7 @@ test "public Host consumer streams approves cancels pages and reopens durable st
     var live = true;
     defer if (live) consumer.host.destroy();
     const project = (try consumer.command(.{ .command_id = .{ .value = "host-project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "consumer" } } })).entity_ids.project.?;
-    const workspace = (try consumer.command(.{ .command_id = .{ .value = "host-workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = .{ .canonical_root = path_buffer[0..n], .filesystem_identity = "temporary", .repository_identity = "", .checkout_identity = "temporary", .expected_branch = "", .base_revision = "", .non_git = true } } } })).entity_ids.workspace.?;
+    const workspace = (try consumer.command(.{ .command_id = .{ .value = "host-workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = try domain.workspace_binding.capture(consumer.arena.allocator(), std.testing.io, path_buffer[0..n]) } } })).entity_ids.workspace.?;
     const thread = (try consumer.command(.{ .command_id = .{ .value = "host-thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
     const selection: t.adapter.Selection = .{ .workspace = workspace, .model_provider = "fake", .model_id = "fixture", .effort = "none", .account_ref = "fixture" };
     const send: t.CommandEnvelope = .{ .command_id = .{ .value = "host-send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "Hello 世界", .selection = selection } } };
@@ -599,6 +599,16 @@ const AsyncAdapter = struct {
     fn handle(self: *AsyncAdapter) adapter.Adapter {
         return .{ .context = self, .vtable = &vtable };
     }
+    fn discoverFactory(context: *anyopaque, _: t.adapter.Selection) t.adapter.Discovery { return discover(context); }
+    fn accountFactory(context: *anyopaque, _: t.adapter.Selection) t.adapter.Account { return account(context); }
+    fn createFactory(context: *anyopaque, _: std.mem.Allocator, _: t.adapter.Selection, _: []const u8, _: t.adapter.RuntimeSessionId, _: ?adapter.Bridge) !adapter.Adapter { return (@as(*AsyncAdapter, @ptrCast(@alignCast(context)))).handle(); }
+    fn destroyFactory(_: *anyopaque, _: std.mem.Allocator, _: adapter.Adapter) void {}
+    fn factory(self: *AsyncAdapter) adapter.Factory {
+        return .{ .context = self, .vtable = &.{
+            .discover = discoverFactory, .accountStatus = accountFactory, .resolveSelection = selection,
+            .create = createFactory, .destroy = destroyFactory,
+        } };
+    }
 };
 
 test "async session evidence unlocks start and upstream chunks retain durable identity" {
@@ -608,8 +618,9 @@ test "async session evidence unlocks start and upstream chunks retain durable id
     defer arena.deinit();
     const allocator = arena.allocator();
     var runtime: AsyncAdapter = .{};
-    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "async", .utc_ms = 1000, .adapter = runtime.handle() };
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "async", .utc_ms = 1000 };
     const conversation = try Conversation.create(&owner, allocator);
+    owner.factory = runtime.factory();
     const sent = try owner.command(allocator, conversation.send("async-send", "hello", 1));
     try std.testing.expectEqual(.accepted, sent.outcome);
     const open = (try owner.claimNext(allocator)).?;
@@ -643,12 +654,67 @@ test "schema one conversation migrates runtime mapping without rewriting history
     var f = try Fixture.init();
     defer f.deinit();
     try seed(&f.store);
-    try f.store.exec("DROP TABLE runtime_blocks; UPDATE meta SET schema_version=1; PRAGMA user_version=1");
+    try f.store.exec("DROP TABLE runtime_blocks; DROP TABLE tasks; DROP TABLE bridge_calls; UPDATE meta SET schema_version=1; PRAGMA user_version=1");
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try f.path(&buffer);
     try f.store.close();
     f.store = try storage.Store.open(std.testing.io, path);
-    try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, storage.schema_version), try f.store.scalar("PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM messages WHERE id='m'"));
     try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM runtime_blocks"));
+}
+
+test "durable app task delegation deduplicates bounds and correlates out of order children" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "tasks", .utc_ms = 1000 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const parent = try owner.command(allocator, conversation.send("task-parent", "coordinate", 1));
+    const opened = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, opened.id, .{ .outcome = .acknowledged, .session = .{ .id = parent.entity_ids.session.?, .instance = .{ .value = "tasks" }, .upstream = .{ .value = "parent" } } });
+    const started = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, started.id, .{ .outcome = .acknowledged });
+    const packet: t.orchestration.Packet = .{
+        .purpose = "first child", .prompt = "implement first", .selection = conversation.send("", "", 1).payload.thread_send.selection,
+        .owned_paths = &.{"first.zig"}, .acceptance = "deterministic result", .result_location = "evidence/first",
+        .budget = .{ .max_elapsed_ms = 1000 },
+    };
+    var command: t.CommandEnvelope = .{ .command_id = .{ .value = "delegate-one" }, .target = .{ .run = parent.entity_ids.run.? }, .expected_revision = .{ .revision = 3 }, .payload = .{ .task_delegate = packet } };
+    const first = try owner.command(allocator, command);
+    try std.testing.expectEqual(.accepted, first.outcome);
+    const duplicate = try owner.command(allocator, command);
+    try std.testing.expectEqualStrings(first.entity_ids.run.?.value, duplicate.entity_ids.run.?.value);
+    command.command_id.value = "delegate-two";
+    command.expected_revision.revision = 4;
+    command.payload.task_delegate.owned_paths = &.{"second.zig"};
+    command.payload.task_delegate.detached = true;
+    const second = try owner.command(allocator, command);
+    try std.testing.expectEqual(.accepted, second.outcome);
+    command.command_id.value = "delegate-over-capacity";
+    command.expected_revision.revision = 5;
+    command.payload.task_delegate.owned_paths = &.{"third.zig"};
+    try std.testing.expectEqual(t.Reason.admission_limit, (try owner.command(allocator, command)).reason.?);
+    try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM tasks"));
+    // Dispatch the accepted children's independent durable effects, not a prose
+    // delegation or a second in-memory task owner.
+    while (try owner.claimNext(allocator)) |claim| {
+        const session = if (claim.request == .open) claim.request.open.create.session else claim.request.start.correlation.session;
+        try owner.delivered(allocator, claim.id, .{ .outcome = .acknowledged, .session = if (claim.request == .open) .{ .id = session, .instance = .{ .value = "tasks" }, .upstream = .{ .value = session.value } } else null });
+    }
+    const second_event: t.adapter.Observation = .{ .correlation = .{ .run = second.entity_ids.run, .session = second.entity_ids.session.? }, .upstream_event = "second-complete", .body = .completed };
+    try owner.observe(allocator, second_event);
+    try owner.observe(allocator, second_event);
+    try owner.observe(allocator, .{ .correlation = .{ .run = first.entity_ids.run, .session = first.entity_ids.session.? }, .upstream_event = "first-failure", .body = .{ .failure = .{ .code = "test", .detail = "deterministic failure" } } });
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM tasks t JOIN runs r ON r.id=t.run_id WHERE r.state='completed'"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM tasks t JOIN runs r ON r.id=t.run_id WHERE r.state='failed'"));
+    const result = try owner.command(allocator, .{ .command_id = .{ .value = "first-result" }, .target = .{ .run = first.entity_ids.run.? }, .expected_revision = .{ .revision = 4 }, .payload = .{ .task_result = .{ .candidate = "candidate-sha", .evidence = "checks.log", .summary = "failed check" } } });
+    try std.testing.expectEqual(.accepted, result.outcome);
+    const review = try owner.command(allocator, .{ .command_id = .{ .value = "first-review" }, .target = .{ .run = first.entity_ids.run.? }, .expected_revision = .{ .revision = 5 }, .payload = .{ .task_review = .{ .candidate = "candidate-sha", .evidence = "checks.log", .disposition = .changes_requested } } });
+    try std.testing.expectEqual(.accepted, review.outcome);
+    try owner.recover();
+    try std.testing.expectEqual(@as(?domain.Owner.Claimed, null), try owner.claimNext(allocator));
+    try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM tasks"));
 }

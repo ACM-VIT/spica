@@ -9,6 +9,14 @@ pub const Options = struct {
     state_directory: ?[]const u8 = null,
     automation_live: ?[]const u8 = null,
     lua_module: ?[]const u8 = null,
+    provider: enum { fake, codex, opencode } = .fake,
+    runtime_account_directory: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    model_provider: ?[]const u8 = null,
+    effort: ?[]const u8 = null,
+    workspace: ?[]const u8 = null,
+    codex_auth: enum { none, status, browser, device } = .none,
+    runtime_executable: ?[]const u8 = null,
 
     pub fn parse(args: []const [:0]const u8) !Options {
         var options: Options = .{};
@@ -17,6 +25,22 @@ pub const Options = struct {
             const flag = args[index];
             if (std.mem.eql(u8, flag, "--help")) {
                 options.help = true;
+            } else if (std.mem.eql(u8, flag, "--provider")) {
+                index += 1;
+                if (index == args.len) return error.MissingOptionValue;
+                options.provider = std.meta.stringToEnum(@TypeOf(options.provider), args[index]) orelse return error.InvalidProvider;
+            } else if (std.mem.eql(u8, flag, "--runtime-executable")) {
+                index += 1;
+                if (index == args.len or !std.fs.path.isAbsolute(args[index])) return error.AbsoluteRuntimeExecutableRequired;
+                options.runtime_executable = args[index];
+            } else if (std.mem.eql(u8, flag, "--codex-auth")) {
+                index += 1;
+                if (index == args.len) return error.MissingOptionValue;
+                options.codex_auth = std.meta.stringToEnum(@TypeOf(options.codex_auth), args[index]) orelse return error.InvalidAuthMode;
+            } else if (std.mem.eql(u8, flag, "--runtime-account-directory") or std.mem.eql(u8, flag, "--model") or std.mem.eql(u8, flag, "--model-provider") or std.mem.eql(u8, flag, "--effort") or std.mem.eql(u8, flag, "--workspace")) {
+                index += 1;
+                if (index == args.len or args[index].len == 0) return error.MissingOptionValue;
+                if (std.mem.eql(u8, flag, "--runtime-account-directory")) options.runtime_account_directory = args[index] else if (std.mem.eql(u8, flag, "--model")) options.model = args[index] else if (std.mem.eql(u8, flag, "--model-provider")) options.model_provider = args[index] else if (std.mem.eql(u8, flag, "--effort")) options.effort = args[index] else options.workspace = args[index];
             } else if (std.mem.eql(u8, flag, "--quit-after-ms")) {
                 index += 1;
                 if (index == args.len) return error.MissingOptionValue;
@@ -43,6 +67,11 @@ pub const Options = struct {
                 options.metrics_capacity = try std.fmt.parseInt(u32, args[index], 10);
                 if (options.metrics_capacity == 0 or options.metrics_capacity > 1048576) return error.InvalidCapacity;
             } else return error.UnknownOption;
+        }
+        if (options.codex_auth != .none and options.provider != .codex and !options.help) return error.CodexAuthRequiresCodex;
+        if (options.provider != .fake and !options.help) {
+            if (options.runtime_account_directory == null or options.model == null or options.model_provider == null or options.effort == null or options.workspace == null) return error.ExplicitRuntimeSelectionRequired;
+            if (!std.fs.path.isAbsolute(options.runtime_account_directory.?) or !std.fs.path.isAbsolute(options.workspace.?)) return error.AbsoluteRuntimePathsRequired;
         }
         return options;
     }
@@ -77,6 +106,13 @@ pub const help =
     \\Default: $XDG_DATA_HOME/spica-native/conversation ($HOME/.local/share fallback).
     \\Enter sends; Shift+Enter inserts newline. F6 cancels; F7 allows; F8 denies.
     \\--lua-module PATH selects a custom Lua root/renderer. F5 reloads; F9 toggles default/custom.
+    \\--provider fake|codex|opencode selects the runtime (default fake).
+    \\Real runtimes require --runtime-account-directory PATH --workspace PATH
+    \\and explicit --model-provider ID --model ID --effort VALUE.
+    \\Runtime account state is independent of the application database.
+    \\--codex-auth status|browser|device queries/initiates supported isolated ChatGPT sign-in,
+    \\prints the actual runtime response, then exits without opening the native UI.
+    \\--runtime-executable PATH overrides /usr/bin/codex or /usr/bin/opencode.
     \\Escape dismisses local editing state. Ctrl+Q or window close exits.
     \\--quit-after-ms exits after a bounded smoke run (0 exits immediately).
     \\--automation-output PATH exports the read-only final native snapshot.
@@ -109,4 +145,11 @@ test "telemetry options require values and bounded capacity" {
 test "custom module selection is explicit and requires a path" {
     try std.testing.expectEqualStrings("examples/minimal.lua", (try Options.parse(&.{ "spica", "--lua-module", "examples/minimal.lua" })).lua_module.?);
     try std.testing.expectError(error.MissingOptionValue, Options.parse(&.{ "spica", "--lua-module" }));
+}
+
+test "real runtime selection is explicit and account paths are absolute" {
+    try std.testing.expectError(error.ExplicitRuntimeSelectionRequired, Options.parse(&.{ "spica", "--provider", "codex" }));
+    try std.testing.expectError(error.InvalidProvider, Options.parse(&.{ "spica", "--provider", "other" }));
+    const options = try Options.parse(&.{ "spica", "--provider", "codex", "--runtime-account-directory", "/tmp/account", "--workspace", "/tmp/project", "--model-provider", "openai", "--model", "gpt-6.1-sol", "--effort", "medium" });
+    try std.testing.expectEqual(.codex, options.provider);
 }

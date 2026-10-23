@@ -137,6 +137,9 @@ pub const Observation = struct {
         tool_started: struct { name: []const u8, action_digest: []const u8 },
         tool_completed: struct { outcome: enum { succeeded, failed, unknown }, result: []const u8 },
         approval: ApprovalEvidence,
+        /// Cumulative run usage; cached input is a subset of input, not added
+        /// again. Subscription billing cannot be inferred from these counters.
+        usage: struct { input_tokens: u64, output_tokens: u64, cached_tokens: u64 },
         completed: void,
         cancelled: struct { tools_stopped: bool },
         failure: struct { code: []const u8, detail: []const u8 },

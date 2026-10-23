@@ -5,7 +5,12 @@ pub const store = @import("domain/store.zig");
 const t = types;
 const a = t.adapter;
 const V = store.Value;
-const Adapter = @import("runtime/adapter.zig").Adapter;
+const common = @import("runtime/adapter.zig");
+const Factory = common.Factory;
+const Registry = @import("domain/registry.zig").Registry;
+const Mcp = @import("orchestration_mcp.zig").Server;
+pub const coordinator_tools = @import("orchestration_tools.zig");
+pub const workspace_binding = @import("domain/workspace.zig");
 
 /// Internal single-thread reducer. Every returned slice belongs to the operation
 /// allocator; callers must copy before resetting it. Never call from the UI.
@@ -14,7 +19,7 @@ pub const Owner = struct {
     io: std.Io,
     epoch: []const u8,
     utc_ms: ?u64,
-    adapter: ?Adapter = null,
+    factory: ?Factory = null,
     workspace_root: ?[]const u8 = null,
 
     fn id(self: *Owner, allocator: std.mem.Allocator) ![]const u8 {
@@ -51,7 +56,11 @@ pub const Owner = struct {
         return if (try statement.step()) @intCast(statement.integer(0)) else null;
     }
     fn event(self: *Owner, allocator: std.mem.Allocator, sequence: u64, index: u32, aggregate: t.AggregateRef, revision_value: u64, kind: []const u8, causation: ?t.CommandId, effect: ?a.EffectId, payload: []const u8) !void {
-        try self.database.appendEvent(.{ .event_id = .{ .value = try self.id(allocator) }, .position = .{ .commit_sequence = sequence, .event_index = index }, .aggregate = aggregate, .aggregate_revision = revision_value, .kind = kind, .causation_command_id = causation, .effect_id = effect, .payload = payload });
+        const next = try self.database.prepare("SELECT coalesce(max(event_index)+1,0) FROM events WHERE sequence=?", &.{.{ .integer = @intCast(sequence) }});
+        defer next.deinit();
+        if (!try next.step()) return error.Corrupt;
+        const position: u32 = @intCast(@max(index, next.integer(0)));
+        try self.database.appendEvent(.{ .event_id = .{ .value = try self.id(allocator) }, .position = .{ .commit_sequence = sequence, .event_index = position }, .aggregate = aggregate, .aggregate_revision = revision_value, .kind = kind, .causation_command_id = causation, .effect_id = effect, .payload = payload });
     }
     fn plan(self: *Owner, allocator: std.mem.Allocator, effect: []const u8, run: []const u8, session: []const u8, kind: t.EffectKind, request: a.Request, dependency: ?[]const u8, approval: ?[]const u8, causation: t.CommandId) !void {
         const bytes = try encoded(allocator, request);
@@ -132,7 +141,7 @@ pub const Owner = struct {
         if (try s.step()) return error.Limit;
         try self.database.execute("UPDATE messages SET incomplete=0,revision=revision+1 WHERE run_id=? AND incomplete=1 AND EXISTS(SELECT 1 FROM runs WHERE id=? AND state IN('completed','cancelled','failed'))", &.{ .{ .text = run }, .{ .text = run } });
     }
-    fn reduce(self: *Owner, allocator: std.mem.Allocator, e: t.CommandEnvelope, r: *t.Receipt) !?t.Reason {
+    fn reduce(self: *Owner, allocator: std.mem.Allocator, e: t.CommandEnvelope, r: *t.Receipt) anyerror!?t.Reason {
         const db = self.database;
         const seq = r.commit_sequence;
         var aggregate: t.AggregateRef = undefined;
@@ -148,6 +157,7 @@ pub const Owner = struct {
             },
             .workspace_register => |p| {
                 if (e.target != .absent or e.expected_revision != .absent or p.binding.canonical_root.len == 0 or p.binding.canonical_root[0] != '/') return .invalid_command;
+                if (self.factory != null and !(workspace_binding.verify(allocator, self.io, p.binding) catch false)) return .workspace_mismatch;
                 if (try self.revision(.{ .project = p.project }) == null) return .not_found;
                 const key = try self.id(allocator);
                 try db.execute("INSERT INTO workspaces VALUES(?,1,?,?)", &.{ .{ .text = key }, .{ .text = p.project.value }, .{ .blob = try encoded(allocator, p.binding) } });
@@ -171,12 +181,13 @@ pub const Owner = struct {
                 if (self.workspace_root) |root| {
                     const binding_bytes = try self.field(allocator, "SELECT binding FROM workspaces WHERE id=?", &.{.{ .text = workspace }}) orelse return .workspace_mismatch;
                     const binding = try t.decode(t.WorkspaceBinding, binding_bytes, allocator);
+                    if (!(workspace_binding.verify(allocator, self.io, binding) catch false)) return .workspace_mismatch;
                     if (!std.mem.eql(u8, binding.canonical_root, root)) return .workspace_mismatch;
                 }
                 if (p.selection.account_ref.len == 0 or p.selection.model_id.len == 0 or p.selection.model_provider.len == 0) return .capability_unavailable;
-                if (self.adapter) |runtime| {
-                    const discovery = runtime.discover();
-                    const account = runtime.accountStatus();
+                if (self.factory) |runtime| {
+                    const discovery = runtime.discover(p.selection);
+                    const account = runtime.accountStatus(p.selection);
                     const resolved = runtime.resolveSelection(p.selection);
                     if (!std.mem.eql(u8, discovery.runtime_kind, p.selection.runtime_kind) or
                         !std.mem.eql(u8, discovery.runtime_version, p.selection.required_runtime_version) or
@@ -232,6 +243,15 @@ pub const Owner = struct {
                 try self.guardRunRevisions(run);
                 const state = try self.field(allocator, "SELECT state FROM runs WHERE id=?", &.{.{ .text = run }}) orelse return .not_found;
                 if (!(std.mem.eql(u8, state, "queued") or std.mem.eql(u8, state, "starting") or std.mem.eql(u8, state, "streaming") or std.mem.eql(u8, state, "awaiting_approval") or std.mem.eql(u8, state, "unknown") or std.mem.eql(u8, state, "interrupted"))) return .invalid_command;
+                const children = try db.prepare("SELECT t.run_id,r.revision FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.parent_run=? AND t.detached=0 AND r.state IN('queued','starting','streaming','awaiting_approval','unknown','interrupted')", &.{.{ .text = run }});
+                defer children.deinit();
+                while (try children.step()) {
+                    var child_receipt: t.Receipt = .{ .command_id = e.command_id, .outcome = .accepted, .commit_sequence = seq };
+                    const child = try allocator.dupe(u8, try children.bytes(0));
+                    const reason = try self.reduce(allocator, .{ .command_id = e.command_id, .target = .{ .run = .{ .value = child } }, .expected_revision = .{ .revision = @intCast(children.integer(1)) }, .payload = .{ .run_cancel = p } }, &child_receipt);
+                    if (reason != null) return reason;
+                    try self.finalizeMessages(child);
+                }
                 const session = try self.field(allocator, "SELECT session_id FROM runs WHERE id=?", &.{.{ .text = run }}) orelse return error.Corrupt;
                 const dispatched = try self.field(allocator, "SELECT id FROM effects WHERE run_id=? AND read_only=0 AND state IN('in_flight','confirmed','unknown') LIMIT 1", &.{.{ .text = run }});
                 try db.execute("UPDATE effects SET state='withdrawn',revision=revision+1 WHERE run_id=? AND state='planned' AND read_only=0", &.{.{ .text = run }});
@@ -294,8 +314,87 @@ pub const Owner = struct {
                 aggregate = .{ .run = e.target.run };
                 revision_value = e.expected_revision.revision + 1;
             },
+            .task_delegate, .task_send, .task_cancel, .task_result, .task_review => return self.taskCommand(allocator, e, r),
         }
         try self.event(allocator, seq, if (e.payload == .thread_send) 1 else 0, aggregate, revision_value, @tagName(e.payload), e.command_id, null, "");
+        return null;
+    }
+    fn taskCommand(self: *Owner, allocator: std.mem.Allocator, e: t.CommandEnvelope, r: *t.Receipt) anyerror!?t.Reason {
+        if (e.target != .run or e.expected_revision != .revision) return .invalid_command;
+        const run = e.target.run.value;
+        const db = self.database;
+        switch (e.payload) {
+            .task_delegate => |packet| {
+                if (!packet.budget.valid() or packet.purpose.len == 0 or packet.prompt.len == 0 or packet.acceptance.len == 0 or packet.result_location.len == 0 or packet.owned_paths.len == 0 or packet.owned_paths.len > 32) return .invalid_command;
+                if (self.utc_ms == null) return .authority_unavailable;
+                if (try self.field(allocator, "SELECT run_id FROM tasks WHERE run_id=?", &.{.{ .text = run }}) != null) return .admission_limit;
+                const parent = try db.prepare("SELECT t.project_id,r.state FROM runs r JOIN threads t ON t.id=r.thread_id WHERE r.id=?", &.{.{ .text = run }});
+                defer parent.deinit();
+                if (!try parent.step()) return .not_found;
+                const state = try parent.bytes(1);
+                if (!(std.mem.eql(u8, state, "streaming") or std.mem.eql(u8, state, "awaiting_approval"))) return .invalid_command;
+                const count = try db.prepare("SELECT count(*),coalesce(sum(CASE WHEN r.state NOT IN('completed','cancelled','failed') THEN 1 ELSE 0 END),0) FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.parent_run=?", &.{.{ .text = run }});
+                defer count.deinit();
+                if (!try count.step() or count.integer(0) >= 16 or count.integer(1) >= 2) return .admission_limit;
+                const project = try allocator.dupe(u8, try parent.bytes(0));
+                const workspace_project = try self.field(allocator, "SELECT project_id FROM workspaces WHERE id=?", &.{.{ .text = packet.selection.workspace.value }}) orelse return .workspace_mismatch;
+                if (!std.mem.eql(u8, project, workspace_project)) return .workspace_mismatch;
+                for (packet.owned_paths) |path| {
+                    if (path.len == 0 or path[0] == '/' or std.mem.indexOf(u8, path, "..") != null) return .invalid_command;
+                }
+                const siblings = try db.prepare("SELECT t.packet FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.parent_run=? AND r.state NOT IN('completed','cancelled','failed')", &.{.{ .text = run }});
+                defer siblings.deinit();
+                while (try siblings.step()) {
+                    const other = try t.decode(t.orchestration.Packet, try siblings.bytes(0), allocator);
+                    if (!std.mem.eql(u8, other.selection.workspace.value, packet.selection.workspace.value)) continue;
+                    for (other.owned_paths) |left| for (packet.owned_paths) |right| {
+                        if (std.mem.startsWith(u8, left, right) or std.mem.startsWith(u8, right, left)) return .workspace_mismatch;
+                    };
+                }
+                const thread = try self.id(allocator);
+                try db.execute("INSERT INTO threads(id,revision,project_id,workspace_id) VALUES(?,1,?,?)", &.{ .{ .text = thread }, .{ .text = project }, .{ .text = packet.selection.workspace.value } });
+                const reason = try self.reduce(allocator, .{ .command_id = e.command_id, .target = .{ .thread = .{ .value = thread } }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = packet.prompt, .selection = packet.selection } } }, r);
+                if (reason != null) return reason;
+                try db.execute("INSERT INTO tasks(run_id,parent_run,packet,detached,created_at) VALUES(?,?,?,?,?)", &.{ .{ .text = r.entity_ids.run.?.value }, .{ .text = run }, .{ .blob = try encoded(allocator, packet) }, .{ .integer = @intFromBool(packet.detached) }, .{ .integer = @intCast(self.utc_ms.?) } });
+            },
+            .task_send => |message| {
+                if (message.content.len == 0) return .invalid_command;
+                const task = try db.prepare("SELECT t.packet,t.requests,r.session_id,r.state FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.run_id=?", &.{.{ .text = run }});
+                defer task.deinit();
+                if (!try task.step()) return .not_found;
+                const packet = try t.decode(t.orchestration.Packet, try task.bytes(0), allocator);
+                if (task.integer(1) >= packet.budget.max_requests) return .admission_limit;
+                if (!std.mem.eql(u8, try task.bytes(3), "streaming")) return .invalid_command;
+                if (self.factory) |runtime| {
+                    if (runtime.discover(packet.selection).capabilities[@intFromEnum(a.Capability.message)].status != .supported) return .capability_unavailable;
+                } else return .capability_unavailable;
+                const effect_id = try self.id(allocator);
+                const request: a.Request = .{ .message = .{ .correlation = .{ .effect = .{ .value = effect_id }, .run = e.target.run, .session = .{ .value = try allocator.dupe(u8, try task.bytes(2)) } }, .message = .{ .value = try self.id(allocator) }, .content = message.content } };
+                if (a.frameBytes(request) > 4096) return .admission_limit;
+                try self.plan(allocator, effect_id, run, request.message.correlation.session.value, .message, request, null, null, e.command_id);
+                try db.execute("UPDATE tasks SET requests=requests+1 WHERE run_id=?", &.{.{ .text = run }});
+            },
+            .task_cancel => |cancel| {
+                if (try self.field(allocator, "SELECT run_id FROM tasks WHERE run_id=?", &.{.{ .text = run }}) == null) return .not_found;
+                var nested = e;
+                nested.payload = .{ .run_cancel = .{ .reason = cancel.reason } };
+                return self.reduce(allocator, nested, r);
+            },
+            .task_result => |result| {
+                if (result.candidate.len == 0 or result.evidence.len == 0 or result.summary.len == 0) return .invalid_command;
+                if (try self.field(allocator, "SELECT t.run_id FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.run_id=? AND r.state IN('completed','failed','cancelled') AND t.result IS NULL", &.{.{ .text = run }}) == null) return .invalid_command;
+                try db.execute("UPDATE tasks SET result=? WHERE run_id=?", &.{ .{ .blob = try encoded(allocator, result) }, .{ .text = run } });
+            },
+            .task_review => |review| {
+                const bytes = try self.field(allocator, "SELECT result FROM tasks WHERE run_id=?", &.{.{ .text = run }}) orelse return .invalid_command;
+                const result = try t.decode(t.orchestration.Result, bytes, allocator);
+                if (!std.mem.eql(u8, result.candidate, review.candidate) or !std.mem.eql(u8, result.evidence, review.evidence)) return .invalid_command;
+                try db.execute("UPDATE tasks SET review=? WHERE run_id=?", &.{ .{ .text = @tagName(review.disposition) }, .{ .text = run } });
+            },
+            else => unreachable,
+        }
+        try db.execute("UPDATE runs SET revision=revision+1 WHERE id=?", &.{.{ .text = run }});
+        try self.event(allocator, r.commit_sequence, 0, .{ .run = e.target.run }, e.expected_revision.revision + 1, @tagName(e.payload), e.command_id, null, "");
         return null;
     }
 
@@ -334,7 +433,7 @@ pub const Owner = struct {
         try self.guardRunRevisions(run);
         const sequence = try db.nextSequence();
         const missing_session = std.mem.eql(u8, kind, "create_session") and receipt.outcome == .acknowledged and receipt.session == null;
-        const pending_session = missing_session and self.adapter != null;
+        const pending_session = missing_session and self.factory != null;
         const state = if (pending_session) "in_flight" else if (missing_session) "unknown" else switch (receipt.outcome) {
             .acknowledged => "confirmed",
             .rejected => "failed",
@@ -370,7 +469,7 @@ pub const Owner = struct {
     pub fn observe(self: *Owner, allocator: std.mem.Allocator, input: a.Observation) !void {
         if (a.frameBytes(input) > 4096 or input.upstream_event.len == 0) return error.Limit;
         var observation = input;
-        const run = observation.correlation.run orelse if (self.adapter != null) a.RunId{
+        const run = observation.correlation.run orelse if (self.factory != null) a.RunId{
             .value = try self.field(allocator, "SELECT id FROM runs WHERE session_id=?", &.{.{ .text = observation.correlation.session.value }}) orelse return error.Conflict,
         } else return error.Conflict;
         const session = observation.correlation.session;
@@ -388,7 +487,7 @@ pub const Owner = struct {
                 return;
             }
         }
-        if (self.adapter != null) {
+        if (self.factory != null) {
             observation.correlation.run = run;
             if (observation.correlation.effect) |effect_id| {
                 if (try self.field(allocator, "SELECT id FROM effects WHERE id=? AND session_id=? AND run_id=?", &.{ .{ .text = effect_id.value }, .{ .text = session.value }, .{ .text = run.value } }) == null) return error.Conflict;
@@ -443,7 +542,7 @@ pub const Owner = struct {
                 if (terminal) return error.Conflict;
                 const existing = try self.field(allocator, "SELECT id FROM tools WHERE session_id=? AND upstream_tool=?", &.{ .{ .text = session.value }, .{ .text = upstream } });
                 if (existing) |key| {
-                    if (self.adapter == null or !std.mem.eql(u8, key, tool_id.value)) return error.Conflict;
+                    if (self.factory == null or !std.mem.eql(u8, key, tool_id.value)) return error.Conflict;
                     const old = try db.prepare("SELECT revision,action_digest FROM tools WHERE id=? AND run_id=? AND outcome='pending'", &.{ .{ .text = key }, .{ .text = run.value } });
                     defer old.deinit();
                     if (!try old.step() or old.integer(0) == std.math.maxInt(i64)) return error.Conflict;
@@ -484,7 +583,7 @@ pub const Owner = struct {
                 const request = approval.correlation.upstream_request orelse return error.Conflict;
                 const tool_digest = try self.field(allocator, "SELECT action_digest FROM tools WHERE id=? AND run_id=? AND session_id=?", &.{ .{ .text = tool_id.value }, .{ .text = run.value }, .{ .text = session.value } }) orelse return error.Conflict;
                 const workspace = try self.field(allocator, "SELECT workspace_id FROM sessions WHERE id=?", &.{.{ .text = session.value }}) orelse return error.Corrupt;
-                if (self.adapter != null and !std.mem.eql(u8, tool_digest, approval.action_digest)) {
+                if (self.factory != null and !std.mem.eql(u8, tool_digest, approval.action_digest)) {
                     try self.refineTool(tool_id.value, approval.action_digest);
                 } else if (!std.mem.eql(u8, tool_digest, approval.action_digest)) return error.Conflict;
                 if (!std.mem.eql(u8, workspace, approval.workspace.value)) return error.Conflict;
@@ -505,7 +604,12 @@ pub const Owner = struct {
                 next_state = "failed";
             },
             .disconnect, .ambiguous => if (!terminal) {
+                // Unknown tools/requests remain unreplayed after process loss.
                 next_state = "unknown";
+            },
+            .usage => |usage| {
+                if (usage.cached_tokens > usage.input_tokens or usage.input_tokens > std.math.maxInt(i64) or usage.output_tokens > std.math.maxInt(i64)) return error.Limit;
+                try db.execute("UPDATE tasks SET input_tokens=max(input_tokens,?),output_tokens=max(output_tokens,?),cached_tokens=max(cached_tokens,?) WHERE run_id=?", &.{ .{ .integer = @intCast(usage.input_tokens) }, .{ .integer = @intCast(usage.output_tokens) }, .{ .integer = @intCast(usage.cached_tokens) }, .{ .text = run.value } });
             },
             .selection => |selection| {
                 const bytes = try self.field(allocator, "SELECT requested FROM runs WHERE id=?", &.{.{ .text = run.value }}) orelse return error.Corrupt;
@@ -514,7 +618,7 @@ pub const Owner = struct {
                 try db.execute("UPDATE runs SET effective=? WHERE id=?", &.{ .{ .blob = try encoded(allocator, selection.effective.?) }, .{ .text = run.value } });
             },
             .session => |live| {
-                if (self.adapter == null or terminal or !std.mem.eql(u8, live.id.value, session.value)) return error.Conflict;
+                if (self.factory == null or terminal or !std.mem.eql(u8, live.id.value, session.value)) return error.Conflict;
                 const effect_id = observation.correlation.effect orelse return error.Conflict;
                 const pending = try db.prepare("SELECT revision FROM effects WHERE id=? AND session_id=? AND kind='create_session' AND state='in_flight'", &.{ .{ .text = effect_id.value }, .{ .text = session.value } });
                 defer pending.deinit();
@@ -568,6 +672,105 @@ pub const Owner = struct {
         try self.database.execute("UPDATE tools SET action_digest=? WHERE id=? AND outcome='pending'", &.{ .{ .blob = digest }, .{ .text = tool } });
     }
 
+    pub fn enforceTaskBudgets(self: *Owner, allocator: std.mem.Allocator) !void {
+        const utc = self.utc_ms orelse return;
+        const pending = try self.database.prepare("SELECT t.run_id,t.packet,t.created_at,t.input_tokens,t.output_tokens,r.revision FROM tasks t JOIN runs r ON r.id=t.run_id WHERE r.state IN('queued','starting','streaming','awaiting_approval') LIMIT 128", &.{});
+        defer pending.deinit();
+        while (try pending.step()) {
+            const packet = try t.decode(t.orchestration.Packet, try pending.bytes(1), allocator);
+            const tokens: u64 = @as(u64, @intCast(pending.integer(3))) +| @as(u64, @intCast(pending.integer(4)));
+            const elapsed = if (pending.isNull(2)) 0 else utc -| @as(u64, @intCast(pending.integer(2)));
+            if (tokens < packet.budget.max_tokens and elapsed < packet.budget.max_elapsed_ms) continue;
+            const run = try allocator.dupe(u8, try pending.bytes(0));
+            _ = try self.command(allocator, .{
+                .command_id = .{ .value = try std.fmt.allocPrint(allocator, "budget:{s}", .{run}) },
+                .target = .{ .run = .{ .value = run } },
+                .expected_revision = .{ .revision = @intCast(pending.integer(5)) },
+                .payload = .{ .task_cancel = .{ .reason = if (tokens >= packet.budget.max_tokens) "Observed token budget exhausted" else "Elapsed task budget exhausted" } },
+            });
+        }
+    }
+    pub const ToolReply = struct { success: bool, json: []const u8 };
+    /// Both Codex dynamic RPCs and authenticated MCP invoke this owner method.
+    /// A stable caller request key retains the exact public envelope before
+    /// dispatch, including its original optimistic revision across retries.
+    pub fn toolCall(self: *Owner, allocator: std.mem.Allocator, session: a.RuntimeSessionId, name: []const u8, arguments_json: []const u8) !ToolReply {
+        if (arguments_json.len > 16384) return error.Limit;
+        const Args = struct {
+            request_key: ?[]const u8 = null,
+            packet: ?t.orchestration.Packet = null,
+            task_id: ?[]const u8 = null,
+            content: ?[]const u8 = null,
+            reason: ?[]const u8 = null,
+        };
+        const args = try t.decode(Args, arguments_json, allocator);
+        const parent = try self.field(allocator, "SELECT id FROM runs WHERE session_id=?", &.{.{ .text = session.value }}) orelse return error.AuthorityUnavailable;
+        if (std.mem.eql(u8, name, "task.list") or std.mem.eql(u8, name, "task.wait")) {
+            if (std.mem.eql(u8, name, "task.wait") and args.task_id == null) return error.InvalidToolArguments;
+            return .{ .success = true, .json = try encoded(allocator, try self.taskRows(allocator, parent, args.task_id)) };
+        }
+        const key = args.request_key orelse return error.InvalidToolArguments;
+        if (key.len == 0 or key.len > 256) return error.InvalidToolArguments;
+        const canonical_args = try encoded(allocator, args);
+        const digest = t.digest(canonical_args);
+        var envelope: t.CommandEnvelope = undefined;
+        const previous = try self.database.prepare("SELECT method,digest,command FROM bridge_calls WHERE session_id=? AND request_key=?", &.{ .{ .text = session.value }, .{ .text = key } });
+        {
+            defer previous.deinit();
+            if (try previous.step()) {
+                if (!std.mem.eql(u8, try previous.bytes(0), name) or !std.mem.eql(u8, try previous.bytes(1), &digest)) return error.ToolRequestConflict;
+                envelope = try t.decode(t.CommandEnvelope, try previous.bytes(2), allocator);
+            } else {
+                const state = try self.field(allocator, "SELECT state FROM runs WHERE id=?", &.{.{ .text = parent }}) orelse return error.AuthorityUnavailable;
+                if (!(std.mem.eql(u8, state, "streaming") or std.mem.eql(u8, state, "awaiting_approval"))) return error.AuthorityUnavailable;
+                var payload: t.Payload = undefined;
+                var target: a.RunId = .{ .value = parent };
+                if (std.mem.eql(u8, name, "task.delegate")) {
+                    payload = .{ .task_delegate = args.packet orelse return error.InvalidToolArguments };
+                    if (args.task_id != null or args.content != null or args.reason != null) return error.InvalidToolArguments;
+                } else {
+                    const task = args.task_id orelse return error.InvalidToolArguments;
+                    if (try self.field(allocator, "SELECT run_id FROM tasks WHERE parent_run=? AND run_id=?", &.{ .{ .text = parent }, .{ .text = task } }) == null) return error.AuthorityUnavailable;
+                    target = .{ .value = task };
+                    if (std.mem.eql(u8, name, "task.send")) payload = .{ .task_send = .{ .content = args.content orelse return error.InvalidToolArguments } }
+                    else if (std.mem.eql(u8, name, "task.cancel")) payload = .{ .task_cancel = .{ .reason = args.reason orelse return error.InvalidToolArguments } }
+                    else return error.UnsupportedTool;
+                    if (args.packet != null) return error.InvalidToolArguments;
+                }
+                const command_id = try std.fmt.allocPrint(allocator, "tool:{s}:{s}", .{ session.value, key });
+                envelope = .{ .command_id = .{ .value = command_id }, .target = .{ .run = target }, .expected_revision = .{ .revision = (try self.revision(.{ .run = target })) orelse return error.NotFound }, .payload = payload };
+                try self.database.execute("INSERT INTO bridge_calls VALUES(?,?,?,?,?)", &.{ .{ .text = session.value }, .{ .text = key }, .{ .text = name }, .{ .blob = &digest }, .{ .blob = try encoded(allocator, envelope) } });
+            }
+        }
+        const receipt = try self.command(allocator, envelope);
+        return .{ .success = receipt.outcome == .accepted, .json = try encoded(allocator, receipt) };
+    }
+    fn taskRows(self: *Owner, allocator: std.mem.Allocator, parent: []const u8, task: ?[]const u8) ![]t.Row {
+        const statement = try self.database.prepare("SELECT t.run_id,t.parent_run,t.packet,t.requests,t.input_tokens,t.output_tokens,t.cached_tokens,t.result,t.review,r.state,r.revision FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.parent_run=? AND (? IS NULL OR t.run_id=?) ORDER BY t.rowid LIMIT 16", &.{ .{ .text = parent }, if (task) |v| .{ .text = v } else .null, if (task) |v| .{ .text = v } else .null });
+        defer statement.deinit();
+        const rows = try allocator.alloc(t.Row, 16);
+        var count: usize = 0;
+        while (try statement.step()) {
+            rows[count] = .{ .task = .{
+                .task = .{
+                    .id = .{ .value = try allocator.dupe(u8, try statement.bytes(0)) },
+                    .parent = .{ .value = try allocator.dupe(u8, try statement.bytes(1)) },
+                    .packet = try t.decode(t.orchestration.Packet, try statement.bytes(2), allocator),
+                    .requests = @intCast(statement.integer(3)),
+                    .input_tokens = @intCast(statement.integer(4)),
+                    .output_tokens = @intCast(statement.integer(5)),
+                    .cached_tokens = @intCast(statement.integer(6)),
+                    .result = if (statement.isNull(7)) null else try t.decode(t.orchestration.Result, try statement.bytes(7), allocator),
+                    .review = if (statement.isNull(8)) null else std.meta.stringToEnum(t.orchestration.Disposition, try statement.bytes(8)) orelse return error.Corrupt,
+                },
+                .state = std.meta.stringToEnum(t.RunState, try statement.bytes(9)) orelse return error.Corrupt,
+                .revision = @intCast(statement.integer(10)),
+            } };
+            count += 1;
+        }
+        if (task != null and count == 0) return error.AuthorityUnavailable;
+        return rows[0..count];
+    }
     pub fn recover(self: *Owner) !void {
         try self.database.begin();
         errdefer self.database.rollback() catch {};
@@ -587,9 +790,9 @@ pub const Host = struct {
         limits: t.Limits = .{},
         wake: ?*const fn (?*anyopaque) void = null,
         wake_context: ?*anyopaque = null,
-        /// Main retains the instance until Host.destroy returns. The Host
-        /// worker exclusively calls it and shuts it down on exit.
-        adapter: ?Adapter = null,
+        /// Main retains factory/config through Host.destroy. Each committed
+        /// app session receives a distinct Host-owned process/session object.
+        factory: ?Factory = null,
         selection: ?a.Selection = null,
         workspace_root: ?[]const u8 = null,
     };
@@ -602,6 +805,8 @@ pub const Host = struct {
     io: std.Io,
     options: Options,
     database: store.Store,
+    registry: ?Registry = null,
+    mcp: ?Mcp = null,
     thread: ?std.Thread = null,
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
@@ -622,6 +827,7 @@ pub const Host = struct {
     pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Host {
         const l = options.limits;
         if (l.request_slots == 0 or l.request_slots > 8 or l.result_slots == 0 or l.result_slots > 8 or l.snapshot_slots == 0 or l.snapshot_slots > 2 or l.subscription_slots > 4 or l.command_bytes > 65536 or l.page_bytes > 65536 or l.page_rows > 128 or l.page_rows == 0) return error.InvalidLimits;
+        if (options.factory != null and options.selection == null) return error.InvalidSelection;
         const self = try allocator.create(Host);
         errdefer allocator.destroy(self);
         var database = try store.Store.open(io, options.state_directory);
@@ -633,6 +839,10 @@ pub const Host = struct {
         const path = try std.fmt.allocPrintSentinel(allocator, "{s}/conversation.sqlite3", .{filename[0..n]}, 0);
         errdefer allocator.free(path);
         self.* = .{ .allocator = allocator, .io = io, .options = options, .database = database, .path = path };
+        const factory = options.factory orelse @import("domain/fake_factory.zig").factory(self);
+        self.mcp = try Mcp.init();
+        self.registry = .{ .allocator = allocator, .factory = factory };
+        errdefer if (self.mcp) |*server| server.deinit();
         for (&self.subscriptions) |*sub| sub.* = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -650,6 +860,7 @@ pub const Host = struct {
         self.mutex.unlock(self.io);
         if (self.thread) |thread| thread.join();
         for (&self.snapshots) |*snapshot| self.closeSnapshot(snapshot);
+        if (self.mcp) |*server| server.deinit();
         for (&self.subscriptions) |*sub| sub.arena.deinit();
         self.database.close() catch {};
         self.allocator.free(self.path);
@@ -739,14 +950,14 @@ pub const Host = struct {
         snapshot.database = null;
     }
     fn run(self: *Host) void {
-        var owner: Owner = .{ .database = &self.database, .io = self.io, .epoch = &self.epoch, .utc_ms = null, .adapter = self.options.adapter, .workspace_root = self.options.workspace_root };
-        defer if (self.options.adapter) |runtime| runtime.shutdown();
+        var owner: Owner = .{ .database = &self.database, .io = self.io, .epoch = &self.epoch, .utc_ms = null, .factory = self.registry.?.factory, .workspace_root = self.options.workspace_root };
+        defer if (self.registry) |*registry| registry.deinit(&self.mcp.?);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         var operation_memory: [2 * 1024 * 1024]u8 = undefined;
         while (true) {
             self.mutex.lockUncancelable(self.io);
-            while (!self.closed and self.request_count == 0 and self.options.adapter == null) self.changed.waitUncancelable(self.io, &self.mutex);
+            while (!self.closed and self.request_count == 0 and self.options.factory == null) self.changed.waitUncancelable(self.io, &self.mutex);
             if (self.closed) {
                 self.mutex.unlock(self.io);
                 return;
@@ -762,6 +973,7 @@ pub const Host = struct {
             var fixed = std.heap.FixedBufferAllocator.init(&operation_memory);
             const allocator = fixed.allocator();
             owner.utc_ms = @intCast(@max(0, std.Io.Clock.real.now(self.io).toMilliseconds()));
+            owner.enforceTaskBudgets(allocator) catch {};
             for (&self.snapshots) |*snapshot| if (snapshot.database != null and self.now() >= snapshot.deadline) {
                 self.closeSnapshot(snapshot);
             };
@@ -789,25 +1001,119 @@ pub const Host = struct {
                 const claimed = owner.claimNext(arena.allocator()) catch break;
                 const effect = claimed orelse break;
                 self.dispatch(&owner, arena.allocator(), effect) catch break;
+                self.pumpRuntimes(&owner, &arena) catch {};
             }
-            if (self.options.adapter) |runtime| {
-                runtime.pump() catch {};
-                var observations: usize = 0;
-                while (observations < 32) : (observations += 1) {
-                    _ = arena.reset(.retain_capacity);
-                    const observation = (runtime.poll(arena.allocator()) catch break) orelse break;
-                    owner.observe(arena.allocator(), observation) catch {
-                        // Invalid evidence never authorizes replaying work.
-                        self.database.rollback() catch {};
-                    };
-                }
-            }
+            self.pumpRuntimes(&owner, &arena) catch {};
             self.deliverSubscriptions(allocator) catch {};
             // Admission and shutdown wake immediately; absent transport wake
             // support, pending protocol frames are sampled at a bounded 10ms.
-            if (frame == null and self.options.adapter != null)
+            if (frame == null and self.options.factory != null)
                 self.runtime_wake.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch {};
         }
+    }
+    fn runtimeFault(owner: *Owner, allocator: std.mem.Allocator, session: a.RuntimeSessionId, reason: []const u8) !void {
+        try owner.observe(allocator, .{
+            .correlation = .{ .session = session },
+            .upstream_event = try owner.id(allocator),
+            .body = .{ .ambiguous = .{ .reason = reason } },
+        });
+    }
+    fn pumpRuntimes(self: *Host, owner: *Owner, arena: *std.heap.ArenaAllocator) !void {
+        const registry = if (self.registry) |*value| value else return;
+        for (&registry.entries, 0..) |*optional, entry_index| {
+            const entry = if (optional.*) |*value| value else continue;
+            _ = arena.reset(.retain_capacity);
+            var allocator = arena.allocator();
+            entry.adapter.pump() catch |err| {
+                if (entry.pending_open) |pending| {
+                    try owner.delivered(allocator, pending.effect, .{ .outcome = .rejected, .detail = @errorName(err) });
+                    entry.pending_open = null;
+                } else try runtimeFault(owner, allocator, entry.session, @errorName(err));
+                registry.release(&self.mcp.?, entry_index);
+                continue;
+            };
+            if (try entry.openReady(allocator, self.now())) |delivery|
+                try owner.delivered(allocator, delivery.effect, delivery.receipt);
+            var observations: usize = 0;
+            while (observations < 32) : (observations += 1) {
+                _ = arena.reset(.retain_capacity);
+                allocator = arena.allocator();
+                const observation = (entry.adapter.poll(allocator) catch |err| {
+                    try runtimeFault(owner, allocator, entry.session, @errorName(err));
+                    break;
+                }) orelse break;
+                if (!std.mem.eql(u8, observation.correlation.session.value, entry.session.value)) {
+                    try runtimeFault(owner, allocator, entry.session, "Runtime emitted another app session identity");
+                    break;
+                }
+                owner.observe(allocator, observation) catch |err|
+                    try runtimeFault(owner, allocator, entry.session, @errorName(err));
+            }
+            _ = arena.reset(.retain_capacity);
+            allocator = arena.allocator();
+            if (try entry.adapter.pollTool(allocator)) |call| {
+                const reply: Owner.ToolReply = if (!std.mem.eql(u8, call.correlation.session.value, entry.session.value))
+                    .{ .success = false, .json = "{\"error\":\"Session authority mismatch\"}" }
+                else owner.toolCall(allocator, entry.session, call.name, call.arguments_json) catch |err|
+                    .{ .success = false, .json = try t.encode(.{ .@"error" = @errorName(err) }, try allocator.alloc(u8, 4096)) };
+                try entry.adapter.respondTool(call.request_id_json, reply.success, reply.json);
+            }
+            // Process ownership ends at a terminal/ambiguous boundary, while
+            // durable unknown claims remain for explicit reconciliation.
+            const done = try self.database.prepare("SELECT 1 FROM runs r WHERE r.session_id=? AND (r.state IN('unknown','interrupted','failed') OR (r.state IN('completed','cancelled') AND NOT EXISTS(SELECT 1 FROM effects e WHERE e.run_id=r.id AND e.state IN('planned','in_flight'))))", &.{.{ .text = entry.session.value }});
+            const release = blk: {
+                defer done.deinit();
+                break :blk try done.step();
+            };
+            if (release) registry.release(&self.mcp.?, entry_index);
+        }
+        _ = arena.reset(.retain_capacity);
+        const allocator = arena.allocator();
+        if (try self.mcp.?.poll(allocator, @intCast(self.now()))) |invocation| {
+            self.handleMcp(owner, allocator, invocation) catch |err| {
+                const body = try t.encode(.{ .jsonrpc = "2.0", .id = @as(?u8, null), .@"error" = .{ .code = -32603, .message = @errorName(err) } }, try allocator.alloc(u8, 4096));
+                try self.mcp.?.respond(invocation.client, 200, body);
+            };
+        }
+    }
+    fn jsonField(value: std.json.Value, key: []const u8) std.json.Value {
+        return if (value == .object) value.object.get(key) orelse .null else .null;
+    }
+    fn handleMcp(self: *Host, owner: *Owner, allocator: std.mem.Allocator, invocation: Mcp.Invocation) !void {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, invocation.json, .{ .allocate = .alloc_always, .max_value_len = 65536 });
+        const id = jsonField(value, "id");
+        const method = jsonField(value, "method");
+        if (method != .string) return error.InvalidMcpRequest;
+        if (id == .null) {
+            if (!std.mem.eql(u8, method.string, "notifications/initialized")) return error.UnsupportedMcpNotification;
+            try self.mcp.?.respond(invocation.client, 202, "");
+            return;
+        }
+        const response = try allocator.alloc(u8, 65536);
+        const bytes = if (std.mem.eql(u8, method.string, "initialize"))
+            try t.encode(.{ .jsonrpc = "2.0", .id = id, .result = .{ .protocolVersion = "2025-03-26", .capabilities = .{ .tools = .{} }, .serverInfo = .{ .name = "spica", .version = "1" } } }, response)
+        else if (std.mem.eql(u8, method.string, "tools/list")) blk: {
+            const Tool = struct { name: []const u8, description: []const u8, inputSchema: std.json.Value };
+            var tools: [coordinator_tools.descriptors.len]Tool = undefined;
+            for (coordinator_tools.descriptors, 0..) |tool_descriptor, index| tools[index] = .{
+                .name = tool_descriptor.name, .description = tool_descriptor.description,
+                .inputSchema = try std.json.parseFromSliceLeaky(std.json.Value, allocator, tool_descriptor.input_schema, .{}),
+            };
+            break :blk try t.encode(.{ .jsonrpc = "2.0", .id = id, .result = .{ .tools = tools } }, response);
+        } else if (std.mem.eql(u8, method.string, "tools/call")) blk: {
+            const params = jsonField(value, "params");
+            const name = jsonField(params, "name");
+            if (name != .string) return error.InvalidMcpRequest;
+            const args = try t.encode(jsonField(params, "arguments"), try allocator.alloc(u8, 16384));
+            const reply = owner.toolCall(allocator, .{ .value = invocation.session }, name.string, args) catch |err| Owner.ToolReply{
+                .success = false, .json = try t.encode(.{ .@"error" = @errorName(err) }, try allocator.alloc(u8, 4096)),
+            };
+            break :blk try t.encode(.{ .jsonrpc = "2.0", .id = id, .result = .{ .content = .{.{ .type = "text", .text = reply.json }}, .isError = !reply.success } }, response);
+        } else if (std.mem.eql(u8, method.string, "ping"))
+            try t.encode(.{ .jsonrpc = "2.0", .id = id, .result = .{} }, response)
+        else
+            try t.encode(.{ .jsonrpc = "2.0", .id = id, .@"error" = .{ .code = -32601, .message = "Unsupported MCP method" } }, response);
+        try self.mcp.?.respond(invocation.client, 200, bytes);
     }
     fn fail(self: *Host, ticket: t.Ticket, reason: @FieldType(t.Failure, "reason")) void {
         self.publish(.{ .failure = .{ .ticket = ticket, .failure = .{ .reason = reason, .refresh_required = reason == .cursor_invalid } } }) catch {};
@@ -851,55 +1157,32 @@ pub const Host = struct {
         }
     }
 
-    const fake = @import("runtime/fake.zig");
-    /// Fixed fake-v1 scenario. IDs derive from durable run identity, not UI state.
-    /// Each call is exercised through the accepted bounded fake adapter, with no
-    /// external provider or script owning lifecycle. No recovered run is started.
     fn dispatch(self: *Host, owner: *Owner, allocator: std.mem.Allocator, effect: Owner.Claimed) !void {
-        if (self.options.adapter) |runtime| {
-            try owner.delivered(allocator, effect.id, try runtime.dispatch(allocator, effect.request));
+        const registry = &self.registry.?;
+        {
+            const metadata = try self.database.prepare("SELECT e.session_id,s.selection,w.binding FROM effects e JOIN sessions s ON s.id=e.session_id JOIN workspaces w ON w.id=s.workspace_id WHERE e.id=?", &.{.{ .text = effect.id.value }});
+            defer metadata.deinit();
+            if (!try metadata.step()) return error.Corrupt;
+            const session: a.RuntimeSessionId = .{ .value = try allocator.dupe(u8, try metadata.bytes(0)) };
+            const selection = try t.decode(a.Selection, try metadata.bytes(1), allocator);
+            const binding = try t.decode(t.WorkspaceBinding, try metadata.bytes(2), allocator);
+            if (effect.request == .open or effect.request == .start or effect.request == .message) {
+                if (!(workspace_binding.verify(allocator, self.io, binding) catch false)) {
+                    try owner.delivered(allocator, effect.id, .{ .outcome = .rejected, .detail = "Workspace identity changed before dispatch" });
+                    return;
+                }
+            }
+            if (effect.request == .open and effect.request.open == .create) {
+                _ = registry.create(self.io, &self.mcp.?, selection, binding.canonical_root, effect.id, effect.request, self.now()) catch |err| {
+                    try owner.delivered(allocator, effect.id, .{ .outcome = .unknown, .detail = @errorName(err) });
+                };
+            } else if (registry.find(session)) |entry| {
+                try owner.delivered(allocator, effect.id, try entry.adapter.dispatch(allocator, effect.request));
+            } else {
+                try owner.delivered(allocator, effect.id, .{ .outcome = .unknown, .detail = "No live instance for durable session; explicit reconciliation required" });
+            }
             return;
         }
-        const request = effect.request;
-        const s = try self.database.prepare("SELECT e.run_id,e.session_id,r.requested,m.id,b.id FROM effects e JOIN runs r ON r.id=e.run_id JOIN messages m ON m.run_id=r.id AND m.role='assistant' JOIN blocks b ON b.message_id=m.id AND b.ordinal=0 WHERE e.id=?", &.{.{ .text = effect.id.value }});
-        defer s.deinit();
-        if (!try s.step()) return error.Corrupt;
-        const run_id = a.RunId{ .value = try allocator.dupe(u8, try s.bytes(0)) };
-        const session_id = a.RuntimeSessionId{ .value = try allocator.dupe(u8, try s.bytes(1)) };
-        const selection = try t.decode(a.Selection, try s.bytes(2), allocator);
-        const tool_id = a.ToolCallId{ .value = try std.fmt.allocPrint(allocator, "{s}-tool", .{run_id.value}) };
-        const approval_id = a.ApprovalId{ .value = try std.fmt.allocPrint(allocator, "{s}-approval", .{run_id.value}) };
-        const correlation: a.Correlation = .{ .session = session_id, .run = run_id, .tool = tool_id, .approval = approval_id, .upstream_tool = "fake-tool", .upstream_request = "fake-approval" };
-        var receipt: a.Receipt = .{ .outcome = .acknowledged };
-        if (request == .open) receipt.session = .{ .id = session_id, .instance = .{ .value = &self.epoch }, .upstream = .{ .value = session_id.value } };
-        var script: [6]fake.Step = undefined;
-        script[0] = .{ .expect = .{ .request = request, .receipt = receipt } };
-        var count: usize = 1;
-        switch (request) {
-            .start => {
-                script[1] = .{ .emit = .{ .correlation = correlation, .upstream_event = "selection", .body = .{ .selection = .{ .requested = selection, .effective = selection, .readiness = .ready } } } };
-                script[2] = .{ .emit = .{ .correlation = correlation, .upstream_event = "response", .body = .{ .chunk = .{ .message = .{ .value = try s.bytes(3) }, .block = .{ .value = try s.bytes(4) }, .offset = 0, .text = "Fake response: café 世界 👩‍💻\n\n```zig\nconst answer = 42;\n```\n" } } } };
-                script[3] = .{ .emit = .{ .correlation = correlation, .upstream_event = "tool-start", .body = .{ .tool_started = .{ .name = "workspace.inspect", .action_digest = "fake-v1-inspect" } } } };
-                script[4] = .{ .emit = .{ .correlation = correlation, .upstream_event = "approval", .body = .{ .approval = .{ .correlation = correlation, .workspace = selection.workspace, .action_digest = "fake-v1-inspect", .scope = "one workspace inspection" } } } };
-                count = 5;
-            },
-            .respond_approval => |reply| {
-                script[1] = .{ .emit = .{ .correlation = correlation, .upstream_event = "tool-result", .body = .{ .tool_completed = .{ .outcome = if (reply.decision == .allow) .succeeded else .failed, .result = if (reply.decision == .allow) "Inspection approved; temporary workspace inspected." else "Inspection denied; no action executed." } } } };
-                script[2] = .{ .emit = .{ .correlation = correlation, .upstream_event = "completed", .body = .completed } };
-                count = 3;
-            },
-            .cancel => {
-                script[1] = .{ .emit = .{ .correlation = correlation, .upstream_event = "cancelled", .body = .{ .cancelled = .{ .tools_stopped = true } } } };
-                count = 2;
-            },
-            .open => {},
-            else => receipt = .{ .outcome = .unknown, .detail = "no live recovery continuity" },
-        }
-        script[0] = .{ .expect = .{ .request = request, .receipt = receipt } };
-        var runtime = try fake.Runtime(16, 32).init(.{ .account = .{ .reference = selection.account_ref, .readiness = .ready }, .selection = .{ .requested = selection, .effective = selection, .readiness = .ready } }, script[0..count]);
-        try owner.delivered(allocator, effect.id, try runtime.dispatch(request));
-        try runtime.pump();
-        while (runtime.poll()) |observation| try owner.observe(allocator, observation);
     }
 
     fn snapshotFor(self: *Host, page: t.Page) !struct { id: t.SnapshotId, value: *Snapshot } {
@@ -961,7 +1244,8 @@ pub const Host = struct {
             .effects => |v| v.page,
             .tools => |v| v.page,
             .approvals => |v| v.page,
-            .thread, .capabilities => .{},
+            .task_list => |v| v.page,
+            .thread, .capabilities, .task_wait => .{},
         };
         if (page.limit == 0 or page.limit > self.options.limits.page_rows or page.max_bytes == 0 or page.max_bytes > self.options.limits.page_bytes) return error.InvalidQuery;
         const snapshot = try self.snapshotFor(page);
@@ -985,6 +1269,7 @@ pub const Host = struct {
             .effects => |*v| v.page = .{},
             .tools => |*v| v.page = .{},
             .approvals => |*v| v.page = .{},
+            .task_list => |*v| v.page = .{},
             else => {},
         }
         const identity = try t.encode(identity_query, identity_buffer);
@@ -999,9 +1284,19 @@ pub const Host = struct {
         var n: usize = 0;
         switch (q) {
             .capabilities => {
-                rows[0] = .{ .capabilities = if (self.options.adapter) |runtime| runtime.discover() else .{ .capabilities = fake.defaultCapabilities(), .limits = .{} } };
+                rows[0] = .{ .capabilities = self.registry.?.factory.discover(self.selectionFor(.{ .value = "" })) };
                 result.items = rows[0..1];
                 return result;
+            },
+            .task_list => |v| {
+                sql = "SELECT t.rowid,t.run_id,t.parent_run,t.packet,t.requests,t.input_tokens,t.output_tokens,t.cached_tokens,t.result,t.review,r.state,r.revision FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.parent_run=? AND t.rowid>? ORDER BY t.rowid LIMIT ?";
+                values[0] = .{ .text = v.parent.value };
+                n = 1;
+            },
+            .task_wait => |v| {
+                sql = "SELECT t.rowid,t.run_id,t.parent_run,t.packet,t.requests,t.input_tokens,t.output_tokens,t.cached_tokens,t.result,t.review,r.state,r.revision FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.run_id=? AND t.rowid>? LIMIT ?";
+                values[0] = .{ .text = v.value };
+                n = 1;
             },
             .projects => sql = "SELECT rowid,id,revision,display_name FROM projects WHERE rowid>? ORDER BY rowid LIMIT ?",
             .workspaces => |v| {
@@ -1124,6 +1419,21 @@ pub const Host = struct {
                 .runs => .{ .run = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .thread = .{ .value = try text(allocator, s, 3) }, .session = .{ .value = try text(allocator, s, 4) }, .state = try enumeration(t.RunState, s, 5), .requested = try t.decode(a.Selection, try s.bytes(6), allocator), .effective = if (s.isNull(7)) null else try t.decode(a.Selection, try s.bytes(7), allocator) } },
                 .effects => .{ .effect = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .run = .{ .value = try text(allocator, s, 3) }, .kind = try enumeration(t.EffectKind, s, 4), .state = try enumeration(t.EffectState, s, 5), .outcome = try text(allocator, s, 6) } },
                 .tools => .{ .tool = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .run = .{ .value = try text(allocator, s, 3) }, .name = try text(allocator, s, 4), .action_digest = try text(allocator, s, 5), .outcome = try enumeration(t.ToolOutcome, s, 6), .result_block = if (s.isNull(7)) null else .{ .value = try text(allocator, s, 7) } } },
+                .task_list, .task_wait => .{ .task = .{
+                    .task = .{
+                        .id = .{ .value = try text(allocator, s, 1) },
+                        .parent = .{ .value = try text(allocator, s, 2) },
+                        .packet = try t.decode(t.orchestration.Packet, try s.bytes(3), allocator),
+                        .requests = @intCast(try number(s, 4)),
+                        .input_tokens = try number(s, 5),
+                        .output_tokens = try number(s, 6),
+                        .cached_tokens = try number(s, 7),
+                        .result = if (s.isNull(8)) null else try t.decode(t.orchestration.Result, try s.bytes(8), allocator),
+                        .review = if (s.isNull(9)) null else try enumeration(t.orchestration.Disposition, s, 9),
+                    },
+                    .state = try enumeration(t.RunState, s, 10),
+                    .revision = try number(s, 11),
+                } },
                 .approvals => .{ .approval = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .run = .{ .value = try text(allocator, s, 3) }, .state = try enumeration(t.ApprovalState, s, 4), .evidence = .{ .correlation = .{ .session = .{ .value = try text(allocator, s, 5) }, .run = .{ .value = try text(allocator, s, 3) }, .tool = .{ .value = try text(allocator, s, 6) }, .approval = .{ .value = try text(allocator, s, 1) }, .upstream_request = try text(allocator, s, 8) }, .workspace = .{ .value = try text(allocator, s, 7) }, .action_digest = try text(allocator, s, 9), .scope = try text(allocator, s, 10), .expires_at = if (s.isNull(11)) null else try number(s, 11) }, .live = !s.isNull(12) and std.mem.eql(u8, try s.bytes(12), &self.epoch) } },
                 else => unreachable,
             };
@@ -1211,4 +1521,5 @@ pub const Host = struct {
 test {
     _ = types;
     _ = @import("domain/domain_test.zig");
+    _ = @import("domain/factory_test.zig");
 }

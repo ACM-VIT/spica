@@ -86,3 +86,10 @@ The real-process independence scenario now runs through **both** concrete
 factories, including OpenCode's final-address inline allocator ownership. Each
 surviving instance exchanges a pipe frame after its peer stops; teardown is
 also protected on failed test assertions. Focused consumer: 7/7 passed.
+
+Published domain factory/registry seam `9a822cc` is integrated with the actual
+native startup candidate: Host receives the held factory rather than a
+precreated singleton, including the ordinary conversation path. `zig build
+-Doptimize=Debug` passed on the assembled seam. Explicit native provider flags
+and isolated Codex auth handling are preserved; actual mixed runtime account
+configuration and provider/desktop consumer evidence remain distinct work.

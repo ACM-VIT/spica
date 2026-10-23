@@ -10,7 +10,7 @@ extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, Closed };
 pub const application_id = 0x53504334;
-pub const schema_version = 2;
+pub const schema_version = 3;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
 
 pub const Statement = struct {
@@ -79,7 +79,7 @@ pub const Store = struct {
         const tables = try result.scalar("SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'");
         const fresh = identity == 0 and version == 0 and tables == 0;
         // Do not mutate unknown/legacy databases, including user_version=6.
-        if (!fresh and (identity != application_id or (version != 1 and version != schema_version))) return error.UnsupportedStore;
+        if (!fresh and (identity != application_id or version < 1 or version > schema_version)) return error.UnsupportedStore;
         if (!fresh) {
             if (try result.scalar("SELECT schema_version FROM meta WHERE singleton=1") != version) return error.Corrupt;
             if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN('meta','commands','projects','workspaces','sessions','threads','runs','messages','blocks','chunks','tools','approvals','effects','observations','events')") != 15) return error.Corrupt;
@@ -107,6 +107,12 @@ pub const Store = struct {
             try result.exec("CREATE TABLE runtime_blocks(session_id TEXT NOT NULL REFERENCES sessions(id),upstream_message TEXT NOT NULL,upstream_block TEXT NOT NULL,block_id TEXT NOT NULL UNIQUE REFERENCES blocks(id),PRIMARY KEY(session_id,upstream_message,upstream_block)); UPDATE meta SET schema_version=2 WHERE singleton=1; PRAGMA user_version=2");
             try result.exec("COMMIT");
         } else if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='runtime_blocks'") != 1) return error.Corrupt;
+        if (fresh or version < 3) {
+            try result.exec("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE");
+            errdefer result.exec("ROLLBACK; PRAGMA foreign_keys=ON") catch {};
+            try result.exec(task_schema);
+            try result.exec("UPDATE meta SET schema_version=3 WHERE singleton=1; PRAGMA user_version=3; COMMIT; PRAGMA foreign_keys=ON");
+        }
         const dir_z = try std.fmt.bufPrintZ(&path_buffer, "{s}", .{directory[0..n]});
         if (spica_store_sync_ancestry(dir_z.ptr) != 0) return error.Storage;
         // Bounds per row and SQL statement, not a claimed total C/RSS/disk ceiling.
@@ -399,4 +405,17 @@ const schema =
     \\CREATE TABLE observations(session_id TEXT NOT NULL REFERENCES sessions(id),upstream_event TEXT NOT NULL,runtime_version TEXT NOT NULL,correlation BLOB NOT NULL,digest BLOB NOT NULL,evidence BLOB,cursor BLOB,commit_sequence INTEGER NOT NULL,PRIMARY KEY(session_id,upstream_event));
     \\CREATE TABLE events(sequence INTEGER NOT NULL,event_index INTEGER NOT NULL CHECK(event_index>=0),event_id TEXT NOT NULL UNIQUE,aggregate BLOB NOT NULL,revision INTEGER NOT NULL,kind TEXT NOT NULL,command_id TEXT,effect_id TEXT,payload BLOB NOT NULL,PRIMARY KEY(sequence,event_index));
     \\CREATE INDEX aggregate_events ON events(aggregate,sequence,event_index);
+;
+
+const task_schema =
+    \\CREATE TABLE tasks(run_id TEXT PRIMARY KEY REFERENCES runs(id),parent_run TEXT NOT NULL REFERENCES runs(id),packet BLOB NOT NULL,detached INTEGER NOT NULL,created_at INTEGER,requests INTEGER NOT NULL DEFAULT 1,input_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,cached_tokens INTEGER NOT NULL DEFAULT 0,result BLOB,review TEXT);
+    \\CREATE INDEX task_parent ON tasks(parent_run);
+    \\CREATE TABLE bridge_calls(session_id TEXT NOT NULL REFERENCES sessions(id),request_key TEXT NOT NULL,method TEXT NOT NULL,digest BLOB NOT NULL,command BLOB NOT NULL,PRIMARY KEY(session_id,request_key));
+    \\CREATE TABLE effects_v3(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,run_id TEXT NOT NULL REFERENCES runs(id),session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL CHECK(kind IN('create_session','start','approval_reply','cancel','inspect','attach','message')),read_only INTEGER NOT NULL DEFAULT 0,request BLOB NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=32),state TEXT NOT NULL CHECK(state IN('planned','in_flight','withdrawn','confirmed','failed','unknown')),depends_on TEXT REFERENCES effects_v3(id),approval_id TEXT UNIQUE REFERENCES approvals(id),command_id TEXT NOT NULL,claim_owner TEXT,outcome TEXT NOT NULL DEFAULT '',evidence BLOB);
+    \\INSERT INTO effects_v3 SELECT * FROM effects;
+    \\DROP TABLE effects;
+    \\ALTER TABLE effects_v3 RENAME TO effects;
+    \\CREATE UNIQUE INDEX one_effect ON effects(run_id,kind) WHERE kind IN('create_session','start','cancel');
+    \\CREATE UNIQUE INDEX one_reconcile_call ON effects(command_id,kind) WHERE kind IN('inspect','attach');
+    \\CREATE INDEX pending_effect ON effects(state,id);
 ;
