@@ -12,5 +12,6 @@ test {
     _ = @import("content/markdown_test.zig");
     _ = @import("native/highlight_test.zig");
     _ = @import("native/text_test.zig");
+    _ = @import("native/metrics.zig");
     _ = @import("platform/process_test.zig");
 }
