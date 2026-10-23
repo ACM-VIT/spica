@@ -41,9 +41,7 @@ pub const Options = struct {
             } else if (std.mem.eql(u8, flag, "--additional-runtime-account-directory") or std.mem.eql(u8, flag, "--additional-model-provider") or std.mem.eql(u8, flag, "--additional-runtime-executable")) {
                 index += 1;
                 if (index == args.len or args[index].len == 0) return error.MissingOptionValue;
-                if (std.mem.eql(u8, flag, "--additional-runtime-account-directory")) options.additional_runtime_account_directory = args[index]
-                else if (std.mem.eql(u8, flag, "--additional-model-provider")) options.additional_model_provider = args[index]
-                else options.additional_runtime_executable = args[index];
+                if (std.mem.eql(u8, flag, "--additional-runtime-account-directory")) options.additional_runtime_account_directory = args[index] else if (std.mem.eql(u8, flag, "--additional-model-provider")) options.additional_model_provider = args[index] else options.additional_runtime_executable = args[index];
             } else if (std.mem.eql(u8, flag, "--runtime-executable")) {
                 index += 1;
                 if (index == args.len or !std.fs.path.isAbsolute(args[index])) return error.AbsoluteRuntimeExecutableRequired;

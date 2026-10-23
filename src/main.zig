@@ -71,6 +71,10 @@ const NativeProvider = struct {
             if (transport.c.spica_monotonic_ms() - start > 15000) return error.InitializeTimeout;
             _ = transport.c.spica_process_poll(&runtime.wire.process, -1, @intFromBool(runtime.wire.input_len != 0), 20);
         }
+        if (runtime.diagnostic.len != 0) {
+            try std.Io.File.stderr().writeStreamingAll(io, runtime.diagnostic);
+            return error.AccountStatusFailed;
+        }
         if (mode == .status) {
             try std.Io.File.stdout().writeStreamingAll(io, if (runtime.readiness == .ready) "ChatGPT account ready in selected isolated state.\n" else "ChatGPT sign-in required in selected isolated state.\n");
             return;

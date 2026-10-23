@@ -101,3 +101,10 @@ explicit and are retained unchanged for handshake verification. Native options
 6/6, mixed factory/lifetime tests 8/8, and the Debug native build passed.
 OpenCode's pinned installed home override and explicit config directory are
 set separately from Codex's managed home; neither authorizes another tool's auth.
+
+Native auth status now preserves a real account/read RPC diagnostic instead of
+mislabeling that failure as ordinary missing sign-in. Debug native build passed;
+the actual executable driven by a synthetic app-server error fixture exited 1,
+printed the supplied diagnostic and `AccountStatusFailed`, and did not print
+“sign-in required.” Reproduction/evidence:
+`.artifacts/provider-factory/native-auth/error.py` and `account-error.log`.
