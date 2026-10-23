@@ -25,6 +25,19 @@ upstream tests were executed; no source was transplanted. Read the effect-ts
 skill before inspecting Effect-specific implementation. Both feature producers
 received this absolute path and immutable pin.
 
+Concrete ongoing native-rewrite reference targets (all at the same pin):
+`apps/web/src/components/chat/ComposerSurface.tsx`, `useComposerSend.ts`,
+`ComposerPrimaryActions.tsx` (send/interrupt admission controls),
+`ComposerPendingApprovalActions.tsx`, `ComposerPendingApprovalPanel.tsx`
+(non-resumable provider response), and `MessagesTimeline.tsx`/`.logic.ts`.
+The domain lane targets the existing Orchestrator, EventSink, EffectWorker and
+ProviderRuntimeRecoveryService paths below; integration targets
+`packages/provider-core/src/server/ProviderAdapter.ts:48-95,551-645` for explicit
+runtime policy/session identities, event-subscription ownership and distinct
+ensure/resume/start/interrupt/respond operations. These are bounded behavior
+references, not authority to transplant Effect/React into native Zig. The
+checkout's workspace catalog pins Effect 4.0.5; no dependency was installed.
+
 ## T3 source observations
 
 All paths in this section refer to the T3 pin above. Observations are static source findings; tests present upstream were not executed.
