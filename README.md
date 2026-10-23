@@ -14,11 +14,16 @@ This starts the OMP Astra coordinator with Sol worker definitions. It uses your 
 ```bash
 python3 build/driver.py          # build (existing local dependencies)
 python3 build/driver.py run      # native starter window
-./tools/check                   # formatting, build and regressions
+./tools/check                   # formatting, Debug/ReleaseSafe builds + regressions + CLI smoke
+./tools/check --core            # isolated Unicode/core checks in both safety modes
 ./tools/eval-starter            # private desktop screenshot + Escape smoke check
 ```
 
 For a clean machine, run `python3 build/bootstrap.py` first. Dependencies are pinned in deps.lock.json; see [CONTRIBUTING.md](CONTRIBUTING.md).
+Both check commands use local dependencies only; the core target needs the locked
+libunibreak, not SDL/fonts/a display. Linux CI bootstraps the locked sources before
+running the same default check. Host prerequisites are documented, not vendored;
+the build is not claimed to be hermetic.
 
 ## What to build next
 

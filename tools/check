@@ -1,6 +1,29 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
-python3 tools/format.py --check
-python3 build/driver.py
-python3 build/driver.py test
+case "${1-}" in
+    "") target=full ;;
+    --core) target=core ;;
+    *) echo "Usage: ./tools/check [--core]" >&2; exit 2 ;;
+esac
+if [ "$#" -gt 1 ]; then
+    echo "Usage: ./tools/check [--core]" >&2
+    exit 2
+fi
+if [ "$target" = full ]; then
+    python3 tools/format.py --check
+    temporary=$(mktemp -d)
+    trap 'rm -rf "$temporary"' EXIT HUP INT TERM
+fi
+for mode in Debug ReleaseSafe; do
+    echo "[check] $target $mode (compiled artifacts may be cached; tests always execute)"
+    if [ "$target" = core ]; then
+        python3 build/driver.py test-core "-Doptimize=$mode" --summary all
+    else
+        python3 build/driver.py "-Doptimize=$mode" --summary all
+        python3 build/driver.py test "-Doptimize=$mode" --summary all
+        HOME="$temporary" XDG_CONFIG_HOME="$temporary/config" \
+            XDG_DATA_HOME="$temporary/data" XDG_CACHE_HOME="$temporary/cache" \
+            ./zig-out/bin/spica --help
+    fi
+done

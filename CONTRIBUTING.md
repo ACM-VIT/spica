@@ -34,4 +34,28 @@ Use ./tools/agents for the Astra coordinator and the project Sol agents. Keep ea
 
 Use narrow tests during implementation and ./tools/check for integration. GUI work also needs inspected private-desktop screenshots and real input. Expensive profiling and repeated benchmark matrices are justified by an actual change or unresolved regression; they are not a mandatory loop for every edit. See docs/EVALUATION.md.
 
-There is no CI configured in this initial scaffold; reproducible CI is an early P0 task in the roadmap. Resolve project-source licensing/provenance before distributing this rewrite: the inherited tree has no top-level license file. Do not infer a license from a dependency or the reference application.
+Linux CI is configured in `.github/workflows/check.yml`: it provisions the host
+prerequisites, verifies the pinned Zig archive, installs clang-format 22.1.8,
+runs `python3 build/bootstrap.py`, then runs the same `./tools/check` entrypoint.
+The default check formats without mutation, builds and exercises the full suite
+in Debug and ReleaseSafe (debug symbols retained), and runs the existing CLI
+`--help` path with temporary HOME/XDG directories. `./tools/check --core` runs
+only the isolated core target in both modes, without formatting/native startup.
+Neither local check command downloads dependencies or installs packages.
+
+On Ubuntu 24.04 the host packages are `build-essential cmake pkg-config autoconf
+automake libtool libsqlite3-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev
+libxi-dev libxfixes-dev libxss-dev libxtst-dev libwayland-dev libxkbcommon-dev
+libegl1-mesa-dev libgl1-mesa-dev libdrm-dev libgbm-dev libpng-dev zlib1g-dev
+libbz2-dev python3 python3-venv curl xz-utils`. Native source/font revisions and
+hashes are locked, not every host dependency: SQLite (including FTS5), the
+system compiler, desktop libraries and optional FreeType dependencies remain
+host prerequisites. This is a repeatable supported-host build, not a hermetic
+or bit-for-bit reproducible toolchain. Native C dependencies are built in Release;
+the Debug/ReleaseSafe matrix applies to Zig application/tests, not C sanitizer
+coverage. Existing bootstrap/SDK/platform tests use separate temporary roots;
+SQLite fixtures synthesize their own history and never open user data.
+
+Resolve project-source licensing/provenance before distributing this rewrite:
+the inherited tree has no top-level license file. Do not infer a license from a
+dependency or the reference application.
