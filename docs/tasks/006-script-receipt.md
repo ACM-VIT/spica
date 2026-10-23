@@ -47,3 +47,19 @@ assertion from LuaBootstrapTests; behavioral cache/artifact recovery and archive
 checksum coverage remain. Focused `python3 -m unittest
 bootstrap_test.LuaBootstrapTests` from `build/`: 2 passed in 0.029s; raw
 `.artifacts/script006/bootstrap-review-fix.log`. No broad checks repeated.
+
+## Queued proposal revocation review repair
+
+Integration review found a concrete lifetime gap: an already-completed action
+proposal could remain unconsumed across successful reload. Poll now linearizes
+proposal handoff against the reload generation mutex; replacement revokes queued
+old-generation proposals before closing the old VM. Their result identities are
+delivered as failures with cleared intent, never dropped. No ABI shape change.
+Proposals already handed off/native accepted durable work remain independent.
+
+New focused regression explicitly completes an action, reloads successfully
+without consuming that result, then proves old intent clearing and new visual
+generation retention. Debug and ReleaseSafe each 1/1 passed with
+`--test-filter \"successful reload revokes\"`; formatting passed. Exact commands and
+raw evidence `.artifacts/script006/queued-generation-revocation.log`. No old
+passing cohorts rerun. Native still rechecks installed generation before Host.

@@ -256,10 +256,15 @@ static void *worker(void *ud) {
                 result.status = protected_call(&candidate, initialize);
             } else { result.status = LUA_ERRMEM; snprintf(result.error, sizeof(result.error), "VM allocation failed"); }
             if (!result.status && s->generation != UINT64_MAX) {
+                /* Revoke queued old proposals before closing the old VM.
+                 * Poll linearizes proposal handoff against this generation. */
+                pthread_mutex_lock(&s->mutex);
+                ++s->generation; result.generation = s->generation;
+                pthread_mutex_unlock(&s->mutex);
                 close_vm(&active); active = candidate;
                 *(VM **)lua_getextraspace(active.L) = &active;
                 lua_setallocf(active.L, vm_alloc, &active);
-                ++s->generation; result.generation = s->generation; last_root = result.root; last_render = result.render;
+                last_root = result.root; last_render = result.render;
             } else { if (!result.status) result.status = LUA_ERRRUN; close_vm(&candidate); }
         } else if (!active.L) { result.status = LUA_ERRRUN; snprintf(result.error, sizeof(result.error), "no active module"); }
         else if (kind == 2) {
@@ -340,7 +345,16 @@ int spica_script_poll(SpicaScript *s, SpicaScriptResult *out) {
     if (!s || !out) return 0;
     pthread_mutex_lock(&s->mutex);
     int found = 1;
-    if (s->result_count) { *out = s->results[s->result_head]; s->result_head = (s->result_head + 1) % SPICA_SCRIPT_ACTIONS; --s->result_count; --s->outstanding; }
+    if (s->result_count) {
+        *out = s->results[s->result_head];
+        s->result_head = (s->result_head + 1) % SPICA_SCRIPT_ACTIONS;
+        --s->result_count; --s->outstanding;
+        if (!out->status && out->generation != s->generation) {
+            out->status = LUA_ERRRUN;
+            memset(&out->intent, 0, sizeof(out->intent));
+            snprintf(out->error, sizeof(out->error), "action revoked by reload before handoff");
+        }
+    }
     else if (s->visual_ready) { *out = s->visual; s->visual_ready = 0; }
     else found = 0;
     pthread_mutex_unlock(&s->mutex); return found;

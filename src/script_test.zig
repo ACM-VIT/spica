@@ -214,3 +214,40 @@ test "descriptor allocation boundaries and forbidden finalizer capabilities" {
     const context = std.mem.zeroes(script.ActionContext);
     try std.testing.expectError(error.InvalidInput, runtime.action(102, 1, &invalid_id, &payload, &context));
 }
+
+fn waitWakes(count: u32) !void {
+    for (0..10000) |_| {
+        if (wakes.load(.acquire) >= count) return;
+        _ = c.usleep(1000);
+    }
+    return error.WorkerTimeout;
+}
+
+test "successful reload revokes completed but unconsumed action proposals" {
+    wakes.store(0, .release);
+    var runtime = try script.Runtime.init(256 * 1024, 100000, wake, null);
+    defer runtime.deinit() catch unreachable;
+    var input = try snapshot();
+    var result: script.Result = undefined;
+    try runtime.reload(1, good, &input);
+    try wait(&runtime, &result);
+    try equal(@as(c_int, 0), result.status);
+    try waitWakes(1);
+    const action_id = try script.id("send");
+    const payload = try script.text("must not escape old generation");
+    const context = std.mem.zeroes(script.ActionContext);
+    try runtime.action(2, 1, &action_id, &payload, &context);
+    try waitWakes(2); // Action completed, but its proposal is still owned by VM.
+    try runtime.reload(3, good, &input);
+    try waitWakes(3); // Successful replacement revoked the queued old proposal.
+    try expect(runtime.poll(&result));
+    try equal(@as(u64, 2), result.sequence);
+    try equal(@as(u64, 1), result.generation);
+    try expect(result.status != 0);
+    try equal(@as(c_int, 0), result.intent.kind);
+    try equal(@as(usize, 0), result.intent.text.len);
+    try expect(runtime.poll(&result));
+    try equal(@as(u64, 3), result.sequence);
+    try equal(@as(u64, 2), result.generation);
+    try equal(@as(c_int, 0), result.status);
+}

@@ -35,6 +35,11 @@ and QueueFull means no admission. Worker execution rejects obsolete generations
 and undeclared IDs. Successful actions return a proposed send/cancel/approve/deny
 intent (1–4), NOT a command receipt. Their results have kind 3; visual reload and
 render results have kinds 1 and 2. Never install an action result as a visual tree.
+Poll also rechecks generation under the same mutex as successful reload
+revocation, before handing a proposal to native ownership. A completed but
+unconsumed old-generation action becomes an explicit failure with its identity
+preserved and intent cleared. Native handoff is the linearization boundary;
+reload does not revoke proposals already handed off or accepted durable work.
 
 **Actual Host admission remains native-owned.** On wake, drain results on the
 App thread. Recheck current installed generation before admitting a successful
