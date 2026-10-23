@@ -1,6 +1,6 @@
 # Spica — native agent workspace
 
-A fresh rewrite branch using Spica's Zig/SDL3/Clay and Unicode text foundations. T3 Code is a behavior reference. The old Pi-specific application has been removed. The current native draft surface is not a connected agent client; domain integration and rendered acceptance remain in progress.
+A fresh rewrite branch using Spica's Zig/SDL3/Clay and Unicode text foundations. T3 Code is a behavior reference. The native coding interface connects to an independent durable fake-provider Host; real Codex/OpenCode adapters are not connected.
 
 ## Start the development loop
 
@@ -32,6 +32,16 @@ output and run status. Ordinary launch uses `$XDG_DATA_HOME/spica-native/convers
 (or `$HOME/.local/share/spica-native/conversation`); legacy histories are never
 discovered or migrated. `--state-directory` selects isolated state explicitly.
 
+Select the minimal user module with `--lua-module examples/minimal.lua`. F5
+reloads that file; F9 switches between its root/renderer and the native default.
+Invalid initial configuration keeps the default; invalid reload keeps the
+last-good custom composition. Reload/root switching never restarts accepted
+provider work. The native composer and its approval/cancel controls are reused.
+Lua receives a bounded immutable visible transcript, not history or Host pointers.
+Custom Send actions pass captured targets/revisions and a stable command ID to
+the same actual public Host. `./tools/eval-starter --mode custom` exercises this
+bridge with real isolated-desktop input and temporary state.
+
 For a clean machine, run `python3 build/bootstrap.py` first. Dependencies are pinned in deps.lock.json; see [CONTRIBUTING.md](CONTRIBUTING.md).
 Both check commands use local dependencies only; the core target needs the locked
 libunibreak, not SDL/fonts/a display. Linux CI bootstraps the locked sources before
@@ -42,7 +52,7 @@ the build is not claimed to be hermetic.
 
 [ROADMAP.md](docs/ROADMAP.md) is the ordered backlog. Begin with core contracts and the deterministic fake-provider/evaluation harness. The first feature milestone is a persisted conversation with streaming, approval/cancel, restart and one minimal custom root. After that gate, add Codex with ChatGPT sign-in, then OpenCode v2; build app-owned delegation/review orchestration after runtime and workspace gates. These integrations are planned and are not connected by this scaffold.
 
-The API should expose commands, queries, subscriptions and composable native UI/input primitives so people can share their own configuration. A full replacement root and custom renderers are required; built-in boards and other alternative interfaces are not deliverables. Runtime selection and API details remain open until the proof. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) and [provider/orchestration design](docs/PROVIDERS_AND_ORCHESTRATION.md).
+The selected protected Lua 5.4.9 runtime exposes bounded root/renderer descriptors and explicit action proposals; native code owns actual public command admission. Users can replace the composition without owning durable work. Built-in boards and alternate workspace presets are not deliverables. See [the scripting contract](docs/contracts/scripting.md), [ARCHITECTURE.md](docs/ARCHITECTURE.md) and [provider/orchestration design](docs/PROVIDERS_AND_ORCHESTRATION.md).
 
 [Task records](docs/tasks/README.md) retain decisions, ownership, attempts and evidence between sessions. [EVALUATION.md](docs/EVALUATION.md) defines verification and human checkpoints.
 

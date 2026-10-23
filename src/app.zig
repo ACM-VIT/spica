@@ -10,6 +10,7 @@ const domain = @import("domain.zig");
 const types = @import("domain/types.zig");
 const presentation = @import("content/presentation.zig");
 const Id = @import("ui/transcript.zig").Id;
+const script = @import("script.zig");
 
 /// Only a payload-free wake crosses worker threads. Registered after SDL init;
 /// its storage and SDL outlive both Host and presentation worker joins.
@@ -22,6 +23,9 @@ pub const Wake = struct {
         _ = c.SDL_PushEvent(&event);
     }
     pub fn presentationNotify(context: *anyopaque) void {
+        notify(context);
+    }
+    pub fn scriptNotify(context: ?*anyopaque) callconv(.c) void {
         notify(context);
     }
 };
@@ -42,6 +46,17 @@ pub const App = struct {
     conversation: ?*Conversation = null,
     live: ?*Live = null,
 
+    lua: ?*LuaBridge = null,
+
+    pub fn configureLua(self: *App, io: std.Io, path: []const u8, wake: *Wake) !void {
+        const bridge = try self.view.allocator.create(LuaBridge);
+        errdefer self.view.allocator.destroy(bridge);
+        bridge.* = .{ .io = io, .path = path, .runtime = try script.Runtime.init(4 * 1024 * 1024, 100000, Wake.scriptNotify, wake) };
+        self.lua = bridge;
+        bridge.reload(self) catch |err| {
+            self.view.notice = @errorName(err);
+        };
+    }
     const Live = struct { io: std.Io, file: std.Io.File, buffer: [2 * 1024 * 1024]u8 = undefined };
 
     pub fn enableLive(self: *App, io: std.Io, path: []const u8) !void {
@@ -89,6 +104,20 @@ pub const App = struct {
 
     /// Dispose replaceable presentation before Host join, retaining SDL/wake.
     pub fn disconnect(self: *App) void {
+        if (self.lua) |bridge| {
+            // Accepted actions reserve output slots. Drain/admit them while the
+            // actual Host and wake still live, then join the protected worker.
+            while (bridge.runtime.deinit()) |_| break else |_| {
+                bridge.pump(self) catch |err| {
+                    self.view.notice = @errorName(err);
+                };
+                c.SDL_Delay(1);
+            }
+            self.view.custom_root = null;
+            self.view.custom_render = null;
+            self.view.allocator.destroy(bridge);
+            self.lua = null;
+        }
         if (self.conversation) |conversation| conversation.destroy();
         self.conversation = null;
     }
@@ -120,6 +149,7 @@ pub const App = struct {
                 break;
             };
             if (self.conversation) |conversation| try conversation.pump(self);
+            if (self.lua) |bridge| try bridge.pump(self);
             if (self.dirty and !self.minimized) {
                 try self.paint();
                 self.dirty = false;
@@ -170,6 +200,24 @@ pub const App = struct {
             },
             else => {},
         }
+        if (event.type == c.SDL_EVENT_KEY_DOWN) {
+            if (self.lua) |bridge| {
+                if (event.key.key == c.SDLK_F5) {
+                    bridge.reload(self) catch |err| {
+                        self.view.notice = @errorName(err);
+                    };
+                    self.dirty = true;
+                    return;
+                }
+                if (event.key.key == c.SDLK_F9) {
+                    bridge.active = !bridge.active;
+                    bridge.epoch += 1;
+                    bridge.install(self);
+                    self.dirty = true;
+                    return;
+                }
+            }
+        }
         const changed = self.view.handle(event, self.window, self.text) catch |err| switch (err) {
             error.TextTooLarge, error.PieceLimit, error.InvalidUtf8, error.ClipboardRead, error.ClipboardWrite, error.ClipboardContainsNul => blk: {
                 self.view.notice = @errorName(err);
@@ -180,9 +228,28 @@ pub const App = struct {
             else => return err,
         };
         if (self.view.takeIntent()) |intent| {
-            if (self.conversation) |conversation| conversation.act(self, intent) catch |err| {
+            if (self.lua) |bridge| {
+                if (bridge.active and bridge.generation != 0 and intent == .send) {
+                    bridge.queue(self, try script.id("send"), .send) catch |err| {
+                        self.view.notice = @errorName(err);
+                    };
+                } else if (self.conversation) |conversation| conversation.act(self, intent) catch |err| {
+                    self.view.notice = @errorName(err);
+                };
+            } else if (self.conversation) |conversation| conversation.act(self, intent) catch |err| {
                 self.view.notice = @errorName(err);
             };
+        }
+        if (self.view.custom_action) |index| {
+            self.view.custom_action = null;
+            if (self.lua) |bridge| {
+                const action = bridge.root.nodes[index].action;
+                const name = action.bytes[0..action.len];
+                const intent: @import("ui/coding.zig").Intent = if (std.mem.eql(u8, name, "cancel")) .cancel else if (std.mem.eql(u8, name, "approve")) .allow else if (std.mem.eql(u8, name, "deny")) .deny else .send;
+                bridge.queue(self, action, intent) catch |err| {
+                    self.view.notice = @errorName(err);
+                };
+            }
         }
         self.dirty = self.dirty or changed;
     }
@@ -219,8 +286,16 @@ pub const App = struct {
         const scale_y = @as(f32, @floatFromInt(pixel_height)) / h;
         if (!c.SDL_SetRenderScale(self.renderer, scale_x, scale_y) or !c.spica_text_set_render_scale(self.text, scale_x, scale_y)) return error.RenderScale;
         self.layout.resize(w, h);
-        try self.view.draw(self.renderer, self.text, self.window, self.layout.coding(w));
+        const coding_bounds = if (self.view.custom_root) |root| self.layout.script(root, &self.view.custom_bounds) else self.layout.coding(w);
+        try self.view.draw(self.renderer, self.text, self.window, coding_bounds);
         self.snapshot.draft = self.view.editor.textBytes();
+        if (self.lua) |bridge| {
+            self.snapshot.custom_root = self.view.custom_root != null;
+            self.snapshot.script_generation = bridge.generation;
+            self.snapshot.script_error = if (bridge.error_text[0] != 0) std.mem.sliceTo(&bridge.error_text, 0) else null;
+            self.snapshot.custom_render = if (self.view.custom_render) |render| render.bytes[0..render.len] else "";
+            self.snapshot.pending_script_action = bridge.pending != null;
+        }
         self.snapshot.caret = self.view.editor.caret;
         self.snapshot.anchor = self.view.editor.anchor;
         self.snapshot.editor_focused = self.view.focused;
@@ -284,6 +359,174 @@ pub const App = struct {
             try std.json.Stringify.value(self.snapshot, .{}, &writer);
             try live.file.writePositionalAll(live.io, writer.buffered(), 0);
             try live.file.setLength(live.io, writer.buffered().len);
+        }
+    }
+};
+
+/// Descriptor and proposal ownership; provider lifetime remains in main's Host.
+const LuaBridge = struct {
+    io: std.Io,
+    path: []const u8,
+    runtime: script.Runtime,
+    sequence: u64 = 0,
+    visual_sequence: u64 = 0,
+    reload_pending: bool = false,
+    generation: u64 = 0,
+    epoch: u64 = 0,
+    active: bool = true,
+    root: script.Root = undefined,
+    render: script.Render = undefined,
+    result: script.Result = undefined,
+    snapshot: script.Snapshot = std.mem.zeroes(script.Snapshot),
+    observed_generation: u64 = std.math.maxInt(u64),
+    observed_count: usize = std.math.maxInt(usize),
+    observed_revision: u64 = std.math.maxInt(u64),
+    error_text: [256]u8 = @splat(0),
+    pending: ?Pending = null,
+
+    const Pending = struct {
+        sequence: u64,
+        generation: u64,
+        epoch: u64,
+        context: script.ActionContext,
+        workspace: Id,
+        thread_revision: u64,
+        run_revision: u64,
+        approval_revision: u64,
+        draft_revision: u64,
+        command_id: [32]u8,
+    };
+
+    fn visible(self: *LuaBridge, app: *App) void {
+        self.snapshot = std.mem.zeroes(script.Snapshot);
+        if (app.conversation) |conversation| self.snapshot.revision = conversation.thread_revision;
+        for (0..app.view.rich_count) |offset| {
+            const index = if (app.view.rich_count == app.view.rich_tiles.len) (app.view.rich_next + offset) % app.view.rich_tiles.len else offset;
+            const tile = &app.view.rich_tiles[index];
+            var end = @min(tile.length, self.snapshot.text.bytes.len - self.snapshot.text.len);
+            while (end != 0 and !std.unicode.utf8ValidateSlice(tile.rendered[0..end])) end -= 1;
+            @memcpy(self.snapshot.text.bytes[self.snapshot.text.len..][0..end], tile.rendered[0..end]);
+            self.snapshot.text.len += end;
+        }
+    }
+
+    fn reload(self: *LuaBridge, app: *App) !void {
+        const source = try std.Io.Dir.cwd().readFileAlloc(self.io, self.path, app.view.allocator, .limited(script.abi.SPICA_SCRIPT_SOURCE));
+        defer app.view.allocator.free(source);
+        self.visible(app);
+        self.sequence += 1;
+        try self.runtime.reload(self.sequence, source, &self.snapshot);
+        self.visual_sequence = self.sequence;
+        self.reload_pending = true;
+    }
+
+    fn install(self: *LuaBridge, app: *App) void {
+        app.view.custom_root = if (self.active and self.generation != 0) &self.root else null;
+        app.view.custom_render = if (self.active and self.generation != 0) &self.render else null;
+    }
+
+    fn queue(self: *LuaBridge, app: *App, action: script.Id, intent: @import("ui/coding.zig").Intent) !void {
+        if (!self.active or self.generation == 0) return error.NoCustomRoot;
+        if (self.pending != null) return error.ScriptActionPending;
+        const conversation = app.conversation orelse return error.NoConversation;
+        if (conversation.command != null) return error.CommandPending;
+        const enabled = switch (intent) {
+            .send => app.view.can_send,
+            .cancel => app.view.can_cancel,
+            .allow, .deny => app.view.can_approve,
+        };
+        if (!enabled) return error.ActionUnavailable;
+        const context: script.ActionContext = .{
+            .thread_id = try script.id(conversation.thread.slice()),
+            .run_id = try script.id(conversation.run.slice()),
+            .approval_id = try script.id(conversation.approval.slice()),
+            .action_digest = try script.id(conversation.approval_digest.slice()),
+            .selection = try script.id(conversation.workspace.slice()),
+            .revision = switch (intent) {
+                .send => conversation.thread_revision,
+                .cancel => conversation.run_revision,
+                .allow, .deny => conversation.approval_revision,
+            },
+        };
+        const payload = try script.text(if (intent == .send) app.view.editor.textBytes() else "");
+        const command_id = try conversation.commandId();
+        self.sequence += 1;
+        try self.runtime.action(self.sequence, self.generation, &action, &payload, &context);
+        self.pending = .{
+            .sequence = self.sequence,
+            .generation = self.generation,
+            .epoch = self.epoch,
+            .context = context,
+            .workspace = conversation.workspace,
+            .thread_revision = conversation.thread_revision,
+            .run_revision = conversation.run_revision,
+            .approval_revision = conversation.approval_revision,
+            .draft_revision = app.view.revision,
+            .command_id = command_id,
+        };
+    }
+
+    fn admit(self: *LuaBridge, app: *App, result: *const script.Result, pending: Pending) !void {
+        if (!self.active or pending.epoch != self.epoch or result.generation != self.generation or result.generation != pending.generation) return error.ObsoleteScriptAction;
+        if (!std.meta.eql(pending.context, result.intent.context)) return error.ScriptContextChanged;
+        const conversation = app.conversation orelse return error.NoConversation;
+        const context = &pending.context;
+        switch (result.intent.kind) {
+            1 => try conversation.submitIdentified(.send, .{ .thread = .{ .value = context.thread_id.bytes[0..context.thread_id.len] } }, .{ .revision = pending.thread_revision }, .{ .thread_send = .{
+                .text = result.intent.text.bytes[0..result.intent.text.len],
+                .selection = .{ .model_provider = "fake", .model_id = "fixture", .effort = "none", .account_ref = "fixture", .workspace = .{ .value = pending.workspace.slice() } },
+            } }, pending.draft_revision, pending.command_id),
+            2 => try conversation.submitIdentified(.cancel, .{ .run = .{ .value = context.run_id.bytes[0..context.run_id.len] } }, .{ .revision = pending.run_revision }, .{ .run_cancel = .{ .reason = "Custom root cancellation" } }, 0, pending.command_id),
+            3, 4 => try conversation.submitIdentified(.approval, .{ .approval = .{ .value = context.approval_id.bytes[0..context.approval_id.len] } }, .{ .revision = pending.approval_revision }, .{ .approval_respond = .{ .decision = if (result.intent.kind == 3) .allow else .deny, .action_digest = context.action_digest.bytes[0..context.action_digest.len] } }, 0, pending.command_id),
+            else => return error.InvalidScriptIntent,
+        }
+    }
+
+    fn pump(self: *LuaBridge, app: *App) !void {
+        while (self.runtime.poll(&self.result)) {
+            const result = &self.result;
+            app.dirty = true;
+            if (result.kind == 3) {
+                const pending = self.pending orelse return error.UnexpectedScriptAction;
+                if (pending.sequence != result.sequence) return error.UnexpectedScriptSequence;
+                self.pending = null;
+                if (result.status == 0) self.admit(app, result, pending) catch |err| {
+                    app.view.notice = @errorName(err);
+                };
+            } else if (result.sequence >= self.visual_sequence) {
+                if (result.kind == 1) {
+                    self.reload_pending = false;
+                    // Refresh the snapshot after staging, even if Host output
+                    // changed while the module was being evaluated.
+                    self.observed_revision = std.math.maxInt(u64);
+                }
+                if (result.status == 0) {
+                    self.root = result.root;
+                    self.render = result.render;
+                    self.generation = result.generation;
+                    app.view.custom_render_sequence += 1;
+                    self.install(app);
+                    if (result.kind == 1) self.error_text = @splat(0);
+                    if (self.error_text[0] == 0) app.view.notice = null;
+                }
+            }
+            if (result.status != 0) {
+                self.error_text = result.@"error";
+                app.view.notice = std.mem.sliceTo(&self.error_text, 0);
+            }
+        }
+        if (app.conversation) |conversation| {
+            if (!self.reload_pending and (self.observed_generation != conversation.generation or self.observed_count != app.view.rich_count or self.observed_revision != conversation.thread_revision)) {
+                self.observed_generation = conversation.generation;
+                self.observed_count = app.view.rich_count;
+                self.observed_revision = conversation.thread_revision;
+                self.visible(app);
+                if (self.generation != 0) {
+                    self.sequence += 1;
+                    try self.runtime.render(self.sequence, &self.snapshot);
+                    self.visual_sequence = self.sequence;
+                }
+            }
         }
     }
 };
@@ -361,6 +604,10 @@ const Conversation = struct {
 
     fn submit(self: *Conversation, kind: CommandKind, target: types.Target, revision: types.Precondition, payload: types.Payload, draft_revision: u64) !void {
         if (self.command != null) return error.CommandPending;
+        return self.submitIdentified(kind, target, revision, payload, draft_revision, try self.commandId());
+    }
+
+    fn commandId(self: *Conversation) ![32]u8 {
         var random: [16]u8 = undefined;
         try self.io.randomSecure(&random);
         const hex = "0123456789abcdef";
@@ -369,6 +616,11 @@ const Conversation = struct {
             id[index * 2] = hex[byte >> 4];
             id[index * 2 + 1] = hex[byte & 15];
         }
+        return id;
+    }
+
+    fn submitIdentified(self: *Conversation, kind: CommandKind, target: types.Target, revision: types.Precondition, payload: types.Payload, draft_revision: u64, id: [32]u8) !void {
+        if (self.command != null) return error.CommandPending;
         const ticket = try self.host.submit(.{ .command_id = .{ .value = &id }, .target = target, .expected_revision = revision, .payload = payload });
         self.command = .{ .ticket = ticket, .kind = kind, .draft_revision = draft_revision, .id = id };
     }
@@ -677,6 +929,7 @@ test "ordinary text admission failure stays local and preserves draft and undo" 
     app.dirty = false;
     app.metrics = null;
     app.conversation = null;
+    app.lua = null;
     var full: [64 * 1024]u8 = @splat('x');
     try app.view.editor.setText(&full);
     app.view.editor.selectAll();
@@ -709,6 +962,7 @@ test "native re-layout during ordinary key dispatch emits event-boundary cache s
     app.dirty = false;
     app.metrics = .{ .storage = &.{}, .cache_storage = &changes };
     app.conversation = null;
+    app.lua = null;
     app.view.editor_view.width = 200;
     try app.view.insert("hello\nworld", .typing);
     var event: c.SDL_Event = std.mem.zeroes(c.SDL_Event);
@@ -718,4 +972,43 @@ test "native re-layout during ordinary key dispatch emits event-boundary cache s
     try std.testing.expectEqual(@as(usize, 1), app.metrics.?.cacheSamples().len);
     try std.testing.expectEqual(@as(u32, 0), app.metrics.?.cacheSamples()[0].before.live_layouts);
     try std.testing.expectEqual(@as(u32, 1), app.metrics.?.cacheSamples()[0].after.live_layouts);
+}
+
+test "native Lua handoff rejects root switch and generation before Host access" {
+    var bridge: LuaBridge = undefined;
+    bridge.active = true;
+    bridge.epoch = 4;
+    bridge.generation = 9;
+    var app: App = undefined;
+    var result = std.mem.zeroes(script.Result);
+    result.generation = 9;
+    var pending = std.mem.zeroes(LuaBridge.Pending);
+    pending.generation = 9;
+    pending.epoch = 3;
+    try std.testing.expectError(error.ObsoleteScriptAction, bridge.admit(&app, &result, pending));
+    pending.epoch = 4;
+    result.generation = 8;
+    try std.testing.expectError(error.ObsoleteScriptAction, bridge.admit(&app, &result, pending));
+    result.generation = 9;
+    result.intent.context.revision = 1;
+    try std.testing.expectError(error.ScriptContextChanged, bridge.admit(&app, &result, pending));
+}
+
+test "Lua snapshot copies only bounded visible UTF8 without borrowing tiles" {
+    const app = try std.testing.allocator.create(App);
+    defer std.testing.allocator.destroy(app);
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    app.conversation = null;
+    app.view.rich_count = 1;
+    const tile = &app.view.rich_tiles[0];
+    @memset(tile.rendered[0..16383], 'x');
+    @memcpy(tile.rendered[16383..16386], "€");
+    tile.length = 16386;
+    var bridge: LuaBridge = undefined;
+    bridge.visible(app);
+    try std.testing.expectEqual(@as(usize, 16383), bridge.snapshot.text.len);
+    tile.rendered[0] = 'y';
+    try std.testing.expectEqual(@as(u8, 'x'), bridge.snapshot.text.bytes[0]);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(bridge.snapshot.text.bytes[0..bridge.snapshot.text.len]));
 }

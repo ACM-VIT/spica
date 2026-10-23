@@ -73,3 +73,50 @@ passed the real prompt/allow/tool/cancel/reopen flow **without a state-directory
 argument**, with XDG_DATA_HOME isolated below evidence output. All other evaluator
 modes now pass explicit disposable state too, so no test opens user histories.
 Formatting passed. Lua bridge remains the next separate slice.
+
+## Native Lua root, renderer and action bridge
+
+Replacement worker recovered clean private candidate
+`a04c1c32aec969bc8f7edd49e25a26e5a2108283`, focused-diff SHA256
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+That immutable candidate already consumes the selected protected Lua dependency,
+queued-generation revocation, runtime formatting and domain terminal/revision
+repairs; no mutable sibling source or additional dependency cherry-pick is used.
+
+`--lua-module PATH`, F5 reload and F9 default/custom switching operate in the
+actual App. A bounded Clay preorder consumes runtime root descriptors; retained
+native composer/transcript/input are reused. The renderer consumes only copied,
+bounded Host-visible transcript bytes. Lua execution remains on its protected
+C worker. Native input retains immutable thread/run/approval/digest/workspace,
+all relevant revisions, draft revision, installed generation/root epoch and a
+stable command ID before delayed execution. Proposals are generation/context
+checked and passed to the actual public Host, never treated as command receipts.
+Main still owns Host outside both compositions; shutdown drains reserved action
+results before joining Lua, then presentation, then Host while SDL/wake live.
+
+New inline regressions cover native generation/root-epoch rejection before Host
+access, captured-context tampering and bounded copied UTF-8 visible snapshots.
+The existing evaluator gains the custom cohort rather than a second runner.
+Initial compile failure (callback C calling convention and local-name shadowing)
+is preserved by tool artifact147; both issues were repaired locally.
+
+Focused Debug native build passed; direct real-C/SQLite/Lua native-root checks
+passed53/53, options4/4, evaluator10/10. After review, absent-composer input is
+guarded; its additional focused native regression passed2/2 (including root
+import), and the actual changed candidate was rebuilt by the custom evaluator.
+Exact commands/raw logs: parent `.artifacts/ui005/lua-native-check/` and
+`run-lua-native-check.py`, `check-lua-input-guard.py`.
+
+Actual `./tools/eval-starter --mode custom --optimize Debug --output
+/home/ashman/Documents/spica/.artifacts/ui005/lua-native-custom` passed every
+assertion. Inspected `initial-invalid-default.png`, `custom-render.png`,
+`malformed-last-good.png` and `reopened.png`: real Unicode prompt, custom heading
+and renderer prefix, actual Host response/code, same accepted run over valid
+reload/default switch, malformed reload retention/error, physical painted
+approval/cancel and retained approved tool output/cancelled status on restart.
+The manifest records physical vd commands separately from deliberate module-file
+changes; no internal input mutation or standalone consumer substitutes proof.
+Source fingerprint `3fab96b8e8ded5c30530229e1f6b6689372052f0fd23d2d9c7a3422a7d4cc2f4`;
+Debug binary `0999ffd394bbcadb3a62dbee4e9733087e21984a803806d9914ab0a9a4c8b350`.
+No passing prior default cohort was repeated. Full assembled check/performance
+and coordinator acceptance remain parent-owned.

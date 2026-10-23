@@ -30,6 +30,11 @@ pub const Snapshot = struct {
     approval_id: []const u8 = "",
     pending_command: bool = false,
     transcript: [8][]const u8 = @splat(""),
+    custom_root: bool = false,
+    script_generation: u64 = 0,
+    script_error: ?[]const u8 = null,
+    custom_render: []const u8 = "",
+    pending_script_action: bool = false,
     targets: [6]Target = .{ .{}, .{ .id = "composer.input", .role = "textbox", .key = "Tab" }, .{ .id = "command.send", .role = "button", .key = "Enter" }, .{ .id = "run.cancel", .role = "button", .key = "F6" }, .{ .id = "approval.allow", .role = "button", .key = "F7" }, .{ .id = "approval.deny", .role = "button", .key = "F8" } },
 };
 

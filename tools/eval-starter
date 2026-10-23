@@ -171,7 +171,7 @@ def key_command(session, window_id, value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / '.artifacts/starter')
-    parser.add_argument('--mode', choices=('smoke', 'editor', 'capacity', 'conversation', 'measure'), default='smoke')
+    parser.add_argument('--mode', choices=('smoke', 'editor', 'capacity', 'conversation', 'custom', 'measure'), default='smoke')
     parser.add_argument('--binary', type=Path, help='Explicit frozen binary; requires --binary-sha256 and --source-sha256')
     parser.add_argument('--binary-sha256')
     parser.add_argument('--source-sha256')
@@ -225,8 +225,14 @@ def main():
             argv = ['env', 'XDG_DATA_HOME=' + str(output / 'xdg-data'), *argv]
         else:
             argv += ['--state-directory', str(output / 'conversation-state')]
-        if args.mode == 'conversation':
+        if args.mode in ('conversation', 'custom'):
             argv += ['--automation-live', str(output / 'live.json')]
+        if args.mode == 'custom':
+            module = output / 'custom.lua'
+            module.write_text('return { broken =')  # Deliberate file config, not UI state mutation.
+            argv += ['--lua-module', str(module)]
+            manifest['module_source'] = str(ROOT / 'examples/minimal.lua')
+            manifest['module_sha256'] = sha(ROOT / 'examples/minimal.lua')
         if not args.disable_metrics:
             argv += ['--metrics-output', str(output / 'native.json')]
         launch = json.loads(run('vd', 'run', session, '--bg', '--log', str(output / 'app.log'), '--', *argv))
@@ -248,7 +254,7 @@ def main():
         ipc(f'[con_id={window_id}] floating enable')
         ipc(f'[con_id={window_id}] resize set width 1100 px height 740 px')
         run('vd', 'shot', session, str(output / 'before.png'))
-        if args.mode == 'conversation':
+        if args.mode in ('conversation', 'custom'):
             def observe(predicate, label):
                 deadline = time.monotonic() + 15
                 while time.monotonic() < deadline:
@@ -287,22 +293,57 @@ def main():
                 run('vd', 'click', session, window_id, str(rect['x'] + x + w // 2), str(rect['y'] + y + h // 2))
             enabled = lambda s, name: any(t['id'] == name and t['enabled'] for t in s['targets'])
             current = observe(lambda s: enabled(s, 'command.send'), 'ready')
+            if args.mode == 'custom':
+                current = observe(lambda s: not s['custom_root'] and s['script_generation'] == 0 and s['script_error'], 'initial invalid module retains native default')
+                run('vd', 'shot', session, str(output / 'initial-invalid-default.png'))
+                module.write_text((ROOT / 'examples/minimal.lua').read_text())
+                actions.append(dict(operation='configuration file replacement', source='examples/minimal.lua', internal_ui_mutation=False))
+                key('F5')
+                current = observe(lambda s: s['custom_root'] and s['script_generation'] > 0 and not s['script_error'], 'installed custom root')
             run('vd', 'text', session, window_id, 'Inspect café 世界 👩‍💻')
             current = observe(lambda s: s['draft'] == 'Inspect café 世界 👩‍💻', 'typed prompt')
             key('Return')
             current = observe(lambda s: s['run_status'] == 'awaiting_approval' and enabled(s, 'approval.allow') and any('const answer' in text for text in s['transcript']), 'rendered response and code awaiting approval')
             run('vd', 'shot', session, str(output / 'approval.png'))
+            if args.mode == 'custom':
+                current = observe(lambda s: s['custom_root'] and '[custom]' in s['custom_render'] and 'const answer' in s['custom_render'], 'custom renderer displays actual Host output')
+                retained = current['run_id']
+                generation = current['script_generation']
+                run('vd', 'shot', session, str(output / 'custom-render.png'))
+                key('F5')
+                current = observe(lambda s: s['custom_root'] and s['script_generation'] > generation and s['run_id'] == retained and s['run_status'] == 'awaiting_approval', 'accepted run survives valid reload')
+                generation = current['script_generation']
+                module.write_text('return { broken =')
+                key('F5')
+                current = observe(lambda s: s['custom_root'] and s['script_generation'] == generation and s['script_error'] and s['run_id'] == retained, 'malformed reload retains last-good custom root and run')
+                run('vd', 'shot', session, str(output / 'malformed-last-good.png'))
+                module.write_text((ROOT / 'examples/minimal.lua').read_text())
+                key('F5')
+                current = observe(lambda s: s['custom_root'] and s['script_generation'] > generation and not s['script_error'], 'valid reload clears error')
+                key('F9')
+                current = observe(lambda s: not s['custom_root'] and s['run_id'] == retained and s['run_status'] == 'awaiting_approval', 'same accepted run in default root')
+                run('vd', 'shot', session, str(output / 'same-run-default.png'))
             target(current, 'approval.allow')
             current = observe(lambda s: s['run_status'] == 'completed' and any('Inspection approved' in text for text in s['transcript']) and enabled(s, 'command.send'), 'completed tool result')
             run('vd', 'shot', session, str(output / 'completed.png'))
+            if args.mode == 'custom':
+                key('F9')
+                current = observe(lambda s: s['custom_root'] and 'Inspection approved' in s['custom_render'], 'custom renderer shows accepted tool output')
             target(current, 'composer.input')
             run('vd', 'text', session, window_id, 'Cancel this second request')
             key('Return')
             current = observe(lambda s: s['run_status'] == 'awaiting_approval' and enabled(s, 'run.cancel'), 'second run awaiting approval')
+            if args.mode == 'custom':
+                retained = current['run_id']
+                key('F9')
+                current = observe(lambda s: not s['custom_root'] and s['run_id'] == retained, 'second custom run survives switch before cancel')
             target(current, 'run.cancel')
             current = observe(lambda s: s['run_status'] == 'cancelled' and enabled(s, 'command.send'), 'cancelled')
             retained_thread, retained_run = current['thread_id'], current['run_id']
             run('vd', 'shot', session, str(output / 'cancelled.png'))
+            if args.mode == 'custom':
+                key('F9')
+                observe(lambda s: s['custom_root'] and s['run_status'] == 'cancelled', 'cancelled run in custom root')
             key('ctrl+q')
             wait_windows(session, False)
             first_export = read_export(output / 'automation.json', time.monotonic() + 10)
@@ -315,6 +356,8 @@ def main():
             windows = wait_windows(session, True)
             window_id = windows.splitlines()[0].split()[0]
             current = observe(lambda s: s['thread_id'] == retained_thread and s['run_id'] == retained_run and s['run_status'] == 'cancelled' and any('Inspection approved' in text for text in s['transcript']) and enabled(s, 'command.send'), 'reopened durable conversation')
+            if args.mode == 'custom':
+                current = observe(lambda s: s['custom_root'] and '[custom]' in s['custom_render'] and 'Inspection approved' in s['custom_render'] and s['run_id'] == retained_run, 'reopened custom renderer and retained cancelled run')
             manifest['conversation_reopened'] = current
             manifest['conversation_limits'] = ['Fixed fake adapter publishes a bounded observation burst; no paced-token latency claim.', 'Native controls and retained output verified through real Host; no provider authentication.']
             run('vd', 'shot', session, str(output / 'reopened.png'))

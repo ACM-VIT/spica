@@ -21,6 +21,18 @@ This opt-in adds fixed-buffer JSON/file I/O after present, so do not use it as
 uninstrumented performance evidence. New frame generations invalidate old
 geometry. Partial live-file reads must be retried, not accepted.
 
+`--mode custom` additionally starts with a malformed module (native default
+fallback), installs `examples/minimal.lua` via physical F5, sends a Unicode
+prompt through Lua into the actual Host, observes custom-rendered Host bytes,
+reloads during the accepted approval-waiting run, rejects a malformed reload
+without losing the last-good UI, recovers with valid F5, switches the same run
+to default via F9, approves/cancels via real painted controls, and reopens the
+retained conversation in the custom root. Configuration-file writes are logged
+separately from physical vd input; they are not internal UI mutations.
+Read-only exports add `custom_root`, `script_generation`, `script_error`,
+`custom_render` and `pending_script_action`. These opt-in bytes are private
+evidence, not an input endpoint or proof of physical latency.
+
 ## Frozen binaries and finite measurement
 
 Default runner builds before launching. Alternatively explicitly pin **both** current source and binary fingerprints (from a prior manifest); no build occurs in this mode:

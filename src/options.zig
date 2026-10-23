@@ -8,6 +8,7 @@ pub const Options = struct {
     metrics_capacity: u32 = 8192,
     state_directory: ?[]const u8 = null,
     automation_live: ?[]const u8 = null,
+    lua_module: ?[]const u8 = null,
 
     pub fn parse(args: []const [:0]const u8) !Options {
         var options: Options = .{};
@@ -20,6 +21,10 @@ pub const Options = struct {
                 index += 1;
                 if (index == args.len) return error.MissingOptionValue;
                 options.quit_after_ms = try std.fmt.parseInt(u32, args[index], 10);
+            } else if (std.mem.eql(u8, flag, "--lua-module")) {
+                index += 1;
+                if (index == args.len or args[index].len == 0) return error.MissingOptionValue;
+                options.lua_module = args[index];
             } else if (std.mem.eql(u8, flag, "--state-directory")) {
                 index += 1;
                 if (index == args.len or args[index].len == 0) return error.MissingOptionValue;
@@ -71,6 +76,7 @@ pub const help =
     \\--state-directory overrides the independent durable fake-provider conversation.
     \\Default: $XDG_DATA_HOME/spica-native/conversation ($HOME/.local/share fallback).
     \\Enter sends; Shift+Enter inserts newline. F6 cancels; F7 allows; F8 denies.
+    \\--lua-module PATH selects a custom Lua root/renderer. F5 reloads; F9 toggles default/custom.
     \\Escape dismisses local editing state. Ctrl+Q or window close exits.
     \\--quit-after-ms exits after a bounded smoke run (0 exits immediately).
     \\--automation-output PATH exports the read-only final native snapshot.
@@ -98,4 +104,9 @@ test "telemetry options require values and bounded capacity" {
     try std.testing.expectError(error.InvalidCapacity, Options.parse(&.{ "spica", "--metrics-capacity", "0" }));
     try std.testing.expectError(error.InvalidCapacity, Options.parse(&.{ "spica", "--metrics-capacity", "1048577" }));
     try std.testing.expectError(error.MissingOptionValue, Options.parse(&.{ "spica", "--automation-output" }));
+}
+
+test "custom module selection is explicit and requires a path" {
+    try std.testing.expectEqualStrings("examples/minimal.lua", (try Options.parse(&.{ "spica", "--lua-module", "examples/minimal.lua" })).lua_module.?);
+    try std.testing.expectError(error.MissingOptionValue, Options.parse(&.{ "spica", "--lua-module" }));
 }

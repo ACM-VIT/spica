@@ -59,6 +59,46 @@ pub const Layout = struct {
         return .{ .header = bounds("header"), .transcript = bounds("transcript"), .composer = bounds("composer") };
     }
 
+    /// The runtime validates preorder, unique IDs, depth and node/text bounds.
+    /// Layout remains finite and uses the same retained native Clay arena.
+    pub fn script(_: *Layout, root: *const @import("../script.zig").Root, output: *[64]c.Clay_BoundingBox) Coding {
+        c.Clay_BeginLayout();
+        var stack: [8]usize = undefined;
+        var depth: usize = 0;
+        for (root.nodes[0..root.count], 0..) |*node, index| {
+            while (depth != 0 and stack[depth - 1] != node.parent) {
+                c.Clay__CloseElement();
+                depth -= 1;
+            }
+            var declaration = std.mem.zeroes(c.Clay_ElementDeclaration);
+            declaration.id = id(node.id.bytes[0..node.id.len]);
+            declaration.layout.sizing = .{ .width = grow(), .height = switch (node.kind) {
+                2 => fixed(28),
+                3 => fixed(32),
+                4 => fixed(180),
+                else => grow(),
+            } };
+            declaration.layout.layoutDirection = if (node.kind == 1) c.CLAY_LEFT_TO_RIGHT else c.CLAY_TOP_TO_BOTTOM;
+            declaration.layout.childGap = 8;
+            if (index == 0) declaration.layout.padding = .{ .left = 24, .right = 24, .top = 12, .bottom = 20 };
+            c.Clay__OpenElement();
+            c.Clay__ConfigureOpenElement(declaration);
+            if (node.kind <= 1) {
+                stack[depth] = index;
+                depth += 1;
+            } else c.Clay__CloseElement();
+        }
+        while (depth != 0) : (depth -= 1) c.Clay__CloseElement();
+        _ = c.Clay_EndLayout();
+        var result: Coding = std.mem.zeroes(Coding);
+        for (root.nodes[0..root.count], 0..) |*node, index| {
+            output[index] = bounds(node.id.bytes[0..node.id.len]);
+            if (node.kind == 4) result.composer = output[index];
+            if (node.kind == 5) result.transcript = output[index];
+        }
+        return result;
+    }
+
     fn id(name: []const u8) c.Clay_ElementId {
         return c.Clay_GetElementId(.{ .isStaticallyAllocated = true, .length = @intCast(name.len), .chars = name.ptr });
     }

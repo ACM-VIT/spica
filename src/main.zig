@@ -69,6 +69,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try dir.deleteFile(threaded.io(), ".ui-projection");
         try app.connect(threaded.io(), host.?, spool, &wake, workspace_buffer[0..workspace_length]);
     }
+    if (options.lua_module) |path| try app.configureLua(threaded.io(), path, &wake);
     if (options.automation_live) |path| try app.enableLive(threaded.io(), path);
     const storage: []telemetry.Frame = if (options.metrics_output != null)
         try std.heap.page_allocator.alloc(telemetry.Frame, options.metrics_capacity)
