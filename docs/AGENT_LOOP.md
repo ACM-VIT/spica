@@ -8,11 +8,11 @@ Run `./tools/agents`: Astra (`gpt-6-astra`, high thinking) coordinates and revie
 
 Astra owns decomposition, contracts, dependencies, decisions, shared ledger index and acceptance. Delegate all implementation, scouting, checks, interaction, measurement, repair and mechanical integration to project Sol agents: `task` (medium), `sol-measure` (medium), `sol-repair` (high). No alternative worker models, advisors or grandchildren. Inspect actual resolved identity; cancel a non-Sol worker and record the mismatch.
 
-Default concurrency is two; raise project configuration to three only for independent ownership. Each worker has a 30-minute hard limit and 40-request soft budget, forced yield at 60 requests; packets may be smaller. Explicit thinking avoids classification calls; worker tier is `default`. Prewalk, advisors, speculation, completion probes, warming, autolearn and automatic continuations are disabled; the launcher disables titles. Retries, compaction and global extensions can still add requests: these are not exact cost caps. Never add paid background loops or setup-test inference.
+Default active concurrency is two when no independent third lane exists; project configuration permits at most three: implementation, an asynchronous evaluator on a pinned private candidate, and an optional high-thinking `sol-repair` worker. Ownership and dependencies, not available slots, determine dispatch. Each worker has a 30-minute hard limit and 40-request soft budget, forced yield at 60 requests; packets may be smaller. Explicit thinking avoids classification calls; worker tier is `default`. Prewalk, advisors, speculation, completion probes, warming, autolearn and automatic continuations are disabled; the launcher disables titles. Retries, compaction and global extensions can still add requests: these are not exact cost caps. Never add paid background loops or setup-test inference.
 
 ## Ownership and integration
 
-Before dispatch record branch, base HEAD, dirty paths and owners. Shared checkout is default; ownership is not filesystem isolation. Assign disjoint source, receipt and artifact paths; one writer owns each interface and shared output. Freeze candidates during review/measurement; serialize benchmarks after competing builds stop.
+Before dispatch record branch, base HEAD, dirty paths and owners. Shared checkout is default; ownership is not filesystem isolation. Assign disjoint source, receipt and artifact paths; one writer owns each interface and shared output. Freeze each evaluated candidate, not unrelated source work. Large correctness evaluations may run asynchronously on a pinned committed candidate in an assigned private worktree while independent development continues. Acceptance and dependent gates wait for required evidence; verified slices can checkpoint without waiting for unrelated larger evaluations. Performance sampling is exclusive versus builds, recordings and profilers, but not source edits or review.
 
 Make frequent small, descriptive checkpoint commits throughout implementation and repair, after each cohesive working slice and its relevant checks. Do not wait for the whole task/milestone or Astra's final review. Keep implementation, tests and related docs together; preserve separate follow-up fix commits. No arbitrary commit quota, padding, automatic amend/squash or known-broken checkpoints. Committing is not acceptance.
 
@@ -38,7 +38,7 @@ Minimal OMP batch syntax (example only):
 }
 ```
 
-Model settings belong in agent/config definitions, not task JSON. Retain agent/job IDs; let results arrive asynchronously. Keep same-candidate repairs with the existing worker. Escalate after three substantive failed repairs, repeated identical failure, invalid evidence, changed contracts/ownership/scope or exhausted budget. Never weaken acceptance.
+Model settings belong in agent/config definitions, not task JSON. Retain agent/job IDs; let results arrive asynchronously. Findings identify the exact candidate SHA, reproduction command and raw evidence. Keep same-candidate repairs with the existing owner when practical; assign an isolated repair candidate and explicit ownership to a high-thinking `sol-repair` worker when needed. Escalate after three substantive failed repairs, repeated identical failure, invalid evidence, changed contracts/ownership/scope or exhausted budget. Never weaken acceptance.
 
 Yield a 100–250 word receipt, with raw evidence on disk:
 

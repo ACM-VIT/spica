@@ -24,7 +24,7 @@ task:
   batch: true
   eager: always
   speculativeLaunch: false
-  maxConcurrency: 2
+  maxConcurrency: 3
   maxRecursionDepth: 1
   maxRuntimeMs: 1800000
   softRequestBudget: 40
