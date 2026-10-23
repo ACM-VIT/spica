@@ -1339,7 +1339,12 @@ pub const Host = struct {
                 n = 1;
             },
             .messages => |v| {
-                sql = if (v.direction == .newer) "SELECT ordinal+1,id,revision,ordinal,role,incomplete,run_id FROM messages WHERE thread_id=? AND ordinal+1>max(?,coalesce((SELECT ordinal+1 FROM messages WHERE id=? AND thread_id=?),0)) ORDER BY ordinal LIMIT ?" else "SELECT ordinal+1,id,revision,ordinal,role,incomplete,run_id FROM messages WHERE thread_id=? AND ordinal+1<min(nullif(?,0),coalesce((SELECT ordinal+1 FROM messages WHERE id=? AND thread_id=?),9223372036854775807)) ORDER BY ordinal DESC LIMIT ?";
+                if (v.anchor) |anchor| {
+                    const existing = try reader.prepare("SELECT 1 FROM messages WHERE id=? AND thread_id=?", &.{ .{ .text = anchor.value }, .{ .text = v.thread.value } });
+                    defer existing.deinit();
+                    if (!try existing.step()) return error.NotFound;
+                }
+                sql = if (v.direction == .newer) "SELECT ordinal+1,id,revision,ordinal,role,incomplete,run_id FROM messages WHERE thread_id=? AND ordinal>=max(?,coalesce((SELECT ordinal+1 FROM messages WHERE id=? AND thread_id=?),0)) ORDER BY ordinal LIMIT ?" else "SELECT ordinal+1,id,revision,ordinal,role,incomplete,run_id FROM messages WHERE thread_id=? AND ordinal<min(?-1,coalesce((SELECT ordinal FROM messages WHERE id=? AND thread_id=?),9223372036854775807)) ORDER BY ordinal DESC LIMIT ?";
                 if (v.direction == .older and cursor == 0) cursor = std.math.maxInt(i64);
                 values[0] = .{ .text = v.thread.value };
                 values[1] = .{ .integer = @intCast(cursor) };
@@ -1381,15 +1386,20 @@ pub const Host = struct {
                 if (v.start_byte > committed) return error.InvalidQuery;
                 const end = @min(v.end_byte, committed);
                 const bytes = try allocator.alloc(u8, @intCast(end - v.start_byte));
-                const chunks = try reader.prepare("SELECT byte_offset,bytes FROM chunks WHERE block_id=? AND byte_offset<? AND byte_offset+length(bytes)>? ORDER BY byte_offset", &.{ .{ .text = v.block.value }, .{ .integer = @intCast(end) }, .{ .integer = @intCast(v.start_byte) } });
+                const chunks = try reader.prepare("SELECT rowid,byte_offset,length(bytes) FROM chunks WHERE block_id=? AND byte_offset>=coalesce((SELECT byte_offset FROM chunks WHERE block_id=? AND byte_offset<=? ORDER BY byte_offset DESC LIMIT 1),?) AND byte_offset<? AND byte_offset+length(bytes)>? ORDER BY byte_offset", &.{ .{ .text = v.block.value }, .{ .text = v.block.value }, .{ .integer = @intCast(v.start_byte) }, .{ .integer = @intCast(v.start_byte) }, .{ .integer = @intCast(end) }, .{ .integer = @intCast(v.start_byte) } });
                 defer chunks.deinit();
                 var copied: usize = 0;
                 while (try chunks.step()) {
-                    const start = try number(chunks, 0);
-                    const chunk = try chunks.bytes(1);
+                    const start = try number(chunks, 1);
+                    const length = try number(chunks, 2);
                     const low = @max(start, v.start_byte);
-                    const high = @min(start + chunk.len, end);
-                    @memcpy(bytes[@intCast(low - v.start_byte)..@intCast(high - v.start_byte)], chunk[@intCast(low - start)..@intCast(high - start)]);
+                    const high = @min(start + length, end);
+                    var blob: ?*store.c.sqlite3_blob = null;
+                    try store.check(store.c.sqlite3_blob_open(reader.database, "main", "chunks", "bytes", chunks.integer(0), 0, &blob));
+                    defer _ = store.c.sqlite3_blob_close(blob);
+                    const actual = store.c.sqlite3_blob_bytes(blob);
+                    if (actual < 0 or @as(u64, @intCast(actual)) != length) return error.Corrupt;
+                    try store.check(store.c.sqlite3_blob_read(blob, bytes[@intCast(low - v.start_byte)..].ptr, @intCast(high - low), @intCast(low - start)));
                     copied += @intCast(high - low);
                 }
                 if (copied != bytes.len) return error.Corrupt;

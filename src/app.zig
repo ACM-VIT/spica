@@ -227,6 +227,19 @@ pub const App = struct {
             },
             else => return err,
         };
+        if (self.view.history_move) |move| {
+            self.view.history_move = null;
+            if (self.conversation) |conversation| conversation.navigate(self, move) catch |err| {
+                self.view.notice = @errorName(err);
+            };
+        }
+        if (self.view.copy_selection) |selection| {
+            self.view.copy_selection = null;
+            if (self.conversation) |conversation| {
+                conversation.copy_pending = selection;
+                Wake.notify(conversation.wake);
+            }
+        }
         if (self.view.takeIntent()) |intent| {
             if (self.lua) |bridge| {
                 if (bridge.active and bridge.generation != 0 and intent == .send) {
@@ -570,14 +583,179 @@ const Conversation = struct {
     messages: [8]Id = undefined,
     message_count: usize = 0,
     message_index: usize = 0,
-    blocks: [8]struct { id: Id, revision: u64, bytes: u64 } = undefined,
+    blocks: [8]struct { id: Id, revision: u64, bytes: u64, ordinal: u64 } = undefined,
     block_count: usize = 0,
     block_index: usize = 0,
     worker_key: ?presentation.Key = null,
+    projected_key: ?presentation.Key = null,
+    pending_history_move: ?Coding.HistoryMove = null,
     source_pending: bool = false,
     tile_request: ?presentation.PageRequest = null,
     runs_cursor: ?Id = null,
     runs_snapshot: ?types.SnapshotId = null,
+    history_paused: bool = false,
+    history_first: ?struct { key: presentation.Key, cursor: presentation.Cursor, ordinal: u64 } = null,
+    history_start: ?presentation.PageRequest = null,
+    desired_block: ?u64 = null,
+    block_cursor: ?Id = null,
+    block_snapshot: ?types.SnapshotId = null,
+    message_anchor: ?Id = null,
+    message_direction: types.Direction = .older,
+    message_snapshot: ?types.SnapshotId = null,
+    history_retrying: bool = false,
+    recovery_block: ?Id = null,
+    copy_pending: ?presentation.Selection = null,
+    restored_pixel: ?f32 = null,
+    restored_revision: ?u64 = null,
+
+    fn prepareHistoryRestore(self: *Conversation, view: *Coding) bool {
+        if (!view.history_restore) return false;
+        view.history_restore = false;
+        if (view.follow_latest) return false;
+        const position = view.history_position orelse return false;
+        self.generation += 1;
+        self.message_count = 1;
+        self.message_index = 0;
+        self.messages[0] = position.message;
+        self.desired_block = position.block_ordinal;
+        self.recovery_block = position.block;
+        self.block_cursor = null;
+        self.block_snapshot = null;
+        self.message_snapshot = null;
+        self.worker_key = null;
+        self.projected_key = null;
+        self.source_pending = false;
+        self.tile_request = null;
+        self.history_paused = false;
+        self.history_first = null;
+        self.history_retrying = false;
+        self.pending_history_move = null;
+        self.copy_pending = null;
+        self.history_start = .{ .key = undefined, .first_block = position.cursor.block, .start_byte = position.cursor.byte };
+        self.restored_pixel = position.pixel_offset;
+        self.restored_revision = position.revision;
+        view.rendered_selection = if (position.selection) |selection| .{ .key = .{ .source = selection.source, .revision = selection.revision, .generation = self.generation }, .anchor = selection.anchor, .caret = selection.caret } else null;
+        view.clearHistory();
+        return true;
+    }
+
+    fn reconcileRestoredRevision(self: *Conversation, view: *Coding, revision: u64) void {
+        const restored = self.restored_revision orelse return;
+        self.restored_revision = null;
+        if (restored == revision) return;
+        // Rendered coordinates belong to one projection revision, not its source bytes.
+        self.history_start = .{ .key = undefined, .first_block = 0, .start_byte = 0 };
+        self.restored_pixel = 0;
+        view.rendered_selection = null;
+        view.notice = "History revision changed while away";
+    }
+
+    fn askHistory(self: *Conversation, app: *App) !void {
+        if (self.prepareHistoryRestore(&app.view)) return self.askBlocks();
+        return self.askMessages();
+    }
+
+    fn recoveryQuery(self: *Conversation, kind: QueryKind) ?struct { kind: QueryKind, value: types.Query } {
+        if (self.history_retrying or self.message_count == 0) return null;
+        switch (kind) {
+            .messages => {
+                self.history_retrying = true;
+                self.message_snapshot = null;
+                var bounds = page;
+                bounds.limit = 1;
+                return .{ .kind = .messages, .value = .{ .messages = .{ .thread = .{ .value = self.thread.slice() }, .anchor = if (self.message_anchor) |*anchor| .{ .value = anchor.slice() } else null, .direction = self.message_direction, .page = bounds } } };
+            },
+            .blocks, .content => {
+                self.history_retrying = true;
+                self.message_index = 0;
+                self.block_cursor = null;
+                self.block_snapshot = null;
+                self.source_pending = false;
+                self.worker_key = null;
+                if (self.desired_block == null and self.block_count != 0) {
+                    self.desired_block = if (self.block_index < self.block_count) self.blocks[self.block_index].ordinal else self.blocks[self.block_count - 1].ordinal + 1;
+                }
+                if (self.block_index < self.block_count) self.recovery_block = self.blocks[self.block_index].id;
+                if (self.history_start == null) if (self.history_first) |first| {
+                    if (self.desired_block == first.ordinal) self.history_start = .{ .key = undefined, .first_block = first.cursor.block, .start_byte = first.cursor.byte };
+                };
+                return .{ .kind = .blocks, .value = .{ .blocks = .{ .message = .{ .value = self.messages[0].slice() }, .page = page } } };
+            },
+            else => return null,
+        }
+    }
+
+    fn navigate(self: *Conversation, app: *App, move: Coding.HistoryMove) !void {
+        if (self.query != null or self.source_pending or (!self.history_paused and self.worker_key != null)) {
+            // Same latest-wins coalescing rule as source/visible-range requests.
+            self.pending_history_move = move;
+            return;
+        }
+        self.message_index = 0;
+        self.history_retrying = false;
+        self.recovery_block = null;
+        switch (move) {
+            .first, .latest => {
+                self.message_anchor = null;
+                self.message_snapshot = null;
+                self.message_direction = if (move == .first) .newer else .older;
+                app.view.follow_latest = move == .latest;
+                self.history_paused = false;
+                self.worker_key = null;
+                self.tile_request = null;
+                try self.askHistory(app);
+            },
+            .next => {
+                app.view.follow_latest = false;
+                if (self.history_paused and self.worker_key != null) {
+                    self.history_paused = false;
+                    app.view.clearHistory();
+                    self.history_first = null;
+                    if (self.tile_request == null) try self.nextBlock(app);
+                } else {
+                    self.message_anchor = self.messages[0];
+                    self.message_direction = .newer;
+                    self.message_snapshot = null;
+                    try self.askHistory(app);
+                }
+            },
+            .previous => {
+                const first = self.history_first orelse return;
+                app.view.follow_latest = false;
+                self.history_paused = false;
+                self.tile_request = null;
+                self.worker_key = null;
+                if (first.cursor.block != 0 or first.cursor.byte != 0) {
+                    if (self.projected_key) |key| if (std.meta.eql(key, first.key)) {
+                        for (self.blocks[0..self.block_count], 0..) |block, index| if (block.ordinal == first.ordinal) {
+                            self.block_index = index;
+                            self.worker_key = key;
+                            self.tile_request = .{ .key = key, .first_block = first.cursor.block, .start_byte = first.cursor.byte, .backward = true };
+                            app.view.clearHistory();
+                            self.history_first = null;
+                            return;
+                        };
+                    };
+                    self.desired_block = first.ordinal;
+                    self.history_start = .{ .key = undefined, .first_block = first.cursor.block, .start_byte = first.cursor.byte, .backward = true };
+                    self.block_cursor = null;
+                    self.block_snapshot = null;
+                    try self.askBlocks();
+                } else if (first.ordinal != 0) {
+                    self.desired_block = first.ordinal - 1;
+                    self.history_start = .{ .key = undefined, .first_block = 0, .last = true };
+                    self.block_cursor = null;
+                    self.block_snapshot = null;
+                    try self.askBlocks();
+                } else {
+                    self.message_anchor = self.messages[0];
+                    self.message_direction = .older;
+                    self.message_snapshot = null;
+                    try self.askHistory(app);
+                }
+            },
+        }
+    }
 
     const QueryKind = enum { projects, workspaces, threads, thread, runs, approvals, tasks, messages, blocks, content };
     const CommandKind = enum { project, workspace, thread, send, cancel, approval };
@@ -677,6 +855,20 @@ const Conversation = struct {
                 .failure => |value| {
                     if (self.query) |pending| if (pending.ticket.value == value.ticket.value) {
                         self.query = null;
+                        if (value.failure.reason == .cursor_invalid) if (self.recoveryQuery(pending.kind)) |retry| {
+                            try self.ask(retry.kind, retry.value);
+                            app.view.notice = "History snapshot expired; restoring stable anchor";
+                            continue;
+                        };
+                        if (value.failure.reason == .cursor_invalid and self.history_retrying) {
+                            self.history_paused = true;
+                            self.worker_key = null;
+                            self.source_pending = false;
+                            self.tile_request = null;
+                            self.refresh = false;
+                            app.view.notice = "History snapshot expired again; navigate to retry";
+                            continue;
+                        }
                     };
                     if (self.command) |pending| if (pending.ticket.value == value.ticket.value) {
                         self.command = null;
@@ -697,27 +889,70 @@ const Conversation = struct {
             switch (self.completion) {
                 .projected => |header| if (self.worker_key) |key| {
                     if (std.meta.eql(header.key, key)) {
-                        if (header.state == .rich and header.block_count != 0) self.tile_request = .{ .key = key, .first_block = 0 } else try self.nextBlock(app);
+                        self.projected_key = header.key;
+                        if (header.state == .rich and header.block_count != 0) {
+                            var request = self.history_start orelse presentation.PageRequest{ .key = key, .first_block = 0, .last = app.view.follow_latest and self.blocks[self.block_index].bytes > presentation.page_text_bytes };
+                            request.key = key;
+                            self.history_start = null;
+                            self.tile_request = request;
+                        } else try self.nextBlock(app);
                     }
                 },
                 .tile => |*tile| if (self.worker_key) |key| {
                     if (std.meta.eql(tile.key, key)) {
+                        self.history_retrying = false;
+                        self.recovery_block = null;
+                        if (self.history_first == null) self.history_first = .{ .key = tile.key, .cursor = .{ .block = tile.block.index, .byte = tile.start_byte }, .ordinal = self.blocks[self.block_index].ordinal };
                         var width: c_int = 0;
                         _ = c.SDL_GetWindowSize(app.window, &width, null);
                         app.view.admitTile(app.text, tile, @min(960, @as(f32, @floatFromInt(width)) - 48)) catch |err| {
                             app.view.notice = @errorName(err);
                         };
+                        for (app.view.rich_tiles[0..app.view.rich_count]) |*retained| {
+                            if (retained.key) |retained_key| if (std.meta.eql(retained_key, key) and retained.block_index == tile.block.index and retained.start_byte == tile.start_byte) {
+                                retained.message = self.messages[self.message_index];
+                                retained.canonical_block = self.blocks[self.block_index].id;
+                                retained.canonical_ordinal = self.blocks[self.block_index].ordinal;
+                            };
+                        }
+                        if (self.restored_pixel) |offset| {
+                            app.view.transcript_scroll = @max(0, 10 + offset);
+                            self.restored_pixel = null;
+                        }
                         app.dirty = true;
-                        if (tile.next_block) |index| self.tile_request = .{ .key = key, .first_block = index } else try self.nextBlock(app);
+                        self.tile_request = if (tile.next) |next| .{ .key = key, .first_block = next.block, .start_byte = next.byte } else null;
+                        if (app.view.rich_count == app.view.rich_tiles.len or !app.view.follow_latest) {
+                            self.history_paused = true;
+                        } else if (self.tile_request == null) try self.nextBlock(app);
                     }
                 },
-                .failure => |failure| if (self.worker_key) |key| {
-                    if (std.meta.eql(failure.key, key)) {
-                        if (failure.reason != error.EndOfProjection) app.view.notice = @errorName(failure.reason);
-                        try self.nextBlock(app);
+                .copied => |*value| {
+                    @import("ui/clipboard.zig").copyBytes(value.bytes[0..value.len], app.view.scratch) catch |err| {
+                        app.view.notice = @errorName(err);
+                    };
+                    app.dirty = true;
+                },
+                .failure => |failure| {
+                    if (failure.copy) {
+                        app.view.notice = @errorName(failure.reason);
+                    } else if (self.worker_key) |key| {
+                        if (std.meta.eql(failure.key, key)) {
+                            if (failure.reason != error.EndOfProjection) app.view.notice = @errorName(failure.reason);
+                            try self.nextBlock(app);
+                        }
                     }
                 },
             }
+        }
+        if (self.copy_pending) |selection| {
+            self.worker.copy(selection) catch |err| switch (err) {
+                error.Busy => {
+                    Wake.notify(self.wake);
+                    return;
+                },
+                else => return err,
+            };
+            self.copy_pending = null;
         }
         if (self.source_pending) {
             self.worker.submit(self.worker_key.?, self.source[0..self.source_len]) catch |err| switch (err) {
@@ -729,28 +964,45 @@ const Conversation = struct {
             };
             self.source_pending = false;
         }
-        if (self.tile_request) |request| {
-            self.worker.request(request) catch |err| switch (err) {
-                error.Busy => {
-                    Wake.notify(self.wake);
-                    return;
-                },
-                else => return err,
-            };
-            self.tile_request = null;
+        if (!self.history_paused) {
+            if (self.tile_request) |request| {
+                self.worker.request(request) catch |err| switch (err) {
+                    error.Busy => {
+                        Wake.notify(self.wake);
+                        return;
+                    },
+                    else => return err,
+                };
+                self.tile_request = null;
+            }
         }
-        if (self.refresh and self.query == null and self.worker_key == null and self.thread.len != 0) {
+        if (self.refresh and self.query == null and (self.worker_key == null or self.history_paused) and self.thread.len != 0) {
             self.refresh = false;
+            if (app.view.follow_latest) {
+                self.history_paused = false;
+                self.worker_key = null;
+                self.tile_request = null;
+                self.message_snapshot = null;
+                self.message_anchor = null;
+                self.message_direction = .older;
+            }
             try self.ask(.thread, .{ .thread = .{ .value = self.thread.slice() } });
         }
         const terminal = if (self.run_state) |state| switch (state) {
             .completed, .cancelled, .failed, .interrupted, .unknown => true,
             else => false,
         } else true;
-        app.view.can_send = self.thread.len != 0 and terminal and self.command == null and self.query == null and !self.refresh and self.worker_key == null;
+        app.view.can_send = self.thread.len != 0 and terminal and self.command == null and self.query == null and !self.refresh and (self.worker_key == null or self.history_paused);
         app.view.can_cancel = self.run.len != 0 and !terminal and self.command == null;
         app.view.tasks_enabled = self.command == null and !self.refresh;
         app.view.can_approve = self.approval_live and self.command == null and !self.refresh;
+        if (self.pending_history_move) |move| {
+            if (self.query == null and !self.source_pending and (self.history_paused or self.worker_key == null)) {
+                self.pending_history_move = null;
+                try self.navigate(app, move);
+                Wake.notify(self.wake);
+            }
+        }
     }
 
     fn receipt(self: *Conversation, app: *App, ticket: types.Ticket, value: types.Receipt) !void {
@@ -860,7 +1112,7 @@ const Conversation = struct {
                     try self.askRuns();
                 } else {
                     self.approval_live = false;
-                    if (self.run.len != 0) try self.ask(.approvals, .{ .approvals = .{ .run = .{ .value = self.run.slice() }, .page = page } }) else try self.askMessages();
+                    if (self.run.len != 0) try self.ask(.approvals, .{ .approvals = .{ .run = .{ .value = self.run.slice() }, .page = page } }) else try self.askHistory(app);
                 }
             },
             .approvals => {
@@ -900,24 +1152,47 @@ const Conversation = struct {
                 }
                 if (value.next_cursor) |cursor| {
                     try self.ask(.tasks, .{ .task_list = .{ .parent = .{ .value = self.run.slice() }, .page = .{ .limit = 16, .max_bytes = 64 * 1024, .snapshot = value.snapshot_id, .cursor = cursor } } });
-                } else try self.askMessages();
+                } else if (app.view.follow_latest or self.message_count == 0 or app.view.history_restore) try self.askHistory(app);
             },
             .messages => {
-                self.message_count = value.items.len;
+                if (value.items.len == 0) {
+                    self.history_paused = true;
+                    app.view.notice = "History boundary";
+                    return;
+                }
+                self.message_snapshot = value.snapshot_id;
+                self.message_count = 1;
                 self.message_index = 0;
-                for (value.items, 0..) |row, index| self.messages[value.items.len - 1 - index] = try Id.init(row.message.message_id.value);
+                self.messages[0] = try Id.init(value.items[0].message.message_id.value);
                 self.generation += 1;
-                for (&app.view.rich_tiles) |*tile| tile.deinit();
-                app.view.rich_count = 0;
-                app.view.rich_next = 0;
-                if (self.message_count != 0) try self.askBlocks();
+                app.view.clearHistory();
+                self.history_first = null;
+                self.block_cursor = null;
+                self.block_snapshot = null;
+                try self.askBlocks();
             },
             .blocks => {
+                self.block_snapshot = value.snapshot_id;
+                self.block_cursor = if (value.next_cursor) |cursor| try Id.init(cursor) else null;
                 self.block_count = value.items.len;
                 self.block_index = 0;
-                for (value.items, 0..) |row, index| self.blocks[index] = .{ .id = try Id.init(row.block.block_id.value), .revision = row.block.revision, .bytes = row.block.committed_bytes };
-                if (value.next_cursor != null) app.view.notice = "Message block neighborhood exceeds eight-block display budget";
-                if (self.block_count != 0) try self.startBlock(app) else try self.nextMessage();
+                for (value.items, 0..) |row, index| self.blocks[index] = .{ .id = try Id.init(row.block.block_id.value), .revision = row.block.revision, .bytes = row.block.committed_bytes, .ordinal = row.block.ordinal };
+                if (self.desired_block) |ordinal| {
+                    while (self.block_index < self.block_count and self.blocks[self.block_index].ordinal < ordinal) self.block_index += 1;
+                    if (self.block_index == self.block_count and self.block_cursor != null) return self.askBlocks();
+                    self.desired_block = null;
+                    if (self.recovery_block) |id| {
+                        if (self.block_index == self.block_count or !id.eql(self.blocks[self.block_index].id.slice())) {
+                            app.view.notice = "History anchor no longer exists";
+                            self.history_paused = true;
+                            return;
+                        }
+                    }
+                    if (self.block_index < self.block_count) self.reconcileRestoredRevision(&app.view, self.blocks[self.block_index].revision);
+                    app.view.clearHistory();
+                    self.history_first = null;
+                }
+                if (self.block_index < self.block_count) try self.startBlock(app) else try self.nextMessage();
             },
             .content => {
                 if (value.items.len != 1) return error.MissingContent;
@@ -944,10 +1219,17 @@ const Conversation = struct {
         try self.ask(.runs, .{ .runs = .{ .thread = .{ .value = self.thread.slice() }, .page = bounds } });
     }
     fn askMessages(self: *Conversation) !void {
-        try self.ask(.messages, .{ .messages = .{ .thread = .{ .value = self.thread.slice() }, .direction = .older, .page = page } });
+        var bounds = page;
+        bounds.limit = 1;
+        bounds.snapshot = self.message_snapshot;
+        try self.ask(.messages, .{ .messages = .{ .thread = .{ .value = self.thread.slice() }, .anchor = if (self.message_anchor) |*anchor| .{ .value = anchor.slice() } else null, .direction = self.message_direction, .page = bounds } });
+        self.history_paused = false;
     }
     fn askBlocks(self: *Conversation) !void {
-        try self.ask(.blocks, .{ .blocks = .{ .message = .{ .value = self.messages[self.message_index].slice() }, .page = page } });
+        var bounds = page;
+        bounds.snapshot = self.block_snapshot;
+        bounds.cursor = if (self.block_cursor) |*cursor| cursor.slice() else null;
+        try self.ask(.blocks, .{ .blocks = .{ .message = .{ .value = self.messages[self.message_index].slice() }, .page = bounds } });
     }
     fn startBlock(self: *Conversation, app: *App) !void {
         const block = &self.blocks[self.block_index];
@@ -963,16 +1245,18 @@ const Conversation = struct {
     }
     fn askContent(self: *Conversation) !void {
         const block = &self.blocks[self.block_index];
-        try self.ask(.content, .{ .content = .{ .block = .{ .value = block.id.slice() }, .start_byte = self.source_len, .end_byte = @min(block.bytes, self.source_len + 16 * 1024), .page = page } });
+        var bounds = page;
+        bounds.snapshot = self.block_snapshot;
+        try self.ask(.content, .{ .content = .{ .block = .{ .value = block.id.slice() }, .start_byte = self.source_len, .end_byte = @min(block.bytes, self.source_len + 16 * 1024), .page = bounds } });
     }
     fn nextBlock(self: *Conversation, app: *App) anyerror!void {
         self.worker_key = null;
         self.block_index += 1;
-        if (self.block_index < self.block_count) try self.startBlock(app) else try self.nextMessage();
+        if (self.block_index < self.block_count) try self.startBlock(app) else if (self.block_cursor != null) try self.askBlocks() else try self.nextMessage();
     }
     fn nextMessage(self: *Conversation) !void {
         self.message_index += 1;
-        if (self.message_index < self.message_count) try self.askBlocks();
+        if (self.message_index < self.message_count) try self.askBlocks() else self.history_paused = true;
     }
 };
 
@@ -1066,4 +1350,124 @@ test "Lua snapshot copies only bounded visible UTF8 without borrowing tiles" {
     tile.rendered[0] = 'y';
     try std.testing.expectEqual(@as(u8, 'x'), bridge.snapshot.text.bytes[0]);
     try std.testing.expect(std.unicode.utf8ValidateSlice(bridge.snapshot.text.bytes[0..bridge.snapshot.text.len]));
+}
+
+test "history navigation reuses immutable projection and coalesces busy input" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    const key = presentation.Key{ .source = @splat(23), .revision = 4, .generation = 1 };
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    conversation.block_count = 1;
+    conversation.blocks[0] = .{ .id = try Id.init("stable-block"), .revision = 4, .bytes = 523183, .ordinal = 0 };
+    conversation.history_first = .{ .key = key, .cursor = .{ .block = 0, .byte = 400000 }, .ordinal = 0 };
+    conversation.worker_key = key;
+    conversation.projected_key = key;
+    conversation.history_paused = true;
+    try conversation.navigate(&app, .previous);
+    try std.testing.expect(conversation.query == null and !conversation.source_pending);
+    try std.testing.expect(conversation.tile_request.?.backward);
+    try std.testing.expectEqual(@as(u32, 400000), conversation.tile_request.?.start_byte);
+    try conversation.navigate(&app, .latest);
+    try std.testing.expectEqual(Coding.HistoryMove.latest, conversation.pending_history_move.?);
+}
+
+test "expired history continuation restarts queries once at stable block and byte anchor" {
+    const key = presentation.Key{ .source = @splat(24), .revision = 7, .generation = 2 };
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    conversation.message_count = 1;
+    conversation.messages[0] = try Id.init("stable-message");
+    conversation.block_count = 1;
+    conversation.blocks[0] = .{ .id = try Id.init("stable-block"), .revision = 7, .bytes = 523183, .ordinal = 11 };
+    conversation.history_first = .{ .key = key, .cursor = .{ .block = 2, .byte = 400000 }, .ordinal = 11 };
+    conversation.block_snapshot = .{ .slot = 0, .generation = 9 };
+    conversation.block_cursor = try Id.init("expired-cursor");
+    const retry = conversation.recoveryQuery(.content).?;
+    try std.testing.expectEqualStrings("stable-message", retry.value.blocks.message.value);
+    try std.testing.expect(retry.value.blocks.page.snapshot == null and retry.value.blocks.page.cursor == null);
+    try std.testing.expectEqualStrings("stable-block", conversation.recovery_block.?.slice());
+    try std.testing.expectEqual(@as(u64, 11), conversation.desired_block.?);
+    try std.testing.expectEqual(@as(u32, 400000), conversation.history_start.?.start_byte);
+    try std.testing.expect(conversation.recoveryQuery(.content) == null);
+}
+
+test "bounded per-thread position restores stable history IDs bytes pixels and selection" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    view.follow_latest = false;
+    view.history_restore = true;
+    view.history_position = .{
+        .message = try Id.init("selected-old-message"),
+        .block = try Id.init("selected-old-block"),
+        .block_ordinal = 42,
+        .revision = 7,
+        .cursor = .{ .block = 8, .byte = 400123 },
+        .pixel_offset = 3.5,
+        .selection = .{ .source = @splat(25), .revision = 7, .anchor = 400100, .caret = 404200 },
+    };
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    try std.testing.expect(conversation.prepareHistoryRestore(&view));
+    try std.testing.expectEqualStrings("selected-old-message", conversation.messages[0].slice());
+    try std.testing.expectEqualStrings("selected-old-block", conversation.recovery_block.?.slice());
+    try std.testing.expectEqual(@as(u32, 400123), conversation.history_start.?.start_byte);
+    try std.testing.expectEqual(@as(f32, 3.5), conversation.restored_pixel.?);
+    try std.testing.expectEqual(@as(u32, 404200), view.rendered_selection.?.caret);
+    const selection = view.rendered_selection.?;
+    conversation.reconcileRestoredRevision(&view, 7);
+    try std.testing.expectEqual(@as(u32, 8), conversation.history_start.?.first_block);
+    try std.testing.expectEqual(@as(u32, 400123), conversation.history_start.?.start_byte);
+    try std.testing.expectEqual(@as(f32, 3.5), conversation.restored_pixel.?);
+    try std.testing.expectEqualDeep(selection, view.rendered_selection.?);
+    try std.testing.expect(conversation.restored_revision == null);
+    // The revision check is one-shot, not a later projection's state reset.
+    conversation.reconcileRestoredRevision(&view, 8);
+    try std.testing.expectEqual(@as(u32, 400123), conversation.history_start.?.start_byte);
+    try std.testing.expectEqualDeep(selection, view.rendered_selection.?);
+    try std.testing.expect(!view.history_restore and !view.follow_latest);
+    try std.testing.expect(!conversation.prepareHistoryRestore(&view));
+}
+
+test "changed history revision restarts canonical block after Markdown append shrinks rendering" {
+    const markdown = @import("content/markdown.zig");
+    const source = "**bold";
+    var before = try markdown.parse(std.testing.allocator, @splat(26), source);
+    defer before.deinit();
+    var after = try markdown.parse(std.testing.allocator, @splat(26), source ++ "**");
+    defer after.deinit();
+    try std.testing.expectEqualStrings("**bold\n", before.text.items);
+    try std.testing.expectEqualStrings("bold\n", after.text.items);
+    const old_byte: u32 = @intCast(before.text.items.len - 1);
+    try std.testing.expect(old_byte > after.text.items.len);
+
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    view.follow_latest = false;
+    view.history_position = .{
+        .message = try Id.init("selected-old-message"),
+        .block = try Id.init("selected-old-block"),
+        .block_ordinal = 42,
+        .revision = 7,
+        .cursor = .{ .block = 0, .byte = old_byte },
+        .pixel_offset = 3.5,
+        .selection = .{ .source = @splat(26), .revision = 7, .anchor = 2, .caret = old_byte },
+    };
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    // Both an out-of-range byte and a stale semantic range must restart, never clamp.
+    for ([_]presentation.Cursor{ .{ .block = 0, .byte = old_byte }, .{ .block = 8, .byte = 400123 } }) |cursor| {
+        view.history_position.?.cursor = .{ .block = cursor.block, .byte = cursor.byte };
+        view.history_restore = true;
+        try std.testing.expect(conversation.prepareHistoryRestore(&view));
+        conversation.reconcileRestoredRevision(&view, 8);
+        try std.testing.expectEqualStrings("selected-old-message", conversation.messages[0].slice());
+        try std.testing.expectEqualStrings("selected-old-block", conversation.recovery_block.?.slice());
+        try std.testing.expectEqual(@as(u64, 42), conversation.desired_block.?);
+        try std.testing.expectEqual(@as(u32, 0), conversation.history_start.?.first_block);
+        try std.testing.expectEqual(@as(u32, 0), conversation.history_start.?.start_byte);
+        try std.testing.expect(!conversation.history_start.?.backward and !conversation.history_start.?.last);
+        try std.testing.expectEqual(@as(f32, 0), conversation.restored_pixel.?);
+        try std.testing.expect(view.rendered_selection == null);
+        try std.testing.expect(conversation.restored_revision == null);
+        try std.testing.expectEqualStrings("History revision changed while away", view.notice.?);
+        try std.testing.expect(!view.follow_latest);
+    }
 }

@@ -731,3 +731,84 @@ test "durable app task delegation deduplicates bounds and correlates out of orde
     try std.testing.expectEqual(@as(?domain.Owner.Claimed, null), try owner.claimNext(allocator));
     try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM tasks"));
 }
+
+test "indexed distant history pages retain boundaries cursors and exact source ranges" {
+    const Host = @import("../domain.zig").Host;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    {
+        var database = try storage.Store.open(std.testing.io, path_buffer[0..n]);
+        defer database.close() catch @panic("close");
+        try seed(&database);
+        try database.exec("UPDATE runs SET state='completed'; WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<10000) INSERT INTO messages SELECT printf('message-%d',n),1,'h','r',n,'assistant',0 FROM numbers");
+        try database.begin();
+        var raw: [2048]u8 = undefined;
+        for (&raw, 0..) |*byte, index| byte.* = @truncate(index);
+        for (0..256) |index| _ = try database.appendChunk("b", index * raw.len, &raw);
+        const imported = try std.testing.allocator.alloc(u8, 523183);
+        defer std.testing.allocator.free(imported);
+        for (imported, 0..) |*byte, index| byte.* = @truncate(index);
+        try database.exec("INSERT INTO blocks(id,revision,message_id,ordinal,kind,committed_bytes) VALUES('large-import',1,'m',1,'text',524207)");
+        try database.execute("INSERT INTO chunks VALUES('large-import',0,?)", &.{.{ .blob = imported }});
+        const tail: [1024]u8 = @splat('z');
+        try database.execute("INSERT INTO chunks VALUES('large-import',523183,?)", &.{.{ .blob = &tail }});
+        const seek = try database.prepare("EXPLAIN QUERY PLAN SELECT byte_offset FROM chunks WHERE block_id=? AND byte_offset<=? ORDER BY byte_offset DESC LIMIT 1", &.{ .{ .text = "large-import" }, .{ .integer = 100000 } });
+        defer seek.deinit();
+        try std.testing.expect(try seek.step());
+        try std.testing.expect(std.mem.indexOf(u8, try seek.bytes(3), "SEARCH") != null);
+        // Model an explicit independent/older importer, not Store's current
+        // 1MiB writer-value admission cap. Snapshot reads must remain bounded.
+        _ = c.sqlite3_limit(database.database, c.SQLITE_LIMIT_LENGTH, 32 * 1024 * 1024);
+        try database.exec("INSERT INTO blocks(id,revision,message_id,ordinal,kind,committed_bytes) VALUES('huge-import',1,'m',2,'text',16777216); INSERT INTO chunks VALUES('huge-import',0,zeroblob(16777216))");
+        try database.commit();
+    }
+    var consumer: Consumer = .{ .host = undefined, .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer consumer.arena.deinit();
+    consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .wake = Consumer.wake, .wake_context = &consumer });
+    defer consumer.host.destroy();
+    const latest = try consumer.query(.{ .messages = .{ .thread = .{ .value = "h" }, .direction = .older, .page = .{ .limit = 32 } } });
+    try std.testing.expectEqual(@as(u64, 10000), latest.items[0].message.ordinal);
+    try std.testing.expectEqual(@as(u64, 9969), latest.items[31].message.ordinal);
+    const continued = try consumer.query(.{ .messages = .{ .thread = .{ .value = "h" }, .direction = .older, .page = .{ .limit = 32, .snapshot = latest.snapshot_id, .cursor = latest.next_cursor.? } } });
+    try std.testing.expectEqual(@as(u64, 9968), continued.items[0].message.ordinal);
+    const distant = try consumer.query(.{ .messages = .{ .thread = .{ .value = "h" }, .anchor = .{ .value = "message-5000" }, .direction = .newer, .page = .{ .limit = 1 } } });
+    try std.testing.expectEqual(@as(u64, 5001), distant.items[0].message.ordinal);
+    const oldest = try consumer.query(.{ .messages = .{ .thread = .{ .value = "h" }, .anchor = .{ .value = "message-1" }, .direction = .older, .page = .{ .limit = 1 } } });
+    try std.testing.expectEqual(@as(u64, 0), oldest.items[0].message.ordinal);
+    try std.testing.expect(oldest.next_cursor == null);
+    const end = try consumer.query(.{ .messages = .{ .thread = .{ .value = "h" }, .anchor = .{ .value = "m" }, .direction = .older } });
+    try std.testing.expectEqual(@as(usize, 0), end.items.len);
+    const range = try consumer.query(.{ .content = .{ .block = .{ .value = "b" }, .start_byte = 500001, .end_byte = 504097 } });
+    for (range.items[0].content.bytes, 0..) |byte, index| try std.testing.expectEqual(@as(u8, @truncate(500001 + index)), byte);
+    _ = try consumer.host.query(.{ .messages = .{ .thread = .{ .value = "h" }, .anchor = .{ .value = "missing" } } });
+    const missing = try consumer.next();
+    try std.testing.expectEqual(.not_found, missing.failure.failure.reason);
+    _ = try consumer.host.query(.{ .messages = .{ .thread = .{ .value = "h" }, .page = .{ .cursor = "malformed" } } });
+    const invalid = try consumer.next();
+    try std.testing.expectEqual(.cursor_invalid, invalid.failure.failure.reason);
+    // Several newer roots have evicted this paused snapshot deterministically.
+    _ = try consumer.host.query(.{ .content = .{ .block = .{ .value = "b" }, .start_byte = 500001, .end_byte = 504097, .page = .{ .snapshot = latest.snapshot_id } } });
+    const expired = try consumer.next();
+    try std.testing.expectEqual(.cursor_invalid, expired.failure.failure.reason);
+    const fresh = try consumer.query(.{ .blocks = .{ .message = .{ .value = "m" } } });
+    try std.testing.expectEqualStrings("b", fresh.items[0].block.block_id.value);
+    const restored = try consumer.query(.{ .content = .{ .block = fresh.items[0].block.block_id, .start_byte = 500001, .end_byte = 504097, .page = .{ .snapshot = fresh.snapshot_id } } });
+    try std.testing.expectEqualSlices(u8, range.items[0].content.bytes, restored.items[0].content.bytes);
+    const interior = try consumer.query(.{ .content = .{ .block = .{ .value = "large-import" }, .start_byte = 100000, .end_byte = 104096 } });
+    for (interior.items[0].content.bytes, 0..) |byte, index| try std.testing.expectEqual(@as(u8, @truncate(100000 + index)), byte);
+    const crossing = try consumer.query(.{ .content = .{ .block = .{ .value = "large-import" }, .start_byte = 522111, .end_byte = 524000 } });
+    for (crossing.items[0].content.bytes, 0..) |byte, index| try std.testing.expectEqual(if (522111 + index < 523183) @as(u8, @truncate(522111 + index)) else @as(u8, 'z'), byte);
+    var heap_before: i64 = 0;
+    var heap_peak: i64 = 0;
+    try storage.check(c.sqlite3_status64(c.SQLITE_STATUS_MEMORY_USED, &heap_before, &heap_peak, 1));
+    const bounded = try consumer.query(.{ .content = .{ .block = .{ .value = "huge-import" }, .start_byte = 8000000, .end_byte = 8004096 } });
+    try std.testing.expectEqual(@as(usize, 4096), bounded.items[0].content.bytes.len);
+    for (bounded.items[0].content.bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    var heap_after: i64 = 0;
+    try storage.check(c.sqlite3_status64(c.SQLITE_STATUS_MEMORY_USED, &heap_after, &heap_peak, 0));
+    const query_peak = heap_peak - heap_before;
+    std.debug.print("incremental blob 16MiB/4KiB query SQLite peak delta={d} bytes\n", .{query_peak});
+    try std.testing.expect(query_peak < 4 * 1024 * 1024);
+}

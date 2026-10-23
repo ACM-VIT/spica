@@ -257,6 +257,11 @@ const widgets = @import("widgets.zig");
 pub const RichTile = struct {
     key: ?presentation.Key = null,
     block_index: u32 = 0,
+    start_byte: u32 = 0,
+    projection_start: u32 = 0,
+    message: Id = .{},
+    canonical_block: Id = .{},
+    canonical_ordinal: u64 = 0,
     layout: ?*native.SpicaTextLayout = null,
     width: f32 = 0,
     length: usize = 0,
@@ -281,7 +286,7 @@ pub const RichTile = struct {
         if (tile.state != .rich) return error.DisplayBudget;
         if (width <= 24 or !std.math.isFinite(width)) return error.InvalidWidth;
         if (self.key) |key| {
-            if (std.meta.eql(key, tile.key) and self.block_index == tile.block.index and self.width == width) return;
+            if (std.meta.eql(key, tile.key) and self.block_index == tile.block.index and self.start_byte == tile.start_byte and self.width == width) return;
         }
         var spans: [presentation.tile_runs]native.SpicaTextSpan = undefined;
         var colors: [presentation.tile_runs]native.SpicaTextColorSpan = undefined;
@@ -307,6 +312,8 @@ pub const RichTile = struct {
         self.deinit();
         self.key = tile.key;
         self.block_index = tile.block.index;
+        self.start_byte = tile.start_byte;
+        self.projection_start = tile.block.start;
         self.layout = layout;
         self.width = width;
         self.length = tile.len;
@@ -325,6 +332,22 @@ pub const RichTile = struct {
         native.spica_text_layout_release(self.layout.?);
         self.layout = layout;
         self.width = width;
+    }
+
+    pub const ScrollPoint = struct { byte: usize, offset: f32 };
+
+    pub fn capture(self: *const RichTile, y: f32) ScrollPoint {
+        const layout = self.layout orelse return .{ .byte = 0, .offset = y };
+        const byte = native.spica_text_layout_hit_test(layout, 0, @max(0, y - 10));
+        var rect: native.SDL_FRect = undefined;
+        if (!native.spica_text_layout_caret(layout, byte, &rect)) return .{ .byte = 0, .offset = y };
+        return .{ .byte = byte, .offset = y - rect.y - 10 };
+    }
+
+    pub fn restore(self: *const RichTile, point: ScrollPoint) f32 {
+        var rect: native.SDL_FRect = undefined;
+        if (self.layout) |layout| if (native.spica_text_layout_caret(layout, point.byte, &rect)) return rect.y + 10 + point.offset;
+        return 0;
     }
 
     pub fn height(self: *const RichTile) f32 {
@@ -493,4 +516,37 @@ test "same revision unseen positions invalidate selection without stealing scrol
     try std.testing.expectEqual(@as(u32, 1), transcript.applied_position.event_index);
     try std.testing.expectEqual(@as(u64, 42), transcript.anchor.?.byte_offset);
     try std.testing.expect(transcript.newer_output);
+}
+
+test "visible geometry reflow preserves logical top anchor and selected byte range" {
+    const build_options = @import("build_options");
+    const surface = native.SDL_CreateSurface(700, 400, native.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer native.SDL_DestroySurface(surface);
+    const renderer = native.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer native.SDL_DestroyRenderer(renderer);
+    const text = native.spica_text_create(renderer, build_options.font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer native.spica_text_destroy(text);
+    var tile: presentation.Tile = .{
+        .key = .{ .source = @splat(13), .revision = 2, .generation = 1 },
+        .block = .{ .index = 9000, .kind = .paragraph, .start = 0, .end = 0, .first_run = 0, .end_run = 0, .heading = 0, .flags = 0, .number = 0, .columns = 0, .info_start = 0, .info_len = 0 },
+        .state = .rich,
+        .start_byte = 400000,
+    };
+    const line = "anchor survives narrow reflow and distant history jumps\n";
+    for (0..30) |index| @memcpy(tile.text[index * line.len ..][0..line.len], line);
+    tile.len = line.len * 30;
+    var retained: RichTile = .{};
+    defer retained.deinit();
+    try retained.update(text, &tile, 600);
+    retained.selected = true;
+    retained.anchor = line.len;
+    retained.caret = line.len * 2;
+    const point = retained.capture(120);
+    try retained.reflow(text, 260);
+    const restored = retained.restore(point);
+    const recaptured = retained.capture(restored);
+    try std.testing.expectEqual(point.byte, recaptured.byte);
+    try std.testing.expectApproxEqAbs(point.offset, recaptured.offset, 0.01);
+    try std.testing.expectEqualStrings(line, retained.selectedBytes());
+    try std.testing.expectEqual(@as(u32, 400000), retained.start_byte);
 }
