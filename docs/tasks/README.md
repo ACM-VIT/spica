@@ -9,6 +9,17 @@ Workers own only assigned paths. Astra directs integration and owns this ledger;
 ## Queue
 
 - 000-bootstrap.md: branch/scaffold/OMP preparation.
-- [001-contracts.md](001-contracts.md): accepted; [core contract v1](../contracts/core.md), [reference scenarios](../contracts/scenarios.md) and [immutable source evidence](../contracts/references.md). Documentation only; domain/fake-adapter implementation and live runtime validation remain separate gates. Startup authorization stops here.
-- 007-codex-adapter.md, 008-opencode-adapter.md and 012-app-orchestration.md are explicit future task packets; their prerequisites are unmet, so do not dispatch them yet.
-- Subsequent records follow ROADMAP order with explicit dependencies; run independent infrastructure/UI groundwork beside contracts only when they do not invent competing interfaces.
+- [001-contracts.md](001-contracts.md): accepted at 0d82092f0578310903d5ff49556acc820ed7179b; [core contract v1](../contracts/core.md), [reference scenarios](../contracts/scenarios.md) and [immutable source evidence](../contracts/references.md). Documentation only; domain/fake-adapter implementation and live runtime validation remain separate gates.
+- [002-build-checks.md](002-build-checks.md): accepted; Debug/ReleaseSafe checks, isolated core regressions, tool pins and Linux CI configuration. Remote CI/clean-host execution remain explicitly unexercised.
+- [003-fake-harness.md](003-fake-harness.md): running; fake/native private implementation lanes allocated, independent asynchronous baseline collected.
+- 004 durable conversation, 005 useful native UI and 006 public API proof: pending 001–003; shared fake-provider milestone with distinct owners.
+- [007-codex-adapter.md](007-codex-adapter.md), [008-opencode-adapter.md](008-opencode-adapter.md): blocked on their stated implementation/live gates, not lack of roadmap authorization.
+- 009 projects/threads/background runs, 010 bounded history, 011 workspace/Git identity: pending prerequisites.
+- [012-app-orchestration.md](012-app-orchestration.md): pending fake/runtime/workspace gates; 013 queueing/recovery/portability follows.
+- 014 extension primitives, 015 explicitly demanded further integrations, 016 performance/soak and 017 Linux release readiness: pending acceptance/dependency gates. Item 015 does not authorize inventing an additional provider.
+
+## Continuation authorization
+
+After task 001 acceptance, the user explicitly requested completion of all sixteen remaining roadmap tasks. This supersedes the earlier startup-only boundary for this continuation, not the historical task 001 receipt. Subsequent user direction requires RSS/PSS/CPU/frame-time/FPS verification, private worktrees where useful, asynchronous larger evaluations and optional high-reasoning Sol repairs. Project ceiling is now three after ownership/config review; use two unless a genuinely independent third lane exists. No unattended goal loop, scheduler, blanket approval or account/profile rewrite.
+
+Continuation base: 0d82092f0578310903d5ff49556acc820ed7179b, rewrite/native-agent-workspace, initially clean. Infra002 is sole shared Git/integration owner; Fake003/NativeHarness003 will own disjoint private worktrees from the task002 acceptance/allocation checkpoint, with Native003 as asynchronous evaluator. Astra owns task records/index and reviews actual diffs/evidence. Performance measurements exclude competing builds/recordings/profilers, not independent source edits. Real entitlement, credentials, human checkpoints and distribution licensing remain explicit gates; mocks or missing prerequisites cannot count as acceptance.
