@@ -8,6 +8,7 @@ test {
     _ = @import("runtime/fake_test.zig");
     _ = @import("domain.zig");
     _ = @import("script_test.zig");
+    _ = @import("app.zig");
     _ = @import("ui/coding.zig");
     _ = @import("ui/transcript.zig");
     _ = @import("content/presentation.zig");

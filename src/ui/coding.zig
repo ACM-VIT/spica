@@ -50,6 +50,8 @@ pub const View = struct {
     history_move: ?HistoryMove = null,
     history_height: f32 = 0,
     transcript_drag: ?usize = null,
+    rendered_selection: ?presentation.Selection = null,
+    copy_selection: ?presentation.Selection = null,
     custom_root: ?*const @import("../script.zig").Root = null,
     custom_render: ?*const @import("../script.zig").Render = null,
     custom_bounds: [64]c.Clay_BoundingBox = undefined,
@@ -136,11 +138,13 @@ pub const View = struct {
         for (self.rich_tiles[0..self.rich_count]) |*slot| {
             if (slot.key) |key| if (std.meta.eql(key, tile.key) and slot.block_index == tile.block.index and slot.start_byte == tile.start_byte) {
                 try slot.update(text, tile, width);
+                self.applySelection(slot);
                 return;
             };
         }
         const index = if (self.rich_count < self.rich_tiles.len) self.rich_count else self.rich_next;
         try self.rich_tiles[index].update(text, tile, width);
+        self.applySelection(&self.rich_tiles[index]);
         if (self.rich_count < self.rich_tiles.len) self.rich_count += 1;
         self.rich_next = (index + 1) % self.rich_tiles.len;
     }
@@ -151,6 +155,34 @@ pub const View = struct {
         self.rich_next = 0;
         self.transcript_drag = null;
         self.transcript_scroll = 0;
+    }
+
+    fn applySelection(self: *View, tile: *transcript.RichTile) void {
+        const selection = self.rendered_selection orelse {
+            tile.selected = false;
+            return;
+        };
+        const key = tile.key orelse return;
+        if (!selection.sameSource(key)) {
+            tile.selected = false;
+            return;
+        }
+        const start = tile.projection_start + tile.start_byte;
+        const end = start + @as(u32, @intCast(tile.length));
+        const low = @min(selection.anchor, selection.caret);
+        const high = @max(selection.anchor, selection.caret);
+        tile.selected = low < end and high > start;
+        tile.anchor = std.math.clamp(low, start, end) - start;
+        tile.caret = std.math.clamp(high, start, end) - start;
+    }
+
+    fn selectTile(self: *View, tile: *transcript.RichTile, extend: bool) void {
+        const key = tile.key orelse return;
+        const caret = tile.projection_start + tile.start_byte + @as(u32, @intCast(tile.caret));
+        if (extend and self.rendered_selection != null and self.rendered_selection.?.sameSource(key)) {
+            self.rendered_selection.?.caret = caret;
+        } else self.rendered_selection = .{ .key = key, .anchor = caret, .caret = caret };
+        for (self.rich_tiles[0..self.rich_count]) |*slot| self.applySelection(slot);
     }
 
     fn hasComposer(self: *const View) bool {
@@ -200,8 +232,10 @@ pub const View = struct {
                 if (widgets.contains(self.transcript_bounds, event.button.x, event.button.y)) {
                     try self.focus(window, false);
                     for (self.rich_tiles[0..self.rich_count], 0..) |*tile, index| {
-                        tile.selected = false;
-                        if (tile.hit(event.button.x, event.button.y, false)) self.transcript_drag = index;
+                        if (tile.hit(event.button.x, event.button.y, false)) {
+                            self.transcript_drag = index;
+                            self.selectTile(tile, c.SDL_GetModState() & c.SDL_KMOD_SHIFT != 0);
+                        }
                     }
                     if (self.transcript_drag != null) _ = c.SDL_CaptureMouse(true);
                     return true;
@@ -226,6 +260,7 @@ pub const View = struct {
                 if (self.transcript_drag) |index| {
                     const tile = &self.rich_tiles[index];
                     _ = tile.hit(std.math.clamp(event.motion.x, tile.bounds.x, tile.bounds.x + tile.bounds.w - 1), std.math.clamp(event.motion.y, tile.bounds.y, tile.bounds.y + tile.bounds.h - 1), true);
+                    self.selectTile(tile, true);
                     return true;
                 }
                 if (!self.dragging) return false;
@@ -274,7 +309,7 @@ pub const View = struct {
                 const mods = event.key.mod;
                 const ctrl = mods & c.SDL_KMOD_CTRL != 0;
                 const shift = mods & c.SDL_KMOD_SHIFT != 0;
-                if (ctrl) {
+                if (ctrl and mods & c.SDL_KMOD_ALT != 0 and self.window_active) {
                     self.history_move = switch (key) {
                         c.SDLK_PAGEUP => .previous,
                         c.SDLK_PAGEDOWN => .next,
@@ -300,9 +335,7 @@ pub const View = struct {
                     else => {},
                 }
                 if (ctrl and key == c.SDLK_C and !self.focused and self.window_active) {
-                    for (self.rich_tiles[0..self.rich_count]) |*tile| {
-                        if (tile.selected) try clipboard.copyBytes(tile.selectedBytes(), self.scratch);
-                    }
+                    if (self.rendered_selection) |selection| self.copy_selection = selection;
                     return true;
                 }
                 if (!self.hasComposer()) return false;
@@ -639,4 +672,55 @@ test "native task cancellation retains exact durable run revision" {
     try std.testing.expectEqual(@as(u64, 91), intent.revision);
     try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat('a')), &intent.id);
     try std.testing.expect(view.takeTaskCancel() == null);
+}
+
+test "history shortcuts preserve focused composer document edges and inactive input" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.insert("first\nlast", .paste);
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.mod = c.SDL_KMOD_CTRL;
+    event.key.key = c.SDLK_HOME;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqual(@as(usize, 0), view.editor.caret);
+    try std.testing.expect(view.history_move == null);
+    event.key.key = c.SDLK_END;
+    event.key.mod |= c.SDL_KMOD_SHIFT;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqual(view.editor.len, view.editor.caret);
+    try std.testing.expectEqual(@as(usize, 0), view.editor.anchor);
+    try std.testing.expect(view.history_move == null);
+    view.window_active = false;
+    event.key.mod = c.SDL_KMOD_CTRL | c.SDL_KMOD_ALT;
+    try std.testing.expect(!try view.handle(event, undefined, undefined));
+    try std.testing.expect(view.history_move == null);
+    view.window_active = true;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqual(View.HistoryMove.latest, view.history_move.?);
+}
+
+test "stable rendered selection survives page eviction and clips adjacent geometry" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    const key = presentation.Key{ .source = @splat(22), .revision = 3, .generation = 1 };
+    view.rich_count = 1;
+    const tile = &view.rich_tiles[0];
+    tile.key = key;
+    tile.start_byte = 4000;
+    tile.length = 100;
+    tile.caret = 80;
+    view.selectTile(tile, false);
+    view.clearHistory();
+    view.rich_count = 1;
+    tile.key = key;
+    tile.start_byte = 4100;
+    tile.length = 100;
+    tile.caret = 50;
+    view.selectTile(tile, true);
+    try std.testing.expectEqual(@as(u32, 4080), view.rendered_selection.?.anchor);
+    try std.testing.expectEqual(@as(u32, 4150), view.rendered_selection.?.caret);
+    try std.testing.expect(tile.selected);
+    try std.testing.expectEqual(@as(usize, 0), tile.anchor);
+    try std.testing.expectEqual(@as(usize, 50), tile.caret);
 }

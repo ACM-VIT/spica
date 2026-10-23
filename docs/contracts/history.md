@@ -15,8 +15,10 @@ Transcript cache remains capped at three 64-KiB metadata pages plus one staging
 page, and eight 16-KiB content pages. Native geometry is at most eight retained
 rich tiles, not a height entry for each historical row. No total-history pixel
 height or global scroll offset is promised: navigation uses IDs and rendered-byte
-cursors. Ctrl+Home/End selects the oldest/latest message; Ctrl+PageUp/Down and
-wheel movement at a viewport boundary traverse rich ranges or adjacent messages.
+cursors. Ctrl+Alt+Home/End selects the oldest/latest message;
+Ctrl+Alt+PageUp/PageDown and wheel movement at a viewport boundary traverse
+rich ranges or adjacent messages. These explicit history chords require an
+active window and do not steal composer Ctrl+Home/End caret/selection semantics.
 Selecting latest resumes follow mode; browsing older ranges does not let new
 output steal the viewport.
 
@@ -27,10 +29,16 @@ style runs. Oversized code/paragraph blocks are not replaced by plain text or
 silently dropped. Each tile contains at most 4096 rendered bytes and 256 clipped
 style runs. Forward boundaries prefer lines and preserve extended graphemes.
 The canonical source remains distinct and exact; rendered selection addresses the
-rendered projection, not Markdown syntax offsets. Retained layouts preserve
-selection byte ranges across reflow; top-visible caret/relative-pixel anchors are
-captured before reflow and restored after it. Source/revision/generation plus
-semantic block and rendered-byte offset distinguish tile identities.
+rendered projection, not Markdown syntax offsets. Selection endpoints retain
+source/revision and absolute rendered-byte offsets across native page eviction;
+Shift+click extends into an adjacent page of that same canonical rich block.
+Visible geometry clips those logical endpoints and survives reflow. Ctrl+C
+copies the complete selected rendered range through the presentation worker's
+spool read, not just the current tile (64-KiB clipboard cap; over-budget copy
+fails explicitly, never truncates). Cross-canonical-block selection is not
+advertised. Top-visible caret/relative-pixel anchors are captured before reflow
+and restored after it. Source/revision/generation plus semantic block and
+rendered-byte offset distinguish tile identities.
 
 Limits are explicit, not a claim of unlimited document support: canonical rich
 source at most 1 MiB, parser arena 8 MiB, projection scratch backing 16 MiB,
@@ -40,3 +48,16 @@ aggregate layout/glyph/font budgets. Process allocator/SQLite/driver overhead is
 outside these source-level ledgers. Task010 evidence distinguishes observed
 whole-process bounds from these designed caps and does not infer physical latency
 from screenshots.
+
+Backward ranges inspect at most 8192 bytes and establish a proven Unicode
+grapheme restart (block start, LF, or adjacent ASCII scalars excluding CRLF)
+before using the retained libunibreak implementation. If bounded context cannot
+prove a restart, the operation reports `DisplayBudget`, never invents a
+scalar-only boundary inside an extended cluster. Same-projection PageUp reads
+the existing spool; it does not reread/reparse canonical source.
+
+Expired snapshots trigger one query-only fresh snapshot attempt from the captured
+MessageId, canonical BlockId/ordinal and rendered-byte cursor. A changed/missing
+anchor remains visible; repeat expiry stops with a notice until explicit
+navigation. No durable command or provider effect is replayed during recovery.
+Busy navigation retains one latest-wins pending intent rather than dropping it.

@@ -773,4 +773,12 @@ test "indexed distant history pages retain boundaries cursors and exact source r
     _ = try consumer.host.query(.{ .messages = .{ .thread = .{ .value = "h" }, .page = .{ .cursor = "malformed" } } });
     const invalid = try consumer.next();
     try std.testing.expectEqual(.cursor_invalid, invalid.failure.failure.reason);
+    // Several newer roots have evicted this paused snapshot deterministically.
+    _ = try consumer.host.query(.{ .content = .{ .block = .{ .value = "b" }, .start_byte = 500001, .end_byte = 504097, .page = .{ .snapshot = latest.snapshot_id } } });
+    const expired = try consumer.next();
+    try std.testing.expectEqual(.cursor_invalid, expired.failure.failure.reason);
+    const fresh = try consumer.query(.{ .blocks = .{ .message = .{ .value = "m" } } });
+    try std.testing.expectEqualStrings("b", fresh.items[0].block.block_id.value);
+    const restored = try consumer.query(.{ .content = .{ .block = fresh.items[0].block.block_id, .start_byte = 500001, .end_byte = 504097, .page = .{ .snapshot = fresh.snapshot_id } } });
+    try std.testing.expectEqualSlices(u8, range.items[0].content.bytes, restored.items[0].content.bytes);
 }

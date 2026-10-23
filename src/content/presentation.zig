@@ -19,6 +19,17 @@ const run_bytes = 28;
 var parse_mutex: std.Io.Mutex = .init;
 
 pub const Key = struct { source: markdown.ContentId, revision: u64, generation: u64 };
+pub const Selection = struct {
+    key: Key,
+    anchor: u32,
+    caret: u32,
+
+    pub fn sameSource(self: Selection, key: Key) bool {
+        return std.mem.eql(u8, &self.key.source, &key.source) and self.key.revision == key.revision;
+    }
+};
+pub const copy_bytes = 64 * 1024;
+pub const Copy = struct { key: Key, bytes: [copy_bytes]u8 = undefined, len: usize = 0 };
 pub const Header = struct {
     key: Key,
     state: markdown.State,
@@ -54,10 +65,8 @@ pub const Tile = struct {
     span_count: usize = 0,
     language: [128]u8 = undefined,
     language_len: usize = 0,
-    next_block: ?u32 = null,
     start_byte: u32 = 0,
     next: ?Cursor = null,
-    previous: ?Cursor = null,
 
     pub fn bytes(self: *const Tile) []const u8 {
         return self.text[0..self.len];
@@ -199,8 +208,6 @@ pub const Projector = struct {
         if (start + amount < length) {
             out.next = .{ .block = index, .byte = start + @as(u32, @intCast(amount)) };
         } else if (index + 1 < header.block_count) out.next = .{ .block = index + 1 };
-        out.next_block = if (out.next) |next| next.block else null;
-        out.previous = try self.before(.{ .block = index, .byte = start });
         if (block.first_run > block.end_run or block.end_run > header.run_count) return error.InvalidProjection;
         var low = block.first_run;
         var high = block.end_run;
@@ -218,7 +225,6 @@ pub const Projector = struct {
                 // End before the unadmitted run, retaining its exact next cursor.
                 out.len = run_start - absolute;
                 out.next = .{ .block = index, .byte = start + @as(u32, @intCast(out.len)) };
-                out.next_block = index;
                 break;
             }
             const run_end = @min(number(&raw, 8), absolute + @as(u32, @intCast(out.len)));
@@ -233,20 +239,50 @@ pub const Projector = struct {
         }
     }
 
+    pub fn copySelection(self: *Projector, selection: Selection, out: *Copy) !void {
+        const header = self.header orelse return error.NoProjection;
+        if (!selection.sameSource(header.key)) return error.StaleProjection;
+        const low = @min(selection.anchor, selection.caret);
+        const high = @max(selection.anchor, selection.caret);
+        if (high > header.text_bytes) return error.InvalidCursor;
+        if (high - low > copy_bytes) return error.CopyBudget;
+        out.* = .{ .key = header.key, .len = high - low };
+        try self.read(out.bytes[0..out.len], header.text_offset + low);
+    }
+
     /// Locate a preceding bounded range without retaining a document-wide index.
     pub fn before(self: *Projector, cursor: Cursor) !?Cursor {
         var index = cursor.block;
         if (cursor.byte != 0) {
             const block = try self.readBlock(index);
             if (cursor.byte > block.end - block.start) return error.InvalidCursor;
-            var start = cursor.byte - @min(cursor.byte, page_text_bytes);
-            var bytes: [page_text_bytes + 4]u8 = undefined;
-            const amount = cursor.byte - start;
-            try self.read(bytes[0..amount], self.header.?.text_offset + block.start + start);
-            var advance: u32 = 0;
-            while (advance < amount and bytes[advance] & 0xc0 == 0x80) : (advance += 1) {}
-            start += advance;
-            return .{ .block = index, .byte = start };
+            const desired = cursor.byte - @min(cursor.byte, page_text_bytes);
+            const window_start = desired - @min(desired, page_text_bytes);
+            var bytes: [page_text_bytes * 2]u8 = undefined;
+            var breaks: [page_text_bytes * 2]u8 = undefined;
+            const amount = cursor.byte - window_start;
+            try self.read(bytes[0..amount], self.header.?.text_offset + block.start + window_start);
+            // A bounded lookbehind needs a PROVEN UAX29 restart, not merely a
+            // scalar boundary: Prepend/Extend/ZWJ and RI state can cross it.
+            // LF resets grapheme state; an adjacent ASCII pair (except CRLF)
+            // proves a break before its second scalar and resets that context.
+            var sync: ?usize = if (window_start == 0) 0 else null;
+            var at: usize = desired - window_start;
+            while (at > 0) : (at -= 1) {
+                if (bytes[at - 1] == '\n' or
+                    (bytes[at - 1] < 0x80 and bytes[at - 1] != '\r' and bytes[at] < 0x80))
+                {
+                    sync = at;
+                    break;
+                }
+            }
+            const begin = sync orelse return error.DisplayBudget;
+            if (!std.unicode.utf8ValidateSlice(bytes[begin..amount])) return error.InvalidCursor;
+            unicode_breaks.set_graphemebreaks_utf8(bytes[begin..amount].ptr, amount - begin, null, @ptrCast(breaks[begin..].ptr));
+            at = desired - window_start;
+            while (at < amount and at != begin and breaks[at - 1] != unicode_breaks.GRAPHEMEBREAK_BREAK) : (at += 1) {}
+            if (at == amount) return error.DisplayBudget;
+            return .{ .block = index, .byte = window_start + @as(u32, @intCast(at)) };
         }
         while (index != 0) {
             index -= 1;
@@ -323,7 +359,7 @@ const Sink = struct {
 
 pub const Wake = struct { context: *anyopaque, notify: *const fn (*anyopaque) void };
 pub const PageRequest = struct { key: Key, first_block: u32, start_byte: u32 = 0, backward: bool = false, last: bool = false };
-pub const Completion = union(enum) { projected: Header, tile: Tile, failure: struct { key: Key, reason: anyerror } };
+pub const Completion = union(enum) { projected: Header, tile: Tile, copied: Copy, failure: struct { key: Key, reason: anyerror, copy: bool = false } };
 const PendingSource = struct { key: Key, slot: u1, len: usize };
 const WorkerStorage = struct { sources: [2][source_limit]u8, output: Completion };
 
@@ -343,6 +379,7 @@ pub const Worker = struct {
     active_slot: ?u1 = null,
     pending: ?PendingSource = null,
     requested: ?PageRequest = null,
+    copy_requested: ?Selection = null,
     output_ready: bool = false,
 
     /// File ownership transfers only on success.
@@ -388,6 +425,14 @@ pub const Worker = struct {
         self.condition.signal(self.io);
     }
 
+    pub fn copy(self: *Worker, selection: Selection) error{ Busy, Closed }!void {
+        if (!self.mutex.tryLock()) return error.Busy;
+        defer self.mutex.unlock(self.io);
+        if (self.stopping) return error.Closed;
+        self.copy_requested = selection;
+        self.condition.signal(self.io);
+    }
+
     /// Caller provides the bounded output destination. Borrowed file/AST/worker
     /// pointers never escape. Busy/empty never consumes a pending completion.
     pub fn drain(self: *Worker, out: *Completion) error{Busy}!bool {
@@ -398,6 +443,7 @@ pub const Worker = struct {
             .projected => |header| out.* = .{ .projected = header },
             .failure => |failure| out.* = .{ .failure = failure },
             .tile => |*value| out.* = .{ .tile = value.* },
+            .copied => |*value| out.* = .{ .copied = value.* },
         }
         self.output_ready = false;
         self.condition.signal(self.io);
@@ -407,17 +453,19 @@ pub const Worker = struct {
     fn run(self: *Worker) void {
         while (true) {
             self.mutex.lockUncancelable(self.io);
-            while (!self.stopping and (self.output_ready or (self.pending == null and self.requested == null))) self.condition.waitUncancelable(self.io, &self.mutex);
+            while (!self.stopping and (self.output_ready or (self.pending == null and self.requested == null and self.copy_requested == null))) self.condition.waitUncancelable(self.io, &self.mutex);
             if (self.stopping) {
                 self.mutex.unlock(self.io);
                 return;
             }
-            const source = self.pending;
-            const request_value = if (source == null) self.requested else null;
+            const copy_selection = self.copy_requested;
+            self.copy_requested = null;
+            const source = if (copy_selection == null) self.pending else null;
+            const request_value = if (source == null and copy_selection == null) self.requested else null;
             if (source) |job| {
                 self.pending = null;
                 self.active_slot = job.slot;
-            } else self.requested = null;
+            } else if (request_value != null) self.requested = null;
             self.mutex.unlock(self.io);
             if (source) |job| {
                 const header = self.projector.project(job.key, self.storage.sources[job.slot][0..job.len]) catch |err| {
@@ -426,6 +474,12 @@ pub const Worker = struct {
                     continue;
                 };
                 self.storage.output = .{ .projected = header };
+                self.publish();
+            } else if (copy_selection) |selection| {
+                self.storage.output = .{ .copied = undefined };
+                self.projector.copySelection(selection, &self.storage.output.copied) catch |err| {
+                    self.storage.output = .{ .failure = .{ .key = selection.key, .reason = err, .copy = true } };
+                };
                 self.publish();
             } else if (request_value) |request_job| {
                 self.storage.output = .{ .tile = undefined };
@@ -478,11 +532,11 @@ test "real GFM projection pages retain styles code and distinct source identity"
     try projector.tile(key, 0, &tile);
     try std.testing.expectEqual(markdown.BlockKind.heading, tile.block.kind);
     try std.testing.expectEqualStrings("Heading\n", tile.bytes());
-    try projector.tile(key, tile.next_block.?, &tile);
+    try projector.page(key, tile.next.?, &tile);
     try std.testing.expectEqualStrings("bold and soft\n", tile.bytes());
     try std.testing.expect(tile.span_count >= 3);
     try std.testing.expect(tile.spans[0].flags & 2 != 0);
-    try projector.tile(key, tile.next_block.?, &tile);
+    try projector.page(key, tile.next.?, &tile);
     try std.testing.expectEqual(markdown.BlockKind.code, tile.block.kind);
     try std.testing.expectEqualStrings("zig", tile.language[0..tile.language_len]);
     try std.testing.expectEqualStrings("const x = 1;\n", tile.bytes());
@@ -689,7 +743,7 @@ test "large single code block pages exact bytes styles and distant cursors" {
     try std.testing.expectEqual(source.len - 11, compared);
     try projector.page(key, distant.?, &tile_value);
     try std.testing.expectEqual(distant.?.byte, tile_value.start_byte);
-    const previous = tile_value.previous.?;
+    const previous = (try projector.before(distant.?)).?;
     try std.testing.expect(previous.byte < distant.?.byte);
     try projector.page(key, previous, &tile_value);
     try std.testing.expectEqualSlices(u8, source[7 + previous.byte ..][0..tile_value.len], tile_value.bytes());
@@ -719,4 +773,51 @@ test "rich range pagination preserves dense formatting without a linear resident
         cursor = tile_value.next orelse break;
     }
     try std.testing.expectEqual(@as(usize, 4000), bytes);
+}
+
+test "backward ranges prove complete combining and ZWJ grapheme starts" {
+    var projector = try tempProjector();
+    defer projector.deinit();
+    const source = try std.testing.allocator.alloc(u8, 12012);
+    defer std.testing.allocator.free(source);
+    const key = Key{ .source = @splat(20), .revision = 1, .generation = 1 };
+    for ([_][]const u8{ "é", "👩‍💻" }) |cluster| {
+        @memcpy(source[0..7], "```zig\n");
+        @memset(source[7..12007], 'a');
+        @memcpy(source[7 + 4095 ..][0..cluster.len], cluster);
+        @memcpy(source[12007..], "\n```\n");
+        _ = try projector.project(key, source);
+        const before_cursor = (try projector.before(.{ .block = 0, .byte = 8192 })).?;
+        try std.testing.expectEqual(@as(u32, @intCast(4095 + cluster.len)), before_cursor.byte);
+        var tile_value: Tile = undefined;
+        try projector.page(key, before_cursor, &tile_value);
+        try std.testing.expectEqualSlices(u8, source[7 + before_cursor.byte ..][0..tile_value.len], tile_value.bytes());
+    }
+    @memcpy(source[0..7], "```zig\n");
+    source[7] = 'e';
+    for (0..5999) |index| @memcpy(source[8 + index * 2 ..][0..2], "\xcc\x81");
+    source[12006] = 'a';
+    @memcpy(source[12007..], "\n```\n");
+    _ = try projector.project(key, source);
+    try std.testing.expectError(error.DisplayBudget, projector.before(.{ .block = 0, .byte = 9001 }));
+}
+
+test "whole rendered selection spans pages exactly with explicit copy budget" {
+    var projector = try tempProjector();
+    defer projector.deinit();
+    const source = try std.testing.allocator.alloc(u8, 12012);
+    defer std.testing.allocator.free(source);
+    @memcpy(source[0..7], "```zig\n");
+    @memset(source[7..12007], 'a');
+    @memcpy(source[7 + 4090 ..][0.."é 👩‍💻".len], "é 👩‍💻");
+    @memcpy(source[12007..], "\n```\n");
+    const key = Key{ .source = @splat(21), .revision = 2, .generation = 1 };
+    _ = try projector.project(key, source);
+    var copied: Copy = undefined;
+    try projector.copySelection(.{ .key = key, .anchor = 4050, .caret = 4200 }, &copied);
+    try std.testing.expectEqualSlices(u8, source[7 + 4050 .. 7 + 4200], copied.bytes[0..copied.len]);
+    var stale = key;
+    stale.revision += 1;
+    try std.testing.expectError(error.StaleProjection, projector.copySelection(.{ .key = stale, .anchor = 4050, .caret = 4200 }, &copied));
+    try std.testing.expectError(error.InvalidCursor, projector.copySelection(.{ .key = key, .anchor = 0, .caret = 100000 }, &copied));
 }
