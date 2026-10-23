@@ -878,7 +878,7 @@ const Conversation = struct {
                     if (app.view.task_count == app.view.tasks.len) break;
                     const task = row.task;
                     const line = &app.view.tasks[app.view.task_count];
-                    const label = std.fmt.bufPrint(&line.bytes, "{s} | {s}/{s} | {s} | requests {d} | tokens {d} | {s}", .{
+                    const label = std.fmt.bufPrint(&line.bytes, "{s} | {s}/{s} | {s} | requests {d} | observed tokens {d} | {s}", .{
                         task.task.packet.purpose,
                         task.task.packet.selection.runtime_kind,
                         task.task.packet.selection.model_id,

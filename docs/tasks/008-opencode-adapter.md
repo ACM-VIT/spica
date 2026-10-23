@@ -1,7 +1,7 @@
 # 008: OpenCode v2 adapter
 
-Status: running — parallel adapter implementation authorized explicitly by user; live parity acceptance follows concrete Codex/conformance evidence.
-Owner: OpenCodeShip008 owns only OpenCode-specific adapter/protocol/fixture code and this task record; no shared Git mutation. CodexShip007 owns common transport/build and serialized checkpoints.
+Status: review — installed provider/factory/MCP/native/permission evidence is recorded; subscription and cross-runtime inference parity are not claimed.
+Owner: RuntimeFactoryLead.NativeBridgeConsumer completed the OpenCode provider/consumer continuation; RuntimeFactoryLead serialized shared integration. Astra reviews acceptance.
 Base: `301e8e35899f9c1aeb2005b220e72c55c9fa178f`, shared checkout. Own `src/runtime/opencode*`, OpenCode-specific fixture/smoke files and `docs/contracts/opencode.md`; do not edit common/domain/native files.
 Dependencies: reviewed automated fake/native milestone and pinned core contracts. Consume the adapter interface published by CodexShip007; report actual v2 capability differences, never assume parity or claim live acceptance before execution.
 
@@ -41,4 +41,11 @@ retained as durable `unknown` because stopped provider tools cannot be proven.
 Read-only reopen retained that exact run and previous completed content. The
 reopen used a newer explicitly identified binary, not a same-binary claim.
 Screenshots/raw inputs/manifests: `consumer/desktop-1/` under the evidence root.
-Live permission interaction remains a separate evidence gate.
+Actual repaired native permissions also exercised F7 allow (exact file and
+completed tool/run) and F8 deny (failed tool, absent denied file). Denial retained
+`unknown` after upstream cancellation without all-tools-stopped proof. The
+strict runner's completed-after-deny exit1 is preserved; actual callback/file
+assertions are in `consumer/permissions-4/approval-receipt.json`. The discovered
+post-approval digest bug is repaired in `221412e`, including interleaved tool
+authority tests (17/17 Debug/ReleaseSafe). Final complete integration gate passed
+141/143 Zig tests per mode (2 skipped), native builds and CLI/Python checks.

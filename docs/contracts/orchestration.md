@@ -20,4 +20,6 @@ An approval with no provider expiry remains explicitly session-bound, not immort
 
 Workspace registration captures real canonical filesystem identity plus Git common directory, checkout directory, branch and base revision. Dispatch rechecks the recorded binding before open/start/message so a changed checkout cannot silently receive work. Task packets require finite request/time/token budgets, explicit owned paths, acceptance and result location. The app owns task lifetimes rather than replaceable presentation/configuration.
 
+Token budgets apply only to cumulative usage counters actually observed from the adapter. Current native Codex/OpenCode adapters do not provide usage observations; the view's “observed tokens 0” is not proof of zero consumption or zero billing. Finite request and elapsed-time limits still apply independently. Missing upstream usage is never synthesized into charge accounting.
+
 Tests and installed-provider receipts establish only their recorded scenarios. No live Codex parent-child claim is justified without isolated ChatGPT authentication; installation, discovery or a handshake alone is not orchestration evidence.

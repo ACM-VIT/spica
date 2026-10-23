@@ -1,7 +1,7 @@
 # 012: App-owned coordinator/worker execution
 
-Status: running — user explicitly requested production orchestration alongside Codex/OpenCode after the reviewed automated fake/native milestone.
-Owner: OrchestratorShip012 owns domain/runtime orchestration, shared adapter vocabulary and native task presentation; CodexShip007 owns transport/build and serialized shared integration.
+Status: review — durable task registry, authenticated bridges, workspace ownership and native task presentation are implemented and checked; live Codex inference awaits user authentication.
+Owner: RuntimeFactoryLead.DomainRegistryFinish completed private domain/native-task checkpoints; RuntimeFactoryLead integrated shared source. Astra retains final acceptance.
 Base: `301e8e35899f9c1aeb2005b220e72c55c9fa178f`. Own `src/domain.zig`, `src/domain/*`, `src/contract.zig`, new `src/orchestration*`, `src/app.zig`, `src/ui/coding.zig`, native task-tree modules, this task record and orchestration contracts.
 Dependencies: implement the minimum real background-run and workspace-identity prerequisites from roadmap009/011 within this lane before live orchestration acceptance. Fake-only durability first, Codex-only next, mixed Codex/OpenCode after both concrete adapters; no unsupported delegation claims.
 
@@ -44,3 +44,10 @@ Raw checks/screenshots/ownership receipt:
 `.artifacts/worktrees/012-orchestration/.artifacts/orchestration012/domain-finish.txt`.
 Authenticated Codex inference and mixed live Codex/OpenCode delegation still
 require the user's supported isolated ChatGPT sign-in/entitlement.
+
+Final producer head `58fe1a1` labels totals as observed tokens, not actual zero
+usage/billing. Both concrete native adapters currently report no usage counters;
+request and elapsed-time bounds remain independently enforced. The final
+assembled Debug/ReleaseSafe gate passed (141/143 Zig tests, 2 skipped, per mode).
+Producer work and desktop sessions are stopped; no shared Git ownership was
+delegated to the producer.

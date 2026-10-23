@@ -35,6 +35,21 @@ the bounded storage. Regression tests cover allow/deny, interleaving, terminal
 result closure, action drift and exhaustion/reset. No Host resolved-approval
 immutability rule is relaxed.
 
+Actual native permission cohort 4 exercised this repaired path with harmless
+`printf` actions in a disposable workspace: real F7 allowed the exact selected
+command, the file contained `SPICA_PERMISSION_ALLOW`, and the tool/run completed.
+Real F8 resolved the second request to denial; the tool reported “The user
+declined this tool call” and the denied file was absent. Its upstream cancelled
+stop remains durable `unknown` because ACP does not prove all tools stopped;
+this is not a fabricated completed or proven-cancelled run. The automation
+captured actual approval snapshots before sending real key input; screenshots
+were inspected afterward, not by a human before the decision. The runner's
+strict completed-after-deny assertion exited 1; `permissions-4/approval-receipt.json`
+records the actual successful allow/deny dispositions and that limitation.
+Earlier failed cohorts remain preserved. Raw rows, exact environment/binary,
+side-effect assertions and screenshots live under
+`.artifacts/provider-factory/consumer/permissions-4/`.
+
 OpenCode accepts stdio or HTTP `mcpServers` in `session/new` and `session/resume`. `Config.mcp_servers` accepts the serialized ACP array from the actual application MCP owner. This is NOT an ACP tool-call response channel: OpenCode does not support MCP-over-ACP. HTTP registration forwards explicit headers; integration policies still apply. MCP servers are scoped to the private process but shared by sessions in the same workspace directory. Registering a URL or command alone does not prove the app tool bridge: `coordinator_bridge` stays unsupported until the application implements and exercises an actual MCP endpoint and durable host-tool claims. No mock delegation bridge or fictional cross-runtime parity is provided.
 
 `src/runtime/opencode_bridge.zig.serialize(allocator, common.Bridge)` returns an

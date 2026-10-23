@@ -4,6 +4,7 @@ test {
     _ = @import("runtime/codex_test.zig");
     _ = @import("provider_factory_test.zig");
     _ = @import("opencode_bridge_test.zig");
+    _ = @import("opencode_test.zig");
     _ = @import("runtime/fake_test.zig");
     _ = @import("domain.zig");
     _ = @import("script_test.zig");

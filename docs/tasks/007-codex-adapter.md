@@ -1,7 +1,7 @@
 # 007: Codex with ChatGPT sign-in
 
-Status: running — user explicitly requested production Codex, OpenCode and orchestration in parallel after the reviewed automated fake/native milestone.
-Owner: CodexShip007 owns Codex, common transport/adapter plumbing and build/startup integration; sole shared Git owner for explicitly assigned checkpoint paths. Astra retains contract decisions and final acceptance.
+Status: review — production factory/startup/protocol bridge slice is integrated and checked; isolated Codex authentication remains a user prerequisite for inference acceptance.
+Owner: RuntimeFactoryLead recovered common/provider/native integration and serialized shared checkpoints. Astra retains contract decisions and final acceptance.
 Base: `301e8e35899f9c1aeb2005b220e72c55c9fa178f`, shared checkout. Own `src/runtime/codex*`, `src/runtime/transport*`, `src/runtime/adapter.zig`, existing `src/platform/process*`, `build.zig`, `src/test.zig`, `src/main.zig`, `src/options.zig`, this task record and Codex-specific contract/fixture files.
 Dependencies: automated milestone004–006 reviewed; human feedback and live account entitlement remain distinct gates, not blockers to implementation. Publish common adapter interface directly to OpenCodeShip008 and OrchestratorShip012 before callers depend on it.
 
@@ -125,7 +125,7 @@ native CLI smoke passed. ReleaseSafe initially exposed the MCP fortified-header
 C-import failure; the owner replaced the unnecessary header with `std.c.fcntl`
 without disabling fortify (`4dabfc3`). The affected ReleaseSafe native build,
 same 124/126 Zig tests, Python tests and CLI smoke then all exited 0. Raw gate
-and repair provenance: `.artifacts/provider-factory/final-check.log`,
+and repair provenance: `.artifacts/provider-factory/final-check-initial.log`,
 `final-check-failure.json`, `release-check.log`, `release-check.json`.
 
 Final allocation coverage also injects every allocator failure through successful
@@ -133,3 +133,12 @@ owned process spawn and subsequent runtime initialization, rather than stopping
 at missing-executable failure. Both concrete factories clean partial transport/
 runtime allocations and process ownership. Focused factory consumer: 9/9 passed
 with the leak-aware allocator; no real provider inference in this fixture.
+
+Final repaired milestone `./tools/check` exited 0 after integrating ACP
+regressions into the permanent test entrypoint: formatting 89 sources, native
+Debug/ReleaseSafe builds, **141/143 Zig tests (2 skipped) per mode**, Python
+35 tests (2 skipped) per mode, and CLI smoke. `final-check.log/json` plus
+`final-check-candidate.json` identify the committed base and focused delta.
+Producer receipts and final evidence manifest are under
+`.artifacts/provider-factory/`; both workers finished and cleaned owned jobs/
+desktops. Final acceptance remains Astra's source/evidence review.
