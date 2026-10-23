@@ -12,6 +12,15 @@ Protocol frames are limited to 64 KiB, separately from durable observations (409
 
 Tool result pieces use ordinary chunk observations with correlation.tool/upstream_tool and chunk.block equal to the upstream toolCallId, offsets beginning at zero. The Host maps these to one durable tool_result block. After the complete canonical ACP content is emitted, exactly one empty-result tool_completed observation closes that same block; it must not create a duplicate result block or truncate the content. Retained session metadata is bounded to 32 KiB and turn/permission metadata to 16 KiB. Transport supplies bounded JSONL queues. Each poll emits at most one piece or processes one upstream frame. Shutdown is idempotent and owns only the spawned provider process tree.
 
+A transport pump error is terminal protocol evidence even when the process has
+not yet been reaped. The adapter retains and returns the original error, marks
+readiness terminal, and performs no subsequent transport IO. Standalone callers
+that poll receive one correlated disconnect with unknown continuity after any
+already-decoded text pieces; no completion or proven process exit is invented.
+The Host instead handles the thrown pump error itself, durably rejects a pending
+open or marks an active operation ambiguous, then shuts down and destroys its
+factory instance without polling a duplicate diagnostic.
+
 ## Permissions and real bridge semantics
 
 `session/request_permission` carries JSON-RPC request ID, session, tool call and offered options. The adapter hashes the complete request, binds approval to session/run/tool/digest, uses only the actual offered `allow_once`/`reject_once` option IDs, rejects stale/duplicate responses, and never selects `allow_always`. Scope comes from the upstream title; no upstream expiry is invented. The domain's fail-closed handling of absent expiry remains applicable.
@@ -44,6 +53,27 @@ installed OpenCode callback through the actual Host endpoint, durable delegated
 task result and live permission roundtrip remains an integration evidence gap
 until that endpoint/factory consumer is available. Existing free-provider
 inference evidence is not rerun or relabeled as bridge evidence.
+
+`src/opencode_smoke_host.zig` is the actual NativeFactory consumer, not the old
+singleton-adapter seam. It creates isolated project/workspace/thread state, asks
+installed OpenCode to call the application's MCP `task.delegate`, and reads the
+real child through public task/content queries. After completion it records an
+explicit public `task_result` using the observed child text (structured results
+are not automatically synthesized from provider prose), then verifies one exact
+task/result after Host shutdown and read-only reopen. Its executable arguments
+are `OPENCODE_EXECUTABLE WORKSPACE ACCOUNT_DIRECTORY STATE_DIRECTORY`.
+
+`src/opencode_factory_smoke.zig` independently exercises two actual per-session
+factory processes and buffers with the same explicit account/selection. It
+initializes the parent before starting the second process, as the Host does,
+cancels and destroys the first, then requires actual completion from the second.
+It also opens `/bin/false` through the factory and checks terminal rejection and
+allocator-clean shutdown/destroy. This does not establish simultaneous cold
+account initialization support: that cohort produced startup failures, retained
+in `.artifacts/provider-factory/consumer/factory-run-2.log` and `factory-run-3.log`.
+The account-bootstrap cause is unproven; no production retry or hidden
+serialization is added. Exact consumer commands and isolated environments are
+recorded in that evidence directory's per-attempt manifests.
 
 ## Supported authentication and evidence
 

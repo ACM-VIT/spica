@@ -93,3 +93,11 @@ precreated singleton, including the ordinary conversation path. `zig build
 -Doptimize=Debug` passed on the assembled seam. Explicit native provider flags
 and isolated Codex auth handling are preserved; actual mixed runtime account
 configuration and provider/desktop consumer evidence remain distinct work.
+
+Mixed startup now accepts one explicitly authorized additional native runtime
+and separate canonical managed account. The bounded factory routes by exact
+runtime/version/model-provider/account identity; child model and effort remain
+explicit and are retained unchanged for handshake verification. Native options
+6/6, mixed factory/lifetime tests 8/8, and the Debug native build passed.
+OpenCode's pinned installed home override and explicit config directory are
+set separately from Codex's managed home; neither authorizes another tool's auth.

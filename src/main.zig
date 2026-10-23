@@ -16,6 +16,7 @@ const NativeProvider = struct {
     selection: ?contract.Selection = null,
     workspace_root: ?[]const u8 = null,
     factory: ?NativeFactory = null,
+    configs: [2]NativeFactory.Config = undefined,
 
     fn init(self: *NativeProvider, a: std.mem.Allocator, io: std.Io, options: options_module.Options) !void {
         if (options.provider == .fake) return;
@@ -23,20 +24,39 @@ const NativeProvider = struct {
         defer workspace_dir.close(io);
         const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, options.workspace.?, a);
         self.workspace_root = workspace;
-        // Independent runtime-owned state only; never inherit credentials or history.
-        try std.Io.Dir.cwd().createDirPath(io, options.runtime_account_directory.?);
-        const account = try std.Io.Dir.cwd().realPathFileAlloc(io, options.runtime_account_directory.?, a);
-        if (std.mem.eql(u8, workspace, account)) return error.AccountDirectoryIsWorkspace;
-        self.selection = .{ .runtime_kind = @tagName(options.provider), .required_runtime_version = if (options.provider == .codex) "0.163.0" else "2.1.4", .model_provider = options.model_provider.?, .model_id = options.model.?, .effort = options.effort.?, .account_ref = account, .workspace = .{ .value = workspace } };
-        const environment = try a.alloc([:0]const u8, 6);
+        self.configs[0] = try accountConfig(a, io, .{ .runtime_kind = @tagName(options.provider), .required_runtime_version = if (options.provider == .codex) "0.163.0" else "2.1.4", .model_provider = options.model_provider.?, .model_id = options.model.?, .effort = options.effort.?, .account_ref = options.runtime_account_directory.?, .workspace = .{ .value = workspace } }, options.runtime_executable);
+        self.selection = self.configs[0].selection;
+        var count: usize = 1;
+        if (options.additional_provider) |kind| {
+            self.configs[1] = try accountConfig(a, io, .{ .runtime_kind = @tagName(kind), .required_runtime_version = if (kind == .codex) "0.163.0" else "2.1.4", .model_provider = options.additional_model_provider.?, .model_id = "", .effort = "", .account_ref = options.additional_runtime_account_directory.?, .workspace = .{ .value = workspace } }, options.additional_runtime_executable);
+            if (std.mem.eql(u8, self.configs[0].selection.account_ref, self.configs[1].selection.account_ref)) return error.SeparateRuntimeAccountsRequired;
+            count = 2;
+        }
+        self.factory = .{ .configs = self.configs[0..count] };
+    }
+    fn accountConfig(a: std.mem.Allocator, io: std.Io, input: contract.Selection, executable_override: ?[]const u8) !NativeFactory.Config {
+        // Only the selected tool's explicit managed state, never another tool's auth.
+        try std.Io.Dir.cwd().createDirPath(io, input.account_ref);
+        const account = try std.Io.Dir.cwd().realPathFileAlloc(io, input.account_ref, a);
+        if (std.mem.eql(u8, input.workspace.value, account)) return error.AccountDirectoryIsWorkspace;
+        var selected = input;
+        selected.account_ref = account;
+        const codex = std.mem.eql(u8, input.runtime_kind, "codex");
+        const environment = try a.alloc([:0]const u8, if (codex) 7 else 9);
         environment[0] = try std.fmt.allocPrintSentinel(a, "HOME={s}", .{account}, 0);
-        environment[1] = try std.fmt.allocPrintSentinel(a, "CODEX_HOME={s}", .{account}, 0);
-        environment[2] = try std.fmt.allocPrintSentinel(a, "XDG_DATA_HOME={s}/data", .{account}, 0);
-        environment[3] = try std.fmt.allocPrintSentinel(a, "XDG_CONFIG_HOME={s}/config", .{account}, 0);
-        environment[4] = try std.fmt.allocPrintSentinel(a, "XDG_CACHE_HOME={s}/cache", .{account}, 0);
-        environment[5] = "PATH=/usr/bin:/bin";
-        const executable = try a.dupeZ(u8, options.runtime_executable orelse if (options.provider == .codex) "/usr/bin/codex" else "/usr/bin/opencode");
-        self.factory = .{ .selection = self.selection.?, .executable = executable, .environment = environment };
+        environment[1] = try std.fmt.allocPrintSentinel(a, "XDG_DATA_HOME={s}/data", .{account}, 0);
+        environment[2] = try std.fmt.allocPrintSentinel(a, "XDG_CONFIG_HOME={s}/config", .{account}, 0);
+        environment[3] = try std.fmt.allocPrintSentinel(a, "XDG_CACHE_HOME={s}/cache", .{account}, 0);
+        environment[4] = try std.fmt.allocPrintSentinel(a, "XDG_STATE_HOME={s}/state", .{account}, 0);
+        environment[5] = if (codex) try std.fmt.allocPrintSentinel(a, "CODEX_HOME={s}", .{account}, 0) else try std.fmt.allocPrintSentinel(a, "OPENCODE_CONFIG_DIR={s}/config/opencode", .{account}, 0);
+        environment[6] = "PATH=/usr/bin:/bin";
+        if (!codex) {
+            // Pinned OpenCode 2.1.4 resolves its global home through this explicit
+            // override, not HOME. Keep discovery inside the authorized account.
+            environment[7] = try std.fmt.allocPrintSentinel(a, "OPENCODE_TEST_HOME={s}", .{account}, 0);
+            environment[8] = "OPENCODE_DISABLE_CLAUDE_CODE=1";
+        }
+        return .{ .selection = selected, .executable = try a.dupeZ(u8, executable_override orelse if (codex) "/usr/bin/codex" else "/usr/bin/opencode"), .environment = environment };
     }
     fn authenticate(self: *NativeProvider, a: std.mem.Allocator, io: std.Io, mode: @FieldType(options_module.Options, "codex_auth")) !void {
         const factory = if (self.factory) |*value| value.asFactory() else return error.CodexAuthRequiresCodex;

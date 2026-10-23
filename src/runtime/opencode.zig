@@ -58,6 +58,8 @@ pub fn RuntimeFor(comptime Transport: type) type {
         effective: bool = false,
         cancel_requested: bool = false,
         shutdown_done: bool = false,
+        transport_failure: ?anyerror = null,
+        transport_failure_emitted: bool = false,
         // One decoded upstream payload. Poll drains it before reading another
         // transport frame; no unbounded queue or allocation per retained piece.
         pending_bytes: [65536]u8 = undefined,
@@ -235,7 +237,16 @@ pub fn RuntimeFor(comptime Transport: type) type {
             return try clone(allocator, c.Receipt{ .outcome = .acknowledged });
         }
         pub fn pump(self: *Self) !void {
-            try self.transport.pump();
+            if (self.shutdown_done) return;
+            if (self.transport_failure) |err| return err;
+            self.transport.pump() catch |err| {
+                // A write failure can precede reap; transport.exited is not an
+                // authoritative signal in that path. Retain the original error
+                // and terminate protocol use without inventing process exit.
+                self.transport_failure = err;
+                self.phase = .failed;
+                return err;
+            };
         }
         fn observation(self: *Self, allocator: std.mem.Allocator, event: []const u8, body: @FieldType(c.Observation, "body")) !c.Observation {
             self.sequence += 1;
@@ -307,6 +318,12 @@ pub fn RuntimeFor(comptime Transport: type) type {
         /// One frame per poll, preserving order and bounding per-call work.
         pub fn poll(self: *Self, allocator: std.mem.Allocator) !?c.Observation {
             if (try self.drainPending(allocator)) |result| return result;
+            if (self.transport_failure) |err| {
+                if (self.transport_failure_emitted) return null;
+                const result = try self.observation(allocator, "transport/error", .{ .disconnect = .{ .reason = @errorName(err), .continuity = .unknown } });
+                self.transport_failure_emitted = true;
+                return result;
+            }
             const bytes = (try self.transport.poll(self.allocator)) orelse {
                 if (self.transport.exited and self.phase != .stopped) {
                     self.phase = .stopped;

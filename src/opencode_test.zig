@@ -6,11 +6,16 @@ const Mock = struct {
     len: usize = 0,
     exited: bool = false,
     polls: usize = 0,
+    pump_error: bool = false,
+    pumps: usize = 0,
     pub fn send(self: *Mock, bytes: []const u8) !void {
         @memcpy(self.sent[0..bytes.len], bytes);
         self.len = bytes.len;
     }
-    pub fn pump(_: *Mock) !void {}
+    pub fn pump(self: *Mock) !void {
+        self.pumps += 1;
+        if (self.pump_error) return error.TransportWrite;
+    }
     pub fn poll(self: *Mock, _: std.mem.Allocator) !?[]const u8 {
         self.polls += 1;
         return null;
@@ -262,4 +267,48 @@ test "ACP initialization error and version mismatch end readiness wait" {
         try std.testing.expect(runtime.asAdapter().ready());
         try std.testing.expectError(error.NotReady, runtime.dispatch(arena.allocator(), .{ .open = .{ .create = .{ .session = correlation.session, .effect = correlation.effect.?, .selection = selection } } }));
     }
+}
+
+test "ACP pump error ends initialization and emits one disconnect before reap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var runtime: Runtime = undefined;
+    try runtime.init(std.testing.allocator, .{ .pump_error = true }, .{ .selection = selection, .cwd = "/tmp/spica", .instance = .{ .value = "failed-init" }, .account = .{ .reference = "isolated", .readiness = .unknown } });
+    defer runtime.shutdown();
+    const adapter = runtime.asAdapter();
+    try std.testing.expect(!adapter.ready());
+    try std.testing.expectError(error.TransportWrite, adapter.pump());
+    try std.testing.expect(adapter.ready());
+    try std.testing.expect(!runtime.transport.exited);
+    const event = (try adapter.poll(a)).?;
+    try std.testing.expect(event.body == .disconnect);
+    try std.testing.expectEqualStrings("TransportWrite", event.body.disconnect.reason);
+    try std.testing.expect(event.body.disconnect.continuity == .unknown);
+    try std.testing.expectError(error.NotReady, adapter.dispatch(a, .{ .open = .{ .create = .{ .session = correlation.session, .effect = correlation.effect.?, .selection = selection } } }));
+    try std.testing.expectError(error.TransportWrite, adapter.pump());
+    try std.testing.expectEqual(@as(usize, 1), runtime.transport.pumps);
+    try std.testing.expect((try adapter.poll(a)) == null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.transport.polls);
+}
+
+test "ACP pump error during a turn preserves run correlation and drains accepted text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var runtime: Runtime = undefined;
+    try prompting(&runtime, a);
+    defer runtime.shutdown();
+    const source = "x" ** 4096;
+    _ = try textFrame(&runtime, a, source);
+    runtime.transport.pump_error = true;
+    try std.testing.expectError(error.TransportWrite, runtime.pump());
+    const piece = (try runtime.poll(a)).?;
+    try std.testing.expect(piece.body == .chunk);
+    try std.testing.expectEqual(@as(u64, 2048), piece.body.chunk.offset);
+    const event = (try runtime.poll(a)).?;
+    try std.testing.expect(event.body == .disconnect);
+    try std.testing.expect(c.equal(correlation, event.correlation));
+    try std.testing.expect((try runtime.poll(a)) == null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.transport.polls);
 }

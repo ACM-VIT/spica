@@ -17,6 +17,10 @@ pub const Options = struct {
     workspace: ?[]const u8 = null,
     codex_auth: enum { none, status, browser, device } = .none,
     runtime_executable: ?[]const u8 = null,
+    additional_provider: ?enum { codex, opencode } = null,
+    additional_runtime_account_directory: ?[]const u8 = null,
+    additional_model_provider: ?[]const u8 = null,
+    additional_runtime_executable: ?[]const u8 = null,
 
     pub fn parse(args: []const [:0]const u8) !Options {
         var options: Options = .{};
@@ -29,6 +33,17 @@ pub const Options = struct {
                 index += 1;
                 if (index == args.len) return error.MissingOptionValue;
                 options.provider = std.meta.stringToEnum(@TypeOf(options.provider), args[index]) orelse return error.InvalidProvider;
+            } else if (std.mem.eql(u8, flag, "--additional-provider")) {
+                index += 1;
+                if (index == args.len) return error.MissingOptionValue;
+                if (options.additional_provider != null) return error.DuplicateAdditionalProvider;
+                options.additional_provider = std.meta.stringToEnum(@typeInfo(@FieldType(Options, "additional_provider")).optional.child, args[index]) orelse return error.InvalidProvider;
+            } else if (std.mem.eql(u8, flag, "--additional-runtime-account-directory") or std.mem.eql(u8, flag, "--additional-model-provider") or std.mem.eql(u8, flag, "--additional-runtime-executable")) {
+                index += 1;
+                if (index == args.len or args[index].len == 0) return error.MissingOptionValue;
+                if (std.mem.eql(u8, flag, "--additional-runtime-account-directory")) options.additional_runtime_account_directory = args[index]
+                else if (std.mem.eql(u8, flag, "--additional-model-provider")) options.additional_model_provider = args[index]
+                else options.additional_runtime_executable = args[index];
             } else if (std.mem.eql(u8, flag, "--runtime-executable")) {
                 index += 1;
                 if (index == args.len or !std.fs.path.isAbsolute(args[index])) return error.AbsoluteRuntimeExecutableRequired;
@@ -73,6 +88,15 @@ pub const Options = struct {
             if (options.runtime_account_directory == null or options.model == null or options.model_provider == null or options.effort == null or options.workspace == null) return error.ExplicitRuntimeSelectionRequired;
             if (!std.fs.path.isAbsolute(options.runtime_account_directory.?) or !std.fs.path.isAbsolute(options.workspace.?)) return error.AbsoluteRuntimePathsRequired;
         }
+        if (!options.help) {
+            if (options.additional_provider) |provider| {
+                if (options.provider == .fake or std.mem.eql(u8, @tagName(provider), @tagName(options.provider))) return error.DistinctNativeProvidersRequired;
+                if (options.additional_runtime_account_directory == null or options.additional_model_provider == null) return error.ExplicitAdditionalAccountRequired;
+                if (!std.fs.path.isAbsolute(options.additional_runtime_account_directory.?)) return error.AbsoluteRuntimePathsRequired;
+                if (std.mem.eql(u8, options.runtime_account_directory.?, options.additional_runtime_account_directory.?)) return error.SeparateRuntimeAccountsRequired;
+            } else if (options.additional_runtime_account_directory != null or options.additional_model_provider != null or options.additional_runtime_executable != null) return error.AdditionalProviderRequired;
+            if (options.additional_runtime_executable) |path| if (!std.fs.path.isAbsolute(path)) return error.AbsoluteRuntimeExecutableRequired;
+        }
         return options;
     }
 };
@@ -113,6 +137,10 @@ pub const help =
     \\--codex-auth status|browser|device queries/initiates supported isolated ChatGPT sign-in,
     \\prints the actual runtime response, then exits without opening the native UI.
     \\--runtime-executable PATH overrides /usr/bin/codex or /usr/bin/opencode.
+    \\--additional-provider codex|opencode authorizes the other runtime for children.
+    \\It requires --additional-runtime-account-directory PATH --additional-model-provider ID;
+    \\--additional-runtime-executable PATH optionally selects its absolute executable.
+    \\Runtime account directories must differ; child model/effort remain explicit in task packets.
     \\Escape dismisses local editing state. Ctrl+Q or window close exits.
     \\--quit-after-ms exits after a bounded smoke run (0 exits immediately).
     \\--automation-output PATH exports the read-only final native snapshot.
@@ -152,4 +180,17 @@ test "real runtime selection is explicit and account paths are absolute" {
     try std.testing.expectError(error.InvalidProvider, Options.parse(&.{ "spica", "--provider", "other" }));
     const options = try Options.parse(&.{ "spica", "--provider", "codex", "--runtime-account-directory", "/tmp/account", "--workspace", "/tmp/project", "--model-provider", "openai", "--model", "gpt-6.1-sol", "--effort", "medium" });
     try std.testing.expectEqual(.codex, options.provider);
+}
+
+test "mixed runtime authorization requires distinct explicit account and provider" {
+    const primary = [_][:0]const u8{ "spica", "--provider", "codex", "--runtime-account-directory", "/tmp/codex-account", "--workspace", "/tmp/project", "--model-provider", "openai", "--model", "coordinator-model", "--effort", "medium" };
+    const mixed = try Options.parse(&(primary ++ .{ "--additional-provider", "opencode", "--additional-runtime-account-directory", "/tmp/opencode-account", "--additional-model-provider", "opencode" }));
+    try std.testing.expectEqual(.opencode, mixed.additional_provider.?);
+    try std.testing.expectEqualStrings("coordinator-model", mixed.model.?);
+    try std.testing.expectError(error.ExplicitAdditionalAccountRequired, Options.parse(&(primary ++ .{ "--additional-provider", "opencode" })));
+    try std.testing.expectError(error.DistinctNativeProvidersRequired, Options.parse(&(primary ++ .{ "--additional-provider", "codex" })));
+    try std.testing.expectError(error.SeparateRuntimeAccountsRequired, Options.parse(&(primary ++ .{ "--additional-provider", "opencode", "--additional-runtime-account-directory", "/tmp/codex-account", "--additional-model-provider", "opencode" })));
+    try std.testing.expectError(error.AdditionalProviderRequired, Options.parse(&(primary ++ .{ "--additional-runtime-account-directory", "/tmp/other" })));
+    try std.testing.expectError(error.DuplicateAdditionalProvider, Options.parse(&(primary ++ .{ "--additional-provider", "opencode", "--additional-provider", "opencode" })));
+    try std.testing.expectError(error.AbsoluteRuntimeExecutableRequired, Options.parse(&(primary ++ .{ "--additional-provider", "opencode", "--additional-runtime-account-directory", "/tmp/opencode-account", "--additional-model-provider", "opencode", "--additional-runtime-executable", "relative" })));
 }

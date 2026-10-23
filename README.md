@@ -58,4 +58,35 @@ The selected protected Lua 5.4.9 runtime exposes bounded root/renderer descripto
 
 ## Recovery
 
+Branch: `rewrite/native-agent-workspacei --model gpt-6.1-sol --effort medium \
+  --workspace /tmp/spica-disposable-project --codex-auth device
+```
+
+`browser` selects supported browser sign-in; `status` queries that isolated
+account. Initiation prints the runtime's actual URL/code and waits up to two
+minutes. A ready account and entitlement to the explicit model are prerequisites,
+not inferred from installed software. The pinned OpenCode version needs explicit
+`OPENCODE_CONFIG_DIR` and its installed home override `OPENCODE_TEST_HOME` to keep
+global discovery within the selected account; native startup supplies both and
+disables Claude configuration discovery. This is not a filesystem sandbox.
+Cold concurrent OpenCode account bootstrap can fail on upstream SQLite locking;
+failures remain visible rather than retrying external work.
+
+
+For a clean machine, run `python3 build/bootstrap.py` first. Dependencies are pinned in deps.lock.json; see [CONTRIBUTING.md](CONTRIBUTING.md).
+Both check commands use local dependencies only; the core target needs the locked
+libunibreak, not SDL/fonts/a display. Linux CI bootstraps the locked sources before
+running the same default check. Host prerequisites are documented, not vendored;
+the build is not claimed to be hermetic.
+
+## What to build next
+
+[ROADMAP.md](docs/ROADMAP.md) is the ordered backlog. The durable conversation, protected custom-root bridge, native provider factories and bounded orchestration are implemented in the current shipping loop. Task records distinguish compiled/protocol/consumer evidence from live authenticated provider and human acceptance; absent Codex sign-in or model entitlement is not a successful mixed inference run.
+
+The selected protected Lua 5.4.9 runtime exposes bounded root/renderer descriptors and explicit action proposals; native code owns actual public command admission. Users can replace the composition without owning durable work. Built-in boards and alternate workspace presets are not deliverables. See [the scripting contract](docs/contracts/scripting.md), [ARCHITECTURE.md](docs/ARCHITECTURE.md) and [provider/orchestration design](docs/PROVIDERS_AND_ORCHESTRATION.md).
+
+[Task records](docs/tasks/README.md) retain decisions, ownership, attempts and evidence between sessions. [EVALUATION.md](docs/EVALUATION.md) defines verification and human checkpoints.
+
+## Recovery
+
 Branch: `rewrite/native-agent-workspace`. The original tree is preserved at `backup/pre-native-rewrite-20261023-df45702` (base `df457029`). Inspect old code with `git show backup/pre-native-rewrite-20261023-df45702:path/to/file`; do not switch or restore while workers are running. No remote branches or existing user data are changed by this setup.

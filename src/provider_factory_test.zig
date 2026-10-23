@@ -5,7 +5,7 @@ const fixture = "src/runtime/factory_process_fixture.sh";
 const selection: c.Selection = .{ .runtime_kind = "codex", .required_runtime_version = "0.163.0", .model_provider = "openai", .model_id = "test-model", .effort = "medium", .account_ref = "/tmp/spica-test-account", .workspace = .{ .value = "opaque-workspace" } };
 
 test "factory metadata is side effect free and exact" {
-    var config: native.NativeFactory = .{ .selection = selection, .executable = "/does/not/exist", .environment = &.{} };
+    var config: native.NativeFactory = .{ .configs = &.{.{ .selection = selection, .executable = "/does/not/exist", .environment = &.{} }} };
     const factory = config.asFactory();
     try std.testing.expectEqual(.unknown, factory.accountStatus(selection).readiness);
     try std.testing.expectEqual(.unknown, factory.resolveSelection(selection).readiness);
@@ -28,7 +28,7 @@ fn independentSessions(comptime kind: enum { codex, opencode }) !void {
     var chosen = selection;
     chosen.runtime_kind = @tagName(kind);
     chosen.required_runtime_version = if (kind == .codex) "0.163.0" else "2.1.4";
-    var config: native.NativeFactory = .{ .selection = chosen, .executable = terminated, .environment = &.{} };
+    var config: native.NativeFactory = .{ .configs = &.{.{ .selection = chosen, .executable = terminated, .environment = &.{} }} };
     const factory = config.asFactory();
     const first = try factory.create(std.testing.allocator, chosen, "/tmp", .{ .value = "first" }, null);
     defer factory.destroy(std.testing.allocator, first);
@@ -74,7 +74,7 @@ fn failedCreation(a: std.mem.Allocator) !void {
         var chosen = selection;
         chosen.runtime_kind = kind;
         chosen.required_runtime_version = if (std.mem.eql(u8, kind, "codex")) "0.163.0" else "2.1.4";
-        var config: native.NativeFactory = .{ .selection = chosen, .executable = "/does/not/exist", .environment = &.{} };
+        var config: native.NativeFactory = .{ .configs = &.{.{ .selection = chosen, .executable = "/does/not/exist", .environment = &.{} }} };
         const factory = config.asFactory();
         const adapter = factory.create(a, chosen, "/tmp", .{ .value = "allocation-failure" }, .{ .url = "http://127.0.0.1/mcp/session", .token = "isolated-fixture" }) catch |err| {
             if (err == error.SpawnFailed) continue;
@@ -88,4 +88,61 @@ fn failedCreation(a: std.mem.Allocator) !void {
 
 test "factory cleans every partial allocation failure for both providers" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, failedCreation, .{});
+}
+
+test "mixed factory authorizes runtime account provider and retains explicit child model effort" {
+    var secondary = selection;
+    secondary.runtime_kind = "opencode";
+    secondary.required_runtime_version = "2.1.4";
+    secondary.model_provider = "opencode";
+    secondary.account_ref = "/tmp/separate-opencode-account";
+    var config: native.NativeFactory = .{ .configs = &.{
+        .{ .selection = selection, .executable = "/does/not/exist", .environment = &.{} },
+        .{ .selection = secondary, .executable = "/does/not/exist", .environment = &.{} },
+    } };
+    const factory = config.asFactory();
+    var child = secondary;
+    child.model_id = "explicit-child-model";
+    child.effort = "low";
+    child.workspace.value = "child-workspace";
+    try std.testing.expectEqual(.unknown, factory.resolveSelection(child).readiness);
+    try std.testing.expectEqualStrings("explicit-child-model", factory.resolveSelection(child).requested.model_id);
+    try std.testing.expectEqualStrings("low", factory.resolveSelection(child).requested.effort);
+    try std.testing.expectError(error.SpawnFailed, factory.create(std.testing.allocator, child, "/tmp", .{ .value = "mixed-child" }, null));
+    child.account_ref = selection.account_ref;
+    try std.testing.expectEqual(.unavailable, factory.resolveSelection(child).readiness);
+    child = secondary;
+    child.model_provider = "unauthorized-provider";
+    try std.testing.expectEqual(.unavailable, factory.resolveSelection(child).readiness);
+    child = secondary;
+    child.model_id = "";
+    try std.testing.expectEqual(.unavailable, factory.resolveSelection(child).readiness);
+    child = secondary;
+    child.account_ref = "";
+    try std.testing.expectEqual(.unavailable, factory.resolveSelection(child).readiness);
+    child = secondary;
+    child.runtime_kind = "unconfigured";
+    try std.testing.expectEqual(.unavailable, factory.resolveSelection(child).readiness);
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    const path = try std.Io.Dir.cwd().realPathFileAlloc(threaded.io(), fixture, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const executable = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(executable);
+    config.configs = &.{
+        .{ .selection = selection, .executable = executable, .environment = &.{} },
+        .{ .selection = secondary, .executable = executable, .environment = &.{} },
+    };
+    child = secondary;
+    child.model_id = "explicit-child-model";
+    child.effort = "low";
+    const codex = try factory.create(std.testing.allocator, selection, "/tmp", .{ .value = "mixed-codex" }, null);
+    defer factory.destroy(std.testing.allocator, codex);
+    defer codex.shutdown();
+    const opencode = try factory.create(std.testing.allocator, child, "/tmp", .{ .value = "mixed-opencode" }, null);
+    defer factory.destroy(std.testing.allocator, opencode);
+    defer opencode.shutdown();
+    const runtime: *@import("runtime/opencode.zig").Runtime = @ptrCast(@alignCast(opencode.context));
+    try std.testing.expect(c.equal(runtime.selection, child));
+    try std.testing.expect(codex.vtable != opencode.vtable);
 }

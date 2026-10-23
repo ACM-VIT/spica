@@ -7,9 +7,14 @@ const Codex = @import("codex.zig");
 const OpenCode = @import("opencode.zig");
 
 pub const NativeFactory = struct {
-    selection: c.Selection,
-    executable: [:0]const u8,
-    environment: []const [:0]const u8,
+    /// At most the two known native runtimes, explicitly authorized by startup.
+    /// No configuration lookup, auth probing or process launch occurs in metadata.
+    pub const Config = struct {
+        selection: c.Selection,
+        executable: [:0]const u8,
+        environment: []const [:0]const u8,
+    };
+    configs: []const Config,
     const descriptors = @import("../orchestration_tools.zig").descriptors;
 
     const CodexInstance = struct { arena: std.heap.ArenaAllocator, wire: transport.Transport, runtime: Codex.Runtime };
@@ -17,32 +22,39 @@ pub const NativeFactory = struct {
     fn cast(p: *anyopaque) *NativeFactory {
         return @ptrCast(@alignCast(p));
     }
-    fn compatible(self: *const NativeFactory, selection: c.Selection) bool {
-        var expected = self.selection;
-        expected.workspace = selection.workspace;
-        return c.equal(expected, selection);
+    fn configuration(self: *const NativeFactory, selection: c.Selection) ?*const Config {
+        if (self.configs.len > 2 or selection.model_id.len == 0 or selection.effort.len == 0 or selection.workspace.value.len == 0 or selection.account_ref.len == 0 or selection.model_provider.len == 0) return null;
+        if (!std.mem.eql(u8, selection.runtime_kind, "codex") and !std.mem.eql(u8, selection.runtime_kind, "opencode")) return null;
+        for (self.configs) |*config| {
+            var expected = config.selection;
+            expected.workspace = selection.workspace;
+            expected.model_id = selection.model_id;
+            expected.effort = selection.effort;
+            if (c.equal(expected, selection)) return config;
+        }
+        return null;
     }
     fn discovery(p: *anyopaque, selection: c.Selection) c.Discovery {
         const self = cast(p);
         var caps = [_]c.CapabilityInfo{.{ .status = .unsupported, .evidence = "Not implemented by the selected concrete adapter" }} ** @typeInfo(c.Capability).@"enum".fields.len;
-        if (self.compatible(selection)) {
+        if (self.configuration(selection) != null) {
             for ([_]c.Capability{ .create, .start, .stream, .tools, .approval, .cancel, .selection, .workspace }) |cap| {
                 caps[@intFromEnum(cap)] = .{ .status = .supported, .evidence = "Compiled adapter protocol support; installed version and effective selection require instance handshake" };
             }
             if (std.mem.eql(u8, selection.runtime_kind, "codex")) caps[@intFromEnum(c.Capability.attach)] = .{ .status = .supported, .evidence = "Codex thread/resume protocol; instance handshake required" };
             caps[@intFromEnum(c.Capability.coordinator_bridge)] = .{ .status = .unknown, .evidence = "Host endpoint and actual provider tool callback require consumer verification" };
         }
-        return .{ .runtime_kind = self.selection.runtime_kind, .runtime_version = self.selection.required_runtime_version, .capabilities = caps, .limits = .{} };
+        return .{ .runtime_kind = selection.runtime_kind, .runtime_version = selection.required_runtime_version, .capabilities = caps, .limits = .{} };
     }
     fn account(p: *anyopaque, selection: c.Selection) c.Account {
-        return .{ .reference = selection.account_ref, .readiness = if (cast(p).compatible(selection)) .unknown else .unavailable };
+        return .{ .reference = selection.account_ref, .readiness = if (cast(p).configuration(selection) != null) .unknown else .unavailable };
     }
     fn resolve(p: *anyopaque, selection: c.Selection) c.SelectionResult {
         return .{ .requested = selection, .effective = null, .readiness = account(p, selection).readiness };
     }
     fn createInstance(p: *anyopaque, a: std.mem.Allocator, selection: c.Selection, cwd: []const u8, session: c.RuntimeSessionId, bridge: ?common.Bridge) !common.Adapter {
         const self = cast(p);
-        if (!self.compatible(selection)) return error.SelectionUnavailable;
+        const config = self.configuration(selection) orelse return error.SelectionUnavailable;
         if (!std.fs.path.isAbsolute(cwd)) return error.AbsoluteWorkspaceRequired;
         if (std.mem.eql(u8, selection.runtime_kind, "codex")) {
             const instance = try a.create(CodexInstance);
@@ -58,7 +70,7 @@ pub const NativeFactory = struct {
                 const schema = try std.json.parseFromSlice(std.json.Value, retained, descriptor.input_schema, .{ .allocate = .alloc_always });
                 tool.* = .{ .name = descriptor.name, .description = descriptor.description, .inputSchema = schema.value };
             }
-            instance.wire = try transport.Transport.init(a, .{ .argv = &.{ self.executable, "app-server", "--stdio" }, .cwd = root, .environment = self.environment });
+            instance.wire = try transport.Transport.init(a, .{ .argv = &.{ config.executable, "app-server", "--stdio" }, .cwd = root, .environment = config.environment });
             errdefer instance.wire.deinit();
             instance.runtime = try Codex.Runtime.init(a, &instance.wire, .{ .selection = identity, .cwd = root, .instance = id, .tools = tools });
             return instance.runtime.asAdapter();
@@ -73,14 +85,17 @@ pub const NativeFactory = struct {
         const root = try retained.dupeZ(u8, cwd);
         const id = try retained.dupe(u8, session.value);
         const servers = if (bridge) |endpoint| try @import("opencode_bridge.zig").serialize(retained, endpoint) else "[]";
-        var wire = try transport.Transport.init(a, .{ .argv = &.{ self.executable, "acp" }, .cwd = root, .environment = self.environment });
+        var wire = try transport.Transport.init(a, .{ .argv = &.{ config.executable, "acp" }, .cwd = root, .environment = config.environment });
         errdefer wire.deinit();
         try instance.runtime.init(a, wire, .{ .selection = identity, .cwd = root, .instance = .{ .value = id }, .account = .{ .reference = identity.account_ref, .readiness = .unknown }, .mcp_servers = servers });
         return instance.runtime.asAdapter();
     }
-    fn destroyInstance(p: *anyopaque, a: std.mem.Allocator, adapter: common.Adapter) void {
-        if (std.mem.eql(u8, cast(p).selection.runtime_kind, "codex")) {
-            const runtime: *Codex.Runtime = @ptrCast(@alignCast(adapter.context));
+    fn destroyInstance(_: *anyopaque, a: std.mem.Allocator, adapter: common.Adapter) void {
+        // asAdapter only returns self and a type-static vtable; it does not read
+        // runtime storage. Identify the concrete owner without retaining a map.
+        const candidate: *Codex.Runtime = @ptrCast(@alignCast(adapter.context));
+        if (adapter.vtable == candidate.asAdapter().vtable) {
+            const runtime = candidate;
             const instance: *CodexInstance = @fieldParentPtr("runtime", runtime);
             runtime.deinit();
             instance.arena.deinit();
