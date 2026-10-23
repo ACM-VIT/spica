@@ -108,3 +108,13 @@ the actual executable driven by a synthetic app-server error fixture exited 1,
 printed the supplied diagnostic and `AccountStatusFailed`, and did not print
 “sign-in required.” Reproduction/evidence:
 `.artifacts/provider-factory/native-auth/error.py` and `account-error.log`.
+
+Actual rebuilt native `--codex-auth device` initiated the supported ChatGPT
+device flow in a fresh managed account and printed a real verification URL and
+user code. With no interactive sign-in, it exited `SignInIncomplete` at its
+120-second bound; this is a usable initiation, not authenticated inference.
+Raw command/candidate/output: `.artifacts/provider-factory/native-auth/manifest.json`
+and `device.log`. The same mixed factory also ran installed Codex initialize/
+account-read and real OpenCode inference simultaneously with distinct account
+roots and verified `/proc` cwd identities; see consumer `mixed-manifest-2.json`
+and `mixed-run-2.log`. Codex remained signed out and performed no inference.

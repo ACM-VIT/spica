@@ -71,12 +71,35 @@ It also opens `/bin/false` through the factory and checks terminal rejection and
 allocator-clean shutdown/destroy. This does not establish simultaneous cold
 account initialization support: that cohort produced startup failures, retained
 in `.artifacts/provider-factory/consumer/factory-run-2.log` and `factory-run-3.log`.
-The account-bootstrap cause is unproven; no production retry or hidden
-serialization is added. Exact consumer commands and isolated environments are
-recorded in that evidence directory's per-attempt manifests.
+Installed server logs identify `SQLiteError: database is locked` (attempt 2) and
+concurrent schema bootstrap failing because `account_state` already exists
+(attempt 3). No production retry or hidden serialization is added. Exact
+consumer commands and isolated environments are recorded in that evidence
+directory's per-attempt manifests. The earlier attempt 4 process-lifetime cohort
+used a disposable directory nested in the checkout, so it is not evidence of
+non-Git workspace isolation; subsequent cohorts use explicit `/tmp` workspaces.
 
 ## Supported authentication and evidence
 
 Use an isolated runtime-owned HOME and XDG state, then run the supported `opencode auth login` (or terminal flow `opencode acp --login`) interactively in that same environment. Reconnect and initialize after successful login. Do not use `auth export`, copy OMP secrets, switch global accounts, or modify shared services/config. Product subscription inference remains gated on the user's isolated sign-in and entitlement; an optional explicit free-provider prompt is separate evidence, never subscription parity.
+
+For this exact installed version, HOME/XDG alone does **not** control all global
+discovery: `Global.home` is `OPENCODE_TEST_HOME ?? os.homedir()`. The native
+launcher and factory consumers bind `OPENCODE_TEST_HOME` to the explicitly selected
+account, `OPENCODE_CONFIG_DIR` to its `config/opencode`, and set
+`OPENCODE_DISABLE_CLAUDE_CODE=1`. This version-pinned test-home override is not a
+claim of a broader supported authentication API or filesystem sandbox.
+Installed `ConfigDiscovery` derives global `.agents` from that same home;
+the Claude switch does not disable `.agents`, but the explicit home confines
+its global root. Coding-workspace project configuration remains enabled.
+System `/etc/opencode` discovery is not disabled. Source offsets and the binary
+hash are retained in `consumer/installed-isolation.txt` under the evidence root.
+
+`src/opencode_mixed_smoke.zig` uses one factory configured for both native
+runtimes with distinct accounts and workspaces. It checks actual process cwd,
+Codex initialize/account-read status and the OpenCode handshake/selection before
+requesting only explicit free-provider OpenCode inference. An unavailable
+isolated ChatGPT account is a supported user sign-in prerequisite, not evidence
+of Codex inference or cross-runtime delegated execution.
 
 `tools/opencode-acp-smoke.py` creates disposable HOME/XDG/workspace, strips credential and OpenCode override environment variables, and records raw JSONL and stderr under `.artifacts/opencode-acp`. It exercises initialize, invalid relative cwd, create, resume, mismatched workspace, unavailable model, cancel and close against the installed runtime. Set `SPICA_OPENCODE_CONSUMER` to the built `src/opencode_smoke.zig` executable to exercise the actual shared Adapter vtable in the same isolated environment. `SPICA_OPENCODE_LIVE=1` additionally requests an explicitly selected `opencode/big-pickle` tiny prompt, retaining either actual streamed output or the actual provider error. Default smoke makes no inference claim. `src/opencode_test.zig` contains synthetic permission, identity, streaming, cancellation and error regressions, separate from installed protocol evidence.
