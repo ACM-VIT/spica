@@ -32,6 +32,10 @@ pub const View = struct {
     revision: u64 = 0,
     status: []const u8 = "Conversation not connected",
     connected: bool = false,
+    tasks: [16]TaskLine = @splat(.{}),
+    task_count: usize = 0,
+    tasks_enabled: bool = false,
+    task_cancel: ?TaskCancel = null,
     can_send: bool = false,
     can_cancel: bool = false,
     can_approve: bool = false,
@@ -51,6 +55,12 @@ pub const View = struct {
     custom_tile: transcript.RichTile = .{},
     custom_render_sequence: u64 = 0,
     custom_tile_sequence: u64 = std.math.maxInt(u64),
+    pub const TaskCancel = struct { id: [32]u8, revision: u64 };
+    pub const TaskLine = struct {
+        bytes: [320]u8 = undefined, len: usize = 0,
+        cancel: ?TaskCancel = null,
+        cancel_bounds: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    };
 
     pub fn init(allocator: std.mem.Allocator) !View {
         var editor = try Composer.init(allocator);
@@ -99,6 +109,11 @@ pub const View = struct {
     pub fn takeIntent(self: *View) ?Intent {
         const value = self.intent;
         self.intent = null;
+        return value;
+    }
+    pub fn takeTaskCancel(self: *View) ?TaskCancel {
+        const value = self.task_cancel;
+        self.task_cancel = null;
         return value;
     }
 
@@ -158,6 +173,12 @@ pub const View = struct {
                         }
                     }
                 }
+                if (self.custom_root == null and self.tasks_enabled) for (self.tasks[0..self.task_count]) |task| {
+                    if (task.cancel) |cancel| if (widgets.contains(task.cancel_bounds, event.button.x, event.button.y)) {
+                        self.task_cancel = cancel;
+                        return true;
+                    };
+                };
                 for (self.controls, 0..) |bounds, index| {
                     if (widgets.contains(bounds, event.button.x, event.button.y)) {
                         self.request(@enumFromInt(index));
@@ -346,8 +367,18 @@ pub const View = struct {
         if (self.custom_root == null) {
             try self.labels.draw(text, "SPICA", 24, 18, 18, foreground);
             try self.labels.drawFitted(renderer, text, self.status, 110, 22, bounds.header.width - 140, 13, muted);
+            for (self.tasks[0..self.task_count], 0..) |*task, index| {
+                const y = bounds.transcript.y + @as(f32, @floatFromInt(index)) * 24;
+                try self.labels.drawFitted(renderer, text, task.bytes[0..task.len], bounds.transcript.x, y, bounds.transcript.width - 84, 12, muted);
+                task.cancel_bounds = .{ .x = bounds.transcript.x + bounds.transcript.width - 76, .y = y, .w = 76, .h = 20 };
+                if (task.cancel != null) {
+                    try widgets.panel(renderer, task.cancel_bounds, 3, if (self.tasks_enabled) .{ .r = 51, .g = 69, .b = 105 } else .{ .r = 35, .g = 40, .b = 49 });
+                    try self.labels.draw(text, "Cancel task", task.cancel_bounds.x + 4, y + 2, 11, muted);
+                }
+            }
         }
-        self.transcript_bounds = .{ .x = bounds.transcript.x, .y = bounds.transcript.y, .w = bounds.transcript.width, .h = bounds.transcript.height };
+        const task_height: f32 = if (self.custom_root == null) @as(f32, @floatFromInt(self.task_count)) * 24 else 0;
+        self.transcript_bounds = .{ .x = bounds.transcript.x, .y = bounds.transcript.y + task_height, .w = bounds.transcript.width, .h = @max(0, bounds.transcript.height - task_height) };
         var transcript_clip = widgets.Clip.push(renderer, self.transcript_bounds);
         if (self.custom_render) |render| {
             if (self.custom_tile_sequence != self.custom_render_sequence) {
@@ -374,18 +405,18 @@ pub const View = struct {
                 try tile.reflow(text, bounds.transcript.width);
                 total_height += tile.height() + 8;
             }
-            const max_scroll = @max(0, total_height - bounds.transcript.height);
+            const max_scroll = @max(0, total_height - self.transcript_bounds.h);
             self.transcript_scroll = if (self.follow_latest) max_scroll else @min(max_scroll, self.transcript_scroll);
-            var tile_y = bounds.transcript.y - self.transcript_scroll;
+            var tile_y = self.transcript_bounds.y - self.transcript_scroll;
             for (0..self.rich_count) |offset| {
                 const index = if (self.rich_count == self.rich_tiles.len) (self.rich_next + offset) % self.rich_tiles.len else offset;
                 const tile = &self.rich_tiles[index];
-                if (tile_y + tile.height() >= bounds.transcript.y and tile_y < bounds.transcript.y + bounds.transcript.height) {
+                if (tile_y + tile.height() >= self.transcript_bounds.y and tile_y < self.transcript_bounds.y + self.transcript_bounds.h) {
                     try tile.draw(renderer, text, bounds.transcript.x, tile_y);
                 } else tile.bounds = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
                 tile_y += tile.height() + 8;
             }
-            if (self.rich_count == 0) try self.labels.draw(text, if (self.connected) "Send a prompt to begin." else "Compose a draft below. No provider is running.", bounds.transcript.x, bounds.transcript.y + 20, 16, muted);
+            if (self.rich_count == 0) try self.labels.draw(text, if (self.connected) "Send a prompt to begin." else "Compose a draft below. No provider is running.", bounds.transcript.x, self.transcript_bounds.y + 20, 16, muted);
         }
         transcript_clip.restore(renderer);
         const panel = c.SDL_FRect{ .x = bounds.composer.x, .y = bounds.composer.y, .w = bounds.composer.width, .h = bounds.composer.height };
@@ -556,4 +587,14 @@ test "custom root with absent composer cannot edit or send invisible draft" {
     try std.testing.expect(!try view.handle(event, undefined, undefined));
     try std.testing.expectEqualStrings("retained", view.editor.textBytes());
     try std.testing.expect(view.takeIntent() == null);
+}
+
+test "native task cancellation retains exact durable run revision" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.task_cancel = .{ .id = @splat('a'), .revision = 91 };
+    const intent = view.takeTaskCancel().?;
+    try std.testing.expectEqual(@as(u64, 91), intent.revision);
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat('a')), &intent.id);
+    try std.testing.expect(view.takeTaskCancel() == null);
 }

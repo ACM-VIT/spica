@@ -240,6 +240,11 @@ pub const App = struct {
                 self.view.notice = @errorName(err);
             };
         }
+        if (self.view.takeTaskCancel()) |cancel| if (self.conversation) |conversation| {
+            conversation.submit(.cancel, .{ .run = .{ .value = &cancel.id } }, .{ .revision = cancel.revision }, .{ .task_cancel = .{ .reason = "Native task cancellation" } }, 0) catch |err| {
+                self.view.notice = @errorName(err);
+            };
+        };
         if (self.view.custom_action) |index| {
             self.view.custom_action = null;
             if (self.lua) |bridge| {
@@ -574,7 +579,7 @@ const Conversation = struct {
     runs_cursor: ?Id = null,
     runs_snapshot: ?types.SnapshotId = null,
 
-    const QueryKind = enum { projects, workspaces, threads, thread, runs, approvals, messages, blocks, content };
+    const QueryKind = enum { projects, workspaces, threads, thread, runs, approvals, tasks, messages, blocks, content };
     const CommandKind = enum { project, workspace, thread, send, cancel, approval };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
@@ -744,6 +749,7 @@ const Conversation = struct {
         } else true;
         app.view.can_send = self.thread.len != 0 and terminal and self.command == null and self.query == null and !self.refresh and self.worker_key == null;
         app.view.can_cancel = self.run.len != 0 and !terminal and self.command == null;
+        app.view.tasks_enabled = self.command == null and !self.refresh;
         app.view.can_approve = self.approval_live and self.command == null and !self.refresh;
     }
 
@@ -786,7 +792,10 @@ const Conversation = struct {
     }
 
     fn createWorkspace(self: *Conversation) !void {
-        try self.submit(.workspace, .absent, .absent, .{ .workspace_register = .{ .project = .{ .value = self.project.slice() }, .binding = .{ .canonical_root = self.workspace_root, .filesystem_identity = self.workspace_root, .repository_identity = "", .checkout_identity = self.workspace_root, .expected_branch = "", .base_revision = "", .non_git = true } } }, 0);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const binding = try domain.workspace_binding.capture(arena.allocator(), self.io, self.workspace_root);
+        try self.submit(.workspace, .absent, .absent, .{ .workspace_register = .{ .project = .{ .value = self.project.slice() }, .binding = binding } }, 0);
     }
     fn createThread(self: *Conversation) !void {
         try self.submit(.thread, .absent, .absent, .{ .thread_create = .{ .project = .{ .value = self.project.slice() }, .workspace = .{ .value = self.workspace.slice() } } }, 0);
@@ -801,22 +810,38 @@ const Conversation = struct {
                 }
             },
             .workspaces => {
-                if (value.items.len == 0) try self.createWorkspace() else {
-                    self.workspace = try Id.init(value.items[0].workspace.id.value);
-                    try self.ask(.threads, .{ .threads = .{ .project = .{ .value = self.project.slice() }, .page = page } });
+                var selected = false;
+                for (value.items) |row| {
+                    if (!std.mem.eql(u8, row.workspace.binding.canonical_root, self.workspace_root)) continue;
+                    self.workspace = try Id.init(row.workspace.id.value);
+                    selected = true;
+                    break;
                 }
+                if (selected) {
+                    try self.ask(.threads, .{ .threads = .{ .project = .{ .value = self.project.slice() }, .page = page } });
+                } else if (value.next_cursor) |cursor| {
+                    try self.ask(.workspaces, .{ .workspaces = .{ .project = .{ .value = self.project.slice() }, .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = cursor } } });
+                } else try self.createWorkspace();
             },
             .threads => {
-                if (value.items.len == 0) try self.createThread() else {
-                    self.thread = try Id.init(value.items[0].thread.id.value);
-                    self.refresh = true;
+                var selected = false;
+                for (value.items) |row| {
+                    if (!std.mem.eql(u8, row.thread.workspace.value, self.workspace.slice())) continue;
+                    self.thread = try Id.init(row.thread.id.value);
+                    selected = true;
+                    break;
                 }
+                if (selected) {
+                    self.refresh = true;
+                } else if (value.next_cursor) |cursor| {
+                    try self.ask(.threads, .{ .threads = .{ .project = .{ .value = self.project.slice() }, .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = cursor } } });
+                } else try self.createThread();
             },
             .thread => {
                 if (value.items.len != 1) return error.MissingThread;
                 self.thread_revision = value.items[0].thread.revision;
                 self.workspace = try Id.init(value.items[0].thread.workspace.value);
-                if (self.subscription == null and self.subscribe_ticket == null) self.subscribe_ticket = try self.host.subscribe(.{ .scope = .{ .thread = .{ .value = self.thread.slice() } }, .after_position = value.snapshot_position, .max_batch_bytes = 16 * 1024 });
+                if (self.subscription == null and self.subscribe_ticket == null) self.subscribe_ticket = try self.host.subscribe(.{ .scope = .all, .after_position = value.snapshot_position, .max_batch_bytes = 16 * 1024 });
                 self.runs_cursor = null;
                 self.runs_snapshot = null;
                 try self.askRuns();
@@ -845,7 +870,36 @@ const Conversation = struct {
                     self.approval_digest = try Id.init(row.approval.evidence.action_digest);
                     self.approval_live = true;
                 };
-                try self.askMessages();
+                app.view.task_count = 0;
+                try self.ask(.tasks, .{ .task_list = .{ .parent = .{ .value = self.run.slice() }, .page = .{ .limit = 16, .max_bytes = 64 * 1024 } } });
+            },
+            .tasks => {
+                for (value.items) |row| {
+                    if (app.view.task_count == app.view.tasks.len) break;
+                    const task = row.task;
+                    const line = &app.view.tasks[app.view.task_count];
+                    const label = std.fmt.bufPrint(&line.bytes, "{s} | {s}/{s} | {s} | requests {d} | tokens {d}", .{
+                        task.task.packet.purpose,
+                        task.task.packet.selection.runtime_kind,
+                        task.task.packet.selection.model_id,
+                        @tagName(task.state),
+                        task.task.requests,
+                        task.task.input_tokens +| task.task.output_tokens,
+                    }) catch fallback: {
+                        const message = "Task label exceeds display budget";
+                        @memcpy(line.bytes[0..message.len], message);
+                        break :fallback line.bytes[0..message.len];
+                    };
+                    line.len = label.len;
+                    line.cancel = switch (task.state) {
+                        .completed, .cancelled, .failed, .cancel_requested => null,
+                        else => if (task.task.id.value.len == 32) .{ .id = task.task.id.value[0..32].*, .revision = task.revision } else null,
+                    };
+                    app.view.task_count += 1;
+                }
+                if (value.next_cursor) |cursor| {
+                    try self.ask(.tasks, .{ .task_list = .{ .parent = .{ .value = self.run.slice() }, .page = .{ .limit = 16, .max_bytes = 64 * 1024, .snapshot = value.snapshot_id, .cursor = cursor } } });
+                } else try self.askMessages();
             },
             .messages => {
                 self.message_count = value.items.len;

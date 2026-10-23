@@ -1,6 +1,8 @@
 //! Single-owner, bounded, nonblocking JSONL process transport.
 const std = @import("std");
-pub const c = @cImport({ @cInclude("../platform/process.h"); });
+pub const c = @cImport({
+    @cInclude("../platform/process.h");
+});
 pub const Options = struct {
     argv: []const [:0]const u8,
     cwd: [:0]const u8,
@@ -49,14 +51,19 @@ pub const Transport = struct {
         if (line.len + 1 > self.input.len - self.input_len) return error.QueueFull;
         @memcpy(self.input[self.input_len..][0..line.len], line);
         self.input_len += line.len;
-        self.input[self.input_len] = '\n'; self.input_len += 1;
+        self.input[self.input_len] = '\n';
+        self.input_len += 1;
     }
     pub fn pump(self: *Transport) !void {
         if (self.exited) return;
         if (self.input_len > 0) {
             const n = c.spica_process_write(self.process.input, self.input.ptr, self.input_len);
             if (n == -1) return error.TransportWrite;
-            if (n > 0) { const size: usize = @intCast(n); std.mem.copyForwards(u8, self.input[0 .. self.input_len-size], self.input[size..self.input_len]); self.input_len -= size; }
+            if (n > 0) {
+                const size: usize = @intCast(n);
+                std.mem.copyForwards(u8, self.input[0 .. self.input_len - size], self.input[size..self.input_len]);
+                self.input_len -= size;
+            }
         }
         // Bounded drain per tick, including stderr, so neither pipe deadlocks.
         var scratch: [8192]u8 = undefined;
@@ -67,7 +74,7 @@ pub const Transport = struct {
         }
         for (0..16) |_| {
             if (self.output_len == self.output.len) break;
-            const n = c.spica_process_read(self.process.output, self.output[self.output_len..].ptr, @min(8192, self.output.len-self.output_len));
+            const n = c.spica_process_read(self.process.output, self.output[self.output_len..].ptr, @min(8192, self.output.len - self.output_len));
             if (n == -1) return error.TransportRead;
             if (n <= 0) break;
             self.output_len += @intCast(n);
@@ -75,10 +82,10 @@ pub const Transport = struct {
         // Validate all complete and partial frames, not only the first frame.
         var start: usize = 0;
         for (self.output[0..self.output_len], 0..) |byte, i| if (byte == '\n') {
-            if (i-start > frame_bytes) return error.FrameTooLarge;
-            start = i+1;
+            if (i - start > frame_bytes) return error.FrameTooLarge;
+            start = i + 1;
         };
-        if (self.output_len-start > frame_bytes) return error.FrameTooLarge;
+        if (self.output_len - start > frame_bytes) return error.FrameTooLarge;
         const reaped = c.spica_process_reap(&self.process, &self.status);
         if (reaped < 0) return error.ReapFailed;
         self.exited = reaped == 1;
@@ -87,18 +94,21 @@ pub const Transport = struct {
     pub fn poll(self: *Transport, allocator: std.mem.Allocator) !?[]const u8 {
         const end = std.mem.indexOfScalar(u8, self.output[0..self.output_len], '\n') orelse return null;
         const line = try allocator.dupe(u8, std.mem.trimEnd(u8, self.output[0..end], "\r"));
-        std.mem.copyForwards(u8, self.output[0 .. self.output_len-end-1], self.output[end+1..self.output_len]);
-        self.output_len -= end+1;
+        std.mem.copyForwards(u8, self.output[0 .. self.output_len - end - 1], self.output[end + 1 .. self.output_len]);
+        self.output_len -= end + 1;
         return line;
     }
     pub fn deinit(self: *Transport) void {
         if (self.process.pid > 0) {
             // Force only the tree owned by this runtime, and retain ownership on failure.
             if (c.spica_process_force(&self.process) != 0) @panic("cannot stop owned provider process");
-            while (c.spica_process_reap(&self.process, &self.status) == 0) { _ = c.spica_process_poll(&self.process, -1, 0, 20); }
+            while (c.spica_process_reap(&self.process, &self.status) == 0) {
+                _ = c.spica_process_poll(&self.process, -1, 0, 20);
+            }
         }
         c.spica_process_dispose(&self.process);
-        self.allocator.free(self.input); self.allocator.free(self.output);
+        self.allocator.free(self.input);
+        self.allocator.free(self.output);
     }
 };
 test "JSONL admission bounds" {
@@ -110,12 +120,16 @@ test "JSONL admission bounds" {
     try std.testing.expectError(error.QueueFull, transport.send("01234567890123"));
 }
 test "real process framing and ownership" {
-    var transport = try Transport.init(std.testing.allocator, .{ .argv = &.{ "/bin/cat" }, .cwd = "/tmp", .environment = &.{} });
+    var transport = try Transport.init(std.testing.allocator, .{ .argv = &.{"/bin/cat"}, .cwd = "/tmp", .environment = &.{} });
     defer transport.deinit();
     try transport.send("{\"id\":1}");
     for (0..100) |_| {
         try transport.pump();
-        if (try transport.poll(std.testing.allocator)) |line| { defer std.testing.allocator.free(line); try std.testing.expectEqualStrings("{\"id\":1}", line); return; }
+        if (try transport.poll(std.testing.allocator)) |line| {
+            defer std.testing.allocator.free(line);
+            try std.testing.expectEqualStrings("{\"id\":1}", line);
+            return;
+        }
         _ = c.spica_process_poll(&transport.process, -1, 0, 10);
     }
     return error.TestTimeout;
