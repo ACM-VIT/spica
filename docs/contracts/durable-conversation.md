@@ -4,9 +4,9 @@ Core v1 remains normative. `src/domain/types.zig` provides the domain-only typed
 
 `types.encode(value,buffer)` uses fixed-buffer deterministic structural JSON (explicit tagged unions, null fields, declaration field order, exact string bytes). Its format is private versioned storage encoding, not a replacement public contract. It allocates nothing and fails before buffer overflow. Command envelope encoding includes target, version and precondition, not only payload. Dedup must compare exact bytes, not hash alone. Event positions order `(commit_sequence,event_index)`, preserving unseen same-revision events.
 
-This checkpoint implements value encoding and ordering only. No Host/dispatcher/query execution is exposed by it and no persisted-conversation milestone is claimed. Integration of further executable slices remains under task004's assigned owner.
+The current checkpoints implement domain value encoding/ordering and the real SQLite storage primitives described below. No Host/dispatcher/query execution is exposed and no persisted-conversation milestone is claimed. Further executable slices remain under task004's assigned owner.
 
-Focused check (no SDL/native dependencies): `zig test src/domain.zig -O Debug` and `-O ReleaseSafe`.
+Focused check (system SQLite/libc only; no SDL/native text dependencies): `zig build test-domain -Doptimize=Debug` and `-Doptimize=ReleaseSafe`.
 
 Event/receipt revisions use `AggregateRef`, including message/block/session/effect/tool identities; command `Target` remains constrained to mutation targets. Snapshot `QueryPage.expires_at` is host-monotonic milliseconds, not approval UTC expiry.
 
