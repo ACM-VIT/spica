@@ -41,7 +41,7 @@ pub const help =
     \\Uses SDL's native GPU renderer. Escape or the window close button quits.
     \\--quit-after-ms exits after a bounded smoke run (0 exits immediately).
     \\--automation-output PATH exports the read-only final native shell snapshot.
-    \\--metrics-output PATH enables bounded frame timestamps and final text ledger.
+    \\--metrics-output PATH enables bounded frame timestamps and per-present text ledger.
     \\--metrics-capacity N bounds retained attempts (default 8192; max 1048576).
     \\The agent workspace is not implemented yet. No provider or data store is opened.
     \\Keep the checkout's .deps and assets; rebuild after moving the checkout.

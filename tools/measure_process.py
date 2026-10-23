@@ -117,6 +117,10 @@ def cpu_delta(previous, current, ticks=None):
 
 def summarize(samples):
     result = dict(samples=len(samples), complete_samples=sum(s['complete'] for s in samples),
+                  incomplete_samples=sum(not s['complete'] for s in samples),
+                  missing_intervals=sum(s.get('missed_intervals', 0) for s in samples),
+                  coverage='complete_observed_samples' if samples and all(s['complete'] for s in samples) else 'incomplete_or_unavailable',
+                  peak_scope='observed complete-sample maximum only; not an absolute tree peak',
                   peak_members=max((len(s['members']) for s in samples), default=0),
                   acquisition_seconds=distribution([s['duration_seconds'] for s in samples]),
                   cpu_intervals=[cpu_delta(a, b) for a, b in zip(samples, samples[1:])])

@@ -142,14 +142,29 @@ pub const App = struct {
         const present_begin = if (self.metrics != null) c.SDL_GetTicksNS() else 0;
         const succeeded = c.SDL_RenderPresent(self.renderer);
         const present_end = if (self.metrics != null) c.SDL_GetTicksNS() else 0;
-        if (self.metrics) |*metrics| metrics.record(.{
-            .frame_id = self.frames + 1,
-            .event_sequence = self.snapshot.event_sequence,
-            .paint_begin_ns = paint_begin,
-            .present_begin_ns = present_begin,
-            .present_end_ns = present_end,
-            .succeeded = succeeded,
-        });
+        if (self.metrics) |*metrics| {
+            // Accessor only copies the existing ledger. Sampling is outside the
+            // measured paint/present interval and never schedules idle redraws.
+            var stats: c.SpicaTextStats = undefined;
+            const stats_ok = c.spica_text_get_stats(self.text, &stats);
+            metrics.record(.{
+                .frame_id = self.frames + 1,
+                .event_sequence = self.snapshot.event_sequence,
+                .paint_begin_ns = paint_begin,
+                .present_begin_ns = present_begin,
+                .present_end_ns = present_end,
+                .succeeded = succeeded,
+                .text_stats = if (stats_ok) .{
+                    .fixed_cpu_bytes = stats.fixed_cpu_bytes,
+                    .font_bytes = stats.font_bytes,
+                    .layout_bytes = stats.layout_bytes,
+                    .glyph_bytes = stats.glyph_bytes,
+                    .live_layouts = stats.live_layouts,
+                    .glyph_count = stats.glyph_count,
+                    .face_count = stats.face_count,
+                } else null,
+            });
+        }
         if (!succeeded) return error.RenderPresent;
         self.frames += 1;
         self.snapshot.frame_id = self.frames;

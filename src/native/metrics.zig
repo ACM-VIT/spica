@@ -21,6 +21,16 @@ pub fn mapClock(get_native_ns: *const fn () callconv(.c) u64) ClockMapping {
     };
 }
 
+pub const TextStats = struct {
+    fixed_cpu_bytes: usize,
+    font_bytes: usize,
+    layout_bytes: usize,
+    glyph_bytes: usize,
+    live_layouts: u32,
+    glyph_count: u32,
+    face_count: u32,
+};
+
 pub const Frame = struct {
     frame_id: u64,
     event_sequence: u64,
@@ -28,6 +38,7 @@ pub const Frame = struct {
     present_begin_ns: u64,
     present_end_ns: u64,
     succeeded: bool,
+    text_stats: ?TextStats = null,
 };
 
 /// Storage is allocated once, before the measured loop. Full buffers retain the

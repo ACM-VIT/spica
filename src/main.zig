@@ -10,6 +10,16 @@ fn exportJson(io: std.Io, path: []const u8, value: anytype) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
 }
 
+fn exportIdentity(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator)) |existing| return existing else |err| {
+        if (err != error.FileNotFound) return err;
+    }
+    // Resolve parent symlinks even when the output does not exist yet.
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const real_parent = try std.Io.Dir.cwd().realPathFileAlloc(io, parent, allocator);
+    return std.fs.path.resolve(allocator, &.{ real_parent, std.fs.path.basename(path) });
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .async_limit = .nothing });
     defer threaded.deinit();
@@ -24,6 +34,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try std.Io.File.stdout().writeStreamingAll(threaded.io(), options_module.help);
         return;
     }
+    if (options.metrics_output) |metrics_path| if (options.automation_output) |automation_path| {
+        const metrics_resolved = try exportIdentity(threaded.io(), arena.allocator(), metrics_path);
+        const automation_resolved = try exportIdentity(threaded.io(), arena.allocator(), automation_path);
+        if (std.mem.eql(u8, metrics_resolved, automation_resolved)) return error.ExportPathsMustDiffer;
+    };
     var app = App.init(std.heap.page_allocator) catch |err| {
         std.log.err("Native foundation startup failed: {s}; SDL: {s}", .{ @errorName(err), c.SDL_GetError() });
         return err;
@@ -54,13 +69,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .attempts = metrics.attempts,
             .failures = metrics.failures,
             .dropped = metrics.dropped,
+            .successful_presents = app.frames,
             .frames = metrics.samples(),
             .snapshot = app.snapshot,
             .renderer = std.mem.span(c.SDL_GetRendererName(app.renderer)),
             .video = std.mem.span(c.SDL_GetCurrentVideoDriver()),
             .hardware_acceleration = "not established by renderer name",
             .text_stats = if (stats_ok) @as(?c.SpicaTextStats, stats) else null,
-            .text_stats_scope = "final ledger only; excludes external metadata and driver memory; no eviction or miss counters",
+            .text_stats_scope = "per-present ledger plus final ledger; cache changes only during paint in this native shell; excludes external metadata and driver memory; no eviction or miss counters",
             .run_error = if (run_result) |_| @as(?[]const u8, null) else |err| @errorName(err),
         });
     }
