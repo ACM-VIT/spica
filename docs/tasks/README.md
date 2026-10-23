@@ -120,5 +120,29 @@ raw combined metrics are
 Task005 records frame counts/percentiles, covered tree CPU/RSS/PSS, identical
 settled cache tails and explicit `/proc`/sampling limitations. Both producer and
 measurement workers are finished; no builds, apps or profilers remain running.
-Tasks004–006 remain `review`, not accepted. Main reviews the actual candidate,
-final native captures and measured evidence before opening dependent gates.
+Tasks004–006 remain `review`: Main has reviewed the automated fake-provider
+milestone; the human checkpoint and explicitly unexercised gates remain open.
+
+## Main-reviewed automated fake-provider milestone
+
+Main reviewed frozen production candidate `fe6a0ff` with evidence/record HEAD
+`48acc5c`: final `candidate.json`, actual `tools-check.log` results,
+`custom-render.png`/`reopened.png`, and native main startup/state and
+disconnect/Host-destroy-before-SDL ordering. Main's prior review covered the
+protected Lua C lifecycle/admission/protection and ABI; the integrator reviewed
+native integration source. This records the automated tasks004–006 milestone
+only, not whole-roadmap or product acceptance.
+
+The roadmap's human typing/selection/scroll/cancel/config-failure/restart
+checkpoint remains pending. No live Codex/OpenCode, physical latency or
+large-history soak is established. The one paired baseline retains its
+incomplete `/proc` samples and missed sampling intervals; no absolute peak or
+repeated-run confidence is claimed.
+
+Existing usage is `python3 build/driver.py run`; custom module selection is
+documented for the executable as `zig-out/bin/spica --lua-module examples/minimal.lua`.
+No unverified driver argument-passthrough syntax is implied.
+Final smoke and both measurement manifests record successful `vd clean`:
+`/tmp/nui-t8lkri2v`, `/tmp/nui-u2w764wp`, `/tmp/nui-qwxplu07` stopped;
+evidence files retained. Producer/measurement receipts report no owned running
+builds, apps or profilers. No scenario/check was repeated for this review record.

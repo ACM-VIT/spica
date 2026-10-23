@@ -158,3 +158,20 @@ there were no root-exit or member-read failures. Missing PID identities prevent
 proving whether those were unrelated processes or transient descendants.
 Partial samples are excluded from complete-sample CPU/memory summaries, not
 silently promoted to complete tree peaks. Main retains final acceptance.
+
+## Main review handoff
+
+Main reviewed final `candidate.json`, actual assembled check results and the
+final ReleaseSafe `custom-render.png`/`reopened.png`, observing custom Unicode,
+code/tool content and retained cancelled state. Main also inspected native
+startup/state/teardown; integrator source review covered the UI/script bridge.
+The automated fake-provider004–006 milestone is Main-reviewed, with the human
+typing/selection/scroll/cancel/config-failure/restart checkpoint still pending.
+This is not live Codex/OpenCode, physical-latency, large-history soak or complete
+product acceptance. The single paired baseline's incomplete/missed samples stay
+explicit rather than being waived.
+
+Existing cleanup evidence confirms final smoke `/tmp/nui-t8lkri2v` and paired
+measurement `/tmp/nui-u2w764wp` / `/tmp/nui-qwxplu07` were stopped by `vd clean`;
+raw files were retained. Worker receipts report no owned app/build/profiler left
+running. This review handoff is documentation-only; no scenarios were rerun.

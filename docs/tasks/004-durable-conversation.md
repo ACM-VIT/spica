@@ -94,3 +94,14 @@ cache evidence is recorded in task005's paired baseline and
 `.artifacts/ship-continue-measure/assembled-fe6a0ff-pair1-summary.json`.
 Both real Host flows completed; sampling limitations remain explicit and do not
 change conservative domain recovery or durable ownership.
+
+## Main review handoff
+
+Main reviewed the automated fake-provider004–006 milestone on production
+`fe6a0ff` / evidence-record `48acc5c`, including actual final check evidence and
+main's independent-state startup and presentation/Host-before-SDL teardown.
+Native integration source review and retained domain recovery evidence remain
+part of that handoff. This is not live-provider, power-loss or whole-product
+acceptance; the roadmap human interaction checkpoint remains pending.
+The task index records exact review/cleanup evidence and the paired resource
+sample limitations. No additional build/test/smoke was run for this doc handoff.

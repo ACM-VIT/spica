@@ -125,3 +125,16 @@ maximum was 89611264 bytes versus 87545856 default. Settled cache ledgers
 plateaued within bounds. These are finite observations, not superiority or
 performance acceptance claims; task005 records exact counts, raw JSON and
 incomplete `/proc` coverage/scheduling limits. Both worker slots are released.
+
+## Main review handoff
+
+Main's review combines protected C Lua lifecycle/admission/protection and ABI,
+native main startup and teardown, integrator bridge-source review, actual
+assembled checks, and final custom-render/reopen screenshots at production
+`fe6a0ff` with evidence-record `48acc5c`. The automated fake-provider004–006
+milestone is reviewed, not a claim of whole-roadmap/product acceptance.
+Human interaction checkpoint remains pending; no live adapters, physical
+latency or large-history soak is established. One paired baseline with
+incomplete/missed resource samples remains a finite observation, not a waiver.
+The task index records existing stopped-desktop receipts; no check/smoke or new
+feature work was performed for this documentation-only review handoff.
