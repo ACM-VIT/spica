@@ -1,9 +1,9 @@
 # 004: Durable single conversation and execution state
 
-Status: running — independent read-only implementation preparation; production implementation waits for accepted task003 interfaces and checks.
+Status: running — source preparation reviewed; production implementation allocated after task003 acceptance.
 Authorization: user continuation through remaining roadmap, with explicit instruction to keep independent Sol lanes moving and avoid unnecessary setup/checkpoint serialization.
-Base: d2e4e9250c9c9dd7cfde8ce2d68c8d5c9040f28b; tasks001/002 accepted, task003 fake/native implementation runs independently in private worktrees.
-Owner: Astra owns decisions/acceptance; DomainPrep004 (Sol high repair specialist) performs bounded storage/recovery source preparation. No competing domain writer.
+Base: `3c18aac45d732f217bc9af98d466f3c569c8dd61`, tasks001–003 accepted. Assigned private worktree `.artifacts/worktrees/004-domain`, branch `task/004-domain`, must start from that exact committed base.
+Owner: Astra owns decisions/acceptance; DomainPrep004 (verified Sol high, no fallback) owns domain types/store/owner and private Git for the allowlist below. No competing domain writer. Infra002 remains shared Git integrator.
 
 Scope: pin the smallest concrete reusable SQLite/platform boundary, new independent state location/schema and command/effect transaction design needed for one persisted fake conversation. Accepted core v1 is normative: IDs/revisions/dedup receipts, accepted-vs-completed, approvals, cancel, reopen, unknown outcomes without respawn, bounded queries/subscriptions. Do not read or migrate user history/credentials. No old application restoration.
 
@@ -24,3 +24,5 @@ Expiry ambiguity resolved by coordinator: adapter `ApprovalEvidence.expires_at` 
 Production allocation after task003 acceptance: DomainPrep004 owns new `src/domain.zig`, `src/domain/types.zig`, `src/domain/store.zig`, `src/domain/domain_test.zig`, `src/domain/smoke.zig`, `src/platform/store_fs.c`, `docs/contracts/durable-conversation.md`, `docs/tasks/004-domain-receipt.md`, and narrow `build.zig`/`src/test.zig` integration in its assigned private worktree. One owner avoids competing schema/reducer writers. No native app/main/options or shared adapter edits. UI lane proceeds against the pinned public seam independently; task004 must not wait for complete UI to exercise persisted conversation/crash behavior.
 
 Use cohesive checkpoints: storage identity/transactions first, durable command/effect/reducer behavior next, public owner/query delivery and actual recovery evidence next. Each slice includes relevant meaningful tests/docs and executed checks before committing; no stubs, blind claim-based acceptance or end-only commit. Keep original/follow-up commits. Private Git allowlist is exactly the production allocation; shared integration owner remains Infra002. Whole frozen candidate gets integration checks and actual temporary-state fake-consumer/crash smoke; task004–006 UI milestone remains separate acceptance.
+
+Native UI seam refinement: include `query.tools(run_id)`, bounded block descriptors on message rows with `next_block_cursor`, and `query.blocks(message_id,cursor)` continuation. Message paging specifies `older|newer` relative to stable ordinal/ID anchor within the same pinned snapshot. Nested descriptor bytes/rows count against page limits; source content is still fetched by explicit byte range. DomainPrep004 owns these projections/types; no second UI data/lifecycle owner.

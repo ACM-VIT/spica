@@ -1,6 +1,6 @@
 # 003: Fake provider, native automation and initial metrics
 
-Status: running — source discovery reviewed; task002 accepted; private implementation lanes allocated below.
+Status: accepted — frozen fake/native sources reviewed, combined checks and actual native smoke passed at `3c18aac45d732f217bc9af98d466f3c569c8dd61`; independent resource/frame evidence retains explicit limits below.
 Owner: Astra owns contracts/acceptance; Fake003 owns adapter seam/fake; NativeHarness003 owns native automation/metrics. Native003 is the independent evaluator.
 Base: task002 accepted at native source e9ea99c38077233b503e55af20c91875c69b4426 plus reviewed workflow/guidance checkpoints through 830f355fd4c79d8493ec8f3902369e4e87ae4bfe. Worktrees start from the acceptance/allocation ledger commit containing this record; Infra002 records its exact SHA before dispatch.
 Dependencies: contracts 001 and infrastructure 002 accepted; met. Task003 acceptance still requires completed fake/native/evidence gates.
@@ -42,3 +42,9 @@ Review found source-grounded false-pass branches for missing clock mapping/cache
 Fake003's initial implementation checkpoints are `d91fa8d6d516e9acf014a340a7626d05657d0baf` and `de5d21e95d679877b871d71b6f48a8b157cc85d3`. Astra reviewed source, focused logs and consumer smoke. Follow-up removes a tautological unrelated allocator probe and tests exact historical correlation instead; verification/checkpoint pending.
 
 Coordination correction: performance leases must release between repeat/cohort boundaries and honor queued builds. The initial finite three-repeat run held exclusion for 354 seconds; do not repeat that monolithic lease. Independent correctness jobs require no performance exclusion outside actual sampled windows. No new approval/setup/checkpoint handshake between disjoint private lanes.
+
+## Acceptance
+
+Combined integration source checkpoint `da2cf57`, final ledger checkpoint `3c18aac45d732f217bc9af98d466f3c569c8dd61`. Infra002 preserved seven private commits; original→shared SHA mapping is `.artifacts/infra002/003-integration/manifest.json`. Astra inspected narrow integration diff (only native metrics test import), actual raw check output and independent repaired-candidate evidence. One combined `./tools/check` passed formatting, Debug/ReleaseSafe each 55/56 native tests (one platform skip) and 30 Python cases (two skips), plus actual private compositor resize/Escape/export/cleanup smoke. No failure hidden or budget raised.
+
+Native003's single repaired-candidate evaluation on `ce4fd533` exercised 150 real resize actions/152 frame records, zero native drops/failures and three bounded cache tails. Resource samples 156/160 complete, explicitly incomplete coverage; sampled settled-tail RSS/PSS growth zero. Evidence `.artifacts/native003/eval-ce4fd533/receipt.md`. It establishes the affected cache/interaction path, not a replacement performance baseline or physical latency claim. Acceptance covers task003 fake adapter and actual native shell harness only, not durable conversations, live providers or useful coding UI. Tasks004/005 may now implement concurrently against the agreed seam.
