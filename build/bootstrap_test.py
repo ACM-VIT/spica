@@ -233,7 +233,6 @@ class LuaBootstrapTests(unittest.TestCase):
                 bootstrap.build_lua(prefix, build)
                 self.assertEqual(len(calls), 1)
                 self.assertTrue((prefix / 'lib/libspica-lua54.a').exists())
-                self.assertIn('Copyright (C) 1994-2026', (prefix / 'share/licenses/lua-5.4.9.txt').read_text())
                 bootstrap.build_lua(prefix, build)
                 self.assertEqual(len(calls), 1)
                 for artifact in ('include/lua54/lua.h', 'share/licenses/lua-5.4.9.txt',

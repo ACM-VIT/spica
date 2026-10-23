@@ -38,3 +38,12 @@ task006 acceptance. Those require shared integration outside this lane's exact
 allowlist. Build lease coordinated with RuntimeShip004/UIShip005, released after
 this cohort. Requested/resolved model gpt-6.1-sol; tier default; no descendants,
 no fallback/advisors; detailed token usage unavailable. Worker ScriptShip006.
+
+## Review follow-up
+
+Main approved standalone checkpoint `0df2098ae8346c19098c50ff7855de0dbe970d9a`
+for integration, not native acceptance. Removed the incidental license wording
+assertion from LuaBootstrapTests; behavioral cache/artifact recovery and archive
+checksum coverage remain. Focused `python3 -m unittest
+bootstrap_test.LuaBootstrapTests` from `build/`: 2 passed in 0.029s; raw
+`.artifacts/script006/bootstrap-review-fix.log`. No broad checks repeated.
