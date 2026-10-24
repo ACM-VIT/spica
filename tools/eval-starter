@@ -305,7 +305,9 @@ def main():
                     run('gcc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', str(packaged), '-o', str(pointer), *flags)
                 run('vd', 'click', session, window_id, str(rect['x'] + x + w // 2), str(rect['y'] + y + h // 2))
             enabled = lambda s, name: any(t['id'] == name and t['enabled'] for t in s['targets'])
-            current = observe(lambda s: enabled(s, 'command.send'), 'ready')
+            current = observe(lambda s: s['send_ready'], 'ready')
+            if enabled(current, 'command.send'):
+                raise RuntimeError('Empty composer must keep Send disabled')
             if args.mode == 'custom':
                 current = observe(lambda s: not s['custom_root'] and s['script_generation'] == 0 and s['script_error'], 'initial invalid module retains native default')
                 run('vd', 'shot', session, str(output / 'initial-invalid-default.png'))
@@ -314,7 +316,7 @@ def main():
                 key('F5')
                 current = observe(lambda s: s['custom_root'] and s['script_generation'] > 0 and not s['script_error'], 'installed custom root')
             run('vd', 'text', session, window_id, 'Inspect café 世界 👩‍💻')
-            current = observe(lambda s: s['draft'] == 'Inspect café 世界 👩‍💻', 'typed prompt')
+            current = observe(lambda s: s['draft'] == 'Inspect café 世界 👩‍💻' and enabled(s, 'command.send'), 'typed prompt enables Send')
             key('Return')
             current = observe(lambda s: s['run_status'] == 'awaiting_approval' and enabled(s, 'approval.allow') and any('const answer' in text for text in s['transcript']), 'rendered response and code awaiting approval')
             run('vd', 'shot', session, str(output / 'approval.png'))
@@ -337,7 +339,7 @@ def main():
                 current = observe(lambda s: not s['custom_root'] and s['run_id'] == retained and s['run_status'] == 'awaiting_approval', 'same accepted run in default root')
                 run('vd', 'shot', session, str(output / 'same-run-default.png'))
             target(current, 'approval.allow')
-            current = observe(lambda s: s['run_status'] == 'completed' and any('Inspection approved' in text for text in s['transcript']) and enabled(s, 'command.send'), 'completed tool result')
+            current = observe(lambda s: s['run_status'] == 'completed' and any('Inspection approved' in text for text in s['transcript']) and s['send_ready'], 'completed tool result')
             run('vd', 'shot', session, str(output / 'completed.png'))
             if args.mode == 'custom':
                 key('F9')
@@ -351,7 +353,7 @@ def main():
                 key('F9')
                 current = observe(lambda s: not s['custom_root'] and s['run_id'] == retained, 'second custom run survives switch before cancel')
             target(current, 'run.cancel')
-            current = observe(lambda s: s['run_status'] == 'cancelled' and enabled(s, 'command.send'), 'cancelled')
+            current = observe(lambda s: s['run_status'] == 'cancelled' and s['send_ready'], 'cancelled')
             retained_thread, retained_run = current['thread_id'], current['run_id']
             run('vd', 'shot', session, str(output / 'cancelled.png'))
             if args.mode == 'custom':
@@ -365,7 +367,7 @@ def main():
                     key('Return')
                     current = observe(lambda s: s['run_status'] == 'awaiting_approval' and enabled(s, 'approval.allow'), f'turn {index + 3} approval')
                     target(current, 'approval.allow')
-                    current = observe(lambda s: s['run_status'] == 'completed' and enabled(s, 'command.send'), f'turn {index + 3} completed')
+                    current = observe(lambda s: s['run_status'] == 'completed' and s['send_ready'], f'turn {index + 3} completed')
                 assert_workspace_snapshot(current)
                 (output / 'chronology-geometry.json').write_text(json.dumps(current, indent=2))
                 run('vd', 'shot', session, str(output / 'chronology-latest.png'))
@@ -378,27 +380,27 @@ def main():
                     current = observe(lambda s: s['frame_id'] > frame and not s['pending_command'], f'forward history boundary {index}')
                     time.sleep(.2)
                 key('alt+End')
-                current = observe(lambda s: s['follow_latest'] and enabled(s, 'command.send'), 'explicit live follow restored')
+                current = observe(lambda s: s['follow_latest'] and s['send_ready'], 'explicit live follow restored')
                 target(current, 'composer.input')
                 run('vd', 'text', session, window_id, 'Retained draft café')
                 key('shift+Left')
                 current = observe(lambda s: s['draft'] == 'Retained draft café' and s['caret'] != s['anchor'], 'selected per-thread draft')
                 saved_caret, saved_anchor = current['caret'], current['anchor']
                 target(current, 'workspace.new_thread')
-                current = observe(lambda s: s['thread_id'] != original_thread and enabled(s, 'command.send'), 'new independent thread')
+                current = observe(lambda s: s['thread_id'] != original_thread and s['send_ready'], 'new independent thread')
                 new_thread = current['thread_id']
                 run('vd', 'text', session, window_id, 'Independent draft')
                 current = observe(lambda s: s['draft'] == 'Independent draft', 'second thread draft')
                 target(current, original_thread)
-                current = observe(lambda s: s['thread_id'] == original_thread and s['draft'] == 'Retained draft café' and s['caret'] == saved_caret and s['anchor'] == saved_anchor and enabled(s, 'command.send'), 'original draft and selection restored')
+                current = observe(lambda s: s['thread_id'] == original_thread and s['draft'] == 'Retained draft café' and s['caret'] == saved_caret and s['anchor'] == saved_anchor and s['send_ready'], 'original draft and selection restored')
                 key('ctrl+z')
                 current = observe(lambda s: s['draft'] != 'Retained draft café', 'retained draft undo')
                 key('ctrl+shift+z')
                 current = observe(lambda s: s['draft'] == 'Retained draft café', 'retained draft redo')
                 target(current, new_thread)
-                current = observe(lambda s: s['thread_id'] == new_thread and s['draft'] == 'Independent draft' and enabled(s, 'command.send'), 'second draft restored')
+                current = observe(lambda s: s['thread_id'] == new_thread and s['draft'] == 'Independent draft' and s['send_ready'], 'second draft restored')
                 target(current, original_thread)
-                current = observe(lambda s: s['thread_id'] == original_thread and enabled(s, 'command.send'), 'execution target restored')
+                current = observe(lambda s: s['thread_id'] == original_thread and s['send_ready'], 'execution target restored')
                 run('vd', 'shot', session, str(output / 'workspace-drafts.png'))
                 retained_thread, retained_run = current['thread_id'], current['run_id']
             retained_status = current['run_status']
@@ -413,7 +415,7 @@ def main():
             launch = json.loads(run('vd', 'run', session, '--bg', '--log', str(output / 'reopen.log'), '--', *argv))
             windows = wait_windows(session, True)
             window_id = windows.splitlines()[0].split()[0]
-            current = observe(lambda s: s['thread_id'] == retained_thread and s['run_id'] == retained_run and s['run_status'] == retained_status and any('Inspection approved' in text for text in s['transcript']) and enabled(s, 'command.send'), 'reopened durable conversation')
+            current = observe(lambda s: s['thread_id'] == retained_thread and s['run_id'] == retained_run and s['run_status'] == retained_status and any('Inspection approved' in text for text in s['transcript']) and s['send_ready'], 'reopened durable conversation')
             if args.mode == 'custom':
                 current = observe(lambda s: s['custom_root'] and '[custom]' in s['custom_render'] and 'Inspection approved' in s['custom_render'] and s['run_id'] == retained_run, 'reopened custom renderer and retained cancelled run')
             manifest['conversation_reopened'] = current
