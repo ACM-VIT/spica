@@ -32,6 +32,12 @@ output and run status. Ordinary launch uses `$XDG_DATA_HOME/spica-native/convers
 (or `$HOME/.local/share/spica-native/conversation`); legacy histories are never
 discovered or migrated. `--state-directory` selects isolated state explicitly.
 
+For a short manual test, send a Unicode prompt, exercise approval/cancel, then
+create another chat from the sidebar and check that switching restores your draft.
+Close and reopen with the same state directory to check retained output. The
+default provider is a synthetic fixture; use an explicit real provider below for
+an actual coding task.
+
 Select the minimal user module with `--lua-module examples/minimal.lua`. F5
 reloads that file; F9 switches between its root/renderer and the native default.
 Invalid initial configuration keeps the default; invalid reload keeps the
@@ -47,6 +53,25 @@ bridge with real isolated-desktop input and temporary state.
 Codex targets app-server **0.163.0** and supported ChatGPT sign-in; OpenCode
 targets **2.1.4** ACP. Create a disposable absolute workspace and use separate
 managed account directories. No OMP credentials or old histories are imported.
+For OpenCode alone, with an already authorized isolated OpenCode Go account:
+
+```bash
+zig-out/bin/spica --provider opencode \
+  --runtime-executable /absolute/path/to/opencode \
+  --runtime-account-directory /tmp/spica-opencode-account \
+  --model-provider opencode-go --model gpt-6-luna --effort default \
+  --workspace /tmp/spica-disposable-project \
+  --state-directory /tmp/spica-opencode-conversation
+```
+
+Create the workspace directory first. On a fresh launch, open **Connect provider**
+and click **Refresh models**, then close the connection panel and select the
+desired model and effort in the header. Discovery does not send a prompt; sending
+starts real provider work in the selected workspace. Choose IDs from your actual
+account's catalog; the example requires access to that model. Reuse the same
+arguments to reopen your test conversation. Temporary account/project/state
+directories must remain available for that session.
+
 For an OpenCode coordinator with an explicitly authorized Codex child runtime:
 
 ```bash
