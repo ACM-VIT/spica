@@ -1606,6 +1606,7 @@ const Conversation = struct {
                 self.refresh = true;
             },
             .configure => {
+                app.view.notice = null;
                 self.configuration_pending = true;
                 self.close_setup_after_refresh = true;
                 self.launch_selection = null;
@@ -1650,7 +1651,10 @@ const Conversation = struct {
                     self.login_poll_due = c.SDL_GetTicks() + 500;
                     self.updateLogin(&app.view, status.login);
                     const remaining = app.view.runtime_info[app.view.runtime_info_len..];
-                    const written = std.fmt.bufPrint(remaining, "{s}: {s}\n{s}\n", .{ status.runtime_kind, @tagName(status.readiness), @import("text/utf8.zig").prefix(status.reason, 3000) }) catch continue;
+                    const written = if (status.runtime_kind.len == 0)
+                        std.fmt.bufPrint(remaining, "No provider connected. Choose a provider and workspace above.\n", .{}) catch continue
+                    else
+                        std.fmt.bufPrint(remaining, "{s}: {s}\n{s}\n", .{ status.runtime_kind, @tagName(status.readiness), @import("text/utf8.zig").prefix(status.reason, 3000) }) catch continue;
                     app.view.runtime_info_len += written.len;
                     if (kind == .startup_status) {
                         if (try self.restoreStartup(&app.view, status)) {
@@ -1727,6 +1731,9 @@ const Conversation = struct {
                     if (self.close_setup_after_refresh and !self.catalog_refresh_pending and app.view.model_count != 0) {
                         self.close_setup_after_refresh = false;
                         app.view.setup_open = false;
+                        if (app.view.notice) |message| {
+                            if (std.mem.startsWith(u8, message, "Provider unavailable:")) app.view.notice = null;
+                        }
                     }
                     try self.askRuns();
                 }
