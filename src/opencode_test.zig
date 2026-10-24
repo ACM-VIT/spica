@@ -37,6 +37,12 @@ fn ready(runtime: *Runtime, a: std.mem.Allocator) !void {
     _ = try consume(runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"ses_upstream\"}}");
     const event = (try consume(runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"configOptions\":[{\"id\":\"model\",\"currentValue\":\"opencode/big-pickle\"}]}}")).?;
     try std.testing.expect(event.body == .session);
+    const selected = (try runtime.poll(a)).?;
+    try std.testing.expect(selected.body == .selection);
+    try std.testing.expect(c.equal(selection, selected.body.selection.requested));
+    try std.testing.expect(c.equal(selection, selected.body.selection.effective.?));
+    try std.testing.expect(c.equal(correlation.session, selected.correlation.session));
+    try std.testing.expectEqual(@as(usize, 0), runtime.transport.polls);
 }
 fn prompting(runtime: *Runtime, a: std.mem.Allocator) !void {
     try ready(runtime, a);
@@ -408,6 +414,10 @@ test "ACP effort acknowledgement must retain exact model and initialize uses an 
     try std.testing.expectError(error.SelectionUnavailable, consume(&runtime, allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"configOptions\":[{\"id\":\"model\",\"currentValue\":\"opencode/substituted\"},{\"id\":\"effort\",\"currentValue\":\"high\"}]}}"));
     _ = try consume(&runtime, allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"configOptions\":[{\"id\":\"model\",\"currentValue\":\"opencode/big-pickle\"},{\"id\":\"effort\",\"currentValue\":\"high\"}]}}");
     try std.testing.expect(runtime.resolveSelection(runtime.selection).effective != null);
+    const selected = (try runtime.poll(allocator)).?;
+    try std.testing.expect(selected.body == .selection);
+    try std.testing.expect(c.equal(runtime.selection, selected.body.selection.effective.?));
+    try std.testing.expect((try runtime.poll(allocator)) == null);
 }
 
 test "ACP failure preserves provider error data in bounded diagnostic" {

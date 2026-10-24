@@ -1164,7 +1164,7 @@ pub const Host = struct {
         }
         const response = try allocator.alloc(u8, 65536);
         const bytes = if (std.mem.eql(u8, method.string, "initialize"))
-            try t.encode(.{ .jsonrpc = "2.0", .id = id, .result = .{ .protocolVersion = "2025-03-26", .capabilities = .{ .tools = .{ .listChanged = false } }, .serverInfo = .{ .name = "spica", .version = "1" } } }, response)
+            try t.encode(.{ .jsonrpc = "2.0", .id = id, .result = .{ .protocolVersion = "2025-03-26", .capabilities = .{ .tools = .{ .listChanged = false } }, .serverInfo = .{ .name = "spica", .version = "1" }, .instructions = "These task tools create and manage Spica-owned children. Provider-native subagents are separate and do not appear in Spica. Delegate packets require an explicit authorized runtime, account, model, effort, workspace, owned paths and acceptance evidence. task.wait reads current durable state without blocking generation. Use the registered task tools for app-owned delegation." } }, response)
         else if (std.mem.eql(u8, method.string, "tools/list")) blk: {
             const Tool = struct { name: []const u8, description: []const u8, inputSchema: std.json.Value };
             var tools: [coordinator_tools.descriptors.len]Tool = undefined;

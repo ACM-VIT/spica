@@ -119,6 +119,12 @@ pub const Server = struct {
                 if (client.used > 8192) try self.respond(index, 431, "{}");
                 continue;
             };
+            // The header budget applies equally when the final delimiter
+            // arrives in the same read as an oversized header.
+            if (header_end + 4 > 8192) {
+                try self.respond(index, 431, "{}");
+                continue;
+            }
             var lines = std.mem.splitSequence(u8, bytes[0..header_end], "\r\n");
             const first = lines.next() orelse {
                 try self.respond(index, 400, "{}");
@@ -180,9 +186,98 @@ pub const Server = struct {
                 try self.respond(index, 401, "{}");
                 continue;
             }
+            const json = allocator.dupe(u8, bytes[header_end + 4 .. end]) catch |err| {
+                // Never strand an authenticated request in `waiting` when
+                // copying failed before the Host received an invocation.
+                close(client);
+                return err;
+            };
             client.waiting = true;
-            return .{ .client = index, .session = session.?, .json = try allocator.dupe(u8, bytes[header_end + 4 .. end]) };
+            return .{ .client = index, .session = session.?, .json = json };
         }
         return null;
     }
 };
+
+const HttpFixture = struct {
+    server: Server,
+    peer: c_int,
+    arena: std.heap.ArenaAllocator,
+    const token = "0123456789abcdef0123456789abcdef";
+    fn init() !HttpFixture {
+        var server = try Server.init();
+        errdefer server.deinit();
+        var pair: [2]c_int = undefined;
+        if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair) != 0) return error.SocketUnavailable;
+        errdefer _ = c.close(pair[1]);
+        server.clients[0] = .{ .fd = pair[0], .opened_ms = 100 };
+        try Server.nonblocking(pair[0]);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        errdefer arena.deinit();
+        _ = try server.bindSession(arena.allocator(), "parent", token);
+        return .{ .server = server, .peer = pair[1], .arena = arena };
+    }
+    fn deinit(self: *HttpFixture) void {
+        self.server.deinit();
+        _ = c.close(self.peer);
+        self.arena.deinit();
+    }
+    fn send(self: *HttpFixture, bytes: []const u8) !void {
+        const n = c.send(self.peer, bytes.ptr, bytes.len, c.MSG_NOSIGNAL);
+        if (n < 0 or @as(usize, @intCast(n)) != bytes.len) return error.ShortWrite;
+    }
+    fn request(self: *HttpFixture, session: []const u8, bearer: []const u8) !void {
+        const bytes = try std.fmt.allocPrint(self.arena.allocator(), "POST /mcp/{s} HTTP/1.1\r\nAuthorization: Bearer {s}\r\nContent-Length: 2\r\n\r\n{{}}", .{ session, bearer });
+        try self.send(bytes);
+    }
+};
+
+test "MCP authenticates complete fragmented bodies against exact live session authority" {
+    var fixture = try HttpFixture.init();
+    defer fixture.deinit();
+    try fixture.send("POST /mcp/parent HTTP/1.1\r\nAuthorization: Bearer " ++ HttpFixture.token ++ "\r\nContent-Length: 2\r\n\r\n{");
+    try std.testing.expect((try fixture.server.poll(fixture.arena.allocator(), 101)) == null);
+    try std.testing.expect(!fixture.server.clients[0].waiting);
+    try fixture.send("}");
+    const invocation = (try fixture.server.poll(fixture.arena.allocator(), 102)).?;
+    try std.testing.expectEqualStrings("parent", invocation.session);
+    try std.testing.expectEqualStrings("{}", invocation.json);
+    try std.testing.expect(fixture.server.clients[0].waiting);
+    // A waiting call cannot be dispatched again by a later pump.
+    try std.testing.expect((try fixture.server.poll(fixture.arena.allocator(), 103)) == null);
+}
+
+test "MCP rejects wrong tokens cross-session authority and revoked bindings" {
+    for (0..3) |scenario| {
+        var fixture = try HttpFixture.init();
+        defer fixture.deinit();
+        if (scenario == 2) fixture.server.unbindSession("parent");
+        try fixture.request(if (scenario == 1) "sibling" else "parent", if (scenario == 0) "ffffffffffffffffffffffffffffffff" else HttpFixture.token);
+        try std.testing.expect((try fixture.server.poll(fixture.arena.allocator(), 101)) == null);
+        const client = &fixture.server.clients[0];
+        try std.testing.expect(!client.waiting);
+        try std.testing.expect(std.mem.startsWith(u8, client.output[0..client.output_len], "HTTP/1.1 401 "));
+    }
+}
+
+test "MCP enforces header budget even with complete delimiter and releases failed admission" {
+    {
+        var fixture = try HttpFixture.init();
+        defer fixture.deinit();
+        const padding: [8192]u8 = @splat('x');
+        const bytes = try std.fmt.allocPrint(fixture.arena.allocator(), "POST /mcp/parent HTTP/1.1\r\nX-Padding: {s}\r\nContent-Length: 2\r\n\r\n{{}}", .{padding});
+        try fixture.send(bytes);
+        try std.testing.expect((try fixture.server.poll(fixture.arena.allocator(), 101)) == null);
+        const client = &fixture.server.clients[0];
+        try std.testing.expect(std.mem.startsWith(u8, client.output[0..client.output_len], "HTTP/1.1 431 "));
+    }
+    {
+        var fixture = try HttpFixture.init();
+        defer fixture.deinit();
+        try fixture.request("parent", HttpFixture.token);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, fixture.server.poll(failing.allocator(), 101));
+        try std.testing.expectEqual(@as(c_int, -1), fixture.server.clients[0].fd);
+        try std.testing.expect(!fixture.server.clients[0].waiting);
+    }
+}

@@ -72,14 +72,23 @@ const Consumer = struct {
         var result: std.Io.Writer.Allocating = .init(allocator);
         for (rows) |row| {
             if (row.message.role != .assistant) continue;
-            if (row.message.next_block_cursor != null) return error.BlockLimit;
-            for (row.message.blocks) |block| {
-                if (block.kind != .text or block.committed_bytes == 0) continue;
-                if (block.committed_bytes > 16384) return error.TextLimit;
-                const content = try self.query(.{ .content = .{ .block = block.block_id, .start_byte = 0, .end_byte = block.committed_bytes } });
-                if (content.next_cursor != null) return error.ContentLimit;
-                for (content.items) |piece| try result.writer.writeAll(piece.content.bytes);
-            }
+            // Tool activity can fill the inline descriptors before the final
+            // coordinator reply. Read bounded public block pages explicitly.
+            var bounds: t.Page = .{ .limit = 32 };
+            for (0..8) |_| {
+                const blocks = try common.clone(allocator, try self.query(.{ .blocks = .{ .message = row.message.message_id, .page = bounds } }));
+                for (blocks.items) |item| {
+                    const block = item.block;
+                    if (block.kind != .text or block.committed_bytes == 0) continue;
+                    if (block.committed_bytes > 16384 or result.written().len + block.committed_bytes > 65536) return error.TextLimit;
+                    const content = try self.query(.{ .content = .{ .block = block.block_id, .start_byte = 0, .end_byte = block.committed_bytes } });
+                    if (content.next_cursor != null) return error.ContentLimit;
+                    for (content.items) |piece| try result.writer.writeAll(piece.content.bytes);
+                }
+                if (blocks.next_cursor == null) break;
+                bounds.snapshot = blocks.snapshot_id;
+                bounds.cursor = blocks.next_cursor;
+            } else return error.BlockLimit;
         }
         return result.toOwnedSlice();
     }
@@ -143,7 +152,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const registered = try common.clone(a, (try consumer.command("workspace", .absent, .absent, .{ .workspace_register = .{ .project = project, .binding = binding } })).entity_ids.workspace.?);
     const thread = try common.clone(a, (try consumer.command("thread", .absent, .absent, .{ .thread_create = .{ .project = project, .workspace = registered } })).entity_ids.thread.?);
     var instructions: std.Io.Writer.Allocating = .init(a);
-    try instructions.writer.writeAll("Use only the application's registered delegation and task listing tools. These create app-owned children; do not use native provider subagents. For OpenCode, use the execute Code Mode tool and its advertised spica namespace (tools.spica['task.delegate'] or the catalog's normalized equivalent). For Codex, call the registered dynamic task_delegate and task_list tools directly. Do not use shell, filesystem, network, search or any other tools. Call the delegation tool exactly once for EACH of these exact argument objects, without changing any selection or packet field:\n");
+    try instructions.writer.writeAll("Use the application's registered delegation and task listing tools to create app-owned children. For OpenCode, call execute with JavaScript: return await tools.spica.task_delegate(ARGUMENT_OBJECT). The server namespace is spica and dotted MCP names normalize to underscores. If the catalog is partial, use search({namespace:'spica',query:'task',limit:5}) inside execute to discover the exact paths, then invoke them. For Codex, call the registered dynamic task_delegate and task_list tools directly. Do not use provider-native subagents, shell, filesystem, network or web search. Call the delegation tool exactly once for EACH of these exact argument objects, without changing any selection or packet field:\n");
     for (configs[0..configuration.runtimes.len], 0..) |config, index| {
         var selection = config.selection;
         selection.workspace = registered;
@@ -152,7 +161,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const arguments = try std.json.Stringify.valueAlloc(a, .{ .request_key = try std.fmt.allocPrint(a, "installed-delegate-{d}", .{index}), .packet = packet }, .{});
         try instructions.writer.print("{s}\n", .{arguments});
     }
-    try instructions.writer.writeAll("Then call the application's task listing tool once and reply exactly SPICA_COORDINATOR_OK. Do not wait for the children; the application collects their results. If these registered application tools are absent, report SPICA_BRIDGE_UNAVAILABLE and stop immediately.");
+    try instructions.writer.writeAll("Then call the application's task listing tool once (OpenCode: execute return await tools.spica.task_list({}); Codex: task_list) and reply exactly SPICA_COORDINATOR_OK. Do not wait for the children; the application collects their results. Attempt the registered application tools before reporting SPICA_BRIDGE_UNAVAILABLE.");
     var parent_selection = configs[0].selection;
     parent_selection.workspace = registered;
     const parent = try common.clone(a, (try consumer.command("send", .{ .thread = thread }, .{ .revision = 1 }, .{ .thread_send = .{ .text = instructions.written(), .selection = parent_selection } })).entity_ids.run.?);

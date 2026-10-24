@@ -66,6 +66,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
         resume_supported: bool = false,
         runtime_version: []const u8 = "unnegotiated",
         effective: bool = false,
+        selection_pending: bool = false,
         cancel_requested: bool = false,
         shutdown_done: bool = false,
         transport_failure: ?anyerror = null,
@@ -329,6 +330,11 @@ pub fn RuntimeFor(comptime Transport: type) type {
         }
         /// One frame per poll, preserving order and bounding per-call work.
         pub fn poll(self: *Self, allocator: std.mem.Allocator) !?c.Observation {
+            if (self.selection_pending) {
+                const result = try self.observation(allocator, "session/effective-selection", .{ .selection = self.resolveSelection(self.selection) });
+                self.selection_pending = false;
+                return result;
+            }
             if (try self.drainPending(allocator)) |result| return result;
             if (self.transport_failure) |err| {
                 if (self.transport_failure_emitted) return null;
@@ -399,6 +405,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
                         } else {
                             self.phase = .ready;
                             self.effective = true;
+                            self.selection_pending = true;
                             return try self.observation(allocator, "session/selected", .{ .session = self.session.? });
                         }
                     },
@@ -406,6 +413,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
                         if (!configMatches(result, "effort", "", self.selection.effort) or !configMatches(result, "model", self.selection.model_provider, self.selection.model_id)) return error.SelectionUnavailable;
                         self.phase = .ready;
                         self.effective = true;
+                        self.selection_pending = true;
                         return try self.observation(allocator, "session/selected", .{ .session = self.session.? });
                     },
                     .prompting => {
