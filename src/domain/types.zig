@@ -55,6 +55,8 @@ pub const WorkspaceBinding = struct {
     repository_identity: []const u8,
     checkout_identity: []const u8,
     expected_branch: []const u8,
+    /// Empty for non-Git directories or a proven unborn symbolic Git branch.
+    /// The first commit changes this identity; it never silently rebases a binding.
     base_revision: []const u8,
     non_git: bool = false,
 };

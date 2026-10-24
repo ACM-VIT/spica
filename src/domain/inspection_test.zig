@@ -186,3 +186,68 @@ test "NUL parser preserves raw bytes and rejects malformed or excess records" {
     try std.testing.expectError(error.MalformedStatus, inspection.parseStatus(a, "?? missing terminator", 5));
     try std.testing.expectError(error.MalformedStatus, inspection.parseStatus(a, "\x00?? trailing\x00", 5));
 }
+
+test "unborn capture staged inspection reopen and first commit identity" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(io, &path);
+    const root = path[0..n];
+    try git(root, &.{ "init", "--initial-branch=unborn-fixture" });
+    var captured = try inspection.capture(a, io, root, .{});
+    defer captured.deinit(a);
+    const binding = captured.binding.?;
+    try std.testing.expect(!binding.non_git);
+    try std.testing.expectEqualStrings(root, binding.canonical_root);
+    try std.testing.expect(binding.filesystem_identity.len != 0);
+    const metadata = try std.fmt.allocPrint(a, "{s}/.git", .{root});
+    defer a.free(metadata);
+    try std.testing.expectEqualStrings(metadata, binding.repository_identity);
+    try std.testing.expectEqualStrings(metadata, binding.checkout_identity);
+    try std.testing.expectEqualStrings("unborn-fixture", binding.expected_branch);
+    try std.testing.expectEqualStrings("", binding.base_revision);
+    var fresh = try inspection.inspect(a, io, binding, root, .status, .{});
+    defer fresh.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), fresh.entries.len);
+    try temporary.dir.writeFile(io, .{ .sub_path = "first", .data = "first staged\n" });
+    try git(root, &.{ "add", "--", "first" });
+    var reopened = try inspection.capture(a, io, root, .{});
+    defer reopened.deinit(a);
+    try std.testing.expect(@import("types.zig").adapter.equal(binding, reopened.binding.?));
+    var staged = try inspection.inspect(a, io, binding, root, .{ .diff = .{ .path = "first", .staged = true } }, .{});
+    defer staged.deinit(a);
+    try expectContains(staged.bytes, "+first staged");
+    try temporary.dir.writeFile(io, .{ .sub_path = "first", .data = "first unstaged\n" });
+    var unstaged = try inspection.inspect(a, io, binding, root, .{ .diff = .{ .path = "first" } }, .{});
+    defer unstaged.deinit(a);
+    try expectContains(unstaged.bytes, "+first unstaged");
+    try git(root, &.{ "symbolic-ref", "HEAD", "refs/heads/replacement" });
+    try std.testing.expectError(error.WorkspaceIdentityChanged, inspection.inspect(a, io, binding, root, .status, .{}));
+    try git(root, &.{ "symbolic-ref", "HEAD", "refs/heads/unborn-fixture" });
+    try git(root, &.{ "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "first" });
+    try std.testing.expectError(error.WorkspaceIdentityChanged, inspection.inspect(a, io, binding, root, .status, .{}));
+    try git(root, &.{ "checkout", "--detach" });
+    var detached = try inspection.capture(a, io, root, .{});
+    defer detached.deinit(a);
+    try std.testing.expectEqualStrings("HEAD", detached.binding.?.expected_branch);
+    try std.testing.expect(detached.binding.?.base_revision.len != 0);
+    var detached_status = try inspection.inspect(a, io, detached.binding, root, .status, .{});
+    defer detached_status.deinit(a);
+}
+
+test "malformed HEAD and missing branch objects are not unborn or non Git" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(io, &path);
+    const root = path[0..n];
+    try git(root, &.{ "init", "--initial-branch=fixture" });
+    try temporary.dir.writeFile(io, .{ .sub_path = ".git/refs/heads/fixture", .data = "1111111111111111111111111111111111111111\n" });
+    try std.testing.expectError(error.NotRepository, inspection.capture(a, io, root, .{}));
+    try temporary.dir.writeFile(io, .{ .sub_path = ".git/refs/heads/fixture", .data = "malformed\n" });
+    try std.testing.expectError(error.NotRepository, inspection.capture(a, io, root, .{}));
+    try temporary.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "1111111111111111111111111111111111111111\n" });
+    try std.testing.expectError(error.NotRepository, inspection.capture(a, io, root, .{}));
+    try temporary.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "malformed\n" });
+    try std.testing.expectError(error.NotRepository, inspection.capture(a, io, root, .{}));
+}
