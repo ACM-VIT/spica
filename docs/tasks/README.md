@@ -1,5 +1,13 @@
 # Current work
 
+## T3 UI and presentation API — 2026-10-24
+
+Status: implementation. User requests close T3 Code UI parity, editable through the API, with architecture explained before changes. Architecture communicated: durable Host, bounded projections, shared presentation contract, native primitives, validated extension adapters. Base `57007de`, branch `rewrite/native-agent-workspace`; initial index/tree clean. Pinned T3 reference remains `eb1510d2493cbf28600432d5193cc22a1af8f3d8` (MIT), local source and marketing screenshot inspected. This slice implements presentation settings, custom-node styling and main conversation shell; absent diff/search/terminal surfaces must remain explicit gaps.
+
+Two shared Sol/high/default workers: T3Shell owns `src/ui/coding.zig`, `src/ui/clay.zig`. PresentationAPI owns `src/ui/design.zig`, `src/native/script_lua.h`, `src/native/script_lua.c`, `src/script.zig`, `src/script_test.zig`, `docs/contracts/scripting.md`, `examples/t3-theme.lua`. PresentationAPI exclusively owns shared presentation definitions; fixed interface packet `.artifacts/t3-ui-api/contract.txt` precedes both workers. Parent owns `src/app.zig`, `src/native/automation.zig`, `tools/eval-starter`, `build/eval_starter_test.py`, `src/test.zig`, `README.md`, `docs/ARCHITECTURE.md`, this ledger and is sole shared Git owner for this exact union. All historical workers frozen. Workers initially source/fmt only, no Git mutation, descendants, builds/evaluations, inference or credential access. Parent serializes build, actual private-desktop and benchmark leases.
+
+Contract: bounded by-value colors/layout settings consumed by native default and custom roots; validated Lua design/style descriptors; standalone native root styles the full default without replacing its actions. Last-good atomic reload, exact action context, bounded history and Host provider lifetime remain intact. Local extension binding first; external transport unimplemented pending user preference. Acceptance: meaningful strict-parser/last-good/native-custom geometry tests, `./tools/check` in Debug/ReleaseSafe, actual private-vd screenshots/input including themed reload/rejection/root switching, finite serialized frame/CPU/process-tree RSS/PSS comparison. No new budget/baseline, fabricated controls, history/credential import, push or dependency installation. Checkpoint coherent checked slices with tests; receipts under ignored `.artifacts/t3-ui-api/`.
+
 ## Native chat workspace and memory — 2026-10-24
 
 Status: implementation. User reports inaccessible complete chats, missing flow/model picker and high RSS; requests native T3 Code behavior rewrite, Markdown consolidation, and independent foot-informed performance investigation.
