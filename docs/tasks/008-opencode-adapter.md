@@ -1,6 +1,6 @@
 # 008: OpenCode v2 adapter
 
-Status: review — installed provider/factory/MCP/native/permission evidence is recorded; subscription and cross-runtime inference parity are not claimed.
+Status: review — isolated OpenCode Go coordinator/child completion, exact selections and durable reopen passed; cross-runtime inference parity is not claimed.
 Owner: RuntimeFactoryLead.NativeBridgeConsumer completed the OpenCode provider/consumer continuation; RuntimeFactoryLead serialized shared integration. Astra reviews acceptance.
 Base: `301e8e35899f9c1aeb2005b220e72c55c9fa178f`, shared checkout. Own `src/runtime/opencode*`, OpenCode-specific fixture/smoke files and `docs/contracts/opencode.md`; do not edit common/domain/native files.
 Dependencies: reviewed automated fake/native milestone and pinned core contracts. Consume the adapter interface published by CodexShip007; report actual v2 capability differences, never assume parity or claim live acceptance before execution.
@@ -49,3 +49,5 @@ assertions are in `consumer/permissions-4/approval-receipt.json`. The discovered
 post-approval digest bug is repaired in `221412e`, including interleaved tool
 authority tests (17/17 Debug/ReleaseSafe). Final complete integration gate passed
 141/143 Zig tests per mode (2 skipped), native builds and CLI/Python checks.
+
+2026-10-24 continuation: actual 2.1.4 executable /home/ashman/.opencode/bin/opencode, authorized isolated OpenCode Go account, gpt-6-luna/default. Coordinator invoked Spica delegation/list via normalized tools.spica.task_delegate/task_list; child and parent markers and effective model/effort matched. Public Host accepted correlated result/review, and reopen without factory retained them. Native private-desktop reopen also rendered the completed task/result without another send. Checkpoint 6d5ef8c fixes missing effective-selection publication; narrow suite 43 passed/one skipped in each mode. Evidence: .artifacts/parity-recovery/opencode-go-report-5.json, live-candidate-5.json and ui/opencode-durable/. This finite gate does not establish live approval/cancellation or complete usage/billing.

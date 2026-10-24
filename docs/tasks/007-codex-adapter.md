@@ -1,6 +1,6 @@
 # 007: Codex with ChatGPT sign-in
 
-Status: review — production factory/startup/protocol bridge slice is integrated and checked; isolated Codex authentication remains a user prerequisite for inference acceptance.
+Status: review — production factory/startup/protocol bridge slice is integrated and checked; isolated supported ChatGPT authentication is recognized; live inference is blocked by the account usage limit.
 Owner: RuntimeFactoryLead recovered common/provider/native integration and serialized shared checkpoints. Astra retains contract decisions and final acceptance.
 Base: `301e8e35899f9c1aeb2005b220e72c55c9fa178f`, shared checkout. Own `src/runtime/codex*`, `src/runtime/transport*`, `src/runtime/adapter.zig`, existing `src/platform/process*`, `build.zig`, `src/test.zig`, `src/main.zig`, `src/options.zig`, this task record and Codex-specific contract/fixture files.
 Dependencies: automated milestone004–006 reviewed; human feedback and live account entitlement remain distinct gates, not blockers to implementation. Publish common adapter interface directly to OpenCodeShip008 and OrchestratorShip012 before callers depend on it.
@@ -142,3 +142,5 @@ Debug/ReleaseSafe builds, **141/143 Zig tests (2 skipped) per mode**, Python
 Producer receipts and final evidence manifest are under
 `.artifacts/provider-factory/`; both workers finished and cleaned owned jobs/
 desktops. Final acceptance remains Astra's source/evidence review.
+
+2026-10-24 continuation: authorized isolated ChatGPT account read/model catalog and thread-start negotiation succeeded with installed 0.163.0. Live generation returned usage_limit_exceeded; ordinaryUsageAllowed=false, weekly usage 100%, reset 2026-10-30 18:37:56 UTC (Oct 31 00:07:56 IST). Other discovered ChatGPT credentials identify the same exhausted account. No authenticated completion or mixed-runtime inference acceptance is claimed. Checkpoints cb57bee/c4bc52a add valid dynamic tool aliases, exact selection, correlated rejected-open and bounded retry/turn diagnostics. Provider/protocol tests: 43 passed, one skipped per Debug/ReleaseSafe. Evidence: .artifacts/parity-recovery/runtime/round3-manifest.json and codex-rate-limits.json.
