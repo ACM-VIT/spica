@@ -44,3 +44,29 @@ Lead granted the serialized dedicated build lease. Both `zig build test-workspac
 Raw logs, evidence runner/result, candidate identity and manifest are under private `.artifacts/workspace011`. Earlier failure logs are retained: initial module-root compile, harmless inherited UI Git environment refusal, nested-fixture parent discovery, evidence-script status representation assumption, and missing consumer environment propagation. Repairs: approved module-root wrappers, safe UI-only environment allowlist, explicit nested-checkout refusal fixture, corrected evidence assertion, and explicit CLI I/O environment. No repeated identical failure. No native/UI/provider/performance checks or production `tools/check` were run.
 
 Source entrypoints: `inspection.capture` / `inspection.inspect`; `inspection_smoke.main`; `tools/inspect-workspace`. Normal application/domain targets remain unchanged. Public/UI consumer and external-tool acceptance wait for safe 009 integration; this is not complete 011.
+
+## Shared staged-slice integration
+
+ShippingResume reviewed the actual backend, tests, consumer, wrappers and build
+wiring, then no-ff integrated producer `be5cf90` as shared `09365daa65a19f13732d00a184b66c1e8400f8d8`.
+The first shared `./tools/check` stopped at formatting. The sole source correction
+was Zig's spacing normalization around the saturating slice bound in
+`inspection.zig`; no semantic change or failed-check suppression.
+
+The changed candidate (shared base `09365daa`, binary diff SHA256
+`7c1986edf46057200555b2aad9eb133d66995575c309dfab73541cdd91816686`)
+passed `./tools/check`: formatting 94 files, Debug/ReleaseSafe executable builds
+and CLI smoke, each 156 native tests/two skips plus four image tests, Python 35
+tests/two skips. Dedicated inspection test/build targets passed 11/11 in both
+modes. The actual integrated CLI repeated 22 disposable-root commands, including
+non-UTF8 paths, exact per-root staged/unstaged diffs and a 5.007-second deadline
+with no remaining owned subprocess; temporary roots were cleaned.
+
+Exact commands, hashes and logs are shared
+`.artifacts/shipping-resume/integrated-repaired-checks.json`; changed-path consumer
+evidence is `consumer-result.json` and `consumer-raw.log` alongside it. The first
+formatting failure is preserved as `integrated-0.log`. These checks cover the
+shared recovered tooling and staged 011 backend only: task009 and its separate
+partial FreeType remediation were **not** merged or accepted. No native desktop,
+provider or performance attempt occurred. Full 011 public/UI/external-tool
+acceptance remains 009-dependent.

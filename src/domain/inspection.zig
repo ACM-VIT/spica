@@ -107,7 +107,7 @@ fn work(io: std.Io, memory: []u8, binding: ?WorkspaceBinding, root: []const u8, 
             // Explicitly refuse untracked files; an empty diff must not pretend
             // their content was inspected. Deleted tracked paths remain valid.
             const tracked = try git(a, io, captured.canonical_root, &.{ "ls-files", "--with-tree=HEAD", "-z", "--", d.path }, limits.output_bytes);
-            if (tracked.len != d.path.len + 1 or !std.mem.eql(u8, tracked[0 .. tracked.len -| 1], d.path)) return error.UntrackedDiffUnavailable;
+            if (tracked.len != d.path.len + 1 or !std.mem.eql(u8, tracked[0..tracked.len -| 1], d.path)) return error.UntrackedDiffUnavailable;
             result.bytes = if (d.staged)
                 try git(a, io, captured.canonical_root, &.{ "diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "--", d.path }, limits.diff_bytes)
             else
