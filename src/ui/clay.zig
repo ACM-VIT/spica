@@ -45,10 +45,10 @@ pub const Layout = struct {
         body.layout.layoutDirection = c.CLAY_TOP_TO_BOTTOM;
         body.layout.childAlignment.x = c.CLAY_ALIGN_X_CENTER;
         body.layout.childGap = 12;
-        body.layout.padding = .{ .left = 24, .right = 24, .top = 12, .bottom = 20 };
+        body.layout.padding = .{ .left = 224, .right = 24, .top = 12, .bottom = 20 };
         c.Clay__OpenElement();
         c.Clay__ConfigureOpenElement(body);
-        const content_width = fixed(@min(960, @max(0, width - 48)));
+        const content_width = fixed(@min(960, @max(0, width - 248)));
         open("transcript", content_width, grow(), c.CLAY_TOP_TO_BOTTOM);
         c.Clay__CloseElement();
         open("composer", content_width, fixed(180), c.CLAY_TOP_TO_BOTTOM);

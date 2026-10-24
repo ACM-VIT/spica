@@ -152,26 +152,39 @@ def frame_summary(native, phase):
 
 
 def key_command(session, window_id, value):
-    """vd key accepts one keysym, not chord syntax. Modifiers use real wtype."""
+    """Use modifier key events: protocol-only modifiers can be lost by SDL."""
     parts = value.split('+')
     if len(parts) == 1:
         return ('vd', 'key', session, window_id, value)
     modifiers, key = parts[:-1], parts[-1]
     if not key or any(modifier not in ('ctrl', 'shift', 'alt', 'logo') for modifier in modifiers):
         raise ValueError('Unsupported native key chord')
+    keysyms = dict(ctrl='Control_L', shift='Shift_L', alt='Alt_L', logo='Super_L')
     command = ['vd', 'run', session, '--', 'wtype', '-s', '150']
     for modifier in modifiers:
-        command += ['-M', modifier]
+        command += ['-P', keysyms[modifier]]
     command += ['-k', key]
     for modifier in reversed(modifiers):
-        command += ['-m', modifier]
+        command += ['-p', keysyms[modifier]]
     return tuple(command)
+
+
+def assert_workspace_snapshot(snapshot):
+    """Evidence must contain adjacent distinct messages, not one relabeled tile."""
+    rows = [(message, ordinal, role) for message, ordinal, role in zip(
+        snapshot['transcript_message_ids'], snapshot['transcript_ordinals'], snapshot['transcript_roles']) if message]
+    if len({message for message, _, _ in rows}) < 2:
+        raise RuntimeError('Workspace lacks adjacent chronological messages')
+    if not {'user', 'assistant'} <= {role for _, _, role in rows}:
+        raise RuntimeError('Workspace lacks user and assistant roles')
+    if [ordinal for _, ordinal, _ in rows] != sorted(ordinal for _, ordinal, _ in rows):
+        raise RuntimeError('Workspace message order is not chronological')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / '.artifacts/starter')
-    parser.add_argument('--mode', choices=('smoke', 'editor', 'capacity', 'conversation', 'custom', 'measure'), default='smoke')
+    parser.add_argument('--mode', choices=('smoke', 'editor', 'capacity', 'conversation', 'workspace', 'custom', 'measure'), default='smoke')
     parser.add_argument('--binary', type=Path, help='Explicit frozen binary; requires --binary-sha256 and --source-sha256')
     parser.add_argument('--binary-sha256')
     parser.add_argument('--source-sha256')
@@ -225,7 +238,7 @@ def main():
             argv = ['env', 'XDG_DATA_HOME=' + str(output / 'xdg-data'), *argv]
         else:
             argv += ['--state-directory', str(output / 'conversation-state')]
-        if args.mode in ('conversation', 'custom'):
+        if args.mode in ('conversation', 'workspace', 'custom'):
             argv += ['--automation-live', str(output / 'live.json')]
         if args.mode == 'custom':
             module = output / 'custom.lua'
@@ -254,7 +267,7 @@ def main():
         ipc(f'[con_id={window_id}] floating enable')
         ipc(f'[con_id={window_id}] resize set width 1100 px height 740 px')
         run('vd', 'shot', session, str(output / 'before.png'))
-        if args.mode in ('conversation', 'custom'):
+        if args.mode in ('conversation', 'workspace', 'custom'):
             def observe(predicate, label):
                 deadline = time.monotonic() + 15
                 while time.monotonic() < deadline:
@@ -265,7 +278,7 @@ def main():
                     time.sleep(.05)
                 raise RuntimeError('Native conversation did not reach ' + label)
             def target(snapshot, name):
-                value = next(t for t in snapshot['targets'] if t['id'] == name)
+                value = next(t for t in snapshot['targets'] + snapshot.get('thread_targets', []) if t['id'] == name)
                 if not value['enabled'] or value['pointer_bounds'] is None:
                     raise RuntimeError('Painted control unavailable: ' + name)
                 x, y, w, h = value['pointer_bounds']
@@ -344,6 +357,51 @@ def main():
             if args.mode == 'custom':
                 key('F9')
                 observe(lambda s: s['custom_root'] and s['run_status'] == 'cancelled', 'cancelled run in custom root')
+            if args.mode == 'workspace':
+                original_thread = current['thread_id']
+                for index in range(4):
+                    target(current, 'composer.input')
+                    run('vd', 'text', session, window_id, f'Workspace chronological turn {index + 3}')
+                    key('Return')
+                    current = observe(lambda s: s['run_status'] == 'awaiting_approval' and enabled(s, 'approval.allow'), f'turn {index + 3} approval')
+                    target(current, 'approval.allow')
+                    current = observe(lambda s: s['run_status'] == 'completed' and enabled(s, 'command.send'), f'turn {index + 3} completed')
+                assert_workspace_snapshot(current)
+                (output / 'chronology-geometry.json').write_text(json.dumps(current, indent=2))
+                run('vd', 'shot', session, str(output / 'chronology-latest.png'))
+                key('alt+Home')
+                current = observe(lambda s: not s['follow_latest'] and any(message and ordinal == 0 for message, ordinal in zip(s['transcript_message_ids'], s['transcript_ordinals'])), 'first chronological user message')
+                run('vd', 'shot', session, str(output / 'chronology-first.png'))
+                for index in range(4):
+                    frame = current['frame_id']
+                    key('alt+Next')
+                    current = observe(lambda s: s['frame_id'] > frame and not s['pending_command'], f'forward history boundary {index}')
+                    time.sleep(.2)
+                key('alt+End')
+                current = observe(lambda s: s['follow_latest'] and enabled(s, 'command.send'), 'explicit live follow restored')
+                target(current, 'composer.input')
+                run('vd', 'text', session, window_id, 'Retained draft café')
+                key('shift+Left')
+                current = observe(lambda s: s['draft'] == 'Retained draft café' and s['caret'] != s['anchor'], 'selected per-thread draft')
+                saved_caret, saved_anchor = current['caret'], current['anchor']
+                target(current, 'workspace.new_thread')
+                current = observe(lambda s: s['thread_id'] != original_thread and enabled(s, 'command.send'), 'new independent thread')
+                new_thread = current['thread_id']
+                run('vd', 'text', session, window_id, 'Independent draft')
+                current = observe(lambda s: s['draft'] == 'Independent draft', 'second thread draft')
+                target(current, original_thread)
+                current = observe(lambda s: s['thread_id'] == original_thread and s['draft'] == 'Retained draft café' and s['caret'] == saved_caret and s['anchor'] == saved_anchor and enabled(s, 'command.send'), 'original draft and selection restored')
+                key('ctrl+z')
+                current = observe(lambda s: s['draft'] != 'Retained draft café', 'retained draft undo')
+                key('ctrl+shift+z')
+                current = observe(lambda s: s['draft'] == 'Retained draft café', 'retained draft redo')
+                target(current, new_thread)
+                current = observe(lambda s: s['thread_id'] == new_thread and s['draft'] == 'Independent draft' and enabled(s, 'command.send'), 'second draft restored')
+                target(current, original_thread)
+                current = observe(lambda s: s['thread_id'] == original_thread and enabled(s, 'command.send'), 'execution target restored')
+                run('vd', 'shot', session, str(output / 'workspace-drafts.png'))
+                retained_thread, retained_run = current['thread_id'], current['run_id']
+            retained_status = current['run_status']
             key('ctrl+q')
             wait_windows(session, False)
             first_export = read_export(output / 'automation.json', time.monotonic() + 10)
@@ -355,7 +413,7 @@ def main():
             launch = json.loads(run('vd', 'run', session, '--bg', '--log', str(output / 'reopen.log'), '--', *argv))
             windows = wait_windows(session, True)
             window_id = windows.splitlines()[0].split()[0]
-            current = observe(lambda s: s['thread_id'] == retained_thread and s['run_id'] == retained_run and s['run_status'] == 'cancelled' and any('Inspection approved' in text for text in s['transcript']) and enabled(s, 'command.send'), 'reopened durable conversation')
+            current = observe(lambda s: s['thread_id'] == retained_thread and s['run_id'] == retained_run and s['run_status'] == retained_status and any('Inspection approved' in text for text in s['transcript']) and enabled(s, 'command.send'), 'reopened durable conversation')
             if args.mode == 'custom':
                 current = observe(lambda s: s['custom_root'] and '[custom]' in s['custom_render'] and 'Inspection approved' in s['custom_render'] and s['run_id'] == retained_run, 'reopened custom renderer and retained cancelled run')
             manifest['conversation_reopened'] = current

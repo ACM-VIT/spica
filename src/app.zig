@@ -1,5 +1,5 @@
 const std = @import("std");
-const builtin = @import("builtin");
+const createRenderer = @import("native/renderer.zig").createRenderer;
 const c = @import("native/bindings.zig").c;
 const Layout = @import("ui/clay.zig").Layout;
 const Coding = @import("ui/coding.zig").View;
@@ -78,12 +78,7 @@ pub const App = struct {
         const window = c.SDL_CreateWindow("Spica", 1100, 740, c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY) orelse return error.WindowCreation;
         errdefer c.SDL_DestroyWindow(window);
         if (!c.SDL_SetWindowMinimumSize(window, 720, 480)) return error.WindowMinimumSize;
-        const driver: [*:0]const u8 = switch (builtin.os.tag) {
-            .linux => "opengl",
-            .macos => "metal",
-            else => @compileError("The native foundation currently supports Linux and macOS"),
-        };
-        const renderer = c.SDL_CreateRenderer(window, driver) orelse return error.RendererCreation;
+        const renderer = try createRenderer(window);
         errdefer c.SDL_DestroyRenderer(renderer);
         const text = c.spica_text_create(renderer, build_options.font_directory ++ "/Inter.ttf") orelse return error.FontInitialization;
         errdefer c.spica_text_destroy(text);
@@ -227,6 +222,18 @@ pub const App = struct {
             },
             else => return err,
         };
+        if (self.view.navigation) |navigation| {
+            self.view.navigation = null;
+            if (self.conversation) |conversation| conversation.navigateWorkspace(self, navigation) catch |err| {
+                self.view.notice = @errorName(err);
+            };
+        }
+        if (self.view.setup_action) |action| {
+            self.view.setup_action = null;
+            if (self.conversation) |conversation| conversation.setup(self, action) catch |err| {
+                self.view.notice = @errorName(err);
+            };
+        }
         if (self.view.history_move) |move| {
             self.view.history_move = null;
             if (self.conversation) |conversation| conversation.navigate(self, move) catch |err| {
@@ -332,6 +339,15 @@ pub const App = struct {
                 else => self.view.can_approve,
             };
         }
+        const extra_bounds = [_]c.SDL_FRect{ .{ .x = 16, .y = 68, .w = 184, .h = 30 }, .{ .x = 16, .y = 104, .w = 184, .h = 30 }, self.view.picker_bounds, self.view.effort_bounds, self.view.setup_bounds };
+        for (extra_bounds, 6..) |bounds, index| {
+            self.snapshot.targets[index].pointer_bounds = .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) };
+            self.snapshot.targets[index].enabled = self.view.custom_root == null and (index >= 8 or self.view.navigation_enabled);
+        }
+        self.snapshot.thread_targets = @splat(.{ .enabled = false });
+        for (self.view.threads[0..self.view.thread_count], 0..) |*entry, index| {
+            self.snapshot.thread_targets[index] = .{ .id = entry.id.slice(), .role = "thread", .enabled = self.view.navigation_enabled, .pointer_bounds = .{ 24, @as(i32, @intCast(168 + self.view.project_count * 26 + index * 28)), 176, 28 } };
+        }
         const present_begin = if (self.metrics != null) c.SDL_GetTicksNS() else 0;
         const succeeded = c.SDL_RenderPresent(self.renderer);
         const present_end = if (self.metrics != null) c.SDL_GetTicksNS() else 0;
@@ -369,7 +385,28 @@ pub const App = struct {
             self.snapshot.pending_command = conversation.command != null;
         }
         self.snapshot.transcript = @splat("");
-        for (self.view.rich_tiles[0..self.view.rich_count], 0..) |*tile, index| self.snapshot.transcript[index] = tile.rendered[0..tile.length];
+        self.snapshot.transcript_roles = @splat("");
+        self.snapshot.transcript_message_ids = @splat("");
+        self.snapshot.transcript_geometry = @splat(.{ 0, 0, 0, 0 });
+        for (self.view.rich_tiles[0..self.view.rich_count], 0..) |*tile, index| {
+            self.snapshot.transcript[index] = tile.rendered[0..tile.length];
+            self.snapshot.transcript_roles[index] = tile.role;
+            self.snapshot.transcript_message_ids[index] = tile.message.slice();
+            self.snapshot.transcript_ordinals[index] = tile.message_ordinal;
+            self.snapshot.transcript_geometry[index] = .{ tile.bounds.x, tile.bounds.y, tile.bounds.w, tile.bounds.h };
+        }
+        self.snapshot.transcript_scroll = self.view.transcript_scroll;
+        self.snapshot.transcript_height = self.view.history_height;
+        self.snapshot.follow_latest = self.view.follow_latest;
+        self.snapshot.project_count = self.view.project_count;
+        self.snapshot.thread_count = self.view.thread_count;
+        self.snapshot.model_count = self.view.model_count;
+        self.snapshot.notice = self.view.notice;
+        if (self.view.selected) |*selected| {
+            self.snapshot.selected_runtime = selected.runtime_kind.slice();
+            self.snapshot.selected_model = selected.model_id.slice();
+            self.snapshot.selected_effort = selected.effort.slice();
+        }
         if (self.live) |live| {
             // Explicit automation only. Fixed storage, after measured present,
             // no timers/input endpoints; observers may retry a partial write.
@@ -413,6 +450,7 @@ const LuaBridge = struct {
         approval_revision: u64,
         draft_revision: u64,
         command_id: [32]u8,
+        selection: ?Coding.Identity = null,
     };
 
     fn visible(self: *LuaBridge, app: *App) void {
@@ -476,6 +514,7 @@ const LuaBridge = struct {
             .epoch = self.epoch,
             .context = context,
             .workspace = conversation.workspace,
+            .selection = app.view.selected,
             .thread_revision = conversation.thread_revision,
             .run_revision = conversation.run_revision,
             .approval_revision = conversation.approval_revision,
@@ -492,7 +531,7 @@ const LuaBridge = struct {
         switch (result.intent.kind) {
             1 => try conversation.submitIdentified(.send, .{ .thread = .{ .value = context.thread_id.bytes[0..context.thread_id.len] } }, .{ .revision = pending.thread_revision }, .{ .thread_send = .{
                 .text = result.intent.text.bytes[0..result.intent.text.len],
-                .selection = conversation.host.selectionFor(.{ .value = pending.workspace.slice() }),
+                .selection = if (pending.selection) |*selection| selection.selection() else return error.ChooseModel,
             } }, pending.draft_revision, pending.command_id),
             2 => try conversation.submitIdentified(.cancel, .{ .run = .{ .value = context.run_id.bytes[0..context.run_id.len] } }, .{ .revision = pending.run_revision }, .{ .run_cancel = .{ .reason = "Custom root cancellation" } }, 0, pending.command_id),
             3, 4 => try conversation.submitIdentified(.approval, .{ .approval = .{ .value = context.approval_id.bytes[0..context.approval_id.len] } }, .{ .revision = pending.approval_revision }, .{ .approval_respond = .{ .decision = if (result.intent.kind == 3) .allow else .deny, .action_digest = context.action_digest.bytes[0..context.action_digest.len] } }, 0, pending.command_id),
@@ -581,6 +620,8 @@ const Conversation = struct {
     refresh: bool = false,
     generation: u64 = 0,
     messages: [8]Id = undefined,
+    message_roles: [8]@FieldType(@FieldType(types.Row, "message"), "role") = @splat(.assistant),
+    message_ordinals: [8]u64 = @splat(0),
     message_count: usize = 0,
     message_index: usize = 0,
     blocks: [8]struct { id: Id, revision: u64, bytes: u64, ordinal: u64 } = undefined,
@@ -607,6 +648,84 @@ const Conversation = struct {
     copy_pending: ?presentation.Selection = null,
     restored_pixel: ?f32 = null,
     restored_revision: ?u64 = null,
+    configuration_pending: bool = false,
+
+    fn setup(self: *Conversation, app: *App, action: @typeInfo(@FieldType(Coding, "setup_action")).optional.child) !void {
+        if (self.command != null or self.query != null) return error.WorkspaceBusy;
+        switch (action) {
+            .status => try self.ask(.runtime_status, .{ .runtime_status = {} }),
+            .refresh => try self.submit(.refresh_models, .absent, .absent, .{ .runtime_refresh = {} }, 0),
+            .browser, .device => try self.submit(.login, .absent, .absent, .{ .runtime_login = .{ .runtime_kind = if (app.view.setup_runtime == .codex) .codex else .opencode, .mode = if (action == .browser) .browser else .device } }, 0),
+            .configure => try self.submit(.configure, .absent, .absent, .{ .runtime_configure = .{
+                .runtime_kind = if (app.view.setup_runtime == .codex) .codex else .opencode,
+                .executable = app.view.setup_fields[0][0..app.view.setup_lengths[0]],
+                .account_directory = app.view.setup_fields[1][0..app.view.setup_lengths[1]],
+                .workspace_root = app.view.setup_fields[2][0..app.view.setup_lengths[2]],
+                .model_provider = app.view.setup_fields[3][0..app.view.setup_lengths[3]],
+            } }, 0),
+        }
+    }
+    fn navigateWorkspace(self: *Conversation, app: *App, navigation: Coding.Navigation) !void {
+        if (!app.view.navigation_enabled) return error.WorkspaceBusy;
+        if (std.meta.activeTag(navigation) == .new_thread or std.meta.activeTag(navigation) == .new_project) {
+            var available = false;
+            for (app.view.retained) |slot| if (slot.editor == null) {
+                available = true;
+                break;
+            };
+            if (!available) return error.DraftRetentionFull;
+        }
+        switch (navigation) {
+            .new_project => try self.submit(.project, .absent, .absent, .{ .project_create = .{ .display_name = "Coding project" } }, 0),
+            .new_thread => try self.createThread(),
+            .project => |index| {
+                if (index >= app.view.project_count) return;
+                self.project = app.view.projects[index].id;
+                self.thread = .{};
+                app.view.thread_count = 0;
+                try self.ask(.workspaces, .{ .workspaces = .{ .project = .{ .value = self.project.slice() }, .page = page } });
+            },
+            .thread => |index| {
+                if (index >= app.view.thread_count) return;
+                try self.selectThread(app, app.view.threads[index].id);
+            },
+        }
+    }
+
+    fn selectThread(self: *Conversation, app: *App, id: Id) !void {
+        try app.view.selectThread(id);
+        self.thread = id;
+        self.run = .{};
+        self.run_state = null;
+        self.approval_live = false;
+        app.view.task_count = 0;
+        app.view.active_project = self.project;
+        self.generation += 1;
+        self.worker_key = null;
+        self.projected_key = null;
+        self.tile_request = null;
+        self.source_pending = false;
+        self.history_paused = true;
+        self.message_count = 0;
+        self.message_snapshot = null;
+        self.message_anchor = null;
+        self.message_direction = .older;
+        self.block_snapshot = null;
+        self.block_cursor = null;
+        self.history_first = null;
+        self.pending_history_move = null;
+        self.refresh = true;
+    }
+
+    fn addEntry(entries: []Coding.Entry, count: *usize, id: []const u8, label: []const u8) !void {
+        for (entries[0..count.*]) |entry| if (entry.id.eql(id)) return;
+        if (count.* == entries.len) return;
+        const entry = &entries[count.*];
+        entry.id = try Id.init(id);
+        entry.len = @min(label.len, entry.label.len);
+        @memcpy(entry.label[0..entry.len], label[0..entry.len]);
+        count.* += 1;
+    }
 
     fn prepareHistoryRestore(self: *Conversation, view: *Coding) bool {
         if (!view.history_restore) return false;
@@ -617,6 +736,8 @@ const Conversation = struct {
         self.message_count = 1;
         self.message_index = 0;
         self.messages[0] = position.message;
+        self.message_roles[0] = std.meta.stringToEnum(@FieldType(@FieldType(types.Row, "message"), "role"), position.role) orelse .assistant;
+        self.message_ordinals[0] = position.message_ordinal;
         self.desired_block = position.block_ordinal;
         self.recovery_block = position.block;
         self.block_cursor = null;
@@ -667,7 +788,7 @@ const Conversation = struct {
             },
             .blocks, .content => {
                 self.history_retrying = true;
-                self.message_index = 0;
+                if (self.message_index >= self.message_count) self.message_index = self.message_count - 1;
                 self.block_cursor = null;
                 self.block_snapshot = null;
                 self.source_pending = false;
@@ -679,7 +800,7 @@ const Conversation = struct {
                 if (self.history_start == null) if (self.history_first) |first| {
                     if (self.desired_block == first.ordinal) self.history_start = .{ .key = undefined, .first_block = first.cursor.block, .start_byte = first.cursor.byte };
                 };
-                return .{ .kind = .blocks, .value = .{ .blocks = .{ .message = .{ .value = self.messages[0].slice() }, .page = page } } };
+                return .{ .kind = .blocks, .value = .{ .blocks = .{ .message = .{ .value = self.messages[self.message_index].slice() }, .page = page } } };
             },
             else => return null,
         }
@@ -691,7 +812,9 @@ const Conversation = struct {
             self.pending_history_move = move;
             return;
         }
-        self.message_index = 0;
+        // Retained visible tiles carry their own durable message identity even
+        // when the current query page has been cleared during a refresh.
+        if (self.message_count == 0 and app.view.rich_count == 0 and move != .first and move != .latest) return;
         self.history_retrying = false;
         self.recovery_block = null;
         switch (move) {
@@ -700,6 +823,7 @@ const Conversation = struct {
                 self.message_snapshot = null;
                 self.message_direction = if (move == .first) .newer else .older;
                 app.view.follow_latest = move == .latest;
+                app.view.clearHistory();
                 self.history_paused = false;
                 self.worker_key = null;
                 self.tile_request = null;
@@ -709,19 +833,28 @@ const Conversation = struct {
                 app.view.follow_latest = false;
                 if (self.history_paused and self.worker_key != null) {
                     self.history_paused = false;
-                    app.view.clearHistory();
                     self.history_first = null;
                     if (self.tile_request == null) try self.nextBlock(app);
                 } else {
-                    self.message_anchor = self.messages[0];
+                    self.message_anchor = if (app.view.rich_count != 0) app.view.rich_tiles[app.view.rich_count - 1].message else self.messages[self.message_count - 1];
                     self.message_direction = .newer;
                     self.message_snapshot = null;
                     try self.askHistory(app);
                 }
             },
             .previous => {
+                if (app.view.rich_count != 0) {
+                    const tile = &app.view.rich_tiles[0];
+                    self.history_first = .{ .key = tile.key.?, .cursor = .{ .block = tile.block_index, .byte = tile.start_byte }, .ordinal = tile.canonical_ordinal };
+                    self.messages[0] = tile.message;
+                    self.message_roles[0] = std.meta.stringToEnum(@FieldType(@FieldType(types.Row, "message"), "role"), tile.role) orelse .assistant;
+                    self.message_ordinals[0] = tile.message_ordinal;
+                    self.message_count = 1;
+                    self.message_index = 0;
+                }
                 const first = self.history_first orelse return;
                 app.view.follow_latest = false;
+                self.message_direction = .older;
                 self.history_paused = false;
                 self.tile_request = null;
                 self.worker_key = null;
@@ -731,7 +864,6 @@ const Conversation = struct {
                             self.block_index = index;
                             self.worker_key = key;
                             self.tile_request = .{ .key = key, .first_block = first.cursor.block, .start_byte = first.cursor.byte, .backward = true };
-                            app.view.clearHistory();
                             self.history_first = null;
                             return;
                         };
@@ -757,8 +889,8 @@ const Conversation = struct {
         }
     }
 
-    const QueryKind = enum { projects, workspaces, threads, thread, runs, approvals, tasks, messages, blocks, content };
-    const CommandKind = enum { project, workspace, thread, send, cancel, approval };
+    const QueryKind = enum { projects, workspaces, threads, thread, models, runtime_status, runs, approvals, tasks, messages, blocks, content };
+    const CommandKind = enum { project, workspace, thread, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
     fn create(allocator: std.mem.Allocator, io: std.Io, host: *domain.Host, file: std.Io.File, wake: *Wake, workspace_root: []const u8) !*Conversation {
@@ -767,7 +899,7 @@ const Conversation = struct {
         const root = try allocator.dupe(u8, workspace_root);
         errdefer allocator.free(root);
         // Bootstrap admission precedes worker/file ownership transfer.
-        const ticket = try host.query(.{ .projects = page });
+        const ticket = try host.query(.{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
         const worker = try presentation.Worker.create(allocator, io, file, .{ .context = wake, .notify = Wake.presentationNotify });
         self.* = .{ .allocator = allocator, .io = io, .host = host, .worker = worker, .wake = wake, .workspace_root = root, .query = .{ .ticket = ticket, .kind = .projects } };
         return self;
@@ -810,7 +942,11 @@ const Conversation = struct {
 
     fn act(self: *Conversation, app: *App, intent: @import("ui/coding.zig").Intent) !void {
         switch (intent) {
-            .send => try self.submit(.send, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .thread_send = .{ .text = app.view.editor.textBytes(), .selection = self.host.selectionFor(.{ .value = self.workspace.slice() }) } }, app.view.revision),
+            .send => {
+                const selected = if (app.view.selected) |*identity| identity.selection() else return error.ChooseModel;
+                try self.submit(.send, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .thread_send = .{ .text = app.view.editor.textBytes(), .selection = selected } }, app.view.revision);
+                app.view.follow_latest = true;
+            },
             .cancel => try self.submit(.cancel, .{ .run = .{ .value = self.run.slice() } }, .{ .revision = self.run_revision }, .{ .run_cancel = .{ .reason = "Native user cancellation" } }, 0),
             .allow, .deny => {
                 if (!self.approval_live) return error.ApprovalNotLive;
@@ -905,23 +1041,23 @@ const Conversation = struct {
                         if (self.history_first == null) self.history_first = .{ .key = tile.key, .cursor = .{ .block = tile.block.index, .byte = tile.start_byte }, .ordinal = self.blocks[self.block_index].ordinal };
                         var width: c_int = 0;
                         _ = c.SDL_GetWindowSize(app.window, &width, null);
-                        app.view.admitTile(app.text, tile, @min(960, @as(f32, @floatFromInt(width)) - 48)) catch |err| {
+                        app.view.admitTile(app.text, tile, @min(960, @as(f32, @floatFromInt(width)) - 248), .{
+                            .message = self.messages[self.message_index],
+                            .block = self.blocks[self.block_index].id,
+                            .ordinal = self.blocks[self.block_index].ordinal,
+                            .message_ordinal = self.message_ordinals[self.message_index],
+                            .role = @tagName(self.message_roles[self.message_index]),
+                            .backward = !app.view.follow_latest and self.message_direction == .older,
+                        }) catch |err| {
                             app.view.notice = @errorName(err);
                         };
-                        for (app.view.rich_tiles[0..app.view.rich_count]) |*retained| {
-                            if (retained.key) |retained_key| if (std.meta.eql(retained_key, key) and retained.block_index == tile.block.index and retained.start_byte == tile.start_byte) {
-                                retained.message = self.messages[self.message_index];
-                                retained.canonical_block = self.blocks[self.block_index].id;
-                                retained.canonical_ordinal = self.blocks[self.block_index].ordinal;
-                            };
-                        }
                         if (self.restored_pixel) |offset| {
                             app.view.transcript_scroll = @max(0, 10 + offset);
                             self.restored_pixel = null;
                         }
                         app.dirty = true;
                         self.tile_request = if (tile.next) |next| .{ .key = key, .first_block = next.block, .start_byte = next.byte } else null;
-                        if (app.view.rich_count == app.view.rich_tiles.len or !app.view.follow_latest) {
+                        if (!app.view.follow_latest and app.view.rich_count == app.view.rich_tiles.len and self.tile_request != null) {
                             self.history_paused = true;
                         } else if (self.tile_request == null) try self.nextBlock(app);
                     }
@@ -992,10 +1128,11 @@ const Conversation = struct {
             .completed, .cancelled, .failed, .interrupted, .unknown => true,
             else => false,
         } else true;
-        app.view.can_send = self.thread.len != 0 and terminal and self.command == null and self.query == null and !self.refresh and (self.worker_key == null or self.history_paused);
+        app.view.can_send = self.thread.len != 0 and app.view.selected != null and terminal and self.command == null and self.query == null and !self.refresh and (self.worker_key == null or self.history_paused);
         app.view.can_cancel = self.run.len != 0 and !terminal and self.command == null;
         app.view.tasks_enabled = self.command == null and !self.refresh;
         app.view.can_approve = self.approval_live and self.command == null and !self.refresh;
+        app.view.navigation_enabled = self.command == null and self.query == null and !self.refresh and !self.source_pending and (self.worker_key == null or self.history_paused);
         if (self.pending_history_move) |move| {
             if (self.query == null and !self.source_pending and (self.history_paused or self.worker_key == null)) {
                 self.pending_history_move = null;
@@ -1017,6 +1154,7 @@ const Conversation = struct {
         switch (pending.kind) {
             .project => {
                 self.project = try Id.init(value.entity_ids.project.?.value);
+                try addEntry(&app.view.projects, &app.view.project_count, self.project.slice(), "Coding project");
                 try self.createWorkspace();
             },
             .workspace => {
@@ -1024,8 +1162,9 @@ const Conversation = struct {
                 try self.createThread();
             },
             .thread => {
-                self.thread = try Id.init(value.entity_ids.thread.?.value);
-                self.refresh = true;
+                try self.selectThread(app, try Id.init(value.entity_ids.thread.?.value));
+                app.view.thread_count = 0;
+                try self.ask(.threads, .{ .threads = .{ .project = .{ .value = self.project.slice() }, .page = page } });
             },
             .send => {
                 if (app.view.revision == pending.draft_revision) {
@@ -1040,6 +1179,11 @@ const Conversation = struct {
                 self.approval_live = false;
                 self.refresh = true;
             },
+            .configure => {
+                self.configuration_pending = true;
+                try self.ask(.runtime_status, .{ .runtime_status = {} });
+            },
+            .login, .refresh_models => try self.ask(.runtime_status, .{ .runtime_status = {} }),
         }
     }
 
@@ -1055,7 +1199,50 @@ const Conversation = struct {
 
     fn consume(self: *Conversation, app: *App, kind: QueryKind, value: types.QueryPage) !void {
         switch (kind) {
+            .runtime_status => {
+                app.view.runtime_info_len = 0;
+                for (value.items) |row| {
+                    const status = row.runtime_status;
+                    const remaining = app.view.runtime_info[app.view.runtime_info_len..];
+                    const written = std.fmt.bufPrint(remaining, "{s}: {s} {s}\n{s}\n", .{ status.runtime_kind, @tagName(status.readiness), status.reason, status.login }) catch continue;
+                    app.view.runtime_info_len += written.len;
+                    if (self.configuration_pending and status.workspace_root.len != 0 and status.binding != null) {
+                        self.configuration_pending = false;
+                        const root = try self.allocator.dupe(u8, status.workspace_root);
+                        self.allocator.free(self.workspace_root);
+                        self.workspace_root = root;
+                        app.view.selected = null;
+                        try self.submit(.workspace, .absent, .absent, .{ .workspace_register = .{ .project = .{ .value = self.project.slice() }, .binding = status.binding.? } }, 0);
+                        return;
+                    }
+                }
+                if (self.workspace.len != 0) {
+                    app.view.model_count = 0;
+                    try self.ask(.models, .{ .models = .{ .workspace = .{ .value = self.workspace.slice() }, .page = .{ .limit = 32, .max_bytes = 64 * 1024 } } });
+                }
+            },
+            .models => {
+                for (value.items) |row| {
+                    if (app.view.model_count == app.view.models.len) break;
+                    const model = row.model;
+                    const target = &app.view.models[app.view.model_count];
+                    target.* = .{ .identity = try Coding.Identity.from(model.selection), .readiness = model.readiness, .synthetic = model.synthetic };
+                    target.reason_len = @min(target.reason.len, model.reason.len);
+                    @memcpy(target.reason[0..target.reason_len], model.reason[0..target.reason_len]);
+                    for (model.supported_efforts) |effort| {
+                        if (target.effort_count == target.efforts.len) break;
+                        target.efforts[target.effort_count] = if (effort.len == 0) .{} else try Id.init(effort);
+                        target.effort_count += 1;
+                    }
+                    if (app.view.selected == null) app.view.selected = target.identity;
+                    app.view.model_count += 1;
+                }
+                if (value.next_cursor != null and app.view.model_count < app.view.models.len) {
+                    try self.ask(.models, .{ .models = .{ .workspace = .{ .value = self.workspace.slice() }, .page = .{ .limit = 32, .max_bytes = 64 * 1024, .snapshot = value.snapshot_id, .cursor = value.next_cursor } } });
+                } else try self.askRuns();
+            },
             .projects => {
+                for (value.items) |row| try addEntry(&app.view.projects, &app.view.project_count, row.project.id.value, row.project.display_name);
                 if (value.items.len == 0) try self.submit(.project, .absent, .absent, .{ .project_create = .{ .display_name = "Native coding workspace" } }, 0) else {
                     self.project = try Id.init(value.items[0].project.id.value);
                     try self.ask(.workspaces, .{ .workspaces = .{ .project = .{ .value = self.project.slice() }, .page = page } });
@@ -1079,24 +1266,30 @@ const Conversation = struct {
                 var selected = false;
                 for (value.items) |row| {
                     if (!std.mem.eql(u8, row.thread.workspace.value, self.workspace.slice())) continue;
-                    self.thread = try Id.init(row.thread.id.value);
+                    try addEntry(&app.view.threads, &app.view.thread_count, row.thread.id.value, row.thread.id.value);
+                    if (self.thread.len == 0) self.thread = try Id.init(row.thread.id.value);
                     selected = true;
-                    break;
                 }
-                if (selected) {
-                    self.refresh = true;
-                } else if (value.next_cursor) |cursor| {
-                    try self.ask(.threads, .{ .threads = .{ .project = .{ .value = self.project.slice() }, .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = cursor } } });
+                if (value.next_cursor != null and app.view.thread_count < app.view.threads.len) {
+                    try self.ask(.threads, .{ .threads = .{ .project = .{ .value = self.project.slice() }, .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = value.next_cursor } } });
+                } else if (selected or self.thread.len != 0) {
+                    try self.selectThread(app, self.thread);
                 } else try self.createThread();
             },
             .thread => {
                 if (value.items.len != 1) return error.MissingThread;
                 self.thread_revision = value.items[0].thread.revision;
                 self.workspace = try Id.init(value.items[0].thread.workspace.value);
+                if (app.view.selected == null) if (value.items[0].thread.selection) |selection| {
+                    app.view.selected = try Coding.Identity.from(selection);
+                };
+                const label = try std.fmt.bufPrint(&app.view.workspace_label, "{s}  •  {s}", .{ @import("text/utf8.zig").prefix(self.workspace_root, 384), self.thread.slice() });
+                app.view.workspace_label_len = label.len;
                 if (self.subscription == null and self.subscribe_ticket == null) self.subscribe_ticket = try self.host.subscribe(.{ .scope = .all, .after_position = value.snapshot_position, .max_batch_bytes = 16 * 1024 });
                 self.runs_cursor = null;
                 self.runs_snapshot = null;
-                try self.askRuns();
+                app.view.model_count = 0;
+                try self.ask(.models, .{ .models = .{ .workspace = .{ .value = self.workspace.slice() }, .page = .{ .limit = 32, .max_bytes = 64 * 1024 } } });
             },
             .runs => {
                 for (value.items) |row| {
@@ -1157,15 +1350,19 @@ const Conversation = struct {
             .messages => {
                 if (value.items.len == 0) {
                     self.history_paused = true;
-                    app.view.notice = "History boundary";
                     return;
                 }
                 self.message_snapshot = value.snapshot_id;
-                self.message_count = 1;
+                self.message_count = value.items.len;
                 self.message_index = 0;
-                self.messages[0] = try Id.init(value.items[0].message.message_id.value);
+                for (value.items, 0..) |_, index| {
+                    const source_index = if (self.message_direction == .older) value.items.len - 1 - index else index;
+                    const message = value.items[source_index].message;
+                    self.messages[index] = try Id.init(message.message_id.value);
+                    self.message_roles[index] = message.role;
+                    self.message_ordinals[index] = message.ordinal;
+                }
                 self.generation += 1;
-                app.view.clearHistory();
                 self.history_first = null;
                 self.block_cursor = null;
                 self.block_snapshot = null;
@@ -1220,7 +1417,7 @@ const Conversation = struct {
     }
     fn askMessages(self: *Conversation) !void {
         var bounds = page;
-        bounds.limit = 1;
+        bounds.limit = if (self.message_anchor != null or self.message_direction == .newer) 1 else self.messages.len;
         bounds.snapshot = self.message_snapshot;
         try self.ask(.messages, .{ .messages = .{ .thread = .{ .value = self.thread.slice() }, .anchor = if (self.message_anchor) |*anchor| .{ .value = anchor.slice() } else null, .direction = self.message_direction, .page = bounds } });
         self.history_paused = false;
@@ -1256,6 +1453,9 @@ const Conversation = struct {
     }
     fn nextMessage(self: *Conversation) !void {
         self.message_index += 1;
+        self.block_cursor = null;
+        self.block_snapshot = null;
+        self.worker_key = null;
         if (self.message_index < self.message_count) try self.askBlocks() else self.history_paused = true;
     }
 };
@@ -1360,14 +1560,34 @@ test "history navigation reuses immutable projection and coalesces busy input" {
     var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
     conversation.block_count = 1;
     conversation.blocks[0] = .{ .id = try Id.init("stable-block"), .revision = 4, .bytes = 523183, .ordinal = 0 };
-    conversation.history_first = .{ .key = key, .cursor = .{ .block = 0, .byte = 400000 }, .ordinal = 0 };
     conversation.worker_key = key;
     conversation.projected_key = key;
     conversation.history_paused = true;
+    // No query page and no visible anchor is a harmless boundary.
+    try conversation.navigate(&app, .previous);
+    try std.testing.expect(conversation.tile_request == null);
+    // A retained tile supplies the real chronological anchor independently of
+    // the current message query page. No Host query or source decode is needed.
+    app.view.rich_count = 1;
+    const tile = &app.view.rich_tiles[0];
+    tile.key = key;
+    tile.message = try Id.init("stable-message");
+    tile.message_ordinal = 12;
+    tile.role = "user";
+    tile.canonical_block = conversation.blocks[0].id;
+    tile.canonical_ordinal = 0;
+    tile.start_byte = 400000;
     try conversation.navigate(&app, .previous);
     try std.testing.expect(conversation.query == null and !conversation.source_pending);
+    try std.testing.expect(conversation.tile_request != null);
     try std.testing.expect(conversation.tile_request.?.backward);
     try std.testing.expectEqual(@as(u32, 400000), conversation.tile_request.?.start_byte);
+    try std.testing.expectEqual(@as(usize, 1), conversation.message_count);
+    try std.testing.expectEqualStrings("stable-message", conversation.messages[0].slice());
+    try std.testing.expectEqual(@as(u64, 12), conversation.message_ordinals[0]);
+    try std.testing.expectEqual(.user, conversation.message_roles[0]);
+    try std.testing.expect(!app.view.follow_latest and !conversation.history_paused);
+    try std.testing.expect(std.meta.eql(key, conversation.tile_request.?.key));
     try conversation.navigate(&app, .latest);
     try std.testing.expectEqual(Coding.HistoryMove.latest, conversation.pending_history_move.?);
 }

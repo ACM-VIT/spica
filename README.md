@@ -51,7 +51,7 @@ For an OpenCode coordinator with an explicitly authorized Codex child runtime:
 
 ```bash
 zig-out/bin/spica --provider opencode \
-  --runtime-executable /usr/bin/opencode \
+  --runtime-executable /absolute/path/to/opencode \
   --runtime-account-directory /tmp/spica-opencode-account \
   --model-provider opencode --model big-pickle --effort default \
   --workspace /tmp/spica-disposable-project \

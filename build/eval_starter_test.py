@@ -61,6 +61,16 @@ def run_smoke_fixture(value):
 
 
 class RunnerBoundaries(unittest.TestCase):
+    def test_workspace_requires_distinct_roles_and_chronological_identity(self):
+        snapshot = dict(transcript_message_ids=['u1', 'a1', 'a1'],
+                        transcript_ordinals=[0, 1, 1], transcript_roles=['user', 'assistant', 'assistant'])
+        m.assert_workspace_snapshot(snapshot)
+        for field, value in [('transcript_message_ids', ['a1'] * 3),
+                             ('transcript_roles', ['assistant'] * 3),
+                             ('transcript_ordinals', [2, 1, 0])]:
+            invalid = dict(snapshot, **{field: value})
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                m.assert_workspace_snapshot(invalid)
     def test_event_boundary_cache_change_is_carried_through_idle(self):
         row = native()
         before = copy.deepcopy(row['text_stats'])
@@ -87,8 +97,8 @@ class RunnerBoundaries(unittest.TestCase):
     def test_key_chords_hold_and_release_real_wtype_modifiers(self):
         self.assertEqual(m.key_command('session', '5', 'Escape'), ('vd', 'key', 'session', '5', 'Escape'))
         self.assertEqual(m.key_command('session', '5', 'ctrl+shift+z'),
-                         ('vd', 'run', 'session', '--', 'wtype', '-s', '150', '-M', 'ctrl',
-                          '-M', 'shift', '-k', 'z', '-m', 'shift', '-m', 'ctrl'))
+                         ('vd', 'run', 'session', '--', 'wtype', '-s', '150', '-P', 'Control_L',
+                          '-P', 'Shift_L', '-k', 'z', '-p', 'Shift_L', '-p', 'Control_L'))
         with self.assertRaises(ValueError):
             m.key_command('session', '5', 'arbitrary+a')
 

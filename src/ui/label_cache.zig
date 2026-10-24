@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("../native/bindings.zig").c;
 const widgets = @import("widgets.zig");
 const Color = @import("color.zig").Color;
+const utf8 = @import("../text/utf8.zig");
 
 pub const max_bytes = 128;
 
@@ -50,11 +51,14 @@ pub const LabelCache = struct {
 
     pub fn drawFitted(self: *LabelCache, renderer: *c.SDL_Renderer, text: *c.SpicaText, bytes: []const u8, x: f32, top: f32, available: f32, size: c_uint, color: Color) !void {
         if (available <= 0) return;
-        const truncated = try self.width(text, bytes, size) > available;
+        // Bound presentation before measuring/caching. The caller retains the
+        // complete identity; clipping alone cannot bound shaping or cache keys.
+        const visible = utf8.prefix(bytes, max_bytes);
+        const truncated = visible.len < bytes.len or try self.width(text, visible, size) > available;
         const suffix_width = if (truncated) try self.width(text, "…", size) else 0;
         var clip = widgets.Clip.push(renderer, .{ .x = x, .y = top, .w = @max(0, available - suffix_width), .h = @floatFromInt(size + 8) });
         defer clip.restore(renderer);
-        try self.draw(text, bytes, x, top, size, color);
+        try self.draw(text, visible, x, top, size, color);
         clip.restore(renderer);
         if (truncated) try self.draw(text, "…", x + available - suffix_width, top, size, color);
     }
@@ -142,4 +146,35 @@ test "fitted labels restore an enclosing clip when drawing fails" {
     _ = try cache.width(canvas.text, label, 13);
     try std.testing.expectError(error.LabelDraw, cache.drawFitted(canvas.renderer, other, label, 0, 4, 120, 13, .{ .r = 255, .g = 255, .b = 255 }));
     try canvas.expectClip(parent);
+}
+
+test "fitted labels bound long workspace and model identities at UTF8 boundaries" {
+    const canvas = try TestCanvas.init();
+    defer canvas.deinit();
+    var cache: LabelCache = .{};
+    defer cache.deinit();
+    // The euro sign straddles the cache byte limit, as a path/model may do.
+    const label = "/" ++ "a" ** (max_bytes - 2) ++ "€" ++ "/isolated-workspace • complete-thread-identity";
+    try std.testing.expect(label.len > max_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(label));
+    try std.testing.expect(c.SDL_SetRenderDrawColor(canvas.renderer, 0, 0, 0, 255));
+    try std.testing.expect(c.SDL_RenderClear(canvas.renderer));
+    const parent = c.SDL_Rect{ .x = 10, .y = 0, .w = 150, .h = 40 };
+    try std.testing.expect(c.SDL_SetRenderClipRect(canvas.renderer, &parent));
+    try cache.drawFitted(canvas.renderer, canvas.text, label, 10, 4, 150, 13, .{ .r = 255, .g = 255, .b = 255 });
+    try canvas.expectClip(parent);
+    var found_prefix = false;
+    var found_ellipsis = false;
+    for (cache.entries) |entry| if (entry.layout != null) {
+        try std.testing.expect(entry.len <= max_bytes);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(entry.bytes[0..entry.len]));
+        if (std.mem.eql(u8, entry.bytes[0..entry.len], label[0 .. max_bytes - 1])) found_prefix = true;
+        if (std.mem.eql(u8, entry.bytes[0..entry.len], "…")) found_ellipsis = true;
+    };
+    try std.testing.expect(found_prefix and found_ellipsis);
+    try std.testing.expect(try canvas.litColumns(10, 160) > 0);
+    try std.testing.expectEqual(@as(usize, 0), try canvas.litColumns(160, 200));
+    // Direct cache admission stays strict; its fixed budget is unchanged.
+    try std.testing.expectError(error.LabelTooLong, cache.layoutFor(canvas.text, label, 13));
+    try std.testing.expect(std.mem.endsWith(u8, label, "complete-thread-identity"));
 }

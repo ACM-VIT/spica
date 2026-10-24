@@ -9,6 +9,7 @@ const Layout = @import("clay.zig").Layout;
 const Color = @import("color.zig").Color;
 const transcript = @import("transcript.zig");
 const presentation = @import("../content/presentation.zig");
+const contract = @import("../contract.zig");
 
 pub const Intent = enum { send, cancel, allow, deny };
 
@@ -61,9 +62,137 @@ pub const View = struct {
     custom_tile: transcript.RichTile = .{},
     custom_render_sequence: u64 = 0,
     custom_tile_sequence: u64 = std.math.maxInt(u64),
+    models: [32]Model = undefined,
+    model_count: usize = 0,
+    selected: ?Identity = null,
+    picker_open: bool = false,
+    setup_open: bool = false,
+    setup_runtime: enum { codex, opencode } = .codex,
+    setup_fields: [4][512]u8 = undefined,
+    setup_lengths: [4]usize = @splat(0),
+    setup_field: usize = 0,
+    setup_action: ?enum { configure, browser, device, status, refresh } = null,
+    runtime_info: [4096]u8 = undefined,
+    runtime_info_len: usize = 0,
+    picker_bounds: c.SDL_FRect = .{ .x = 240, .y = 18, .w = 350, .h = 28 },
+    effort_bounds: c.SDL_FRect = .{ .x = 600, .y = 18, .w = 120, .h = 28 },
+    setup_bounds: c.SDL_FRect = .{ .x = 730, .y = 18, .w = 120, .h = 28 },
+    follow_bounds: c.SDL_FRect = .{ .x = 860, .y = 18, .w = 164, .h = 28 },
+    workspace_label: [512]u8 = undefined,
+    workspace_label_len: usize = 0,
+    projects: [16]Entry = @splat(.{}),
+    project_count: usize = 0,
+    threads: [32]Entry = @splat(.{}),
+    thread_count: usize = 0,
+    active_project: transcript.Id = .{},
+    active_thread: transcript.Id = .{},
+    navigation: ?Navigation = null,
+    navigation_enabled: bool = false,
+    retained: [16]Retained = @splat(.{}),
+    retained_clock: u64 = 0,
+    pub const Identity = struct {
+        runtime_kind: transcript.Id = .{},
+        required_runtime_version: transcript.Id = .{},
+        model_provider: transcript.Id = .{},
+        model_id: transcript.Id = .{},
+        effort: transcript.Id = .{},
+        account_ref: transcript.Id = .{},
+        workspace: transcript.Id = .{},
+        capability_revision: u32 = 1,
+        pub fn from(value: contract.Selection) !Identity {
+            var result: Identity = .{};
+            inline for (@typeInfo(Identity).@"struct".fields) |field| {
+                if (comptime std.mem.eql(u8, field.name, "capability_revision")) {
+                    result.capability_revision = value.capability_revision;
+                } else {
+                    const bytes = if (comptime std.mem.eql(u8, field.name, "workspace")) value.workspace.value else @field(value, field.name);
+                    @field(result, field.name) = if (bytes.len == 0) .{} else try transcript.Id.init(bytes);
+                }
+            }
+            return result;
+        }
+        pub fn selection(self: *const Identity) contract.Selection {
+            var result: contract.Selection = undefined;
+            inline for (@typeInfo(contract.Selection).@"struct".fields) |field| {
+                if (comptime std.mem.eql(u8, field.name, "capability_revision")) {
+                    result.capability_revision = self.capability_revision;
+                } else if (comptime std.mem.eql(u8, field.name, "workspace")) {
+                    result.workspace = .{ .value = self.workspace.slice() };
+                } else @field(result, field.name) = @field(self, field.name).slice();
+            }
+            return result;
+        }
+    };
+    pub const Model = struct {
+        identity: Identity,
+        efforts: [8]transcript.Id = @splat(.{}),
+        effort_count: usize = 0,
+        readiness: contract.Readiness,
+        reason: [256]u8 = undefined,
+        reason_len: usize = 0,
+        synthetic: bool = false,
+    };
+    pub const Navigation = union(enum) { new_project, new_thread, project: usize, thread: usize };
+    pub const Entry = struct { id: transcript.Id = .{}, label: [160]u8 = undefined, len: usize = 0 };
+    const Retained = struct {
+        id: transcript.Id = .{},
+        editor: ?Composer = null,
+        revision: u64 = 0,
+        scroll: f32 = 0,
+        follow: bool = true,
+        position: ?ThreadHistory = null,
+        used: u64 = 0,
+        selection: ?Identity = null,
+    };
+
+    pub fn selectThread(self: *View, id: transcript.Id) !void {
+        if (self.active_thread.eql(id.slice())) return;
+        if (self.active_thread.len == 0) {
+            self.active_thread = id;
+            return;
+        }
+        var incoming: ?usize = null;
+        var replacement: ?usize = null;
+        for (self.retained, 0..) |slot, index| {
+            if (slot.id.eql(id.slice())) incoming = index;
+            if (slot.editor == null) replacement = index;
+        }
+        const index = incoming orelse replacement orelse return error.DraftRetentionFull;
+        const next = if (incoming) |found| self.retained[found] else Retained{ .editor = try Composer.init(self.allocator) };
+        if (self.active_thread.len == 0) {
+            self.editor.deinit();
+            self.retained[index] = .{};
+        } else {
+            self.retained_clock += 1;
+            self.retained[index] = .{ .id = self.active_thread, .editor = self.editor, .revision = self.revision, .scroll = self.editor_view.scroll, .follow = self.follow_latest, .position = self.history_position, .selection = self.selected, .used = self.retained_clock };
+        }
+        self.editor = next.editor.?;
+        self.selected = next.selection;
+        self.revision = next.revision;
+        self.editor_view.deinit();
+        self.editor_view = .{ .scroll = next.scroll };
+        self.follow_latest = next.follow;
+        self.history_position = next.position;
+        self.history_restore = next.position != null;
+        self.active_thread = id;
+        self.rendered_selection = null;
+        self.preedit_len = 0;
+        self.preedit_changed = true;
+        self.clearHistory();
+    }
+
+    fn setupInsert(self: *View, bytes: []const u8) !void {
+        if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
+        const len = &self.setup_lengths[self.setup_field];
+        if (len.* + bytes.len > 512) return error.TextTooLarge;
+        @memcpy(self.setup_fields[self.setup_field][len.*..][0..bytes.len], bytes);
+        len.* += bytes.len;
+    }
     pub const HistoryMove = enum { previous, next, first, latest };
     pub const ThreadHistory = struct {
         message: transcript.Id,
+        role: []const u8 = "assistant",
+        message_ordinal: u64 = 0,
         block: transcript.Id,
         block_ordinal: u64,
         revision: u64,
@@ -86,6 +215,7 @@ pub const View = struct {
     }
 
     pub fn deinit(self: *View) void {
+        for (&self.retained) |*slot| if (slot.editor) |*editor| editor.deinit();
         for (&self.rich_tiles) |*tile| tile.deinit();
         self.custom_tile.deinit();
         if (self.preedit_layout) |layout| c.spica_text_layout_release(layout);
@@ -145,19 +275,65 @@ pub const View = struct {
 
     /// Worker completions carry explicit source/revision/generation identity.
     /// Caller discards stale generations before admission into this root.
-    pub fn admitTile(self: *View, text: *c.SpicaText, tile: *const presentation.Tile, width: f32) !void {
-        for (self.rich_tiles[0..self.rich_count]) |*slot| {
-            if (slot.key) |key| if (std.meta.eql(key, tile.key) and slot.block_index == tile.block.index and slot.start_byte == tile.start_byte) {
+    pub const TileInfo = struct { message: transcript.Id, block: transcript.Id, ordinal: u64, message_ordinal: u64, role: []const u8, backward: bool };
+
+    fn removeTile(self: *View, index: usize) void {
+        const height = self.rich_tiles[index].height() + self.rich_tiles[index].headingHeight() + 8;
+        var y: f32 = 0;
+        for (self.rich_tiles[0..index]) |*tile| y += tile.height() + tile.headingHeight() + 8;
+        if (!self.follow_latest and y < self.transcript_scroll) self.transcript_scroll = @max(0, self.transcript_scroll - height);
+        self.rich_tiles[index].deinit();
+        var at = index;
+        while (at + 1 < self.rich_count) : (at += 1) self.rich_tiles[at] = self.rich_tiles[at + 1];
+        self.rich_count -= 1;
+        self.rich_tiles[self.rich_count] = .{};
+        self.transcript_drag = null;
+    }
+
+    pub fn admitTile(self: *View, text: *c.SpicaText, tile: *const presentation.Tile, width: f32, info: TileInfo) !void {
+        var index: usize = 0;
+        while (index < self.rich_count) {
+            const slot = &self.rich_tiles[index];
+            if (slot.canonical_block.eql(info.block.slice()) and slot.key != null and slot.key.?.revision != tile.key.revision) {
+                self.removeTile(index);
+                continue;
+            }
+            if (slot.canonical_block.eql(info.block.slice()) and slot.block_index == tile.block.index and slot.start_byte == tile.start_byte) {
                 try slot.update(text, tile, width);
+                applyTileInfo(slot, info, tile);
                 self.applySelection(slot);
                 return;
-            };
+            }
+            index += 1;
         }
-        const index = if (self.rich_count < self.rich_tiles.len) self.rich_count else self.rich_next;
-        try self.rich_tiles[index].update(text, tile, width);
+        var incoming: transcript.RichTile = .{};
+        errdefer incoming.deinit();
+        try incoming.update(text, tile, width);
+        applyTileInfo(&incoming, info, tile);
+        if (self.rich_count == self.rich_tiles.len) self.removeTile(if (info.backward) self.rich_count - 1 else 0);
+        index = 0;
+        while (index < self.rich_count) : (index += 1) {
+            const slot = &self.rich_tiles[index];
+            if (slot.message_ordinal > info.message_ordinal or (slot.message_ordinal == info.message_ordinal and (slot.canonical_ordinal > info.ordinal or (slot.canonical_ordinal == info.ordinal and (slot.block_index > tile.block.index or (slot.block_index == tile.block.index and slot.start_byte > tile.start_byte)))))) break;
+        }
+        var y: f32 = 0;
+        for (self.rich_tiles[0..index]) |*slot| y += slot.height() + slot.headingHeight() + 8;
+        if (!self.follow_latest and self.rich_count != 0 and y <= self.transcript_scroll) self.transcript_scroll += incoming.height() + incoming.headingHeight() + 8;
+        var at = self.rich_count;
+        while (at > index) : (at -= 1) self.rich_tiles[at] = self.rich_tiles[at - 1];
+        self.rich_tiles[index] = incoming;
+        self.rich_count += 1;
+        self.rich_next = 0;
         self.applySelection(&self.rich_tiles[index]);
-        if (self.rich_count < self.rich_tiles.len) self.rich_count += 1;
-        self.rich_next = (index + 1) % self.rich_tiles.len;
+    }
+
+    fn applyTileInfo(slot: *transcript.RichTile, info: TileInfo, tile: *const presentation.Tile) void {
+        slot.message = info.message;
+        slot.canonical_block = info.block;
+        slot.canonical_ordinal = info.ordinal;
+        slot.message_ordinal = info.message_ordinal;
+        slot.role = info.role;
+        slot.heading = tile.block.index == 0 and tile.start_byte == 0;
     }
 
     pub fn clearHistory(self: *View) void {
@@ -201,6 +377,8 @@ pub const View = struct {
         const key = tile.key orelse return;
         self.history_position = .{
             .message = tile.message,
+            .role = tile.role,
+            .message_ordinal = tile.message_ordinal,
             .block = tile.canonical_block,
             .block_ordinal = tile.canonical_ordinal,
             .revision = key.revision,
@@ -233,6 +411,56 @@ pub const View = struct {
             },
             c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
                 if (event.button.button != c.SDL_BUTTON_LEFT) return false;
+                if (self.custom_root == null) {
+                    const x = event.button.x;
+                    const y = event.button.y;
+                    if (self.setup_open) {
+                        if (y >= 140 and y < 332) self.setup_field = @min(3, @as(usize, @intFromFloat((y - 140) / 48)));
+                        if (y >= 100 and y < 132) self.setup_runtime = if (self.setup_runtime == .codex) .opencode else .codex;
+                        if (y >= 350 and y < 384) self.setup_action = if (x < 400) .configure else if (x < 540) .browser else if (x < 680) .device else .refresh;
+                        return true;
+                    }
+                    if (widgets.contains(self.picker_bounds, x, y)) {
+                        self.picker_open = !self.picker_open;
+                        return true;
+                    }
+                    if (widgets.contains(self.effort_bounds, x, y)) {
+                        if (self.selected) |*selected| for (self.models[0..self.model_count]) |model| {
+                            if (!model.identity.model_id.eql(selected.model_id.slice()) or !model.identity.account_ref.eql(selected.account_ref.slice())) continue;
+                            for (model.efforts[0..model.effort_count], 0..) |effort, index| if (effort.eql(selected.effort.slice())) {
+                                selected.effort = model.efforts[(index + 1) % model.effort_count];
+                                break;
+                            };
+                        };
+                        return true;
+                    }
+                    if (widgets.contains(self.setup_bounds, x, y)) {
+                        self.setup_open = true;
+                        self.setup_action = .status;
+                        return true;
+                    }
+                    if (widgets.contains(self.follow_bounds, x, y)) {
+                        self.history_move = .latest;
+                        return true;
+                    }
+                    if (self.picker_open) {
+                        if (y >= 76 and y < 76 + @as(f32, @floatFromInt(self.model_count)) * 38) {
+                            const index: usize = @intFromFloat((y - 76) / 38);
+                            self.selected = self.models[index].identity;
+                        }
+                        self.picker_open = false;
+                        return true;
+                    }
+                }
+                if (self.custom_root == null and self.navigation_enabled and event.button.x < 208) {
+                    const y = event.button.y;
+                    if (y >= 68 and y < 98) self.navigation = .new_project;
+                    if (y >= 104 and y < 134) self.navigation = .new_thread;
+                    if (y >= 148 and y < 148 + @as(f32, @floatFromInt(self.project_count)) * 26) self.navigation = .{ .project = @intFromFloat((y - 148) / 26) };
+                    const start = 168 + @as(f32, @floatFromInt(self.project_count)) * 26;
+                    if (y >= start and y < start + @as(f32, @floatFromInt(self.thread_count)) * 28) self.navigation = .{ .thread = @intFromFloat((y - start) / 28) };
+                    return true;
+                }
                 if (self.custom_root) |root| {
                     for (root.nodes[0..root.count], 0..) |node, index| {
                         const box = self.custom_bounds[index];
@@ -322,6 +550,10 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_TEXT_INPUT => {
+                if (self.setup_open and self.custom_root == null) {
+                    try self.setupInsert(std.mem.span(event.text.text));
+                    return true;
+                }
                 if (!self.hasComposer() or !self.focused or !self.window_active) return false;
                 const kind: @import("../text/composer.zig").GroupKind = if (self.preedit_len != 0) .ime else .typing;
                 self.preedit_len = 0;
@@ -334,6 +566,24 @@ pub const View = struct {
                 const mods = event.key.mod;
                 const ctrl = mods & c.SDL_KMOD_CTRL != 0;
                 const shift = mods & c.SDL_KMOD_SHIFT != 0;
+                if (self.setup_open and self.custom_root == null) {
+                    if (key == c.SDLK_ESCAPE) self.setup_open = false;
+                    if (key == c.SDLK_TAB) self.setup_field = (self.setup_field + 1) % 4;
+                    if (key == c.SDLK_RETURN) self.setup_action = .configure;
+                    if (key == c.SDLK_BACKSPACE) {
+                        const len = &self.setup_lengths[self.setup_field];
+                        if (len.* > 0) {
+                            len.* -= 1;
+                            while (len.* > 0 and self.setup_fields[self.setup_field][len.*] & 0xc0 == 0x80) len.* -= 1;
+                        }
+                    }
+                    if (ctrl and key == c.SDLK_V) {
+                        const value = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+                        defer c.SDL_free(value);
+                        try self.setupInsert(std.mem.span(value));
+                    }
+                    return true;
+                }
                 if (!ctrl and mods & c.SDL_KMOD_ALT != 0 and self.window_active) {
                     self.history_move = switch (key) {
                         c.SDLK_PAGEUP => .previous,
@@ -448,7 +698,32 @@ pub const View = struct {
         if (!c.SDL_SetRenderDrawColor(renderer, 19, 22, 28, 255) or !c.SDL_RenderClear(renderer)) return error.CanvasDraw;
         if (self.custom_root == null) {
             try self.labels.draw(text, "SPICA", 24, 18, 18, foreground);
-            try self.labels.drawFitted(renderer, text, self.status, 110, 22, bounds.header.width - 140, 13, muted);
+            const model_width = std.math.clamp((bounds.header.width - 240) * 0.40, 140, 350);
+            self.picker_bounds.w = model_width;
+            self.effort_bounds = .{ .x = 248 + model_width, .y = 18, .w = 76, .h = 28 };
+            self.setup_bounds = .{ .x = self.effort_bounds.x + 84, .y = 18, .w = 112, .h = 28 };
+            self.follow_bounds = .{ .x = self.setup_bounds.x + 120, .y = 18, .w = 112, .h = 28 };
+            try self.labels.drawFitted(renderer, text, self.status, 110, 22, 124, 13, muted);
+            try self.labels.drawFitted(renderer, text, self.workspace_label[0..self.workspace_label_len], 240, 49, bounds.header.width - 260, 11, muted);
+            try widgets.panel(renderer, self.picker_bounds, 4, .{ .r = 35, .g = 40, .b = 49 });
+            var identity_label: [512]u8 = undefined;
+            const identity = if (self.selected) |*selected| try std.fmt.bufPrint(&identity_label, "{s} / {s}", .{ if (selected.runtime_kind.eql("fake")) "DEMO synthetic" else selected.runtime_kind.slice(), selected.model_id.slice() }) else "Choose model";
+            try self.labels.drawFitted(renderer, text, identity, 248, 24, self.picker_bounds.w - 16, 13, foreground);
+            try widgets.panel(renderer, self.effort_bounds, 4, .{ .r = 35, .g = 40, .b = 49 });
+            try self.labels.drawFitted(renderer, text, if (self.selected) |*selected| selected.effort.slice() else "Effort", self.effort_bounds.x + 8, 24, self.effort_bounds.w - 16, 13, foreground);
+            try widgets.panel(renderer, self.setup_bounds, 4, .{ .r = 51, .g = 69, .b = 105 });
+            try self.labels.draw(text, "Connect provider", self.setup_bounds.x + 4, 24, 12, foreground);
+            try widgets.panel(renderer, self.follow_bounds, 4, .{ .r = 35, .g = 40, .b = 49 });
+            try self.labels.drawFitted(renderer, text, if (self.follow_latest) "Following live" else "Resume live ↓", self.follow_bounds.x + 4, 24, self.follow_bounds.w - 8, 12, if (self.follow_latest) muted else foreground);
+            try self.labels.draw(text, "+ New project", 16, 74, 14, foreground);
+            try self.labels.draw(text, "+ New chat", 16, 110, 14, foreground);
+            for (self.projects[0..self.project_count], 0..) |*entry, index| {
+                try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], 16, 148 + @as(f32, @floatFromInt(index)) * 26, 184, 13, if (entry.id.eql(self.active_project.slice())) foreground else muted);
+            }
+            const start = 168 + @as(f32, @floatFromInt(self.project_count)) * 26;
+            for (self.threads[0..self.thread_count], 0..) |*entry, index| {
+                try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], 24, start + @as(f32, @floatFromInt(index)) * 28, 176, 13, if (entry.id.eql(self.active_thread.slice())) foreground else muted);
+            }
             for (self.tasks[0..self.task_count], 0..) |*task, index| {
                 const y = bounds.transcript.y + @as(f32, @floatFromInt(index)) * 24;
                 try self.labels.drawFitted(renderer, text, task.bytes[0..task.len], bounds.transcript.x, y, bounds.transcript.width - 84, 12, muted);
@@ -488,12 +763,12 @@ pub const View = struct {
             if (!self.follow_latest) for (0..self.rich_count) |offset| {
                 const index = if (self.rich_count == self.rich_tiles.len) (self.rich_next + offset) % self.rich_tiles.len else offset;
                 const tile = &self.rich_tiles[index];
-                if (old_y + tile.height() + 8 > self.transcript_scroll) {
+                if (old_y + tile.headingHeight() + tile.height() + 8 > self.transcript_scroll) {
                     anchor_index = index;
-                    anchor_point = tile.capture(self.transcript_scroll - old_y);
+                    anchor_point = tile.capture(self.transcript_scroll - old_y - tile.headingHeight());
                     break;
                 }
-                old_y += tile.height() + 8;
+                old_y += tile.headingHeight() + tile.height() + 8;
             };
             var total_height: f32 = 0;
             var restored: ?f32 = null;
@@ -501,8 +776,8 @@ pub const View = struct {
                 const index = if (self.rich_count == self.rich_tiles.len) (self.rich_next + offset) % self.rich_tiles.len else offset;
                 const tile = &self.rich_tiles[index];
                 try tile.reflow(text, bounds.transcript.width);
-                if (anchor_index == index) restored = total_height + tile.restore(anchor_point);
-                total_height += tile.height() + 8;
+                if (anchor_index == index) restored = total_height + tile.headingHeight() + tile.restore(anchor_point);
+                total_height += tile.headingHeight() + tile.height() + 8;
             }
             self.history_height = total_height;
             const max_scroll = @max(0, total_height - self.transcript_bounds.h);
@@ -512,16 +787,24 @@ pub const View = struct {
             for (0..self.rich_count) |offset| {
                 const index = if (self.rich_count == self.rich_tiles.len) (self.rich_next + offset) % self.rich_tiles.len else offset;
                 const tile = &self.rich_tiles[index];
-                if (tile_y + tile.height() >= self.transcript_bounds.y and tile_y < self.transcript_bounds.y + self.transcript_bounds.h) {
+                const heading_y = tile_y;
+                tile_y += tile.headingHeight();
+                if (tile_y + tile.height() >= self.transcript_bounds.y and heading_y < self.transcript_bounds.y + self.transcript_bounds.h) {
                     if (!captured) {
                         self.captureHistory(tile, tile.capture(self.transcript_bounds.y - tile_y));
                         captured = true;
                     }
+                    if (tile.heading) try self.labels.draw(text, tile.role, bounds.transcript.x, heading_y + 2, 13, muted);
                     try tile.draw(renderer, text, bounds.transcript.x, tile_y);
                 } else tile.bounds = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
                 tile_y += tile.height() + 8;
             }
-            if (self.rich_count == 0) try self.labels.draw(text, if (self.connected) "Send a prompt to begin." else "Compose a draft below. No provider is running.", bounds.transcript.x, self.transcript_bounds.y + 20, 16, muted);
+            if (self.rich_count == 0) {
+                try self.labels.draw(text, "Your native coding workspace", bounds.transcript.x, self.transcript_bounds.y + 20, 22, foreground);
+                try self.labels.drawFitted(renderer, text, "Create chats in the sidebar. Drafts and history stay with each chat.", bounds.transcript.x, self.transcript_bounds.y + 58, bounds.transcript.width, 14, muted);
+                try self.labels.drawFitted(renderer, text, "Connect provider to authorize your runtime, isolated account and workspace.", bounds.transcript.x, self.transcript_bounds.y + 86, bounds.transcript.width, 14, muted);
+                try self.labels.drawFitted(renderer, text, "The synthetic Demo exercises controls only; it does not edit your project.", bounds.transcript.x, self.transcript_bounds.y + 114, bounds.transcript.width, 14, muted);
+            }
         }
         transcript_clip.restore(renderer);
         const panel = c.SDL_FRect{ .x = bounds.composer.x, .y = bounds.composer.y, .w = bounds.composer.width, .h = bounds.composer.height };
@@ -595,6 +878,43 @@ pub const View = struct {
             try self.labels.drawFitted(renderer, text, self.status, 24, 0, 600, 11, muted);
         }
         if (self.notice) |notice| try self.labels.drawFitted(renderer, text, notice, bounds.transcript.x, bounds.transcript.y, bounds.transcript.width, 12, muted);
+        if (self.custom_root == null and self.picker_open) {
+            const menu = c.SDL_FRect{ .x = 240, .y = 68, .w = @max(200, bounds.transcript.width), .h = @max(64, @as(f32, @floatFromInt(self.model_count)) * 38 + 16) };
+            try widgets.panel(renderer, menu, 6, .{ .r = 35, .g = 40, .b = 49 });
+            if (self.model_count == 0) try self.labels.draw(text, "No models. Open Connection, then Refresh models.", 252, 84, 14, foreground);
+            for (self.models[0..self.model_count], 0..) |*model, index| {
+                var buffer: [768]u8 = undefined;
+                const label = try std.fmt.bufPrint(&buffer, "{s} / {s}  [{s}]{s}", .{ model.identity.runtime_kind.slice(), model.identity.model_id.slice(), @tagName(model.readiness), if (model.synthetic) " — synthetic test provider" else "" });
+                const y = 76 + @as(f32, @floatFromInt(index)) * 38;
+                try self.labels.drawFitted(renderer, text, label, 252, y, menu.w - 24, 13, foreground);
+                try self.labels.drawFitted(renderer, text, model.reason[0..model.reason_len], 252, y + 17, menu.w - 24, 11, muted);
+            }
+        }
+        if (self.custom_root == null and self.setup_open) {
+            const menu = c.SDL_FRect{ .x = 224, .y = 68, .w = @max(480, bounds.transcript.width), .h = 460 };
+            try widgets.panel(renderer, menu, 8, .{ .r = 35, .g = 40, .b = 49 });
+            try self.labels.draw(text, "Connect an explicitly authorized runtime (Esc closes)", 240, 78, 15, foreground);
+            try self.labels.draw(text, if (self.setup_runtime == .codex) "Runtime: Codex (click to change)" else "Runtime: OpenCode (click to change)", 240, 106, 14, foreground);
+            const names = [_][]const u8{ "Absolute executable", "Absolute isolated account directory", "Absolute workspace root", "Model provider (for example openai)" };
+            for (names, 0..) |name, index| {
+                const y = 140 + @as(f32, @floatFromInt(index)) * 48;
+                try self.labels.draw(text, name, 240, y, 11, muted);
+                try widgets.panel(renderer, .{ .x = 240, .y = y + 16, .w = menu.w - 32, .h = 26 }, 3, if (index == self.setup_field) .{ .r = 51, .g = 69, .b = 105 } else .{ .r = 27, .g = 32, .b = 41 });
+                try self.labels.drawFitted(renderer, text, self.setup_fields[index][0..self.setup_lengths[index]], 246, y + 20, menu.w - 44, 13, foreground);
+            }
+            try self.labels.draw(text, "Save connection", 240, 358, 13, foreground);
+            try self.labels.draw(text, "Browser sign-in", 400, 358, 13, foreground);
+            try self.labels.draw(text, "Device sign-in", 540, 358, 13, foreground);
+            try self.labels.draw(text, "Refresh models", 680, 358, 13, foreground);
+            try self.labels.draw(text, "Tab changes field. Paste supported. No credentials are imported.", 240, 394, 12, muted);
+            var start: usize = 0;
+            var row: usize = 0;
+            while (start < self.runtime_info_len and row < 5) : (row += 1) {
+                const end = start + @import("../text/utf8.zig").prefix(self.runtime_info[start..self.runtime_info_len], 92).len;
+                try self.labels.drawFitted(renderer, text, self.runtime_info[start..end], 240, 416 + @as(f32, @floatFromInt(row)) * 18, menu.w - 32, 11, foreground);
+                start = end;
+            }
+        }
     }
 };
 
@@ -753,4 +1073,42 @@ test "stable rendered selection survives page eviction and clips adjacent geomet
     try std.testing.expect(tile.selected);
     try std.testing.expectEqual(@as(usize, 0), tile.anchor);
     try std.testing.expectEqual(@as(usize, 50), tile.caret);
+}
+
+test "thread switching retains complete composer undo selection and refuses destructive eviction" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.selectThread(try transcript.Id.init("first"));
+    try view.insert("draft café", .typing);
+    view.editor.setCaret(6, false);
+    view.editor.setCaret(10, true);
+    const caret = view.editor.caret;
+    const anchor = view.editor.anchor;
+    try view.selectThread(try transcript.Id.init("second"));
+    try view.insert("independent", .typing);
+    try view.selectThread(try transcript.Id.init("first"));
+    try std.testing.expectEqualStrings("draft café", view.editor.textBytes());
+    try std.testing.expectEqual(caret, view.editor.caret);
+    try std.testing.expectEqual(anchor, view.editor.anchor);
+    try std.testing.expect(view.editor.undo());
+    try std.testing.expectEqualStrings("", view.editor.textBytes());
+    try std.testing.expect(view.editor.redo());
+    for (0..15) |index| {
+        var id: [32]u8 = undefined;
+        try view.selectThread(try transcript.Id.init(try std.fmt.bufPrint(&id, "thread-{d}", .{index})));
+    }
+    try std.testing.expectError(error.DraftRetentionFull, view.selectThread(try transcript.Id.init("overflow")));
+    try view.selectThread(try transcript.Id.init("second"));
+    try std.testing.expectEqualStrings("independent", view.editor.textBytes());
+}
+
+test "model identity copies complete selection without borrowed provider strings" {
+    var model = [_]u8{ 'm', 'o', 'd', 'e', 'l' };
+    var identity = try View.Identity.from(.{ .model_provider = "provider", .model_id = &model, .effort = "high", .account_ref = "explicit-account", .workspace = .{ .value = "selected-workspace" } });
+    model[0] = 'x';
+    const selected = identity.selection();
+    try std.testing.expectEqualStrings("model", selected.model_id);
+    try std.testing.expectEqualStrings("high", selected.effort);
+    try std.testing.expectEqualStrings("explicit-account", selected.account_ref);
+    try std.testing.expectEqualStrings("selected-workspace", selected.workspace.value);
 }

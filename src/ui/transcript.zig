@@ -260,6 +260,10 @@ pub const RichTile = struct {
     start_byte: u32 = 0,
     projection_start: u32 = 0,
     message: Id = .{},
+    role: []const u8 = "assistant",
+    message_ordinal: u64 = 0,
+    heading: bool = false,
+
     canonical_block: Id = .{},
     canonical_ordinal: u64 = 0,
     layout: ?*native.SpicaTextLayout = null,
@@ -275,6 +279,9 @@ pub const RichTile = struct {
     color_count: usize = 0,
     styles: [presentation.tile_runs]native.SpicaTextSpan = undefined,
     size: c_uint = 16,
+    pub fn headingHeight(self: *const RichTile) f32 {
+        return if (self.heading) 24 else 0;
+    }
 
     pub fn deinit(self: *RichTile) void {
         if (self.layout) |layout| native.spica_text_layout_release(layout);
