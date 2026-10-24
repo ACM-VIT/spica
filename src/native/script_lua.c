@@ -2,6 +2,7 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -127,9 +128,105 @@ static int enum_field(lua_State *L, int index, const char *key, const char *cons
         fail(L, "unknown descriptor kind");
     return answer;
 }
+/* Raw traversal rejects coercions, unknown/numeric keys, metatables and sparse
+ * impostors. All throwing operations stay inside protected evaluation. */
+static int named_key(lua_State *L, int index, const char *const *names, size_t count) {
+    if (lua_type(L, index) != LUA_TSTRING)
+        return fail(L, "descriptor key must be a string");
+    size_t len;
+    const char *key = lua_tolstring(L, index, &len);
+    for (size_t i = 0; i < count; ++i)
+        if (len == strlen(names[i]) && !memcmp(key, names[i], len))
+            return (int)i;
+    return fail(L, "unknown descriptor field");
+}
+static float bounded_number(lua_State *L, int index, double low, double high) {
+    if (lua_type(L, index) != LUA_TNUMBER)
+        fail(L, "number required");
+    lua_Number number = lua_tonumber(L, index);
+    if (!isfinite(number) || number < low || number > high)
+        fail(L, "number outside finite bounds");
+    return (float)number;
+}
+static int hex_digit(unsigned char c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+static void color(lua_State *L, int index, uint8_t out[3]) {
+    if (lua_type(L, index) != LUA_TSTRING)
+        fail(L, "color string required");
+    size_t len;
+    const char *text = lua_tolstring(L, index, &len);
+    if (len != 7 || text[0] != '#')
+        fail(L, "color must be #RRGGBB");
+    for (size_t i = 0; i < 3; ++i) {
+        int high = hex_digit((unsigned char)text[1 + 2 * i]);
+        int low = hex_digit((unsigned char)text[2 + 2 * i]);
+        if (high < 0 || low < 0)
+            fail(L, "invalid color digit");
+        out[i] = (uint8_t)(high * 16 + low);
+    }
+}
+static void style(lua_State *L, int index, SpicaScriptStyle *out) {
+    static const char *const names[] = {"width",     "height", "gap",        "padding",
+                                        "font_size", "radius", "background", "foreground"};
+    static const double low[] = {1, 1, 0, 0, 8, 0};
+    static const double high[] = {4096, 4096, 128, 128, 72, 64};
+    float *values[] = {&out->width,   &out->height,    &out->gap,
+                       &out->padding, &out->font_size, &out->radius};
+    index = lua_absindex(L, index);
+    plain_table(L, index);
+    lua_pushnil(L);
+    while (lua_next(L, index)) {
+        int key = named_key(L, -2, names, 8);
+        if (key < 6)
+            *values[key] = bounded_number(L, -1, low[key], high[key]);
+        else
+            color(L, -1, key == 6 ? out->background : out->foreground);
+        out->present |= 1u << key;
+        lua_pop(L, 1);
+    }
+}
+static void design(lua_State *L, int index, SpicaScriptDesign *out) {
+    static const char *const groups[] = {"colors", "layout"};
+    static const char *const colors[] = {"background",  "sidebar",    "surface", "raised",
+                                         "border",      "foreground", "muted",   "accent",
+                                         "accent_text", "selection"};
+    static const char *const metrics[] = {"sidebar_width",   "content_width", "header_height",
+                                          "composer_height", "gutter",        "gap",
+                                          "radius"};
+    static const double low[] = {148, 400, 48, 136, 12, 4, 0};
+    static const double high[] = {400, 1600, 96, 240, 48, 32, 24};
+    index = lua_absindex(L, index);
+    plain_table(L, index);
+    lua_pushnil(L);
+    while (lua_next(L, index)) {
+        int group = named_key(L, -2, groups, 2);
+        int table = lua_absindex(L, -1);
+        plain_table(L, table);
+        lua_pushnil(L);
+        while (lua_next(L, table)) {
+            int key = named_key(L, -2, group == 0 ? colors : metrics, group == 0 ? 10 : 7);
+            if (group == 0) {
+                color(L, -1, out->colors[key]);
+                out->colors_present |= 1u << key;
+            } else {
+                out->layout[key] = bounded_number(L, -1, low[key], high[key]);
+                out->layout_present |= 1u << key;
+            }
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+    }
+}
 static void node(lua_State *L, int index, SpicaScriptRoot *root, uint16_t parent, unsigned depth) {
-    static const char *const kinds[] = {"column", "row",      "text",
-                                        "button", "composer", "transcript"};
+    static const char *const kinds[] = {"column",   "row",        "text",  "button",
+                                        "composer", "transcript", "native"};
     index = lua_absindex(L, index);
     plain_table(L, index);
     if (depth > 8 || root->count == SPICA_SCRIPT_NODES)
@@ -137,7 +234,9 @@ static void node(lua_State *L, int index, SpicaScriptRoot *root, uint16_t parent
     uint16_t current = (uint16_t)root->count++;
     SpicaScriptNode *n = &root->nodes[current];
     n->parent = parent;
-    n->kind = enum_field(L, index, "kind", kinds, 6);
+    n->kind = enum_field(L, index, "kind", kinds, 7);
+    if (n->kind == 6 && parent != UINT16_MAX)
+        fail(L, "native must be a standalone root");
     id_field(L, index, "id", &n->id, 0);
     if (!n->id.len)
         fail(L, "empty semantic id");
@@ -153,6 +252,19 @@ static void node(lua_State *L, int index, SpicaScriptRoot *root, uint16_t parent
     n->text_len =
         (uint16_t)bytes(L, -1, root->text + root->text_len, SPICA_SCRIPT_TEXT - root->text_len, 1);
     root->text_len += n->text_len;
+    lua_pop(L, 1);
+    field(L, index, "style");
+    if (!lua_isnil(L, -1))
+        style(L, -1, &n->style);
+    lua_pop(L, 1);
+    if (n->kind == 6 && n->style.present)
+        fail(L, "native root uses design, not node style");
+    field(L, index, "design");
+    if (!lua_isnil(L, -1)) {
+        if (parent != UINT16_MAX)
+            fail(L, "design belongs to root");
+        design(L, -1, &root->design);
+    }
     lua_pop(L, 1);
     field(L, index, "children");
     if (!lua_isnil(L, -1)) {

@@ -21,12 +21,123 @@ export `root(snapshot)`, `render_block(snapshot)`, and `action(id,payload)`.
 
 Root is a flat preorder tree of at most 64 nodes and depth eight, with unique
 nonempty semantic IDs, parent indexes and a 16 KiB text pool. Kinds are column,
-row, text, button, composer, transcript (0–5). Only column/row have children.
+row, text, button, composer, transcript (0–5), and native (6). Only column/row have children.
 Buttons declare nonempty action IDs. Renderer text is at most 32 KiB with plain,
 markdown or code format (0–2) and optional language. All strings have explicit
 byte lengths, including embedded NULs; consumers must use lengths, not strlen.
 Revision enters Lua as an unsigned decimal string, never a floating-point or
 signed Lua integer. All native generations, sequences and preconditions stay u64.
+
+## Shared presentation configuration
+
+`src/ui/design.zig` defines the runtime-independent, allocation-free native
+`Config { colors: Palette = .{}, layout: Metrics = .{} }`. Colors are opaque
+`ui/color.zig.Color` RGB bytes; metrics are finite f32 values. `Config.validate()`
+rejects invalid metrics. `Config.fromScript(*const script.Root)` validates native
+presence masks and all supplied numeric values before copying optional fields
+into a default Config. Invalid native descriptors return `InvalidDesign`.
+This contract does not depend on a scripting language or provider runtime.
+
+The optional **root-only** Lua field `design` accepts only `colors` and `layout`.
+Both groups are optional plain tables. Their permitted fields are:
+
+| Palette field | Default |
+| --- | --- |
+| background | `#0a0a0a` |
+| sidebar | `#000000` |
+| surface | `#111111` |
+| raised | `#111111` |
+| border | `#191919` |
+| foreground | `#f5f5f5` |
+| muted | `#818181` |
+| accent | `#346bf1` |
+| accent_text | `#ffffff` |
+| selection | `#343a47` |
+
+These are direct RGB values from T3 Code's MIT-licensed
+`packages/shared/src/themePalettes.ts`, `T3_CODE_DARK_THEME_COLORS`, pinned at
+`eb1510d2493cbf28600432d5193cc22a1af8f3d8`. The corresponding roles are canvas,
+sidebar, surface, surfaceRaised, border, text, textMuted, messageAction,
+messageActionForeground and terminalSelection. This is a bounded subset of its
+roles, not its complete theme engine.
+
+| Metrics field | Default | Inclusive range |
+| --- | --- | --- |
+| sidebar_width | 272 | 148–400 |
+| content_width | 880 | 400–1600 |
+| header_height | 56 | 48–96 |
+| composer_height | 160 | 136–240 |
+| gutter | 24 | 12–48 |
+| gap | 12 | 4–32 |
+| radius | 16 | 0–24 |
+
+All color values must be actual Lua strings of exactly seven bytes, `#RRGGBB`;
+hex digits are case insensitive. Short hex, alpha, names and numeric colors are
+rejected. All metric/style numbers must be actual Lua numbers, finite and within
+the specified range. Numeric strings and booleans are rejected without coercion.
+Unknown fields and nonstring keys anywhere inside design, colors, layout or
+style are rejected. Omitted fields use defaults; nil is omission in a Lua table.
+
+`{kind='native', id='workspace', design={...}}` is a standalone root: exactly one
+node with a required nonempty ID and no children. It retains the complete default
+coding interface, native Send, provider controls, approval/cancel and native
+content rendering. A native root rejects any nonempty node style; use `design`
+for this root. `style={}` is allowed. `render_block` and `action` functions are
+still required and their outputs retain the existing validation rules, but a
+native root does not install the custom visible-text renderer or intercept
+native controls. See runnable [t3-theme.lua](../../examples/t3-theme.lua):
+
+```sh
+zig-out/bin/spica --state-directory /tmp/spica-theme-demo \
+  --lua-module examples/t3-theme.lua
+```
+
+Design applies to native or custom composition while the module is active.
+F9 switches to the default Config when inactive. Failed reload or render preserves
+the **entire** last-good root, renderer, styles and design, with an error; failed
+reload does not advance generation. This includes failure after a candidate's
+root/design has parsed successfully but its renderer fails. Domain execution and
+previously accepted Host work keep their lifetimes.
+
+## Per-node style and native ABI
+
+The six custom primitive kinds accept optional `style={...}`:
+
+| Field | Type | Inclusive range | Presence bit |
+| --- | --- | --- | --- |
+| width | number | 1–4096 | 1 |
+| height | number | 1–4096 | 2 |
+| gap | number | 0–128 | 4 |
+| padding | number | 0–128 | 8 |
+| font_size | number | 8–72 | 16 |
+| radius | number | 0–64 | 32 |
+| background | `#RRGGBB` | opaque RGB | 64 |
+| foreground | `#RRGGBB` | opaque RGB | 128 |
+
+Width/height are requested dimensions; native clipping still bounds the visible
+viewport. Padding is uniform. Each supplied value overrides the corresponding
+primitive default, while omitted values retain existing layout/paint behavior.
+Container gap controls children; font size and foreground apply to native text
+within the styled primitive. Background and radius apply to its painted surface.
+Unknown properties fail rather than being silently ignored.
+
+`SpicaScriptNode.style` is a `SpicaScriptStyle`: `uint32_t present`, followed by
+six `float` members named width, height, gap, padding, font_size, radius, followed
+by `uint8_t background[3], foreground[3]` in RGB order. `SPICA_STYLE_*` macros
+define the table's bits. `script.Style` aliases this value and
+`script.validateStyle()` rejects unknown bits, nonfinite and out-of-range supplied
+values. Absent backing slots are ignored, including zero-filled numbers.
+
+`SpicaScriptRoot.design` is `SpicaScriptDesign`: `uint32_t colors_present,
+layout_present`, `uint8_t colors[10][3]`, and `float layout[7]`. Color/layout index
+and mask bit order match the Palette/Metrics tables above. These structures own
+all data by value; the fixed existing node/text/depth/queue bounds remain.
+Bindings must validate descriptors before conversion or installation and install
+the resulting Config atomically with the successful visual result.
+
+An external transport for editing these runtime-independent values is **pending**.
+No network endpoint, remote client, subscription protocol or credential access is
+shipped by this API slice. The local Lua binding is the implemented adapter.
 
 Native input captures the displayed generation, declared action ID, payload,
 and exact ActionContext (thread/run/approval/digest/selection/revision). Accepted

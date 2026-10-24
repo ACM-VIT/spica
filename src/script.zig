@@ -11,7 +11,21 @@ pub const ActionContext = abi.SpicaScriptActionContext;
 pub const Result = abi.SpicaScriptResult;
 pub const Id = abi.SpicaScriptId;
 pub const Text = abi.SpicaScriptText;
+pub const Style = abi.SpicaScriptStyle;
 pub const AdmissionError = error{ QueueFull, InvalidInput };
+
+/// Native transport validation; absent fields do not override primitive defaults.
+pub fn validateStyle(style: *const Style) error{InvalidStyle}!void {
+    if (style.present & ~@as(u32, 255) != 0) return error.InvalidStyle;
+    const values = [6]f32{ style.width, style.height, style.gap, style.padding, style.font_size, style.radius };
+    const minimum = [6]f32{ 1, 1, 0, 0, 8, 0 };
+    const maximum = [6]f32{ 4096, 4096, 128, 128, 72, 64 };
+    for (values, minimum, maximum, 0..) |value, low, high, i| {
+        if (style.present & (@as(u32, 1) << @intCast(i)) != 0 and
+            (!std.math.isFinite(value) or value < low or value > high))
+            return error.InvalidStyle;
+    }
+}
 
 pub const Runtime = struct {
     handle: *abi.SpicaScript,
