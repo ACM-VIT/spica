@@ -17,6 +17,21 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def evidence_value(value, binary=False):
+    """SQLite BLOB text remains readable; arbitrary binary stays lossless."""
+    if not isinstance(value, bytes):
+        return value
+    if binary:
+        return {'encoding': 'hex', 'bytes': len(value), 'value': value.hex()}
+    try:
+        text = value.decode('utf-8')
+    except UnicodeDecodeError:
+        return {'encoding': 'hex', 'bytes': len(value), 'value': value.hex()}
+    if all(character.isprintable() or character in '\r\n\t' for character in text):
+        return text
+    return {'encoding': 'hex', 'bytes': len(value), 'value': value.hex()}
+
+
 def enabled(snapshot):
     return any(t['id'] == 'command.send' and t['enabled'] for t in snapshot.get('targets', []))
 
@@ -80,9 +95,15 @@ class Proof:
         if not condition:
             raise RuntimeError('Assertion failed: ' + name + ': ' + repr(detail))
 
+    def source_identity(self):
+        diff = self.run('git', 'diff', '--binary', 'HEAD', '--', strip=False)
+        status = self.run('git', 'status', '--porcelain', '--untracked-files=no', strip=False)
+        return dict(head=self.run('git', 'rev-parse', 'HEAD'), tracked_status=status,
+                    tracked_binary_diff_sha256=hashlib.sha256(diff.encode()).hexdigest())
+
     def prepare(self):
         self.require('candidate_at_start', self.run('git', 'rev-parse', 'HEAD') == self.args.candidate)
-        self.manifest['source_status'] = self.run('git', 'status', '--porcelain')
+        self.manifest['source_initial'] = self.source_identity()
         self.require('binary_on_disk', sha(self.args.binary) == self.args.binary_sha256)
         self.require('patched_library_on_disk', sha(self.args.patched_library) == self.args.patched_library_sha256)
         self.manifest['tool_sha256'] = sha(__file__)
@@ -240,7 +261,10 @@ class Proof:
     def rows(self, sql='SELECT id,thread_id,state,requested FROM runs ORDER BY rowid'):
         with sqlite3.connect((self.state / 'conversation.sqlite3').as_uri() + '?mode=ro', uri=True) as db:
             db.execute('PRAGMA query_only=ON')
-            return [[v.decode('utf-8') if isinstance(v, bytes) else v for v in row] for row in db.execute(sql)]
+            cursor = db.execute(sql)
+            binary_columns = [column[0] == 'digest' for column in cursor.description]
+            return [[evidence_value(value, binary) for value, binary in zip(row, binary_columns)]
+                    for row in cursor]
 
     def database(self, label):
         result = dict(runs=self.rows(), threads=self.rows('SELECT * FROM threads ORDER BY rowid'),
@@ -332,7 +356,7 @@ class Proof:
                     table: self.rows('SELECT * FROM ' + table + ' ORDER BY rowid')
                     for table in ('commands', 'runs', 'sessions', 'tasks', 'bridge_calls', 'effects', 'tools')}
             except BaseException as database_error:
-                self.manifest['database_capture_error'] = repr(database_error)
+                self.manifest.update(status='failed', database_capture_error=repr(database_error))
         self.manifest['owned_app_pids_absent'] = {
             str(record['pid']): not Path('/proc/' + str(record['pid']) + '/exe').exists()
             for record in self.manifest.get('launches', [])}
@@ -349,6 +373,9 @@ class Proof:
             self.manifest.update(status='failed', root_identity_error='Original committed roots drifted')
         if self.run('git', 'rev-parse', 'HEAD') != self.args.candidate or sha(self.args.binary) != self.args.binary_sha256 or sha(self.args.patched_library) != self.args.patched_library_sha256:
             self.manifest.update(status='failed', candidate_drift=True)
+        self.manifest['source_final'] = self.source_identity()
+        if self.manifest.get('source_initial') != self.manifest['source_final']:
+            self.manifest.update(status='failed', source_fingerprint_drift=True)
         self.manifest['evidence_sha256'] = {str(path.relative_to(self.out)): sha(path)
             for path in self.out.iterdir() if path.is_file() and path.name not in ('manifest.json', 'commands.json')}
         self.save()
@@ -554,7 +581,7 @@ def task(p):
                      model_id='big-pickle', effort='default', account_ref=str(account),
                      workspace={'value': workspace}, capability_revision=1)
     packet = dict(purpose='one native Cancel task acceptance gate',
-                  prompt='Do not use tools or delegate. Explain integers 1 through 10000 in detail, one paragraph per integer.',
+                  prompt='Do not use tools or delegate. Write at most 40 numbered short sentences explaining integers, then stop.',
                   selection=selection, owned_paths=['task-button-result.txt'],
                   acceptance='A human native Cancel task action targets this exact child; do not write files.',
                   result_location='task-button-result.txt', detached=False,
