@@ -12,6 +12,7 @@ const contract = @import("contract.zig");
 const presentation = @import("content/presentation.zig");
 const Id = @import("ui/transcript.zig").Id;
 const script = @import("script.zig");
+const design = @import("ui/design.zig");
 
 /// Only a payload-free wake crosses worker threads. Registered after SDL init;
 /// its storage and SDL outlive both Host and presentation worker joins.
@@ -48,6 +49,15 @@ pub const App = struct {
     live: ?*Live = null,
 
     lua: ?*LuaBridge = null,
+
+    /// Presentation-only API. Call on the App thread; values are validated and
+    /// copied together before the next paint. Host and provider work are untouched.
+    pub fn configurePresentation(self: *App, value: design.Config) !void {
+        try value.validate();
+        self.view.design = value;
+        self.layout.design = value;
+        self.dirty = true;
+    }
 
     pub fn configureLua(self: *App, io: std.Io, path: []const u8, wake: *Wake) !void {
         const bridge = try self.view.allocator.create(LuaBridge);
@@ -232,7 +242,7 @@ pub const App = struct {
                 if (event.key.key == c.SDLK_F9) {
                     bridge.active = !bridge.active;
                     bridge.epoch += 1;
-                    bridge.install(self);
+                    try bridge.install(self);
                     self.dirty = true;
                     return;
                 }
@@ -274,7 +284,7 @@ pub const App = struct {
         }
         if (self.view.takeIntent()) |intent| {
             if (self.lua) |bridge| {
-                if (bridge.active and bridge.generation != 0 and intent == .send) {
+                if (bridge.active and self.view.custom_root != null and bridge.generation != 0 and intent == .send) {
                     bridge.queue(self, try script.id("send"), .send) catch |err| {
                         self.view.notice = @errorName(err);
                     };
@@ -339,7 +349,9 @@ pub const App = struct {
         const coding_bounds = if (self.view.custom_root) |root| self.layout.script(root, &self.view.custom_bounds) else self.layout.coding(w);
         try self.view.draw(self.renderer, self.text, self.window, coding_bounds);
         self.snapshot.draft = self.view.editor.textBytes();
+        self.snapshot.presentation = self.view.design;
         if (self.lua) |bridge| {
+            self.snapshot.presentation_active = bridge.active and bridge.generation != 0;
             self.snapshot.custom_root = self.view.custom_root != null;
             self.snapshot.script_generation = bridge.generation;
             self.snapshot.script_error = if (bridge.error_text[0] != 0) std.mem.sliceTo(&bridge.error_text, 0) else null;
@@ -518,9 +530,15 @@ const LuaBridge = struct {
         self.reload_pending = true;
     }
 
-    fn install(self: *LuaBridge, app: *App) void {
-        app.view.custom_root = if (self.active and self.generation != 0) &self.root else null;
-        app.view.custom_render = if (self.active and self.generation != 0) &self.render else null;
+    fn install(self: *LuaBridge, app: *App) !void {
+        const installed = self.active and self.generation != 0;
+        const candidate: design.Config = if (installed) try design.Config.fromScript(&self.root) else .{};
+        try app.configurePresentation(candidate);
+        // A native root keeps the full conversation and its ordinary commands.
+        // It opts into presentation settings without replacing content/actions.
+        const custom = installed and !(self.root.count == 1 and self.root.nodes[0].kind == 6);
+        app.view.custom_root = if (custom) &self.root else null;
+        app.view.custom_render = if (custom) &self.render else null;
     }
 
     fn queue(self: *LuaBridge, app: *App, action: script.Id, intent: @import("ui/coding.zig").Intent) !void {
@@ -604,7 +622,7 @@ const LuaBridge = struct {
                     self.render = result.render;
                     self.generation = result.generation;
                     app.view.custom_render_sequence += 1;
-                    self.install(app);
+                    try self.install(app);
                     if (result.kind == 1) self.error_text = @splat(0);
                     if (self.error_text[0] == 0) app.view.notice = null;
                 }
@@ -2032,4 +2050,56 @@ test "run diagnostics own bounded UTF8 bytes and clear when the latest run recov
     try conversation.recordRun(&view, row);
     try std.testing.expect(view.notice == null);
     try std.testing.expectEqualStrings("completed", view.status);
+}
+
+test "presentation API rejects invalid configuration before changing layout or paint" {
+    const app = try std.testing.allocator.create(App);
+    defer std.testing.allocator.destroy(app);
+    app.view.design = .{};
+    app.layout.design = .{};
+    app.dirty = false;
+    var configured: design.Config = .{};
+    configured.layout.sidebar_width = 304;
+    configured.colors.background = .{ .r = 16, .g = 16, .b = 21 };
+    try app.configurePresentation(configured);
+    try std.testing.expectEqualDeep(configured, app.view.design);
+    try std.testing.expectEqualDeep(configured, app.layout.design);
+    try std.testing.expect(app.dirty);
+    for ([_]f32{ -1, std.math.nan(f32), std.math.inf(f32) }) |invalid| {
+        var rejected = configured;
+        rejected.layout.sidebar_width = invalid;
+        rejected.colors.background = .{ .r = 255, .g = 255, .b = 255 };
+        app.dirty = false;
+        try std.testing.expectError(error.InvalidDesign, app.configurePresentation(rejected));
+        try std.testing.expectEqualDeep(configured, app.view.design);
+        try std.testing.expectEqualDeep(configured, app.layout.design);
+        try std.testing.expect(!app.dirty);
+    }
+}
+
+test "native theme keeps ordinary composition and restores default settings on switch" {
+    const app = try std.testing.allocator.create(App);
+    defer std.testing.allocator.destroy(app);
+    const bridge = try std.testing.allocator.create(LuaBridge);
+    defer std.testing.allocator.destroy(bridge);
+    bridge.active = true;
+    bridge.generation = 1;
+    bridge.root = std.mem.zeroes(script.Root);
+    bridge.root.count = 1;
+    bridge.root.nodes[0].kind = 6;
+    bridge.root.design.layout_present = 1;
+    bridge.root.design.layout[0] = 304;
+    try bridge.install(app);
+    try std.testing.expect(app.view.custom_root == null);
+    try std.testing.expect(app.view.custom_render == null);
+    try std.testing.expectEqual(@as(f32, 304), app.view.design.layout.sidebar_width);
+    bridge.active = false;
+    try bridge.install(app);
+    try std.testing.expectEqualDeep(design.Config{}, app.view.design);
+    try std.testing.expectEqualDeep(design.Config{}, app.layout.design);
+    bridge.active = true;
+    bridge.root.nodes[0].kind = 0;
+    try bridge.install(app);
+    try std.testing.expect(app.view.custom_root == &bridge.root);
+    try std.testing.expect(app.view.custom_render == &bridge.render);
 }

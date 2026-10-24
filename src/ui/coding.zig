@@ -10,14 +10,22 @@ const Color = @import("color.zig").Color;
 const transcript = @import("transcript.zig");
 const presentation = @import("../content/presentation.zig");
 const contract = @import("../contract.zig");
+const script_api = @import("../script.zig");
+
+// Visual reference: T3 Code eb1510d (MIT), apps/marketing/src/assets/app-desktop.webp;
+// apps/web/src/components/sidebar/{SidebarThreadHeader,SidebarThreadRow}.tsx and
+// chat/{ChatHeader,ComposerSurface,ComposerControlsBar,ComposerPrimaryActions}.tsx.
+// Native geometry/strokes are implemented here against Spica's bounded views.
 
 pub const Intent = enum { send, cancel, allow, deny };
 
 /// Presentation state only. No adapter, store, execution lifetime or accepted work.
 pub const View = struct {
     allocator: std.mem.Allocator,
+    design: @import("design.zig").Config = .{},
     editor: Composer,
     editor_view: EditorView = .{},
+    editor_font_size: f32 = 16,
     labels: LabelCache = .{},
     scratch: []u8,
     focused: bool = true,
@@ -29,6 +37,7 @@ pub const View = struct {
     preedit_layout: ?*c.SpicaTextLayout = null,
     preedit_changed: bool = true,
     preedit_width: f32 = 0,
+    preedit_font_size: f32 = 0,
     notice: ?[]const u8 = null,
     revision: u64 = 0,
     status: []const u8 = "Conversation not connected",
@@ -45,6 +54,8 @@ pub const View = struct {
     controls: [4]c.SDL_FRect = @splat(.{ .x = 0, .y = 0, .w = 0, .h = 0 }),
     rich_tiles: [8]transcript.RichTile = @splat(.{}),
     rich_count: usize = 0,
+    rich_font_base: [8]c_uint = @splat(0),
+    custom_font_base: c_uint = 16,
     rich_next: usize = 0,
     transcript_bounds: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     transcript_scroll: f32 = 0,
@@ -307,9 +318,13 @@ pub const View = struct {
         if (!self.follow_latest and y < self.transcript_scroll) self.transcript_scroll = @max(0, self.transcript_scroll - height);
         self.rich_tiles[index].deinit();
         var at = index;
-        while (at + 1 < self.rich_count) : (at += 1) self.rich_tiles[at] = self.rich_tiles[at + 1];
+        while (at + 1 < self.rich_count) : (at += 1) {
+            self.rich_tiles[at] = self.rich_tiles[at + 1];
+            self.rich_font_base[at] = self.rich_font_base[at + 1];
+        }
         self.rich_count -= 1;
         self.rich_tiles[self.rich_count] = .{};
+        self.rich_font_base[self.rich_count] = 0;
         self.transcript_drag = null;
     }
 
@@ -322,7 +337,9 @@ pub const View = struct {
                 continue;
             }
             if (slot.canonical_block.eql(info.block.slice()) and slot.block_index == tile.block.index and slot.start_byte == tile.start_byte) {
-                try slot.update(text, tile, width);
+                const previous = slot.layout;
+                try slot.update(text, tile, tileWidthForRole(info.role, width));
+                if (previous != slot.layout) self.rich_font_base[index] = slot.size;
                 applyTileInfo(slot, info, tile);
                 self.applySelection(slot);
                 return;
@@ -331,7 +348,7 @@ pub const View = struct {
         }
         var incoming: transcript.RichTile = .{};
         errdefer incoming.deinit();
-        try incoming.update(text, tile, width);
+        try incoming.update(text, tile, tileWidthForRole(info.role, width));
         applyTileInfo(&incoming, info, tile);
         if (self.rich_count == self.rich_tiles.len) self.removeTile(if (info.backward) self.rich_count - 1 else 0);
         index = 0;
@@ -343,8 +360,12 @@ pub const View = struct {
         for (self.rich_tiles[0..index]) |*slot| y += slot.height() + slot.headingHeight() + 8;
         if (!self.follow_latest and self.rich_count != 0 and y <= self.transcript_scroll) self.transcript_scroll += incoming.height() + incoming.headingHeight() + 8;
         var at = self.rich_count;
-        while (at > index) : (at -= 1) self.rich_tiles[at] = self.rich_tiles[at - 1];
+        while (at > index) : (at -= 1) {
+            self.rich_tiles[at] = self.rich_tiles[at - 1];
+            self.rich_font_base[at] = self.rich_font_base[at - 1];
+        }
         self.rich_tiles[index] = incoming;
+        self.rich_font_base[index] = incoming.size;
         self.rich_count += 1;
         self.rich_next = 0;
         self.applySelection(&self.rich_tiles[index]);
@@ -362,6 +383,7 @@ pub const View = struct {
     pub fn clearHistory(self: *View) void {
         for (&self.rich_tiles) |*tile| tile.deinit();
         self.rich_count = 0;
+        self.rich_font_base = @splat(0);
         self.rich_next = 0;
         self.transcript_drag = null;
         self.transcript_scroll = 0;
@@ -545,7 +567,7 @@ pub const View = struct {
                 }
                 if (self.custom_root) |root| {
                     for (root.nodes[0..root.count], 0..) |node, index| {
-                        const box = self.custom_bounds[index];
+                        const box = self.customVisibleBounds(index);
                         if (node.kind == 3 and widgets.contains(.{ .x = box.x, .y = box.y, .w = box.width, .h = box.height }, event.button.x, event.button.y)) {
                             self.custom_action = index;
                             return true;
@@ -780,11 +802,11 @@ pub const View = struct {
                         self.reveal_caret = true;
                     },
                     c.SDLK_UP, c.SDLK_DOWN => {
-                        try self.editor_view.moveVertical(text, &self.editor, 16, key == c.SDLK_DOWN, shift);
+                        try self.editor_view.moveVertical(text, &self.editor, self.composerFontSize(), key == c.SDLK_DOWN, shift);
                         self.reveal_caret = true;
                     },
                     c.SDLK_HOME, c.SDLK_END => {
-                        try self.editor_view.moveLineEdge(text, &self.editor, 16, key == c.SDLK_END, ctrl, shift);
+                        try self.editor_view.moveLineEdge(text, &self.editor, self.composerFontSize(), key == c.SDLK_END, ctrl, shift);
                         self.reveal_caret = true;
                     },
                     c.SDLK_BACKSPACE, c.SDLK_DELETE => {
@@ -802,15 +824,96 @@ pub const View = struct {
         }
     }
 
+    fn nodeStyle(self: *const View, kind: c_int) script_api.abi.SpicaScriptStyle {
+        var result = std.mem.zeroes(script_api.abi.SpicaScriptStyle);
+        if (self.custom_root) |root| for (root.nodes[0..root.count]) |node| {
+            if (node.kind == kind) result = node.style;
+        };
+        return result;
+    }
+
+    fn styleColor(style: script_api.abi.SpicaScriptStyle, foreground: bool, fallback: Color) Color {
+        const mask = if (foreground) script_api.abi.SPICA_STYLE_FOREGROUND else script_api.abi.SPICA_STYLE_BACKGROUND;
+        if (style.present & mask == 0) return fallback;
+        const rgb = if (foreground) style.foreground else style.background;
+        return .{ .r = rgb[0], .g = rgb[1], .b = rgb[2] };
+    }
+
+    fn composerFontSize(self: *const View) f32 {
+        const style = self.nodeStyle(4);
+        return if (style.present & script_api.abi.SPICA_STYLE_FONT_SIZE != 0) style.font_size else 16;
+    }
+
+    fn padded(box: c.Clay_BoundingBox, style: script_api.abi.SpicaScriptStyle) c.Clay_BoundingBox {
+        if (style.present & script_api.abi.SPICA_STYLE_PADDING == 0) return box;
+        const padding_x = @min(style.padding, box.width / 2);
+        const padding_y = @min(style.padding, box.height / 2);
+        return .{ .x = box.x + padding_x, .y = box.y + padding_y, .width = @max(0, box.width - padding_x * 2), .height = @max(0, box.height - padding_y * 2) };
+    }
+
+    fn transcriptDesign(self: *const View) @import("design.zig").Config {
+        var design = self.design;
+        const style = self.nodeStyle(5);
+        design.colors.foreground = styleColor(style, true, design.colors.foreground);
+        design.colors.surface = styleColor(style, false, design.colors.surface);
+        if (style.present & script_api.abi.SPICA_STYLE_RADIUS != 0) design.layout.radius = style.radius;
+        return design;
+    }
+
+    fn styleTile(self: *View, tile: *transcript.RichTile) void {
+        var base = &self.custom_font_base;
+        for (&self.rich_tiles, 0..) |*candidate, index| if (candidate == tile) {
+            base = &self.rich_font_base[index];
+            break;
+        };
+        if (base.* == 0) base.* = tile.size;
+        const style = self.nodeStyle(5);
+        const size: c_uint = if (style.present & script_api.abi.SPICA_STYLE_FONT_SIZE != 0) @intFromFloat(style.font_size) else base.*;
+        if (tile.size != size) {
+            tile.size = size;
+            tile.width = 0; // Reflow retained spans; restore original size on reload.
+        }
+    }
+
+    fn tileWidthForRole(role: []const u8, width: f32) f32 {
+        return @max(25, if (std.mem.eql(u8, role, "user")) width * 0.85 else width);
+    }
+
+    fn intersection(box: c.Clay_BoundingBox, parent: c.Clay_BoundingBox) c.Clay_BoundingBox {
+        const x = @max(box.x, parent.x);
+        const y = @max(box.y, parent.y);
+        return .{ .x = x, .y = y, .width = @max(0, @min(box.x + box.width, parent.x + parent.width) - x), .height = @max(0, @min(box.y + box.height, parent.y + parent.height) - y) };
+    }
+
+    /// Parent clipping is shared by painting and custom-button admission. A
+    /// fixed-size child may overflow Clay's parent but cannot gain invisible hits.
+    fn customVisibleBounds(self: *const View, index: usize) c.Clay_BoundingBox {
+        const root = self.custom_root orelse return std.mem.zeroes(c.Clay_BoundingBox);
+        var result = self.custom_bounds[index];
+        var parent = root.nodes[index].parent;
+        var depth: usize = 0;
+        while (parent < root.count and depth < 8) : (depth += 1) {
+            result = intersection(result, self.custom_bounds[parent]);
+            parent = root.nodes[parent].parent;
+        }
+        return result;
+    }
+
     fn ensurePreedit(self: *View, text: *c.SpicaText, width: f32) !void {
-        if (!self.preedit_changed and self.preedit_width == width) return;
+        const font_size = self.composerFontSize();
+        if (!self.preedit_changed and self.preedit_width == width and self.preedit_font_size == font_size) return;
         if (self.preedit_layout) |layout| c.spica_text_layout_release(layout);
         self.preedit_layout = null;
         if (self.preedit_len != 0) {
-            self.preedit_layout = c.spica_text_layout_create(text, &self.preedit, self.preedit_len, width, 16, false) orelse return error.PreeditLayout;
+            self.preedit_layout = c.spica_text_layout_create(text, &self.preedit, self.preedit_len, width, @intFromFloat(font_size), false) orelse return error.PreeditLayout;
         }
         self.preedit_width = width;
+        self.preedit_font_size = font_size;
         self.preedit_changed = false;
+    }
+
+    pub fn sidebarWidth(self: *const View, width: f32) f32 {
+        return Layout.sidebarWidthWith(self.design, width);
     }
 
     fn workspaceName(self: *const View) []const u8 {
@@ -853,20 +956,46 @@ pub const View = struct {
         } });
     }
 
+    // Fixed native strokes: no decorative Unicode, face discovery or retained
+    // icon textures. Coordinates use a 16-unit local grid.
+    const Icon = enum { plus, folder, pen, chevron, send, stop, settings };
+    fn icon(renderer: *c.SDL_Renderer, kind: Icon, x: f32, y: f32, color: Color) !void {
+        if (!c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, 255)) return error.IconDraw;
+        const paths: []const [4]f32 = switch (kind) {
+            .plus => &.{ .{ 8, 2, 8, 14 }, .{ 2, 8, 14, 8 } },
+            .folder => &.{ .{ 1, 4, 6, 4 }, .{ 6, 4, 8, 6 }, .{ 8, 6, 15, 6 }, .{ 15, 6, 15, 14 }, .{ 15, 14, 1, 14 }, .{ 1, 14, 1, 4 } },
+            .pen => &.{ .{ 9, 3, 2, 3 }, .{ 2, 3, 2, 14 }, .{ 2, 14, 13, 14 }, .{ 13, 14, 13, 9 }, .{ 7, 10, 8, 6 }, .{ 8, 6, 13, 1 }, .{ 13, 1, 16, 4 }, .{ 16, 4, 10, 10 }, .{ 10, 10, 7, 10 } },
+            .chevron => &.{ .{ 4, 6, 8, 10 }, .{ 8, 10, 12, 6 } },
+            .send => &.{ .{ 8, 14, 8, 2 }, .{ 8, 2, 3, 7 }, .{ 8, 2, 13, 7 } },
+            .stop => &.{ .{ 4, 4, 12, 4 }, .{ 12, 4, 12, 12 }, .{ 12, 12, 4, 12 }, .{ 4, 12, 4, 4 } },
+            .settings => &.{ .{ 2, 4, 14, 4 }, .{ 2, 12, 14, 12 }, .{ 5, 1, 5, 7 }, .{ 11, 9, 11, 15 } },
+        };
+        for (paths) |line| if (!c.SDL_RenderLine(renderer, x + line[0], y + line[1], x + line[2], y + line[3])) return error.IconDraw;
+    }
+
     fn drawChrome(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
-        const sidebar = Layout.sidebarWidth(bounds.header.width);
-        const height = bounds.composer.y + bounds.composer.height + 16;
+        const metrics = self.design.layout;
+        const palette = self.design.colors;
+        const sidebar = self.sidebarWidth(bounds.header.width);
+        const height = bounds.composer.y + bounds.composer.height + metrics.gutter;
+        const inset = @min(metrics.gutter, 20);
+        const radius = @min(metrics.radius, 8);
         self.sidebar_bounds = .{ .x = 0, .y = 0, .w = sidebar, .h = height };
-        try widgets.panel(renderer, self.sidebar_bounds, 0, .{ .r = 15, .g = 18, .b = 23 });
-        try self.labels.draw(text, "Spica", 20, 20, 18, foreground);
-        self.new_thread_bounds = .{ .x = 12, .y = 64, .w = sidebar - 24, .h = 34 };
-        self.new_project_bounds = .{ .x = 12, .y = 104, .w = sidebar - 24, .h = 30 };
-        try widgets.panel(renderer, self.new_thread_bounds, 6, .{ .r = 35, .g = 40, .b = 49 });
-        try self.labels.draw(text, "+ New chat", 24, 73, 13, foreground);
-        try self.labels.draw(text, "+ New project", 24, 112, 12, muted);
-        try self.labels.draw(text, "PROJECTS", 20, 151, 10, muted);
-        self.sidebar_rows = .{ .x = 8, .y = 174, .w = sidebar - 16, .h = @max(0, height - 230) };
-        const rows_height = @as(f32, @floatFromInt(self.project_count)) * 30 + @as(f32, @floatFromInt(self.thread_count)) * 36 + 32;
+        try widgets.panel(renderer, self.sidebar_bounds, 0, palette.sidebar);
+        try widgets.panel(renderer, .{ .x = sidebar - 1, .y = 0, .w = 1, .h = height }, 0, palette.border);
+        try icon(renderer, .pen, inset, (bounds.header.height - 16) / 2, foreground);
+        try self.labels.draw(text, "Spica", inset + 26, (bounds.header.height - 18) / 2, 17, foreground);
+        const row_top = bounds.header.height + metrics.gap;
+        self.new_thread_bounds = .{ .x = inset - 6, .y = row_top, .w = sidebar - inset * 2 + 12, .h = 34 };
+        self.new_project_bounds = .{ .x = inset - 6, .y = row_top + 40, .w = sidebar - inset * 2 + 12, .h = 30 };
+        try icon(renderer, .pen, inset, row_top + 9, muted);
+        try self.labels.draw(text, "New chat", inset + 26, row_top + 10, 13, foreground);
+        try icon(renderer, .folder, inset, row_top + 47, muted);
+        try self.labels.draw(text, "New project", inset + 26, row_top + 48, 12, muted);
+        self.sidebar_rows = .{ .x = 8, .y = row_top + 86, .w = sidebar - 16, .h = @max(0, height - row_top - 146) };
+        const project_stride: f32 = 34;
+        const thread_stride: f32 = 38;
+        const rows_height = @as(f32, @floatFromInt(self.project_count)) * project_stride + @as(f32, @floatFromInt(self.thread_count)) * thread_stride + metrics.gap;
         self.sidebar_scroll = std.math.clamp(self.sidebar_scroll, 0, @max(0, rows_height - self.sidebar_rows.h));
         var clip = widgets.Clip.push(renderer, self.sidebar_rows);
         defer clip.restore(renderer);
@@ -875,89 +1004,95 @@ pub const View = struct {
         self.thread_bounds = @splat(zero_rect);
         var project_name: []const u8 = "Workspace";
         var thread_name: []const u8 = "New chat";
+        for (self.threads[0..self.thread_count]) |*entry| if (entry.id.eql(self.active_thread.slice())) {
+            thread_name = entry.label[0..entry.len];
+        };
+        // The parent supplies the active project's bounded chat list. Place it
+        // immediately under that project, preserving entry indices for actions.
+        var drew_threads = false;
         for (self.projects[0..self.project_count], 0..) |*entry, index| {
             const active = entry.id.eql(self.active_project.slice());
             if (active) project_name = entry.label[0..entry.len];
-            self.project_bounds[index] = .{ .x = 12, .y = y, .w = sidebar - 24, .h = 28 };
-            if (y + 28 > self.sidebar_rows.y and y < self.sidebar_rows.y + self.sidebar_rows.h) try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], 20, y + 7, sidebar - 40, 12, if (active) foreground else muted);
-            y += 30;
-        }
-        try self.labels.draw(text, "CHATS", 20, y + 12, 10, muted);
-        y += 32;
-        for (self.threads[0..self.thread_count], 0..) |*entry, index| {
-            const active = entry.id.eql(self.active_thread.slice());
-            if (active) thread_name = entry.label[0..entry.len];
-            const row = c.SDL_FRect{ .x = 12, .y = y, .w = sidebar - 24, .h = 32 };
-            self.thread_bounds[index] = row;
-            if (y + 32 > self.sidebar_rows.y and y < self.sidebar_rows.y + self.sidebar_rows.h) {
-                if (active) try widgets.panel(renderer, row, 6, .{ .r = 39, .g = 45, .b = 56 });
-                try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], 22, y + 8, sidebar - 44, 13, if (active) foreground else muted);
+            self.project_bounds[index] = .{ .x = inset - 6, .y = y, .w = sidebar - inset * 2 + 12, .h = 30 };
+            if (y + 30 > self.sidebar_rows.y and y < self.sidebar_rows.y + self.sidebar_rows.h) {
+                try icon(renderer, .folder, inset, y + 7, muted);
+                try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], inset + 26, y + 8, sidebar - inset * 2 - 30, 12, if (active) foreground else muted);
             }
-            y += 36;
+            y += project_stride;
+            if (active) {
+                try self.drawThreads(renderer, text, &y, sidebar, inset, radius, thread_stride, foreground, muted);
+                drew_threads = true;
+                y += metrics.gap;
+            }
         }
+        if (!drew_threads) try self.drawThreads(renderer, text, &y, sidebar, inset, radius, thread_stride, foreground, muted);
         clip.restore(renderer);
-        try self.labels.draw(text, "Enter to send", 20, height - 44, 11, muted);
-        try self.labels.draw(text, "Shift+Enter newline", 20, height - 26, 10, muted);
-        self.setup_bounds = .{ .x = bounds.header.width - 134, .y = 16, .w = 118, .h = 32 };
-        try widgets.panel(renderer, self.setup_bounds, 5, .{ .r = 35, .g = 40, .b = 49 });
-        try self.labels.draw(text, "Connection", self.setup_bounds.x + 18, 25, 12, foreground);
+        try self.labels.drawFitted(renderer, text, self.status, inset, height - 35, sidebar - inset * 2, 11, muted);
+        const header_x = sidebar + metrics.gutter;
+        self.setup_bounds = .{ .x = bounds.header.width - metrics.gutter - 112, .y = (bounds.header.height - 30) / 2, .w = 112, .h = 30 };
+        try icon(renderer, .settings, self.setup_bounds.x + 7, self.setup_bounds.y + 7, muted);
+        try self.labels.draw(text, "Connection", self.setup_bounds.x + 30, self.setup_bounds.y + 9, 12, muted);
         var title: [512]u8 = undefined;
-        const label = try std.fmt.bufPrint(&title, "{s}  /  {s}", .{ project_name, thread_name });
-        const header_x = sidebar + 24;
-        try self.labels.drawFitted(renderer, text, label, header_x, 15, self.setup_bounds.x - header_x - 16, 16, foreground);
-        var workspace_info: [1024]u8 = undefined;
-        const workspace_status = try std.fmt.bufPrint(&workspace_info, "{s}  ·  {s}", .{ self.workspaceName(), @import("../text/utf8.zig").prefix(self.status, 128) });
-        try self.labels.drawFitted(renderer, text, workspace_status, header_x, 40, self.setup_bounds.x - header_x - 16, 11, muted);
+        const label = try std.fmt.bufPrint(&title, "{s}   /   {s}", .{ project_name, thread_name });
+        try self.labels.drawFitted(renderer, text, label, header_x, (bounds.header.height - 16) / 2, self.setup_bounds.x - header_x - metrics.gap, 14, foreground);
         self.follow_bounds = if (self.follow_latest) zero_rect else .{ .x = bounds.transcript.x + bounds.transcript.width - 128, .y = bounds.transcript.y + bounds.transcript.height - 32, .w = 128, .h = 28 };
         for (self.tasks[0..self.task_count], 0..) |*task, index| {
             const task_y = bounds.transcript.y + @as(f32, @floatFromInt(index)) * 24;
             try self.labels.drawFitted(renderer, text, task.bytes[0..task.len], bounds.transcript.x, task_y, bounds.transcript.width - 84, 12, muted);
             task.cancel_bounds = .{ .x = bounds.transcript.x + bounds.transcript.width - 76, .y = task_y, .w = 76, .h = 20 };
             if (task.cancel != null) {
-                try widgets.panel(renderer, task.cancel_bounds, 3, .{ .r = 35, .g = 40, .b = 49 });
+                try widgets.panel(renderer, task.cancel_bounds, radius / 2, palette.raised);
                 try self.labels.draw(text, "Cancel task", task.cancel_bounds.x + 4, task_y + 2, 11, foreground);
             }
         }
     }
 
+    fn drawThreads(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, y: *f32, sidebar: f32, inset: f32, radius: f32, stride: f32, foreground: Color, muted: Color) !void {
+        for (self.threads[0..self.thread_count], 0..) |*entry, index| {
+            const active = entry.id.eql(self.active_thread.slice());
+            const row = c.SDL_FRect{ .x = inset - 6, .y = y.*, .w = sidebar - inset * 2 + 12, .h = stride - 2 };
+            self.thread_bounds[index] = row;
+            if (row.y + row.h > self.sidebar_rows.y and row.y < self.sidebar_rows.y + self.sidebar_rows.h) {
+                if (active) try widgets.panel(renderer, row, radius, self.design.colors.raised);
+                try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], inset + 14, y.* + 11, sidebar - inset * 2 - 20, 13, if (active) foreground else muted);
+            }
+            y.* += stride;
+        }
+    }
+
     fn drawComposerControls(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, panel: c.SDL_FRect, foreground: Color, muted: Color) !void {
         self.controls = @splat(zero_rect);
-        const y = panel.y + panel.h - 62;
+        const gap = self.design.layout.gap;
+        const y = panel.y + panel.h - 54 - @min(gap, 16);
         const primary: usize = if (self.can_cancel) 1 else 0;
         self.controls[primary] = .{ .x = panel.x + panel.w - 90, .y = y, .w = 80, .h = 30 };
-        self.effort_bounds = .{ .x = self.controls[primary].x - 114, .y = y, .w = 104, .h = 30 };
         const model_x = panel.x + 10;
-        const model_width = @min(270, @max(0, self.effort_bounds.x - 10 - model_x));
+        const available = @max(0, self.controls[primary].x - model_x - gap * 2);
+        const effort_width = @min(104, available * 0.32);
+        const model_width = @min(270, @max(0, available - effort_width));
         self.picker_bounds = .{ .x = model_x, .y = y, .w = model_width, .h = 30 };
+        self.effort_bounds = .{ .x = model_x + model_width + gap, .y = y, .w = effort_width, .h = 30 };
         // Keep menu geometry current while closed, so first-open keyboard
         // reveal uses the same viewport as the next paint.
         const menu_height = @min(344, @max(96, y - 80));
         self.picker_menu = .{ .x = panel.x, .y = y - menu_height - 6, .w = @min(600, panel.w), .h = menu_height };
         self.picker_rows = .{ .x = self.picker_menu.x + 8, .y = self.picker_menu.y + 38, .w = self.picker_menu.w - 16, .h = menu_height - 64 };
 
-        try widgets.panel(renderer, self.picker_bounds, 5, .{ .r = 35, .g = 40, .b = 49 });
-        try widgets.panel(renderer, self.effort_bounds, 5, .{ .r = 35, .g = 40, .b = 49 });
         const label = if (self.selected) |*selected| (if (selected.runtime_kind.eql("fake")) "Demo · synthetic" else selected.model_id.slice()) else "Choose model";
         try self.labels.drawFitted(renderer, text, label, self.picker_bounds.x + 8, y + 8, model_width - 32, 12, foreground);
-        // A native chevron avoids system font discovery for a decorative glyph
-        // absent from the bundled proportional font. No extra face or buffer.
-        const chevron = [_]c.SDL_FPoint{
-            .{ .x = self.picker_bounds.x + model_width - 18, .y = y + 13 },
-            .{ .x = self.picker_bounds.x + model_width - 14, .y = y + 17 },
-            .{ .x = self.picker_bounds.x + model_width - 10, .y = y + 13 },
-        };
-        if (!c.SDL_SetRenderDrawColor(renderer, foreground.r, foreground.g, foreground.b, 255) or !c.SDL_RenderLines(renderer, &chevron, chevron.len)) return error.ChevronDraw;
-        var effort_label: [320]u8 = undefined;
-        const effort = if (self.selected) |*selected| try std.fmt.bufPrint(&effort_label, "{s}  ↻", .{selected.effort.slice()}) else "Effort";
-        try self.labels.drawFitted(renderer, text, effort, self.effort_bounds.x + 8, y + 8, 86, 12, muted);
+        try icon(renderer, .chevron, self.picker_bounds.x + model_width - 24, y + 7, muted);
+        const effort = if (self.selected) |*selected| selected.effort.slice() else "Effort";
+        try self.labels.drawFitted(renderer, text, effort, self.effort_bounds.x + 4, y + 8, self.effort_bounds.w - 25, 12, muted);
+        try icon(renderer, .chevron, self.effort_bounds.x + self.effort_bounds.w - 20, y + 7, muted);
         const enabled = if (primary == 1) self.can_cancel else self.can_send and self.editor.len != 0;
-        try widgets.panel(renderer, self.controls[primary], 5, if (enabled) .{ .r = 56, .g = 83, .b = 138 } else .{ .r = 35, .g = 40, .b = 49 });
-        try self.labels.draw(text, if (primary == 1) "Stop F6" else "Send ↑", self.controls[primary].x + 12, y + 8, 12, if (enabled) foreground else muted);
+        try widgets.panel(renderer, self.controls[primary], @min(self.design.layout.radius, 15), if (enabled) self.design.colors.accent else self.design.colors.raised);
+        try self.labels.draw(text, if (primary == 1) "Stop" else "Send", self.controls[primary].x + 12, y + 8, 12, if (enabled) self.design.colors.accent_text else muted);
+        try icon(renderer, if (primary == 1) .stop else .send, self.controls[primary].x + 53, y + 7, if (enabled) self.design.colors.accent_text else muted);
         if (self.can_approve) {
             try self.labels.drawFitted(renderer, text, "Approval needed", panel.x + 12, y - 28, panel.w - 206, 12, foreground);
             for (2..4) |index| {
                 self.controls[index] = .{ .x = panel.x + panel.w - 188 + @as(f32, @floatFromInt(index - 2)) * 90, .y = y - 34, .w = 80, .h = 28 };
-                try widgets.panel(renderer, self.controls[index], 4, .{ .r = 51, .g = 69, .b = 105 });
+                try widgets.panel(renderer, self.controls[index], @min(self.design.layout.radius, 4), self.design.colors.selection);
                 try self.labels.draw(text, if (index == 2) "Allow F7" else "Deny F8", self.controls[index].x + 10, y - 27, 12, foreground);
             }
         }
@@ -971,7 +1106,7 @@ pub const View = struct {
         const menu = self.picker_menu;
         self.picker_rows = .{ .x = menu.x + 8, .y = menu.y + 38, .w = menu.w - 16, .h = menu.h - 64 };
         self.picker_scroll = std.math.clamp(self.picker_scroll, 0, self.pickerMaxScroll());
-        try widgets.panel(renderer, menu, 8, .{ .r = 39, .g = 45, .b = 56 });
+        try widgets.panel(renderer, menu, @min(self.design.layout.radius, 8), self.design.colors.raised);
         try self.labels.draw(text, "Choose model", menu.x + 14, menu.y + 12, 13, foreground);
         var clip = widgets.Clip.push(renderer, self.picker_rows);
         defer clip.restore(renderer);
@@ -979,7 +1114,7 @@ pub const View = struct {
         for (self.models[0..self.model_count], 0..) |*model, index| {
             const y = self.picker_rows.y + @as(f32, @floatFromInt(index)) * picker_row_height - self.picker_scroll;
             if (y + picker_row_height <= self.picker_rows.y or y >= self.picker_rows.y + self.picker_rows.h) continue;
-            if (index == self.picker_hover) try widgets.panel(renderer, .{ .x = self.picker_rows.x, .y = y, .w = self.picker_rows.w, .h = picker_row_height - 2 }, 4, .{ .r = 51, .g = 62, .b = 82 });
+            if (index == self.picker_hover) try widgets.panel(renderer, .{ .x = self.picker_rows.x, .y = y, .w = self.picker_rows.w, .h = picker_row_height - 2 }, @min(self.design.layout.radius, 4), self.design.colors.selection);
             var buffer: [768]u8 = undefined;
             const label = try std.fmt.bufPrint(&buffer, "{s}{s}", .{ model.identity.model_id.slice(), if (model.synthetic) " · synthetic test" else "" });
             try self.labels.drawFitted(renderer, text, label, menu.x + 16, y + 5, menu.w - 32, 13, foreground);
@@ -996,20 +1131,20 @@ pub const View = struct {
 
     fn drawSetup(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
         const width = bounds.header.width;
-        const height = bounds.composer.y + bounds.composer.height + 16;
+        const height = bounds.composer.y + bounds.composer.height + self.design.layout.gutter;
         const menu_width = @min(800, width - 24);
         const menu_height = @min(536, height - 24);
         self.setup_menu = .{ .x = (width - menu_width) / 2, .y = (height - menu_height) / 2, .w = menu_width, .h = menu_height };
         const menu = self.setup_menu;
-        try widgets.panel(renderer, menu, 8, .{ .r = 35, .g = 40, .b = 49 });
+        try widgets.panel(renderer, menu, @min(self.design.layout.radius, 8), self.design.colors.raised);
         var clip = widgets.Clip.push(renderer, menu);
         defer clip.restore(renderer);
         try self.labels.draw(text, "Provider connection", menu.x + 16, menu.y + 15, 16, foreground);
         self.setup_close_bounds = .{ .x = menu.x + menu.w - 82, .y = menu.y + 10, .w = 66, .h = 30 };
-        try widgets.panel(renderer, self.setup_close_bounds, 4, .{ .r = 51, .g = 59, .b = 73 });
+        try widgets.panel(renderer, self.setup_close_bounds, @min(self.design.layout.radius, 4), self.design.colors.raised);
         try self.labels.draw(text, "Close Esc", self.setup_close_bounds.x + 7, menu.y + 19, 11, foreground);
         self.setup_runtime_bounds = .{ .x = menu.x + 16, .y = menu.y + 48, .w = menu.w - 32, .h = 30 };
-        try widgets.panel(renderer, self.setup_runtime_bounds, 4, .{ .r = 27, .g = 32, .b = 41 });
+        try widgets.panel(renderer, self.setup_runtime_bounds, @min(self.design.layout.radius, 4), self.design.colors.surface);
         try self.labels.draw(text, if (self.setup_runtime == .codex) "Runtime: Codex  ↻ click to switch" else "Runtime: OpenCode  ↻ click to switch", menu.x + 24, menu.y + 57, 13, foreground);
         const names = [_][]const u8{ "Runtime executable · absolute path", "Isolated account directory · absolute path", "Workspace · absolute path", "Model provider · e.g. openai" };
         for (names, 0..) |name, index| {
@@ -1017,7 +1152,7 @@ pub const View = struct {
             try self.labels.draw(text, name, menu.x + 16, y, 11, muted);
             const box = c.SDL_FRect{ .x = menu.x + 16, .y = y + 15, .w = menu.w - 32, .h = 28 };
             self.setup_field_bounds[index] = box;
-            try widgets.panel(renderer, box, 3, if (index == self.setup_field) .{ .r = 51, .g = 69, .b = 105 } else .{ .r = 27, .g = 32, .b = 41 });
+            try widgets.panel(renderer, box, @min(self.design.layout.radius, 3), if (index == self.setup_field) self.design.colors.selection else self.design.colors.surface);
             try self.labels.drawFitted(renderer, text, self.setup_fields[index][0..self.setup_lengths[index]], box.x + 6, box.y + 6, box.w - 12, 12, foreground);
         }
         const names_buttons = [_][]const u8{ "Save connection", "Browser sign-in", "Device sign-in", "Refresh models" };
@@ -1026,7 +1161,7 @@ pub const View = struct {
             const box = c.SDL_FRect{ .x = menu.x + 16 + @as(f32, @floatFromInt(index % 2)) * (button_width + 8), .y = menu.y + 286 + @as(f32, @floatFromInt(index / 2)) * 38, .w = button_width, .h = 32 };
             self.setup_button_bounds[index] = box;
             const enabled = self.setup_runtime == .codex or (index != 1 and index != 2);
-            try widgets.panel(renderer, box, 4, if (enabled) .{ .r = 51, .g = 69, .b = 105 } else .{ .r = 27, .g = 32, .b = 41 });
+            try widgets.panel(renderer, box, @min(self.design.layout.radius, 4), if (enabled) self.design.colors.selection else self.design.colors.surface);
             try self.labels.draw(text, name, box.x + 12, box.y + 9, 12, if (enabled) foreground else muted);
         }
         try self.labels.drawFitted(renderer, text, "Tab changes field · Ctrl+A replaces · Paste supported · No credentials imported", menu.x + 16, menu.y + 368, menu.w - 32, 11, muted);
@@ -1042,11 +1177,31 @@ pub const View = struct {
         }
     }
 
-    pub fn draw(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, window: *c.SDL_Window, bounds: Layout.Coding) !void {
-        const foreground = Color{ .r = 231, .g = 235, .b = 242 };
-        const muted = Color{ .r = 157, .g = 168, .b = 186 };
-        if (!c.SDL_SetRenderDrawColor(renderer, 19, 22, 28, 255) or !c.SDL_RenderClear(renderer)) return error.CanvasDraw;
+    pub fn draw(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, window: *c.SDL_Window, outer_bounds: Layout.Coding) !void {
+        var bounds = outer_bounds;
+        bounds.transcript = padded(bounds.transcript, self.nodeStyle(5));
+        bounds.composer = padded(bounds.composer, self.nodeStyle(4));
+        if (self.custom_root) |root| for (root.nodes[0..root.count], 0..) |node, index| {
+            if (node.kind == 4) bounds.composer = intersection(bounds.composer, self.customVisibleBounds(index));
+            if (node.kind == 5) bounds.transcript = intersection(bounds.transcript, self.customVisibleBounds(index));
+        };
+        const foreground = self.design.colors.foreground;
+        const muted = self.design.colors.muted;
+        if (!c.SDL_SetRenderDrawColor(renderer, self.design.colors.background.r, self.design.colors.background.g, self.design.colors.background.b, 255) or !c.SDL_RenderClear(renderer)) return error.CanvasDraw;
         if (self.custom_root == null) try self.drawChrome(renderer, text, bounds, foreground, muted);
+        // Preorder backgrounds precede content; a styled parent must never
+        // paint over the transcript, editor or a child's label later in frame.
+        if (self.custom_root) |root| for (root.nodes[0..root.count], 0..) |node, index| {
+            const style = node.style;
+            if (style.present & script_api.abi.SPICA_STYLE_BACKGROUND != 0 or node.kind == 3) {
+                const box = self.custom_bounds[index];
+                const visible = self.customVisibleBounds(index);
+                var clip = widgets.Clip.push(renderer, .{ .x = visible.x, .y = visible.y, .w = visible.width, .h = visible.height });
+                defer clip.restore(renderer);
+                const radius = if (style.present & script_api.abi.SPICA_STYLE_RADIUS != 0) style.radius else @min(self.design.layout.radius, 4);
+                try widgets.panel(renderer, .{ .x = box.x, .y = box.y, .w = box.width, .h = box.height }, radius, styleColor(style, false, self.design.colors.selection));
+            }
+        };
         const task_height: f32 = if (self.custom_root == null) @as(f32, @floatFromInt(self.task_count)) * 24 else 0;
         self.transcript_bounds = .{ .x = bounds.transcript.x, .y = bounds.transcript.y + task_height, .w = bounds.transcript.width, .h = @max(0, bounds.transcript.height - task_height) };
         var transcript_clip = widgets.Clip.push(renderer, self.transcript_bounds);
@@ -1065,10 +1220,12 @@ pub const View = struct {
                     tile.span_count = 1;
                 }
                 try self.custom_tile.update(text, &tile, @max(25, bounds.transcript.width));
+                self.custom_font_base = self.custom_tile.size;
                 self.custom_tile_sequence = self.custom_render_sequence;
             }
+            self.styleTile(&self.custom_tile);
             try self.custom_tile.reflow(text, @max(25, bounds.transcript.width));
-            try self.custom_tile.draw(renderer, text, bounds.transcript.x, bounds.transcript.y);
+            try self.custom_tile.drawStyled(renderer, text, bounds.transcript.x, bounds.transcript.y, self.transcriptDesign());
         } else {
             var anchor_index: ?usize = null;
             var anchor_point: transcript.RichTile.ScrollPoint = .{ .byte = 0, .offset = 0 };
@@ -1088,7 +1245,8 @@ pub const View = struct {
             for (0..self.rich_count) |offset| {
                 const index = if (self.rich_count == self.rich_tiles.len) (self.rich_next + offset) % self.rich_tiles.len else offset;
                 const tile = &self.rich_tiles[index];
-                try tile.reflow(text, bounds.transcript.width);
+                self.styleTile(tile);
+                try tile.reflow(text, tileWidthForRole(tile.role, bounds.transcript.width));
                 if (anchor_index == index) restored = total_height + tile.headingHeight() + tile.restore(anchor_point);
                 total_height += tile.headingHeight() + tile.height() + 8;
             }
@@ -1107,8 +1265,9 @@ pub const View = struct {
                         self.captureHistory(tile, tile.capture(self.transcript_bounds.y - tile_y));
                         captured = true;
                     }
-                    if (tile.heading) try self.labels.draw(text, tile.role, bounds.transcript.x, heading_y + 2, 13, muted);
-                    try tile.draw(renderer, text, bounds.transcript.x, tile_y);
+                    const tile_x = bounds.transcript.x + @max(0, bounds.transcript.width - tile.width);
+                    if (tile.heading) try self.labels.draw(text, tile.role, tile_x + 12, heading_y + 2, 12, muted);
+                    try tile.drawStyled(renderer, text, tile_x, tile_y, self.transcriptDesign());
                 } else tile.bounds = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
                 tile_y += tile.height() + 8;
             }
@@ -1122,23 +1281,33 @@ pub const View = struct {
         }
         transcript_clip.restore(renderer);
         if (self.custom_root == null and !self.follow_latest) {
-            try widgets.panel(renderer, self.follow_bounds, 5, .{ .r = 51, .g = 62, .b = 82 });
+            try widgets.panel(renderer, self.follow_bounds, @min(self.design.layout.radius, 5), self.design.colors.selection);
             try self.labels.draw(text, "Back to latest ↓", self.follow_bounds.x + 12, self.follow_bounds.y + 7, 12, foreground);
         }
 
         const panel = c.SDL_FRect{ .x = bounds.composer.x, .y = bounds.composer.y, .w = bounds.composer.width, .h = bounds.composer.height };
         if (bounds.composer.width > 24 and bounds.composer.height > 40) {
-            try widgets.panel(renderer, .{ .x = panel.x, .y = panel.y, .w = panel.w, .h = panel.h - (if (self.custom_root == null) @as(f32, 24) else 0) }, 10, if (self.focused) .{ .r = 103, .g = 129, .b = 210 } else .{ .r = 57, .g = 64, .b = 79 });
-            try widgets.panel(renderer, .{ .x = panel.x + 1, .y = panel.y + 1, .w = panel.w - 2, .h = panel.h - (if (self.custom_root == null) @as(f32, 26) else 2) }, 9, .{ .r = 27, .g = 32, .b = 41 });
-            const editor_bounds = c.SDL_FRect{ .x = panel.x, .y = panel.y, .w = panel.w, .h = panel.h - (if (self.custom_root != null) @as(f32, 40) else if (self.can_approve) @as(f32, 108) else 70) };
+            const composer_style = self.nodeStyle(4);
+            const composer_radius = if (composer_style.present & script_api.abi.SPICA_STYLE_RADIUS != 0) composer_style.radius else self.design.layout.radius;
+            const composer_foreground = styleColor(composer_style, true, foreground);
+            try widgets.panel(renderer, .{ .x = panel.x, .y = panel.y, .w = panel.w, .h = panel.h - (if (self.custom_root == null) @as(f32, 24) else 0) }, composer_radius, self.design.colors.border);
+            try widgets.panel(renderer, .{ .x = panel.x + 1, .y = panel.y + 1, .w = panel.w - 2, .h = panel.h - (if (self.custom_root == null) @as(f32, 26) else 2) }, @max(0, composer_radius - 1), styleColor(composer_style, false, self.design.colors.surface));
+            const inset = @min(self.design.layout.gutter / 3, 8);
+            const editor_bounds = c.SDL_FRect{ .x = panel.x + inset, .y = panel.y + inset, .w = @max(0, panel.w - inset * 2), .h = @max(0, panel.h - inset - (if (self.custom_root != null) @as(f32, 40) else if (self.can_approve) @as(f32, 108) else 70)) };
             self.editor_view.bounds = editor_bounds;
-            try self.editor_view.ensureLayout(text, &self.editor, panel.w, 16);
-            try self.ensurePreedit(text, panel.w - 24);
-            var clip = widgets.Clip.push(renderer, .{ .x = panel.x + 10, .y = panel.y + 8, .w = panel.w - 20, .h = editor_bounds.h - 12 });
-            if (self.editor.len == 0 and self.preedit_len == 0) try self.labels.drawFitted(renderer, text, "Ask for changes, or send a follow-up…", panel.x + 12, panel.y + 12, panel.w - 24, 15, muted);
+            const font_size = self.composerFontSize();
+            if (self.editor_font_size != font_size) {
+                self.editor_view.changed = true;
+                self.preedit_changed = true;
+                self.editor_font_size = font_size;
+            }
+            try self.editor_view.ensureLayout(text, &self.editor, editor_bounds.w, font_size);
+            try self.ensurePreedit(text, @max(1, editor_bounds.w - 24));
+            var clip = widgets.Clip.push(renderer, .{ .x = editor_bounds.x + 10, .y = editor_bounds.y + 8, .w = @max(0, editor_bounds.w - 20), .h = @max(0, editor_bounds.h - 12) });
+            if (self.editor.len == 0 and self.preedit_len == 0) try self.labels.drawFitted(renderer, text, "Ask for changes, or send a follow-up…", editor_bounds.x + 12, editor_bounds.y + 10, editor_bounds.w - 24, @intFromFloat(font_size), muted);
             if (self.editor_view.layout) |layout| {
                 const content_height = c.spica_text_layout_height(layout);
-                const available = editor_bounds.h - 20;
+                const available = @max(0, editor_bounds.h - 20);
                 self.editor_view.scroll = std.math.clamp(self.editor_view.scroll, 0, @max(0, content_height - available));
                 if (self.editor_view.caret(&self.editor)) |caret_rect| {
                     if (self.focused and self.reveal_caret) {
@@ -1146,27 +1315,27 @@ pub const View = struct {
                         if (caret_rect.y + caret_rect.h > self.editor_view.scroll + available) self.editor_view.scroll = caret_rect.y + caret_rect.h - available;
                     }
                     self.reveal_caret = false;
-                    const x = panel.x + 12;
-                    const y = panel.y + 10 - self.editor_view.scroll;
+                    const x = editor_bounds.x + 12;
+                    const y = editor_bounds.y + 10 - self.editor_view.scroll;
                     const selection = self.editor.selection();
                     const begin = @max(selection.start, self.editor_view.start) - self.editor_view.start;
                     const end = @min(selection.end, self.editor_view.end) -| self.editor_view.start;
                     var rects: [128]c.SDL_FRect = undefined;
                     const count = c.spica_text_layout_selection_rects(layout, begin, end, &rects, rects.len);
-                    if (!c.SDL_SetRenderDrawColor(renderer, 64, 84, 125, 255)) return error.SelectionDraw;
+                    if (!c.SDL_SetRenderDrawColor(renderer, self.design.colors.selection.r, self.design.colors.selection.g, self.design.colors.selection.b, 255)) return error.SelectionDraw;
                     for (rects[0..@min(count, rects.len)]) |rect| {
                         const translated = c.SDL_FRect{ .x = x + rect.x, .y = y + rect.y, .w = rect.w, .h = rect.h };
                         if (!c.SDL_RenderFillRect(renderer, &translated)) return error.SelectionDraw;
                     }
                     if (count > rects.len) self.notice = "Selection display budget exceeded";
-                    if (!c.spica_text_layout_draw(text, layout, x, y, .{ .r = 231, .g = 235, .b = 242, .a = 255 })) return error.EditorDraw;
+                    if (!c.spica_text_layout_draw(text, layout, x, y, widgets.rgba(composer_foreground))) return error.EditorDraw;
                     if (self.focused and self.window_active) {
                         const caret = c.SDL_FRect{ .x = x + caret_rect.x, .y = y + caret_rect.y, .w = 1.5, .h = caret_rect.h };
-                        if (!c.SDL_SetRenderDrawColor(renderer, 231, 235, 242, 255) or !c.SDL_RenderFillRect(renderer, &caret)) return error.CaretDraw;
+                        if (!c.SDL_SetRenderDrawColor(renderer, composer_foreground.r, composer_foreground.g, composer_foreground.b, 255) or !c.SDL_RenderFillRect(renderer, &caret)) return error.CaretDraw;
                         const input_rect = c.SDL_Rect{ .x = @intFromFloat(caret.x), .y = @intFromFloat(caret.y), .w = 1, .h = @intFromFloat(caret.h) };
                         if (!c.SDL_SetTextInputArea(window, &input_rect, 0)) return error.TextInputArea;
                         if (self.preedit_layout) |preedit_layout| {
-                            if (!c.spica_text_layout_draw(text, preedit_layout, caret.x, caret.y, .{ .r = 164, .g = 185, .b = 255, .a = 255 })) return error.PreeditDraw;
+                            if (!c.spica_text_layout_draw(text, preedit_layout, caret.x, caret.y, widgets.rgba(composer_foreground))) return error.PreeditDraw;
                             if (!c.SDL_RenderLine(renderer, caret.x, caret.y + caret.h, caret.x + 32, caret.y + caret.h)) return error.PreeditDraw;
                         }
                     }
@@ -1178,14 +1347,16 @@ pub const View = struct {
             } else {
                 const names = [_][]const u8{ "Send", "Cancel F6", "Allow F7", "Deny F8" };
                 for (&self.controls, 0..) |*control, index| {
-                    control.* = .{ .x = panel.x + 12 + @as(f32, @floatFromInt(index)) * 112, .y = panel.y + panel.h - 34, .w = 104, .h = 26 };
+                    const gap = @min(self.design.layout.gap, panel.w / 16);
+                    const control_width = @max(0, (panel.w - 24 - gap * 3) / 4);
+                    control.* = .{ .x = panel.x + 12 + @as(f32, @floatFromInt(index)) * (control_width + gap), .y = panel.y + panel.h - 34, .w = control_width, .h = 26 };
                     const enabled = switch (@as(Intent, @enumFromInt(index))) {
                         .send => self.can_send,
                         .cancel => self.can_cancel,
                         .allow, .deny => self.can_approve,
                     };
-                    try widgets.panel(renderer, control.*, 4, if (enabled) .{ .r = 51, .g = 69, .b = 105 } else .{ .r = 35, .g = 40, .b = 49 });
-                    try self.labels.draw(text, names[index], control.x + 8, control.y + 5, 12, if (enabled) foreground else muted);
+                    try widgets.panel(renderer, control.*, @min(self.design.layout.radius, 4), if (enabled) self.design.colors.selection else self.design.colors.raised);
+                    try self.labels.drawFitted(renderer, text, names[index], control.x + 8, control.y + 5, control.w - 16, 12, if (enabled) composer_foreground else muted);
                 }
             }
         } else {
@@ -1195,11 +1366,18 @@ pub const View = struct {
         if (self.custom_root) |root| {
             for (root.nodes[0..root.count], 0..) |node, index| {
                 const box = self.custom_bounds[index];
+                const style = node.style;
                 const label = root.text[node.text_offset..][0..node.text_len];
-                if (node.kind == 3) try widgets.panel(renderer, .{ .x = box.x, .y = box.y, .w = box.width, .h = box.height }, 4, .{ .r = 51, .g = 69, .b = 105 });
-                if (node.kind == 2 or node.kind == 3) try self.labels.drawFitted(renderer, text, label, box.x + 4, box.y + 4, box.width - 8, 14, foreground);
+                if (node.kind == 2 or node.kind == 3) {
+                    const padding = if (style.present & script_api.abi.SPICA_STYLE_PADDING != 0) style.padding else 4;
+                    const font_size: c_uint = @intFromFloat(if (style.present & script_api.abi.SPICA_STYLE_FONT_SIZE != 0) style.font_size else @as(f32, 14));
+                    const visible = self.customVisibleBounds(index);
+                    var clip = widgets.Clip.push(renderer, .{ .x = visible.x, .y = visible.y, .w = visible.width, .h = visible.height });
+                    defer clip.restore(renderer);
+                    try self.labels.drawFitted(renderer, text, label, box.x + padding, box.y + padding, box.width - padding * 2, font_size, styleColor(style, true, foreground));
+                }
             }
-            try self.labels.drawFitted(renderer, text, self.status, 24, 0, 600, 11, muted);
+            try self.labels.drawFitted(renderer, text, self.status, self.design.layout.gutter, 0, 600, 11, muted);
         }
         if (self.notice) |notice| try self.labels.drawFitted(renderer, text, notice, bounds.transcript.x, bounds.transcript.y, bounds.transcript.width, 12, muted);
         if (self.custom_root == null and self.picker_open) try self.drawPicker(renderer, text, bounds, foreground, muted);
@@ -1619,4 +1797,114 @@ test "picker uses compact catalog metadata and retains actionable unavailable re
     model.reason_len = unavailable.len;
     model.readiness = .unavailable;
     try std.testing.expectEqualStrings("explicit-provider · unavailable · Sign in to the selected account", try View.modelSubtitle(&model, &buffer));
+}
+
+test "custom styles share visible paint and action bounds and invalidate font sizes" {
+    const surface = c.SDL_CreateSurface(640, 480, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(text);
+    var layout = try Layout.init(std.testing.allocator, 640, 480);
+    defer layout.deinit();
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    var root = std.mem.zeroes(script_api.Root);
+    root.count = 3;
+    root.text_len = 4;
+    @memcpy(root.text[0..4], "Send");
+    root.nodes[0] = .{ .kind = 0, .parent = std.math.maxInt(u16), .id = try script_api.id("root"), .style = .{ .present = script_api.abi.SPICA_STYLE_WIDTH | script_api.abi.SPICA_STYLE_HEIGHT | script_api.abi.SPICA_STYLE_PADDING | script_api.abi.SPICA_STYLE_GAP | script_api.abi.SPICA_STYLE_BACKGROUND, .width = 320, .height = 360, .padding = 8, .gap = 8, .background = .{ 20, 30, 60 } } };
+    root.nodes[1] = .{ .kind = 3, .parent = 0, .id = try script_api.id("send-button"), .action = try script_api.id("send"), .text_len = 4, .style = .{ .present = script_api.abi.SPICA_STYLE_WIDTH | script_api.abi.SPICA_STYLE_HEIGHT | script_api.abi.SPICA_STYLE_BACKGROUND | script_api.abi.SPICA_STYLE_FOREGROUND | script_api.abi.SPICA_STYLE_FONT_SIZE | script_api.abi.SPICA_STYLE_RADIUS, .width = 500, .height = 48, .background = .{ 130, 30, 40 }, .foreground = .{ 250, 220, 170 }, .font_size = 24, .radius = 0 } };
+    root.nodes[2] = .{ .kind = 4, .parent = 0, .id = try script_api.id("composer"), .style = .{ .present = script_api.abi.SPICA_STYLE_WIDTH | script_api.abi.SPICA_STYLE_HEIGHT | script_api.abi.SPICA_STYLE_PADDING | script_api.abi.SPICA_STYLE_FONT_SIZE | script_api.abi.SPICA_STYLE_BACKGROUND, .width = 280, .height = 180, .padding = 8, .font_size = 28, .background = .{ 20, 60, 30 } } };
+    view.custom_root = &root;
+    view.focused = false;
+    view.window_active = false;
+    view.preedit_len = 2;
+    @memcpy(view.preedit[0..2], "hi");
+    const boxes = layout.script(&root, &view.custom_bounds);
+    try view.draw(renderer, text, undefined, boxes);
+    try std.testing.expectEqual(@as(f32, 28), view.editor_font_size);
+    try std.testing.expectEqual(@as(f32, 28), view.preedit_font_size);
+    const large_preedit = c.spica_text_layout_height(view.preedit_layout.?);
+    const editor_width = view.editor_view.width;
+    const visible = view.customVisibleBounds(1);
+    try std.testing.expect(view.custom_bounds[1].width > visible.width);
+    try std.testing.expectEqual(@as(f32, 320), visible.x + visible.width);
+    try std.testing.expect(!widgets.contains(.{ .x = visible.x, .y = visible.y, .w = visible.width, .h = visible.height }, 400, 40));
+    // Direct surface reads must follow submission of SDL's queued draw batch.
+    try std.testing.expect(c.SDL_RenderPresent(renderer));
+    var r: u8 = 0;
+    var g: u8 = 0;
+    var b: u8 = 0;
+    var a: u8 = 0;
+    try std.testing.expect(c.SDL_ReadSurfacePixel(surface, 300, 40, &r, &g, &b, &a));
+    try std.testing.expectEqualDeep([3]u8{ 130, 30, 40 }, [3]u8{ r, g, b });
+    try std.testing.expect(c.SDL_ReadSurfacePixel(surface, 400, 40, &r, &g, &b, &a));
+    try std.testing.expectEqualDeep(view.design.colors.background, Color{ .r = r, .g = g, .b = b });
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    event.button.x = visible.x + 6;
+    event.button.y = visible.y + 6;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqual(@as(?usize, 1), view.custom_action);
+    root.nodes[2].style.font_size = 16;
+    try view.draw(renderer, text, undefined, boxes);
+    try std.testing.expectEqual(editor_width, view.editor_view.width);
+    try std.testing.expectEqual(@as(f32, 16), view.editor_font_size);
+    try std.testing.expect(c.spica_text_layout_height(view.preedit_layout.?) < large_preedit);
+    root.nodes[2].style.font_size = 28;
+    try view.ensurePreedit(text, 180);
+    const before_default = c.spica_text_layout_height(view.preedit_layout.?);
+    view.custom_root = null;
+    try view.ensurePreedit(text, 180);
+    try std.testing.expectEqual(@as(f32, 16), view.preedit_font_size);
+    try std.testing.expect(c.spica_text_layout_height(view.preedit_layout.?) < before_default);
+    var stats: c.SpicaTextStats = undefined;
+    try std.testing.expect(c.spica_text_get_stats(text, &stats));
+    try std.testing.expectEqual(@as(c_uint, 1), stats.face_count);
+}
+
+test "user bubbles align after chronological admission and retain exact text hits" {
+    const surface = c.SDL_CreateSurface(1100, 740, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(text);
+    var layout = try Layout.init(std.testing.allocator, 1100, 740);
+    defer layout.deinit();
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.focused = false;
+    view.window_active = false;
+    const boxes = layout.coding(1100);
+    for ([_]u8{ 2, 1, 3 }) |ordinal| {
+        var source: presentation.Tile = .{ .key = .{ .source = @splat(ordinal), .revision = 1, .generation = 1 }, .block = std.mem.zeroes(presentation.Block), .state = .rich, .len = 18 };
+        source.block.kind = .paragraph;
+        @memcpy(source.text[0..18], "Message in a chat.");
+        const id = [_]u8{ 'm', '0' + ordinal };
+        try view.admitTile(text, &source, boxes.transcript.width, .{ .message = try transcript.Id.init(&id), .block = try transcript.Id.init(&id), .ordinal = 0, .message_ordinal = ordinal, .role = if (ordinal == 2) "assistant" else "user", .backward = ordinal == 1 });
+    }
+    try view.draw(renderer, text, undefined, boxes);
+    try std.testing.expectEqual(@as(usize, 3), view.rich_count);
+    const first = &view.rich_tiles[0];
+    const second = &view.rich_tiles[1];
+    const third = &view.rich_tiles[2];
+    try std.testing.expectEqual(@as(u64, 1), first.message_ordinal);
+    try std.testing.expectEqual(@as(u64, 2), second.message_ordinal);
+    try std.testing.expectEqual(@as(u64, 3), third.message_ordinal);
+    try std.testing.expect(first.bounds.y < second.bounds.y and second.bounds.y < third.bounds.y);
+    try std.testing.expect(first.bounds.x > second.bounds.x);
+    try std.testing.expectApproxEqAbs(second.bounds.x + second.bounds.w, first.bounds.x + first.bounds.w, 0.1);
+    try std.testing.expectApproxEqAbs(second.bounds.w * 0.85, first.bounds.w, 0.1);
+    try std.testing.expect(first.hit(first.bounds.x + 12, first.bounds.y + 12, false));
+    try std.testing.expect(first.hit(first.bounds.x + first.bounds.w - 14, first.bounds.y + 12, true));
+    try std.testing.expectEqualStrings("Message in a chat.", first.selectedBytes());
+    const retained_layout = first.layout;
+    view.design.colors.surface = .{ .r = 50, .g = 30, .b = 20 };
+    try view.draw(renderer, text, undefined, boxes);
+    try std.testing.expectEqual(retained_layout, first.layout);
+    try std.testing.expectEqualStrings("Message in a chat.", first.selectedBytes());
 }

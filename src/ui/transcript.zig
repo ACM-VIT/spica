@@ -376,19 +376,28 @@ pub const RichTile = struct {
     }
 
     pub fn draw(self: *RichTile, renderer: *native.SDL_Renderer, text: *native.SpicaText, x: f32, y: f32) !void {
+        return self.drawStyled(renderer, text, x, y, .{});
+    }
+
+    /// Paint-only settings do not invalidate shaping, source offsets or selection.
+    /// Recolor bounded spans in place; do not create a second layout/cache.
+    pub fn drawStyled(self: *RichTile, renderer: *native.SDL_Renderer, text: *native.SpicaText, x: f32, y: f32, design: @import("design.zig").Config) !void {
         const layout = self.layout orelse return;
+        const palette = design.colors;
         self.bounds = .{ .x = x, .y = y, .w = self.width, .h = self.height() };
-        if (self.code) try widgets.panel(renderer, self.bounds, 6, .{ .r = 27, .g = 32, .b = 41 });
+        if (self.code or std.mem.eql(u8, self.role, "user")) try widgets.panel(renderer, self.bounds, @min(design.layout.radius, 12), palette.surface);
         if (self.selected) {
             var rects: [128]native.SDL_FRect = undefined;
             const count = native.spica_text_layout_selection_rects(layout, @min(self.anchor, self.caret), @max(self.anchor, self.caret), &rects, rects.len);
-            if (!native.SDL_SetRenderDrawColor(renderer, 64, 84, 125, 255)) return error.SelectionDraw;
+            if (!native.SDL_SetRenderDrawColor(renderer, palette.selection.r, palette.selection.g, palette.selection.b, 255)) return error.SelectionDraw;
             for (rects[0..@min(count, rects.len)]) |rect| {
                 const translated = native.SDL_FRect{ .x = x + 12 + rect.x, .y = y + 10 + rect.y, .w = rect.w, .h = rect.h };
                 if (!native.SDL_RenderFillRect(renderer, &translated)) return error.SelectionDraw;
             }
         }
-        if (!native.spica_text_layout_draw_colors(text, layout, x + 12, y + 10, .{ .r = 231, .g = 235, .b = 242, .a = 255 }, &self.colors, self.color_count)) return error.TranscriptDraw;
+        const rgba = (@as(u32, palette.foreground.r) << 24) | (@as(u32, palette.foreground.g) << 16) | (@as(u32, palette.foreground.b) << 8) | 255;
+        for (self.colors[0..self.color_count]) |*span| span.rgba = rgba;
+        if (!native.spica_text_layout_draw_colors(text, layout, x + 12, y + 10, widgets.rgba(palette.foreground), &self.colors, self.color_count)) return error.TranscriptDraw;
     }
 };
 
@@ -424,6 +433,25 @@ test "real Markdown tile draws retained native styles and rendered selection" {
     try std.testing.expect(retained.caret != retained.anchor);
     try retained.draw(renderer, text, 20, 30);
     try std.testing.expect(native.SDL_RenderPresent(renderer));
+    const previous_anchor = retained.anchor;
+    const previous_caret = retained.caret;
+    var themed: @import("design.zig").Config = .{};
+    themed.colors.foreground = .{ .r = 40, .g = 50, .b = 60 };
+    themed.colors.surface = .{ .r = 220, .g = 210, .b = 200 };
+    retained.role = "user";
+    retained.selected = false;
+    try retained.drawStyled(renderer, text, 20, 30, themed);
+    try std.testing.expect(native.SDL_RenderPresent(renderer));
+    var r: u8 = 0;
+    var g: u8 = 0;
+    var b: u8 = 0;
+    var a: u8 = 0;
+    try std.testing.expect(native.SDL_ReadSurfacePixel(surface, 40, 33, &r, &g, &b, &a));
+    try std.testing.expectEqual(themed.colors.surface, @import("color.zig").Color{ .r = r, .g = g, .b = b });
+    try std.testing.expectEqual(original_layout, retained.layout);
+    try std.testing.expectEqual(previous_anchor, retained.anchor);
+    try std.testing.expectEqual(previous_caret, retained.caret);
+    for (retained.colors[0..retained.color_count]) |span| try std.testing.expectEqual(@as(u32, 0x28323cff), span.rgba);
     try std.testing.expectError(error.InvalidWidth, retained.update(text, &tile, 0));
     try std.testing.expectEqual(original_layout, retained.layout);
     const selected = retained.caret;

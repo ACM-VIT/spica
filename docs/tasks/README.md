@@ -12,6 +12,10 @@ Architecture checkpoint `f8742b3`; both delegated workers resolved Codex/gpt-6.1
 
 PresentationAPI frozen and inspected: Config defaults traced to pinned T3 shared palette, strict numeric/string and unknown-field validation, standalone native root, bounded node styles, complete visual rollback. Parent narrow real-Lua suite passes11/11 in Debug and ReleaseSafe (`script-checks.json`, including original allocation/action/Unicode regressions). API slice is checkpointed independently before assembled UI compilation; default/custom/native rendering, private input and resources remain pending. Worker source/receipt hashes verified before staging; parent retains sole Git/build/evaluation ownership.
 
+User clarified API means local Neovim-like configuration/scripting, specifically existing Lua. External API transport is outside this request. Parent continues local Lua/native contract and visual parity work. First assembled Debug suite passed204 with2skips and one new fixture failure: direct surface read before renderer batch submission. Original shell worker added checked RenderPresent before pixel assertions, preserving colors/geometry and production behavior; repair1 frozen, parent full check2 running.
+
+Native shell/App integration is frozen and parent-reviewed after shell repair1. Full `./tools/check` cohort2 passes209tests/two skips per Debug/ReleaseSafe (205main+4image), plus Python37/two skips; separate evaluator suite12/12. Config and per-node styles feed real Clay/paint/input, user messages align right with exact retained hits, native-root themes keep ordinary Send and Host ownership, and invalid App settings are atomic. Evidence `.artifacts/t3-ui-api/integration-check-2.log`. Checkpoint includes implementation/tests/docs; native desktop and resource acceptance remain pending. Parent is sole Git/build/evaluation owner; workers frozen.
+
 ## Native chat workspace and memory — 2026-10-24
 
 Status: implementation. User reports inaccessible complete chats, missing flow/model picker and high RSS; requests native T3 Code behavior rewrite, Markdown consolidation, and independent foot-informed performance investigation.

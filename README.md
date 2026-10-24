@@ -48,6 +48,26 @@ Custom Send actions pass captured targets/revisions and a stable command ID to
 the same actual public Host. `./tools/eval-starter --mode custom` exercises this
 bridge with real isolated-desktop input and temporary state.
 
+Customize the full native conversation with the same presentation API:
+
+```bash
+zig-out/bin/spica --state-directory /tmp/spica-themed-conversation \
+  --lua-module examples/t3-theme.lua
+```
+
+The example returns a `native` root with `design.colors` and `design.layout`.
+Edit its colors, sidebar/content widths, spacing or corner radius, then press F5.
+F9 restores the default presentation and switches back without restarting work.
+Invalid settings retain the complete last working interface. Custom row/column
+roots can also set node `style` values for size, spacing, font and paint.
+Native consumers call `App.configurePresentation(Config)` on the App thread;
+the settings are validated and copied together before painting. Lua is the local
+configuration/scripting interface, in the spirit of editor configuration. The
+[architecture](docs/ARCHITECTURE.md) explains the layers and remaining T3 parity
+work; the [scripting contract](docs/contracts/scripting.md) lists exact fields and
+bounds. `./tools/eval-starter --mode presentation` exercises native theme reload,
+rejection, run preservation and restart through actual private-desktop input.
+
 ### Explicit native providers and mixed-runtime children
 
 Codex targets app-server **0.163.0** and supported ChatGPT sign-in; OpenCode
