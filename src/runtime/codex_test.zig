@@ -61,7 +61,7 @@ test "Codex initialize account create stream approval cancel exit" {
     try std.testing.expect((try runtime.asAdapter().pollTool(a)) == null);
     _ = try runtime.dispatch(a, .{ .cancel = .{ .correlation = correlation, .reason = "stop" } });
     try wire.input.append(a, "{\"id\":5,\"result\":{}}");
-    try wire.input.append(a, "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"upstream\",\"turn\":{\"status\":\"interrupted\"}}}");
+    try wire.input.append(a, "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"upstream\",\"turn\":{\"id\":\"turn\",\"status\":\"interrupted\"}}}");
     try runtime.pump();
     try std.testing.expect((try runtime.poll(a)).?.body == .cancelled);
     wire.exited = true;
@@ -160,4 +160,137 @@ test "Codex open and restore RPC errors publish session correlated failure befor
         try std.testing.expect((try runtime.poll(allocator)) == null);
         try std.testing.expect(runtime.pending == null);
     }
+}
+
+fn startErrorFixture(a: std.mem.Allocator, wire: *Mock, runtime: *codex.RuntimeFor(Mock)) !void {
+    try wire.input.append(a, "{\"id\":1,\"result\":{\"userAgent\":\"codex/0.163.0\"}}");
+    try wire.input.append(a, "{\"id\":2,\"result\":{\"account\":{\"type\":\"chatgpt\"}}}");
+    try runtime.pump();
+    _ = try runtime.dispatch(a, .{ .open = .{ .create = .{ .effect = .{ .value = "open" }, .session = .{ .value = "session" }, .selection = selection } } });
+    try wire.input.append(a, "{\"id\":3,\"result\":{\"thread\":{\"id\":\"upstream\"},\"model\":\"gpt-6.1-sol\",\"modelProvider\":\"openai\",\"cwd\":\"/tmp/project\",\"reasoningEffort\":\"medium\"}}");
+    try runtime.pump();
+    _ = try runtime.poll(a);
+    _ = try runtime.poll(a);
+    _ = try runtime.dispatch(a, .{ .start = .{ .correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "run" }, .effect = .{ .value = "start" } }, .prompt = "fixture only" } });
+    try wire.input.append(a, "{\"id\":4,\"result\":{\"turn\":{\"id\":\"turn\"}}}");
+    try runtime.pump();
+}
+
+test "Codex failed completion preserves usage limit message code and additional details without history" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(a, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "errors" });
+    defer runtime.deinit();
+    try startErrorFixture(a, &wire, &runtime);
+    try wire.input.append(a,
+        \\{"method":"turn/completed","params":{"threadId":"upstream","turn":{"id":"turn","status":"failed","items":[{"private_history":"not diagnostic evidence"}],"error":{"message":"You’ve hit your usage limit. Try again Oct 31st 2026 12:07 AM","codexErrorInfo":"usageLimitExceeded","additionalDetails":"Selected account quota exhausted","code":"usage_limit_exceeded"}}}}
+    );
+    try runtime.pump();
+    const observation = (try runtime.poll(a)).?;
+    try std.testing.expectEqualStrings("run", observation.correlation.run.?.value);
+    try std.testing.expectEqualStrings("turn", observation.correlation.upstream_turn.?.value);
+    const detail = observation.body.failure.detail;
+    for ([_][]const u8{ "You’ve hit your usage limit", "Oct 31st 2026", "usageLimitExceeded", "usage_limit_exceeded", "Selected account quota exhausted" }) |expected| try std.testing.expect(std.mem.indexOf(u8, detail, expected) != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "private_history") == null);
+    try std.testing.expectEqualStrings(detail, runtime.diagnostic);
+    try std.testing.expectEqualStrings("", runtime.turn);
+    // A subsequent run must not inherit the previous run's quota diagnostic.
+    _ = try runtime.dispatch(a, .{ .start = .{ .correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "next-run" }, .effect = .{ .value = "next-start" } }, .prompt = "fixture" } });
+    try wire.input.append(a, "{\"id\":5,\"result\":{\"turn\":{\"id\":\"next-turn\"}}}");
+    try wire.input.append(a, "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"upstream\",\"turn\":{\"id\":\"next-turn\",\"status\":\"failed\",\"error\":null}}}");
+    try runtime.pump();
+    const next = (try runtime.poll(a)).?;
+    try std.testing.expectEqualStrings("next-run", next.correlation.run.?.value);
+    try std.testing.expectEqualStrings("Codex turn did not complete", next.body.failure.detail);
+}
+
+test "Codex retry errors remain nonterminal bounded and correlated with terminal fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(a, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "retry-errors" });
+    defer runtime.deinit();
+    try startErrorFixture(a, &wire, &runtime);
+    const retained = runtime.state.end_index;
+    const retry =
+        \\{"method":"error","params":{"threadId":"upstream","turnId":"turn","willRetry":true,"error":{"message":"Response stream disconnected; retrying","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":503}},"additionalDetails":"upstream request diagnostic"}}}
+    ;
+    for (0..1000) |_| {
+        try wire.input.append(a, retry);
+        try runtime.pump();
+        try std.testing.expect((try runtime.poll(a)) == null);
+    }
+    try std.testing.expectEqual(retained, runtime.state.end_index);
+    try std.testing.expect(!runtime.disconnected);
+    // Old-turn and foreign-thread errors/completions cannot poison this run.
+    try wire.input.append(a, "{\"method\":\"error\",\"params\":{\"threadId\":\"upstream\",\"turnId\":\"old-turn\",\"willRetry\":false,\"error\":{\"message\":\"stale failure\"}}}");
+    try wire.input.append(a, "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"upstream\",\"turn\":{\"id\":\"old-turn\",\"status\":\"failed\",\"error\":{\"message\":\"stale failure\"}}}}");
+    try wire.input.append(a, "{\"method\":\"error\",\"params\":{\"threadId\":\"foreign\",\"turnId\":\"turn\",\"willRetry\":false,\"error\":{\"message\":\"foreign failure\"}}}");
+    try runtime.pump();
+    try std.testing.expect((try runtime.poll(a)) == null);
+    try std.testing.expectEqualStrings("turn", runtime.turn);
+    try wire.input.append(a, "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"upstream\",\"turn\":{\"id\":\"turn\",\"status\":\"failed\",\"error\":null}}}");
+    try runtime.pump();
+    const failure = (try runtime.poll(a)).?.body.failure;
+    for ([_][]const u8{ "Response stream disconnected", "responseStreamDisconnected", "503", "upstream request diagnostic" }) |expected| try std.testing.expect(std.mem.indexOf(u8, failure.detail, expected) != null);
+    try std.testing.expect(std.mem.indexOf(u8, failure.detail, "stale failure") == null);
+}
+
+test "Codex nonretry error is observable immediately and completion replaces it with bounded UTF8 details" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(a, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "terminal-errors" });
+    defer runtime.deinit();
+    try startErrorFixture(a, &wire, &runtime);
+    try wire.input.append(a, "{\"method\":\"error\",\"params\":{\"threadId\":\"upstream\",\"turnId\":\"turn\",\"willRetry\":false,\"error\":{\"message\":\"Quota exhausted\",\"codexErrorInfo\":\"usageLimitExceeded\",\"additionalDetails\":\"try later\"}}}");
+    try runtime.pump();
+    const immediate = (try runtime.poll(a)).?;
+    try std.testing.expectEqualStrings("codex_error", immediate.body.failure.code);
+    try std.testing.expect(std.mem.indexOf(u8, immediate.body.failure.detail, "Quota exhausted") != null);
+    const message = "界" ** 3000;
+    const details = "🦉" ** 3000;
+    const completion = try std.json.Stringify.valueAlloc(a, .{ .method = "turn/completed", .params = .{ .threadId = "upstream", .turn = .{ .id = "turn", .status = "failed", .@"error" = .{ .message = message, .codexErrorInfo = "usageLimitExceeded", .additionalDetails = details } } } }, .{});
+    try wire.input.append(a, completion);
+    try runtime.pump();
+    const terminal = (try runtime.poll(a)).?;
+    try std.testing.expect(terminal.body.failure.detail.len <= 2048);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(terminal.body.failure.detail));
+    try std.testing.expect(std.mem.indexOf(u8, terminal.body.failure.detail, "usageLimitExceeded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal.body.failure.detail, "🦉") != null);
+    try std.testing.expect(std.mem.indexOf(u8, immediate.body.failure.detail, "Quota exhausted") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, terminal.body.failure.detail, .{});
+    try std.testing.expect(parsed.value.object.get("message").?.string.len <= 768);
+    try std.testing.expect(parsed.value.object.get("additionalDetails").?.string.len <= 768);
+}
+
+test "Codex retry can recover successfully and oversized structured error stays UTF8 bounded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(a, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "recovered-error" });
+    defer runtime.deinit();
+    try startErrorFixture(a, &wire, &runtime);
+    try wire.input.append(a, "{\"method\":\"error\",\"params\":{\"threadId\":\"upstream\",\"turnId\":\"turn\",\"willRetry\":true,\"error\":{\"message\":\"transient\",\"codexErrorInfo\":\"serverOverloaded\"}}}");
+    try wire.input.append(a, "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"upstream\",\"turn\":{\"id\":\"turn\",\"status\":\"completed\",\"error\":null}}}");
+    try runtime.pump();
+    try std.testing.expect((try runtime.poll(a)).?.body == .completed);
+    try std.testing.expect((try runtime.poll(a)) == null);
+    _ = try runtime.dispatch(a, .{ .start = .{ .correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "next-run" }, .effect = .{ .value = "next-start" } }, .prompt = "fixture" } });
+    try wire.input.append(a, "{\"id\":5,\"result\":{\"turn\":{\"id\":\"next-turn\"}}}");
+    const oversized = try std.json.Stringify.valueAlloc(a, .{ .method = "turn/completed", .params = .{ .threadId = "upstream", .turn = .{ .id = "next-turn", .status = "failed", .@"error" = .{ .message = "failure", .codexErrorInfo = .{ .futureError = "界" ** 3000 } } } } }, .{});
+    try wire.input.append(a, oversized);
+    const retained = runtime.state.end_index;
+    try runtime.pump();
+    const failure = (try runtime.poll(a)).?.body.failure;
+    try std.testing.expect(failure.detail.len <= 2048);
+    try std.testing.expect(failure.detail.len >= 2045);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(failure.detail));
+    // Only the next turn's ID, not the oversized error, enters retained state.
+    try std.testing.expectEqual(retained + "next-turn".len, runtime.state.end_index);
 }

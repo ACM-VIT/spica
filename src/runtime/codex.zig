@@ -13,6 +13,15 @@ fn text(v: Value) []const u8 {
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
+fn prefix(bytes: []const u8, limit: usize) []const u8 {
+    var end = @min(bytes.len, limit);
+    if (end == 0) return bytes[0..0];
+    var last = end - 1;
+    while (last > 0 and bytes[last] & 0xc0 == 0x80) last -= 1;
+    const width = std.unicode.utf8ByteSequenceLength(bytes[last]) catch return bytes[0..last];
+    if (width > end - last) end = last;
+    return bytes[0..end];
+}
 pub const Config = struct {
     selection: c.Selection,
     cwd: []const u8,
@@ -38,6 +47,8 @@ pub fn RuntimeFor(comptime T: type) type {
         readiness: c.Readiness = .unknown,
         login: []const u8 = "",
         diagnostic: []const u8 = "",
+        turn_error_bytes: [2048]u8 = undefined,
+        turn_error_len: usize = 0,
         next_id: u64 = 1,
         pending: ?struct { id: u64, kind: Operation, correlation: c.Correlation } = null,
         session: ?c.Session = null,
@@ -122,6 +133,8 @@ pub fn RuntimeFor(comptime T: type) type {
                     if (p.correlation.run == null or p.correlation.effect == null or self.session == null or !eq(p.correlation.session.value, self.session.?.id.value) or self.turn.len != 0) return error.InvalidCorrelation;
                     self.correlation = try adapter.clone(self.state.allocator(), p.correlation);
                     self.offset = 0;
+                    self.turn_error_len = 0;
+                    self.diagnostic = "";
                     try self.rpc(.start, .{ .threadId = self.session.?.upstream.value, .input = .{.{ .type = "text", .text = p.prompt }}, .model = self.config.selection.model_id, .effort = self.config.selection.effort, .cwd = self.config.cwd }, self.correlation);
                 },
                 .cancel => |p| {
@@ -206,6 +219,19 @@ pub fn RuntimeFor(comptime T: type) type {
             self.tool = null;
             self.readiness = .unavailable;
         }
+        fn rememberTurnError(self: *Self, failure: Value) void {
+            // Retain only the error, never turn.items/history. Retry notifications
+            // overwrite a reusable slot rather than consuming the state arena.
+            var writer = std.Io.Writer.fixed(&self.turn_error_bytes);
+            std.json.Stringify.value(.{
+                .codexErrorInfo = field(failure, "codexErrorInfo"),
+                .code = field(failure, "code"),
+                .message = prefix(text(field(failure, "message")), 768),
+                .additionalDetails = prefix(text(field(failure, "additionalDetails")), 768),
+            }, .{}, &writer) catch {};
+            self.turn_error_len = prefix(writer.buffered(), self.turn_error_bytes.len).len;
+            self.diagnostic = self.turn_error_bytes[0..self.turn_error_len];
+        }
         fn receive(self: *Self, value: Value) !void {
             const method = text(field(value, "method"));
             const params = field(value, "params");
@@ -270,8 +296,26 @@ pub fn RuntimeFor(comptime T: type) type {
             const thread_id = text(field(params, "threadId"));
             if (self.session == null or !eq(thread_id, self.session.?.upstream.value)) return;
             const turn_id = text(field(params, "turnId"));
+            if (eq(method, "error") or eq(method, "turn/completed")) {
+                const observed_turn = if (eq(method, "error")) turn_id else text(field(field(params, "turn"), "id"));
+                if (self.correlation.run == null) return;
+                if (observed_turn.len == 0) return error.InvalidCorrelation;
+                if (self.turn.len == 0) {
+                    // The error can precede turn/start's response, but it must
+                    // still belong to a currently outstanding start request.
+                    if (self.pending == null or self.pending.?.kind != .start) return;
+                    self.turn = try self.state.allocator().dupe(u8, observed_turn);
+                    self.correlation.upstream_turn = .{ .value = self.turn };
+                }
+                if (!eq(observed_turn, self.turn)) return;
+            }
             if (turn_id.len != 0 and self.turn.len != 0 and !eq(turn_id, self.turn)) return error.InvalidCorrelation;
-            if (eq(method, "turn/started")) {
+            if (eq(method, "error")) {
+                const retry = field(params, "willRetry");
+                if (retry != .bool) return error.InvalidErrorNotification;
+                self.rememberTurnError(field(params, "error"));
+                if (!retry.bool) try self.emit(.{ .failure = .{ .code = "codex_error", .detail = self.diagnostic } });
+            } else if (eq(method, "turn/started")) {
                 const started = text(field(field(params, "turn"), "id"));
                 if (started.len == 0 or self.correlation.run == null or (self.turn.len != 0 and !eq(self.turn, started))) return error.InvalidCorrelation;
                 if (self.turn.len == 0) self.turn = try self.state.allocator().dupe(u8, started);
@@ -300,8 +344,10 @@ pub fn RuntimeFor(comptime T: type) type {
                     if (eq(method, "item/started")) try self.emit(.{ .tool_started = .{ .name = kind, .action_digest = encoded } }) else try self.emit(.{ .tool_completed = .{ .outcome = if (eq(text(field(item, "status")), "completed")) .succeeded else .unknown, .result = encoded } });
                 }
             } else if (eq(method, "turn/completed")) {
-                const status = text(field(field(params, "turn"), "status"));
-                if (eq(status, "completed")) try self.emit(.completed) else if (eq(status, "interrupted")) try self.emit(.{ .cancelled = .{ .tools_stopped = false } }) else try self.emit(.{ .failure = .{ .code = status, .detail = "Codex turn did not complete" } });
+                const turn = field(params, "turn");
+                const status = text(field(turn, "status"));
+                if (field(turn, "error") != .null) self.rememberTurnError(field(turn, "error"));
+                if (eq(status, "completed")) try self.emit(.completed) else if (eq(status, "interrupted")) try self.emit(.{ .cancelled = .{ .tools_stopped = false } }) else try self.emit(.{ .failure = .{ .code = status, .detail = if (self.turn_error_len != 0) self.turn_error_bytes[0..self.turn_error_len] else "Codex turn did not complete" } });
                 self.turn = "";
                 self.approval = null;
                 self.tool = null;
