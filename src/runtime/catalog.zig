@@ -72,6 +72,14 @@ fn call(wire: *transport.Transport, allocator: std.mem.Allocator, diagnostic: *R
     }
     return error.CatalogTimeout;
 }
+/// account/read describes cached authentication, never model entitlement.
+/// Both supported OpenAI account variants can already be authorized; discovering
+/// an API-key account must not initiate an unrelated ChatGPT sign-in.
+pub fn codexAccountReadiness(result: Value) c.Readiness {
+    const kind = text(field(field(result, "account"), "type"));
+    return if (eq(kind, "chatgpt") or eq(kind, "apiKey")) .ready else .unavailable;
+}
+
 pub fn codex(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire: *transport.Transport, selection: c.Selection, output: []c.Model) !usize {
     var diagnostic: RpcDiagnostic = .{};
     return codexWithDiagnostic(allocator, retained, wire, selection, output, &diagnostic);
@@ -81,7 +89,7 @@ pub fn codexWithDiagnostic(allocator: std.mem.Allocator, retained: std.mem.Alloc
     if (std.mem.indexOf(u8, text(field(init, "userAgent")), "0.163.0") == null) return error.RuntimeVersionMismatch;
     try wire.send("{\"method\":\"initialized\",\"params\":{}}");
     const account = try call(wire, allocator, diagnostic, 2, "account/read", .{ .refreshToken = false });
-    const readiness: c.Readiness = if (eq(text(field(field(account, "account"), "type")), "chatgpt")) .ready else .unavailable;
+    const readiness = codexAccountReadiness(account);
     var cursor: ?[]const u8 = null;
     var count: usize = 0;
     var id: u64 = 3;
@@ -119,7 +127,7 @@ pub fn codexModel(allocator: std.mem.Allocator, input: c.Selection, model: Value
         if (eq(effort, selection.effort)) valid_default = true;
     }
     if (!valid_default) return error.InvalidCatalog;
-    return .{ .selection = try common.clone(allocator, selection), .supported_efforts = efforts, .display_name = try allocator.dupe(u8, text(field(model, "displayName"))), .readiness = readiness, .reason = if (readiness == .ready) "Codex model/list; account ready, entitlement not proven" else "Codex model/list succeeded; selected isolated account requires ChatGPT sign-in" };
+    return .{ .selection = try common.clone(allocator, selection), .supported_efforts = efforts, .display_name = try allocator.dupe(u8, text(field(model, "displayName"))), .readiness = readiness, .reason = if (readiness == .ready) "Codex model/list; account ready, entitlement not proven" else "Codex model/list succeeded; selected account needs authentication" };
 }
 pub fn opencode(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire: *transport.Transport, selection: c.Selection, cwd: []const u8, output: []c.Model) !usize {
     var diagnostic: RpcDiagnostic = .{};
@@ -285,4 +293,18 @@ test "RPC diagnostic bounds UTF8 sanitizes controls and excludes structured priv
     // Mutating the source JSON does not change retained diagnostic bytes.
     @memset(@constCast(parsed.value.object.get("message").?.string), 'x');
     try std.testing.expectEqualStrings(saved, diagnostic.slice());
+}
+
+test "Codex catalog auth accepts existing supported accounts and rejects absent malformed unknown accounts" {
+    for ([_]struct { json: []const u8, ready: bool }{
+        .{ .json = "{\"account\":{\"type\":\"chatgpt\"},\"requiresOpenaiAuth\":true}", .ready = true },
+        .{ .json = "{\"account\":{\"type\":\"apiKey\"},\"requiresOpenaiAuth\":true}", .ready = true },
+        .{ .json = "{\"account\":null,\"requiresOpenaiAuth\":true}", .ready = false },
+        .{ .json = "{\"account\":{\"type\":\"unsupported\"}}", .ready = false },
+        .{ .json = "{\"account\":{\"type\":true}}", .ready = false },
+    }) |case| {
+        const parsed = try std.json.parseFromSlice(Value, std.testing.allocator, case.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(if (case.ready) c.Readiness.ready else .unavailable, codexAccountReadiness(parsed.value));
+    }
 }

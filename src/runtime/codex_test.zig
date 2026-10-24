@@ -387,3 +387,28 @@ test "Codex stale login completions are ignored and success refresh survives a p
     try runtime.pump();
     try std.testing.expectEqual(c.Readiness.ready, runtime.readiness);
 }
+
+test "Codex adapter reuses cached ChatGPT and API-key auth without sending login requests" {
+    for ([_]struct { account: []const u8, readiness: c.Readiness }{
+        .{ .account = "{\"type\":\"chatgpt\"}", .readiness = .ready },
+        .{ .account = "{\"type\":\"apiKey\"}", .readiness = .ready },
+        .{ .account = "null", .readiness = .unavailable },
+        .{ .account = "{\"type\":\"unrecognized\"}", .readiness = .unavailable },
+    }) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var wire: Mock = .{ .allocator = a };
+        var runtime = try codex.RuntimeFor(Mock).init(a, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "existing-auth" });
+        defer runtime.deinit();
+        try wire.input.append(a, "{\"id\":1,\"result\":{\"userAgent\":\"codex/0.163.0\"}}");
+        try runtime.pump();
+        try wire.input.append(a, try std.fmt.allocPrint(a, "{{\"id\":2,\"result\":{{\"account\":{s},\"requiresOpenaiAuth\":true}}}}", .{case.account}));
+        try runtime.pump();
+        try std.testing.expectEqual(case.readiness, runtime.accountStatus().readiness);
+        try std.testing.expect(!runtime.login_active);
+        try std.testing.expectEqual(@as(usize, 3), wire.lines.items.len);
+        try std.testing.expect(std.mem.indexOf(u8, wire.lines.items[2], "account/read") != null);
+        for (wire.lines.items) |line| try std.testing.expect(std.mem.indexOf(u8, line, "login/start") == null);
+    }
+}

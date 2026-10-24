@@ -282,11 +282,10 @@ pub fn RuntimeFor(comptime T: type) type {
                         try self.rpc(.account, .{ .refreshToken = false }, self.correlation);
                     },
                     .account => {
-                        const account = field(result, "account");
                         // During explicit login, existing account readiness does not
                         // complete the newly requested flow.
                         if (self.diagnostic.len == 0 and (!self.login_active or self.login_completed)) {
-                            self.readiness = if (eq(text(field(account, "type")), "chatgpt")) .ready else .unavailable;
+                            self.readiness = @import("catalog.zig").codexAccountReadiness(result);
                             if (self.login_completed) self.login_active = false;
                         }
                     },
