@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""Recover task009/010 desktop cohorts; optional explicitly authorized live task gate."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+import traceback
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def enabled(snapshot):
+    return any(t['id'] == 'command.send' and t['enabled'] for t in snapshot.get('targets', []))
+
+
+class Proof:
+    def __init__(self, args, name):
+        self.args = args
+        self.out = args.output / name
+        self.out.mkdir(parents=True)
+        self.commands = []
+        self.session = None
+        self.window = None
+        self.pid = None
+        self.env = None
+        self.state = self.out / 'state'
+        self.live = self.out / 'live.json'
+        self.roots = [self.out / 'root-a', self.out / 'root-b']
+        self.heads = {}
+        self.manifest = dict(status='running', scenario=name, invocation=sys.argv,
+                             candidate=args.candidate, binary=str(args.binary),
+                             binary_sha256=args.binary_sha256,
+                             patched_library=str(args.patched_library),
+                             patched_library_sha256=args.patched_library_sha256,
+                             assertions={}, snapshots=[], loaders=[], database={},
+                             limitations=['No performance or physical latency claim.',
+                                          'Screenshots require direct review; successful automation is not acceptance.',
+                                          'Exact numeric composer scroll and logical anchor are not exported by automation v2.'])
+        self.save()
+
+    def save(self):
+        (self.out / 'commands.json').write_text(json.dumps(self.commands, indent=2, ensure_ascii=False))
+        self.manifest['commands_sha256'] = sha(self.out / 'commands.json')
+        (self.out / 'manifest.json').write_text(json.dumps(self.manifest, indent=2, ensure_ascii=False))
+
+    def run(self, *argv, env=None, timeout=30, check=True, input=None, pass_fds=(), strip=True):
+        command = dict(argv=list(map(str, argv)), cwd=str(self.args.app_root),
+                       begin_unix_ns=time.time_ns(), environment_override=env)
+        if input is not None:
+            command.update(input_sha256=hashlib.sha256(input.encode()).hexdigest(),
+                           input_bytes=len(input.encode()))
+        self.commands.append(command)
+        self.save()
+        try:
+            result = subprocess.run(command['argv'], cwd=self.args.app_root, env=env,
+                                    capture_output=True, text=True, timeout=timeout,
+                                    input=input, pass_fds=pass_fds)
+            command.update(exit=result.returncode, stdout=result.stdout, stderr=result.stderr)
+            if check:
+                result.check_returncode()
+            return result.stdout.strip() if strip else result.stdout
+        except BaseException as error:
+            command['error'] = repr(error)
+            raise
+        finally:
+            command['end_unix_ns'] = time.time_ns()
+            self.save()
+
+    def require(self, name, condition, detail=None):
+        self.manifest['assertions'][name] = dict(passed=bool(condition), detail=detail)
+        self.save()
+        if not condition:
+            raise RuntimeError('Assertion failed: ' + name + ': ' + repr(detail))
+
+    def prepare(self):
+        self.require('candidate_at_start', self.run('git', 'rev-parse', 'HEAD') == self.args.candidate)
+        self.manifest['source_status'] = self.run('git', 'status', '--porcelain')
+        self.require('binary_on_disk', sha(self.args.binary) == self.args.binary_sha256)
+        self.require('patched_library_on_disk', sha(self.args.patched_library) == self.args.patched_library_sha256)
+        self.manifest['tool_sha256'] = sha(__file__)
+        self.manifest['pointer_source_sha256'] = sha(self.args.pointer_source)
+        for index, root in enumerate(self.roots):
+            root.mkdir()
+            (root / 'ROOT_ID').write_text('ROOT_' + str(index) + '\n')
+            self.run('git', '-C', root, 'init', '--initial-branch=proof')
+            self.run('git', '-C', root, 'add', 'ROOT_ID')
+            self.run('git', '-C', root, '-c', 'user.name=Proof', '-c',
+                     'user.email=proof@example.invalid', 'commit', '-m', 'immutable proof base')
+            self.heads[str(root)] = self.run('git', '-C', root, 'rev-parse', 'HEAD')
+        self.manifest['root_heads_before'] = self.heads
+        self.session = self.run('vd', 'start', '--width', '1280', '--height', '800')
+        self.manifest['session'] = self.session
+        self.env = dict(json.loads((Path(self.session) / 'session.json').read_text())['environment'])
+        self.manifest['desktop_environment'] = self.env
+        # Existing virtual-desktop helper, compiled only for compositor input, not native app code.
+        self.pointer = self.out / 'virtual-pointer'
+        self.run('gcc', '-O2', self.args.pointer_source, '-o', self.pointer, '-lwayland-client')
+
+    def read(self):
+        try:
+            return json.loads(self.live.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def alive(self):
+        return self.pid is not None and Path('/proc/' + str(self.pid) + '/exe').exists()
+
+    def wait(self, predicate, label, seconds=20):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if self.pid is not None and not self.alive():
+                raise RuntimeError('Native process exited at ' + label)
+            snapshot = self.read()
+            if snapshot and predicate(snapshot):
+                self.manifest['snapshots'].append(dict(label=label, unix_ns=time.time_ns(), snapshot=snapshot))
+                self.save()
+                return snapshot
+            time.sleep(.05)
+        raise RuntimeError(label + ': ' + repr(self.read()))
+
+    def start(self, authorize=True):
+        self.live.unlink(missing_ok=True)
+        number = len(self.manifest['loaders']) + 1
+        loader = ':'.join(map(str, [self.args.patched_library.parent, *self.args.library_directory]))
+        provider = 'opencode' if self.args.scenario == 'task' else 'fake'
+        argv = [self.args.binary, '--provider', provider, '--state-directory', self.state,
+                '--workspace', self.roots[0], '--automation-live', self.live,
+                '--lua-module', self.args.app_root / 'examples/minimal.lua']
+        if provider == 'opencode':
+            argv += ['--runtime-executable', self.args.runtime_executable,
+                     '--runtime-account-directory', self.args.runtime_account_directory,
+                     '--model-provider', 'opencode', '--model', 'big-pickle', '--effort', 'default',
+                     '--quit-after-ms', '180000']
+        if authorize:
+            argv += ['--authorize-workspace', self.roots[1]]
+        launch = json.loads(self.run('vd', 'run', self.session, '--bg', '--cwd', self.args.app_root,
+                                    '--log', self.out / ('app-' + str(number) + '.log'),
+                                    '--env', 'LD_LIBRARY_PATH=' + loader, '--', *argv))
+        self.pid = launch['pid']
+        self.manifest.setdefault('launches', []).append(dict(pid=self.pid, launch=launch))
+        self.save()
+        # Verify actual process mappings BEFORE any application input. Fail closed, including deleted maps.
+        end = time.monotonic() + 15
+        paths = []
+        while time.monotonic() < end:
+            if not self.alive():
+                raise RuntimeError('Native process exited before loader verification')
+            maps = Path('/proc/' + str(self.pid) + '/maps').read_text()
+            paths = sorted({line.split(maxsplit=5)[5] for line in maps.splitlines()
+                            if 'libfreetype' in line and len(line.split(maxsplit=5)) == 6})
+            if paths:
+                break
+            time.sleep(.05)
+        maps_name = 'maps-' + str(number) + '.txt'
+        (self.out / maps_name).write_text(maps)
+        libraries = {path: sha(path) for path in paths if Path(path).is_file()}
+        process_env = Path('/proc/' + str(self.pid) + '/environ').read_bytes().split(b'\0')
+        selected_env = [v.decode() for v in process_env if v.startswith(
+            (b'LD_', b'HOME=', b'XDG_', b'WAYLAND_DISPLAY=', b'SWAYSOCK='))]
+        record = dict(pid=self.pid, argv=list(map(str, argv)), maps=maps_name, libraries=libraries,
+                      binary_sha256=sha('/proc/' + str(self.pid) + '/exe'),
+                      environment=selected_env, process_cwd=os.readlink('/proc/' + str(self.pid) + '/cwd'))
+        self.manifest['loaders'].append(record)
+        self.save()
+        self.require('exact_loaded_freetype_' + str(number), bool(paths) and len(libraries) == len(paths)
+                     and all(Path(path).resolve() == self.args.patched_library
+                             and digest == self.args.patched_library_sha256 for path, digest in libraries.items()), record)
+        self.require('actual_process_binary_' + str(number), record['binary_sha256'] == self.args.binary_sha256)
+        end = time.monotonic() + 15
+        while time.monotonic() < end:
+            windows = self.run('vd', 'windows', self.session)
+            if windows:
+                self.window = windows.splitlines()[0].split()[0]
+                break
+            if not self.alive():
+                raise RuntimeError('Native process exited before window')
+            time.sleep(.1)
+        else:
+            raise RuntimeError('No native window')
+        self.wait(lambda s: s.get('thread_id') and enabled(s), 'connected-' + str(number))
+        if self.read().get('custom_root'):
+            self.key('F9')
+            self.wait(lambda s: not s['custom_root'], 'default root')
+
+    def focus(self):
+        self.run('swaymsg', '--socket', self.env['SWAYSOCK'], '[con_id=' + self.window + '] focus')
+
+    def key(self, chord):
+        self.focus()
+        parts = chord.split('+')
+        argv = ['wtype', '-s', '40']
+        names = {'ctrl': 'Control_L', 'shift': 'Shift_L', 'alt': 'Alt_L'}
+        for modifier in parts[:-1]:
+            argv += ['-P', names[modifier.lower()]]
+        argv += ['-k', parts[-1]]
+        for modifier in reversed(parts[:-1]):
+            argv += ['-p', names[modifier.lower()]]
+        self.run(*argv, env=self.env)
+
+    def text(self, text):
+        for index, line in enumerate(text.split('\n')):
+            if index:
+                self.key('Shift+Return')
+            if line:
+                self.focus()
+                self.run('wtype', '-s', '40', '--', line, env=self.env)
+
+    def click(self, x, y):
+        self.focus()
+        pending = [json.loads(self.run('swaymsg', '--socket', self.env['SWAYSOCK'], '--raw', '-t', 'get_tree'))]
+        while pending:
+            node = pending.pop()
+            if str(node.get('id')) == self.window:
+                break
+            pending.extend(node.get('nodes', []) + node.get('floating_nodes', []))
+        else:
+            raise RuntimeError('Observed native window no longer exists')
+        with socket.socket(socket.AF_UNIX) as channel:
+            channel.connect(str(Path(self.env['XDG_RUNTIME_DIR']) / self.env['WAYLAND_DISPLAY']))
+            fd = channel.fileno()
+            self.run(self.pointer, fd, node['rect']['x'] + x, node['rect']['y'] + y,
+                     1280, 800, 'click', pass_fds=(fd,))
+
+    def nav(self, index):
+        self.wait(lambda s: not s.get('pending_command') and s.get('thread_id'), 'navigation idle')
+        time.sleep(.25)
+        self.click(70 + 135 * index, 44)
+
+    def shot(self, label):
+        self.run('vd', 'shot', self.session, self.out / (label + '.png'))
+
+    def rows(self, sql='SELECT id,thread_id,state,requested FROM runs ORDER BY rowid'):
+        with sqlite3.connect((self.state / 'conversation.sqlite3').as_uri() + '?mode=ro', uri=True) as db:
+            db.execute('PRAGMA query_only=ON')
+            return [[v.decode('utf-8') if isinstance(v, bytes) else v for v in row] for row in db.execute(sql)]
+
+    def database(self, label):
+        result = dict(runs=self.rows(), threads=self.rows('SELECT * FROM threads ORDER BY rowid'),
+                      bindings=self.rows('SELECT t.id,t.project_id,t.workspace_id,w.binding FROM threads t JOIN workspaces w ON w.id=t.workspace_id ORDER BY t.rowid'),
+                      commands=self.rows('SELECT receipt FROM commands ORDER BY rowid'),
+                      tools=self.rows('SELECT run_id,name,outcome FROM tools ORDER BY rowid'))
+        self.manifest['database'][label] = result
+        self.save()
+        return result
+
+    def cancel_command(self, kind, target):
+        matches = []
+        for canonical, receipt in self.rows('SELECT canonical,receipt FROM commands ORDER BY rowid'):
+            command, result = json.loads(canonical), json.loads(receipt)
+            if kind in command['payload'] and command['target'] == {'run': {'value': target}}:
+                matches.append(dict(command=command, receipt=result))
+        self.require('captured_' + kind + '_accepted', len(matches) == 1
+                     and matches[0]['receipt']['outcome'] == 'accepted', matches)
+
+    def states(self):
+        return {row[0]: row[2] for row in self.rows()}
+
+    def refusal(self, reason, count=1):
+        return sum(json.loads(row[0]).get('reason') == reason for row in self.rows('SELECT receipt FROM commands')) >= count
+
+    def bindings(self, expected):
+        data = self.database('exact-bindings')
+        by_thread = {row[0]: (row[2], json.loads(row[3])) for row in data['bindings']}
+        for run_id, thread_id, _, requested in data['runs']:
+            selected = json.loads(requested)
+            workspace_id, binding = by_thread[thread_id]
+            wanted = dict(runtime_kind='fake', required_runtime_version='1', model_provider='fake',
+                          model_id='fixture', effort='none', account_ref='fixture',
+                          workspace={'value': workspace_id}, capability_revision=1)
+            self.require('exact_selection_' + run_id, selected == wanted, selected)
+            root = expected[thread_id]
+            self.require('exact_workspace_' + run_id,
+                         binding['canonical_root'] == str(root) and binding['base_revision'] == self.heads[str(root)]
+                         and binding['expected_branch'] == 'proof' and not binding['non_git'], binding)
+
+    def clipboard(self, value):
+        self.run('wl-copy', '--type', 'text/plain;charset=utf-8', input=value, env=self.env)
+
+    def copied(self, label):
+        sentinel = 'SPICA_NO_RETAINED_SELECTION_' + label
+        self.clipboard(sentinel)
+        self.key('Ctrl+c')
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            value = self.run('wl-paste', '--no-newline', env=self.env, strip=False)
+            if value != sentinel:
+                (self.out / ('selected-' + label + '.txt')).write_text(value)
+                return value
+            time.sleep(.05)
+        raise RuntimeError('No fresh native selection copied: ' + label)
+
+    def close(self):
+        self.key('Ctrl+q')
+        end = time.monotonic() + 10
+        while self.alive() and time.monotonic() < end:
+            time.sleep(.1)
+        self.require('process_closed_' + str(self.pid), not self.alive())
+        self.pid = None
+
+    def finish(self, error):
+        self.manifest.update(status='failed' if error else 'automated scenario passed; review required',
+                             error=error, ended_unix_ns=time.time_ns())
+        if error and self.session:
+            try:
+                self.shot('failure')
+            except BaseException as shot_error:
+                self.manifest['failure_screenshot_error'] = repr(shot_error)
+        if self.session:
+            self.manifest['desktop_logs'] = {}
+            try:
+                for path in Path(self.session).glob('*.log'):
+                    destination = self.out / ('desktop-' + path.name)
+                    destination.write_bytes(path.read_bytes())
+                    self.manifest['desktop_logs'][destination.name] = sha(destination)
+            except BaseException as log_error:
+                self.manifest['desktop_log_capture_error'] = repr(log_error)
+            try:
+                self.manifest['cleanup'] = self.run('vd', 'clean', self.session)
+            except BaseException as cleanup_error:
+                self.manifest.update(status='failed', cleanup_error=repr(cleanup_error))
+        if (self.state / 'conversation.sqlite3').exists():
+            try:
+                self.manifest['durable_final_rows'] = {
+                    table: self.rows('SELECT * FROM ' + table + ' ORDER BY rowid')
+                    for table in ('commands', 'runs', 'sessions', 'tasks', 'bridge_calls', 'effects', 'tools')}
+            except BaseException as database_error:
+                self.manifest['database_capture_error'] = repr(database_error)
+        self.manifest['owned_app_pids_absent'] = {
+            str(record['pid']): not Path('/proc/' + str(record['pid']) + '/exe').exists()
+            for record in self.manifest.get('launches', [])}
+        if not all(self.manifest['owned_app_pids_absent'].values()):
+            self.manifest['status'] = 'failed'
+        after = {}
+        for original in self.roots:
+            root = original if not original.is_symlink() else original.with_name(original.name + '-original')
+            if root.exists() and str(original) in self.heads:
+                after[str(original)] = self.run('git', '-C', root, 'rev-parse', 'HEAD')
+        self.manifest['root_heads_after'] = after
+        self.manifest['roots_retained_for_evidence'] = list(map(str, self.roots))
+        if self.heads and after != self.heads:
+            self.manifest.update(status='failed', root_identity_error='Original committed roots drifted')
+        if self.run('git', 'rev-parse', 'HEAD') != self.args.candidate or sha(self.args.binary) != self.args.binary_sha256 or sha(self.args.patched_library) != self.args.patched_library_sha256:
+            self.manifest.update(status='failed', candidate_drift=True)
+        self.manifest['evidence_sha256'] = {str(path.relative_to(self.out)): sha(path)
+            for path in self.out.iterdir() if path.is_file() and path.name not in ('manifest.json', 'commands.json')}
+        self.save()
+
+
+def fake(p):
+    p.start()
+    first = p.read()['thread_id']
+    prompt = 'Unicode 👩‍💻 שלום é' + ''.join('\nline ' + str(i) + ' — retained scroll' for i in range(12))
+    p.manifest['exact_prompt'] = prompt
+    p.text(prompt)
+    p.wait(lambda s: s['draft'] == prompt, 'exact multiline Unicode input')
+    p.key('Ctrl+a'); p.text('replacement'); p.key('Ctrl+z'); p.key('Ctrl+z')
+    saved = p.wait(lambda s: s['draft'] == prompt and s['anchor'] != s['caret'], 'selected original')
+    p.shot('draft-before')
+    p.nav(4)
+    other = p.wait(lambda s: s['thread_id'] != first and enabled(s), 'root B')['thread_id']
+    p.text('Root B draft λ\nsecond line')
+    p.nav(1)
+    second = p.wait(lambda s: s['thread_id'] not in (first, other) and enabled(s), 'project B')['thread_id']
+    p.text('Project B draft 世界')
+    p.nav(0)
+    p.wait(lambda s: s['thread_id'] in (first, other) and enabled(s), 'original project')
+    if p.read()['thread_id'] != first:
+        p.nav(4)
+    back = p.wait(lambda s: s['thread_id'] == first and enabled(s), 'root A restored')
+    p.require('exact_draft_selection_roundtrip', all(back[k] == saved[k] for k in ('draft', 'anchor', 'caret')))
+    p.shot('draft-restored')
+    p.require('draft_render_pixel_identity', sha(p.out / 'draft-before.png') == sha(p.out / 'draft-restored.png'),
+              'Whole rendered image identity includes visible selection and composer scroll; numeric scroll is unexported.')
+    p.key('Ctrl+y'); p.key('Ctrl+y')
+    p.wait(lambda s: s['draft'] == 'replacement', 'two redo retained')
+    p.key('Ctrl+z'); p.key('Ctrl+z')
+    p.wait(lambda s: s['draft'] == prompt, 'two undo retained')
+    p.require('undo_redo_roundtrip', True)
+    p.key('Return')
+    a = p.wait(lambda s: s['run_status'] == 'awaiting_approval', 'A approval')['run_id']
+    p.nav(4)
+    p.wait(lambda s: s['thread_id'] == other and s['draft'] == 'Root B draft λ\nsecond line', 'B draft restored')
+    p.key('Return')
+    b = p.wait(lambda s: s['run_status'] == 'awaiting_approval' and s['run_id'] != a, 'B approval')['run_id']
+    p.require('two_simultaneous_approvals', p.states() == {a: 'awaiting_approval', b: 'awaiting_approval'}, p.states())
+    p.shot('two-roots-background')
+    generation = p.read()['script_generation']
+    p.key('F9'); p.wait(lambda s: s['custom_root'], 'custom during runs')
+    p.key('F5'); p.wait(lambda s: s['script_generation'] > generation, 'custom reload')
+    p.require('reload_preserves_owned_runs', p.states() == {a: 'awaiting_approval', b: 'awaiting_approval'})
+    p.shot('custom-reloaded-background')
+    p.key('F9'); p.wait(lambda s: not s['custom_root'], 'native during runs')
+    p.click(992, 86)
+    p.wait(lambda s: p.states().get(a) == 'cancelled', 'captured background A cancelled')
+    p.require('target_cancel_only_A', p.states() == {a: 'cancelled', b: 'awaiting_approval'}, p.states())
+    p.cancel_command('run_cancel', a)
+    p.shot('target-cancel')
+    p.key('F7')
+    p.wait(lambda s: s['run_id'] == b and s['run_status'] == 'completed', 'B F7 completion')
+    p.require('allow_other_target_only', p.states() == {a: 'cancelled', b: 'completed'})
+    p.shot('other-target-completed')
+    p.bindings({first: p.roots[0], other: p.roots[1]})
+    before = p.database('before-reopen')
+    p.close(); p.start()
+    p.nav(2)
+    p.wait(lambda s: s['thread_id'] == other and s['run_status'] == 'completed', 'B reopened readable')
+    p.shot('B-reopened')
+    p.nav(2)
+    p.wait(lambda s: s['thread_id'] == first and s['run_status'] == 'cancelled', 'A reopened readable')
+    after = p.database('after-reopen')
+    p.require('reopen_exact_runs_threads_bindings', all(before[k] == after[k] for k in ('runs', 'threads', 'bindings')))
+    p.manifest['thread_ids'] = [first, other, second]
+    p.close()
+
+
+def omission(p):
+    p.start()
+    first = p.read()['thread_id']
+    p.nav(4)
+    other = p.wait(lambda s: s['thread_id'] != first and enabled(s), 'B selected')['thread_id']
+    p.text('Omitted root readable Unicode λ'); p.key('Return')
+    run_id = p.wait(lambda s: s['run_status'] == 'awaiting_approval', 'B pending')['run_id']
+    before = p.database('before-omission')
+    p.close(); p.start(authorize=False)
+    p.nav(2)
+    p.wait(lambda s: s['thread_id'] == other and s['run_status'] == 'interrupted'
+           and any('Omitted root readable' in t for t in s['transcript']), 'omitted B readable interrupted')
+    p.shot('omitted-readable')
+    p.text('must refuse unauthorized root'); p.key('Return')
+    p.wait(lambda s: p.refusal('workspace_unauthorized'), 'omitted execution refused')
+    p.require('no_run_fabricated_on_omission', len(p.rows()) == 1 and p.rows()[0][0] == run_id)
+    after = p.database('after-omission')
+    p.require('omission_preserves_bindings_selection', before['threads'] == after['threads']
+              and before['bindings'] == after['bindings'] and before['runs'][0][3] == after['runs'][0][3])
+    p.shot('omitted-execution-refused'); p.close()
+
+
+def replacement(p):
+    p.start()
+    first = p.read()['thread_id']
+    p.text('Root A owned pending read'); p.key('Return')
+    a = p.wait(lambda s: s['run_status'] == 'awaiting_approval', 'A owned')['run_id']
+    p.nav(4)
+    other = p.wait(lambda s: s['thread_id'] != first and enabled(s), 'B selected')['thread_id']
+    p.text('Root B owned pending read'); p.key('Return')
+    b = p.wait(lambda s: s['run_status'] == 'awaiting_approval', 'B owned')['run_id']
+    held_a = p.roots[0].with_name('root-a-original')
+    p.roots[0].rename(held_a); p.roots[0].symlink_to(p.roots[1], target_is_directory=True)
+    p.nav(4)
+    p.wait(lambda s: s['thread_id'] == first and s['run_status'] == 'awaiting_approval', 'replaced A readable')
+    p.key('F7'); p.wait(lambda s: p.refusal('workspace_mismatch'), 'replaced allow refused')
+    p.require('refused_allow_preserves_both_runs', p.states() == {a: 'awaiting_approval', b: 'awaiting_approval'})
+    p.shot('replaced-allow-refused')
+    p.key('F8'); p.wait(lambda s: s['run_id'] == a and s['run_status'] == 'completed', 'deny owned A')
+    p.require('deny_targets_A_only', p.states() == {a: 'completed', b: 'awaiting_approval'})
+    p.text('must never dispatch changed A'); p.key('Return')
+    p.wait(lambda s: p.refusal('workspace_mismatch', 2), 'replaced send refused')
+    p.require('no_new_run_on_replacement', len(p.rows()) == 2)
+    p.nav(4)
+    p.wait(lambda s: s['thread_id'] == other and s['run_status'] == 'awaiting_approval', 'B still owned')
+    held_b = p.roots[1].with_name('root-b-original')
+    p.roots[1].rename(held_b); p.roots[1].symlink_to(held_a, target_is_directory=True)
+    p.key('F6'); p.wait(lambda s: s['run_id'] == b and s['run_status'] == 'cancelled', 'cancel captured replaced B')
+    p.require('replacement_stop_targets_only_B', p.states() == {a: 'completed', b: 'cancelled'})
+    p.database('replacement-final'); p.shot('replaced-cancel-target-only'); p.close()
+
+
+def history(p):
+    p.start()
+    first = p.read()['thread_id']
+    source = '```zig\n' + ''.join('const row_%04d = "retained é 👩‍💻";\n' % i for i in range(360)) + '```\n'
+    (p.out / 'generated-public-input.md').write_text(source)
+    p.manifest['fixture'] = dict(provenance='GENERATED 360-line source, NOT missing original 523183-byte history',
+                                bytes=len(source.encode()), sha256=hashlib.sha256(source.encode()).hexdigest(),
+                                admission='Real compositor clipboard and public native send; no DB writes')
+    p.require('fixture_within_public_composer_limit', len(source.encode()) < 60000)
+    p.clipboard(source); p.key('Ctrl+v')
+    p.wait(lambda s: s['draft'] == source, 'generated public fixture pasted')
+    p.key('Return'); p.wait(lambda s: s['run_status'] == 'awaiting_approval', 'public send accepted')
+    p.key('F8'); p.wait(lambda s: s['run_status'] == 'completed', 'fake denied and completed')
+    p.click(110, 160); p.key('Alt+Home')
+    oldest = p.wait(lambda s: any('row_0000' in t for t in s['transcript']), 'oldest real source')
+    p.key('Alt+Page_Down')
+    old = p.wait(lambda s: s['transcript'] != oldest['transcript'] and any('row_' in t for t in s['transcript']), 'old logical interior')
+    p.click(110, 160)
+    # Same real wtype modifier hold used by historical history_switch.py.
+    begin = time.time_ns()
+    hold = subprocess.Popen(['wtype', '-s', '100', '-P', 'Shift_L', '-s', '1400', '-p', 'Shift_L'],
+                            env=p.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        time.sleep(.25); p.click(350, 200)
+    finally:
+        try:
+            stdout, stderr = hold.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            hold.kill(); stdout, stderr = hold.communicate()
+        p.commands.append(dict(argv=hold.args, environment_override=p.env, begin_unix_ns=begin,
+                               end_unix_ns=time.time_ns(), exit=hold.returncode, stdout=stdout, stderr=stderr))
+        p.save()
+    p.require('selection_modifier_completed', hold.returncode == 0)
+    selected = p.copied('before-switch')
+    p.require('canonical_selection_from_generated_source', len(selected) > 10 and selected in source)
+    p.shot('oldrange-selected')
+    p.nav(3)
+    second = p.wait(lambda s: s['thread_id'] != first and enabled(s), 'other thread')['thread_id']
+    p.key('Tab'); p.text('Independent Unicode draft λ שלום')
+    p.wait(lambda s: s['draft'] == 'Independent Unicode draft λ שלום', 'second composer')
+    p.nav(2)
+    back = p.wait(lambda s: s['thread_id'] == first and any('row_' in t for t in s['transcript']), 'old logical range returned')
+    if back['editor_focused']:
+        p.key('Tab')
+    p.require('exact_clipboard_after_switch', p.copied('after-return') == selected)
+    p.require('old_logical_transcript_restored', back['transcript'] == old['transcript'],
+              dict(before=old['transcript'], after=back['transcript']))
+    p.shot('returned-logical-selection')
+    p.run('swaymsg', '--socket', p.env['SWAYSOCK'], '[con_id=' + p.window + '] floating enable')
+    p.run('swaymsg', '--socket', p.env['SWAYSOCK'], '[con_id=' + p.window + '] resize set width 760 px height 600 px')
+    p.wait(lambda s: s['logical_width'] == 760, 'actual reflow')
+    p.require('exact_clipboard_after_reflow', p.copied('after-reflow') == selected)
+    p.shot('returned-reflow-selection')
+    p.run('swaymsg', '--socket', p.env['SWAYSOCK'], '[con_id=' + p.window + '] resize set width 1100 px height 740 px')
+    p.wait(lambda s: s['logical_width'] == 1100, 'restore width')
+    p.nav(2)
+    p.wait(lambda s: s['thread_id'] == second and s['draft'] == 'Independent Unicode draft λ שלום', 'independent draft retained')
+    p.manifest.update(old_transcript=old['transcript'], returned_transcript=back['transcript'],
+                      selected_sha256=hashlib.sha256(selected.encode()).hexdigest())
+    p.database('history-final'); p.close()
+
+
+def task(p):
+    # Opt-in only. Reuses the actual successful Host4 Code Mode/MCP prompt pattern.
+    p.manifest['limitations'] += [
+        'ONE authorized OpenCode coordinator and ONE child; no retries, model/account substitution or recurring inference.',
+        'Native adapters do not report token usage; stored observed counters are not actual billing/zero usage.',
+        'OpenCode cancellation without tools-stopped evidence remains unknown, not a stopped-tool claim.']
+    account = p.args.runtime_account_directory
+    account.mkdir(parents=True, exist_ok=False)
+    p.manifest['provider'] = dict(runtime='opencode', model_provider='opencode', model='big-pickle',
+                                effort='default', account=str(account), executable=str(p.args.runtime_executable),
+                                executable_sha256=sha(p.args.runtime_executable), readiness='unmeasured; fresh isolated account',
+                                native_timeout_ms=180000, actual_tokens='unavailable unless provider reports them')
+    p.start()
+    thread = p.read()['thread_id']
+    workspace = p.rows('SELECT workspace_id FROM threads WHERE id=' + "'" + thread + "'")[0][0]
+    selection = dict(runtime_kind='opencode', required_runtime_version='2.1.4', model_provider='opencode',
+                     model_id='big-pickle', effort='default', account_ref=str(account),
+                     workspace={'value': workspace}, capability_revision=1)
+    packet = dict(purpose='one native Cancel task acceptance gate',
+                  prompt='Do not use tools or delegate. Explain integers 1 through 10000 in detail, one paragraph per integer.',
+                  selection=selection, owned_paths=['task-button-result.txt'],
+                  acceptance='A human native Cancel task action targets this exact child; do not write files.',
+                  result_location='task-button-result.txt', detached=False,
+                  budget=dict(max_requests=1, max_elapsed_ms=60000, max_tokens=4000))
+    arguments = dict(request_key='native-task-button-once-v1', packet=packet)
+    prompt = (
+        "Use the execute Code Mode tool to call the application's real registered spica MCP tool exactly once. "
+        "The MCP tool's original name is task.delegate under the spica namespace. Inside execute use the advertised "
+        "catalog path (tools.spica['task.delegate'] or the catalog's normalized equivalent), passing these exact arguments:\n"
+        + json.dumps(arguments, ensure_ascii=False) +
+        "\nThen use execute to call the registered spica task.list tool once and print its result. "
+        "These are MCP calls, not native task/subagent operations. Do not call shell, terminal, filesystem or network tools "
+        "and do not investigate the environment. If the spica tools are absent from the execute catalog, reply "
+        "SPICA_MCP_UNAVAILABLE immediately. After the calls reply SPICA_MCP_COORDINATOR_OK; "
+        "the application collects the child result, do not wait or delegate again.")
+    (p.out / 'coordinator-prompt.txt').write_text(prompt)
+    p.manifest['delegation_arguments'] = arguments
+    p.clipboard(prompt); p.key('Ctrl+v')
+    p.wait(lambda s: s['draft'] == prompt, 'one coordinator prompt pasted')
+    p.key('Return')
+    parent = p.wait(lambda s: bool(s['run_id']), 'coordinator accepted')['run_id']
+
+    def live_child(snapshot):
+        rows = p.rows('SELECT t.run_id,r.state FROM tasks t JOIN runs r ON r.id=t.run_id')
+        if len(rows) > 1:
+            raise RuntimeError('More than one child admitted; no substitute acceptance')
+        if not rows and snapshot['run_status'] in ('completed', 'failed', 'unknown', 'interrupted'):
+            raise RuntimeError('Native task gate unavailable: coordinator terminated without app-owned child')
+        if rows and rows[0][1] in ('completed', 'failed', 'cancelled', 'unknown', 'interrupted'):
+            raise RuntimeError('Native task gate unavailable: child terminated before live Cancel task')
+        return len(rows) == 1 and rows[0][1] == 'streaming'
+
+    p.wait(live_child, 'real MCP child live', seconds=110)
+    child = p.rows('SELECT run_id FROM tasks')[0][0]
+    p.require('one_actual_authenticated_delegate', len(p.rows("SELECT request_key FROM bridge_calls WHERE method='task.delegate'")) == 1)
+    time.sleep(.4)
+    p.shot('live-child-before-task-cancel')
+    # One active background child occupies row 0; its task row is row 1.
+    # These are inherited 1280x800 native coordinates, not an automation mutation.
+    p.click(992, 110)
+    p.wait(lambda s: p.states().get(child) in ('cancelled', 'unknown', 'interrupted'),
+           'native Cancel task terminal state', seconds=20)
+    p.cancel_command('task_cancel', child)
+    p.require('task_cancel_does_not_cancel_coordinator', p.states().get(parent) not in ('cancelled', 'cancel_requested'))
+    p.require('no_parent_cancel_effect', not p.rows("SELECT id FROM effects WHERE run_id='" + parent + "' AND kind='cancel'"))
+    p.shot('native-task-cancel-result')
+    identities = p.rows('SELECT id,requested,effective FROM runs ORDER BY rowid')
+    p.require('exact_requested_effective_identities', len(identities) == 2
+              and all(json.loads(requested) == selection and effective is not None
+                      and json.loads(effective) == selection for _, requested, effective in identities), identities)
+    p.manifest['task_rows'] = p.rows('SELECT * FROM tasks ORDER BY rowid')
+    p.manifest['bridge_calls'] = p.rows('SELECT * FROM bridge_calls ORDER BY rowid')
+    p.manifest['session_rows'] = p.rows('SELECT * FROM sessions ORDER BY rowid')
+    p.manifest['requested_effective'] = identities
+    p.manifest['observed_usage'] = p.rows('SELECT run_id,requests,input_tokens,output_tokens,cached_tokens FROM tasks')
+    p.manifest['usage_availability'] = 'Native token usage unavailable; observed zeros must not be reported as actual zero usage.'
+    p.database('task-final'); p.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--app-root', required=True, type=Path, help='Frozen candidate checkout; no build is performed')
+    parser.add_argument('--binary', required=True, type=Path, help='Exact native executable')
+    parser.add_argument('--binary-sha256', required=True)
+    parser.add_argument('--candidate', required=True, help='Exact full app-root HEAD')
+    parser.add_argument('--patched-library', required=True, type=Path, help='Exact resolved patched libfreetype file; verified in /proc before input')
+    parser.add_argument('--patched-library-sha256', required=True)
+    parser.add_argument('--library-directory', action='append', default=[], type=Path, help='Additional dependency directory (repeatable); no shared default')
+    parser.add_argument('--pointer-source', required=True, type=Path, help='Existing virtual-desktop scripts/virtual_pointer.c')
+    parser.add_argument('--output', required=True, type=Path, help='Fresh evidence directory; existing output refused')
+    parser.add_argument('--scenario', choices=['all', 'fake', 'omission', 'replacement', 'history', 'task'], default='all',
+                        help='all is fake-only; task is a separate live-provider opt-in')
+    parser.add_argument('--allow-live-opencode', action='store_true', help='Acknowledge separately authorized ONE coordinator/child attempt')
+    parser.add_argument('--runtime-executable', type=Path, help='Exact installed OpenCode executable, task scenario only')
+    parser.add_argument('--runtime-account-directory', type=Path, help='Fresh disposable account path, task scenario only; existing path refused')
+    args = parser.parse_args()
+    if args.scenario == 'task':
+        if not args.allow_live_opencode or args.runtime_executable is None or args.runtime_account_directory is None:
+            parser.error('task requires --allow-live-opencode, --runtime-executable and --runtime-account-directory')
+        args.runtime_executable = args.runtime_executable.resolve(strict=True)
+        args.runtime_account_directory = args.runtime_account_directory.resolve()
+        if args.runtime_account_directory.exists():
+            parser.error('task account must be fresh; credentials/accounts are never copied or switched')
+    elif args.allow_live_opencode or args.runtime_executable is not None or args.runtime_account_directory is not None:
+        parser.error('provider options are only valid for the separate task scenario')
+    for name in ('app_root', 'binary', 'patched_library', 'pointer_source'):
+        setattr(args, name, getattr(args, name).resolve(strict=True))
+    args.output = args.output.absolute()
+    args.library_directory = [path.resolve(strict=True) for path in args.library_directory]
+    args.output.mkdir(parents=True, exist_ok=False)
+    names = ['fake', 'omission', 'replacement', 'history'] if args.scenario == 'all' else [args.scenario]
+    cohort = dict(status='running', invocation=sys.argv,
+                  provider='opencode/big-pickle/default: ONE coordinator/child attempt' if args.scenario == 'task' else 'fake only; no inference',
+                  remaining_unexported_gates=['Exact numeric composer scroll/logical anchor', 'Direct rendered screenshot review'],
+                  scenarios=[])
+    cohort_path = args.output / 'cohort.json'
+    exit_code = 0
+    for name in names:
+        proof = Proof(args, name)
+        error = None
+        try:
+            proof.prepare()
+            globals()[name](proof)
+        except BaseException:
+            error = traceback.format_exc()
+            exit_code = 1
+        finally:
+            try:
+                proof.finish(error)
+            except BaseException:
+                proof.manifest.update(status='failed', finalization_error=traceback.format_exc())
+                proof.save()
+                exit_code = 1
+        cohort['scenarios'].append(dict(name=name, manifest=str(proof.out / 'manifest.json'),
+                                        manifest_sha256=sha(proof.out / 'manifest.json'), status=proof.manifest['status']))
+        if proof.manifest['status'] == 'failed':
+            exit_code = 1
+        cohort.update(status='failed' if exit_code else 'automated scenarios passed; direct review required')
+        cohort_path.write_text(json.dumps(cohort, indent=2))
+        if exit_code:
+            break  # Preserve the first failing gate; never retry a known crash.
+    print(json.dumps(cohort, indent=2))
+    return exit_code
+
+
+if __name__ == '__main__':
+    sys.exit(main())
