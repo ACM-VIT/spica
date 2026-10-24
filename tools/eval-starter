@@ -13,6 +13,16 @@ import measure_process as measure
 ROOT = Path(__file__).resolve().parents[1]
 COMMANDS = []
 
+# The native composition must use ordinary Host actions even if a theme module
+# exports an action function. Deliberately fail if the app routes Send there.
+PRESENTATION_MODULE = """return {
+root=function(s) return {kind='native',id='workspace',design={
+colors={background='#101015',accent='#8b5cf6'},
+layout={sidebar_width=304,content_width=760,radius=20}}} end,
+render_block=function(s) return {text=s.text,format='plain'} end,
+action=function() error('Native commands entered theme action') end
+}"""
+
 
 def run(*args, timeout=30):
     begin = time.monotonic()
@@ -181,10 +191,27 @@ def assert_workspace_snapshot(snapshot):
         raise RuntimeError('Workspace message order is not chronological')
 
 
+def assert_presentation_snapshot(snapshot):
+    if snapshot['custom_root'] or not snapshot['presentation_active']:
+        raise RuntimeError('Theme must retain the native composition')
+    config = snapshot['presentation']
+    if config['colors']['background'] != dict(r=16, g=16, b=21):
+        raise RuntimeError('Theme background was not installed')
+    if config['colors']['accent'] != dict(r=139, g=92, b=246):
+        raise RuntimeError('Theme accent was not installed')
+    if any(config['layout'][name] != value for name, value in
+           [('sidebar_width', 304), ('content_width', 760), ('radius', 20)]):
+        raise RuntimeError('Theme layout was not installed')
+    composer = next(t for t in snapshot['targets'] if t['id'] == 'composer.input')
+    x, y, width, height = composer['pointer_bounds']
+    if x < 304 or width > 760 or min(width, height) <= 0:
+        raise RuntimeError('Painted composer does not follow themed layout')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / '.artifacts/starter')
-    parser.add_argument('--mode', choices=('smoke', 'editor', 'capacity', 'conversation', 'workspace', 'custom', 'measure'), default='smoke')
+    parser.add_argument('--mode', choices=('smoke', 'editor', 'capacity', 'conversation', 'workspace', 'custom', 'presentation', 'measure'), default='smoke')
     parser.add_argument('--binary', type=Path, help='Explicit frozen binary; requires --binary-sha256 and --source-sha256')
     parser.add_argument('--binary-sha256')
     parser.add_argument('--source-sha256')
@@ -195,11 +222,14 @@ def main():
     parser.add_argument('--cycles', type=int, default=3)
     parser.add_argument('--interval', type=float, default=.25)
     parser.add_argument('--disable-metrics', action='store_true', help='Same binary opt-in overhead comparison; frame metrics unavailable')
+    parser.add_argument('--lua-module', type=Path, help='Explicit local module for ordinary scenarios or measurement')
     args = parser.parse_args()
     if not all(math.isfinite(v) and v > 0 for v in (args.warmup, args.phase_seconds, args.interval)) or not 1 <= args.cycles <= 100:
         parser.error('finite positive durations and cycles 1..100 required')
     if args.binary and not (args.binary_sha256 and args.source_sha256):
         parser.error('frozen binary requires both fingerprints')
+    if args.lua_module and args.mode in ('custom', 'presentation'):
+        parser.error('custom/presentation scenarios supply their own module')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     # An old export must never satisfy this run's assertions.
@@ -238,14 +268,19 @@ def main():
             argv = ['env', 'XDG_DATA_HOME=' + str(output / 'xdg-data'), *argv]
         else:
             argv += ['--state-directory', str(output / 'conversation-state')]
-        if args.mode in ('conversation', 'workspace', 'custom'):
+        if args.mode in ('conversation', 'workspace', 'custom', 'presentation'):
             argv += ['--automation-live', str(output / 'live.json')]
-        if args.mode == 'custom':
+        if args.mode in ('custom', 'presentation'):
             module = output / 'custom.lua'
             module.write_text('return { broken =')  # Deliberate file config, not UI state mutation.
             argv += ['--lua-module', str(module)]
-            manifest['module_source'] = str(ROOT / 'examples/minimal.lua')
-            manifest['module_sha256'] = sha(ROOT / 'examples/minimal.lua')
+            manifest['module_source'] = str(ROOT / 'examples/minimal.lua') if args.mode == 'custom' else PRESENTATION_MODULE
+            manifest['module_sha256'] = sha(ROOT / 'examples/minimal.lua') if args.mode == 'custom' else hashlib.sha256(PRESENTATION_MODULE.encode()).hexdigest()
+        elif args.lua_module:
+            module = args.lua_module.resolve()
+            manifest['module_source'] = str(module)
+            manifest['module_sha256'] = sha(module)
+            argv += ['--lua-module', str(module)]
         if not args.disable_metrics:
             argv += ['--metrics-output', str(output / 'native.json')]
         launch = json.loads(run('vd', 'run', session, '--bg', '--log', str(output / 'app.log'), '--', *argv))
@@ -267,7 +302,7 @@ def main():
         ipc(f'[con_id={window_id}] floating enable')
         ipc(f'[con_id={window_id}] resize set width 1100 px height 740 px')
         run('vd', 'shot', session, str(output / 'before.png'))
-        if args.mode in ('conversation', 'workspace', 'custom'):
+        if args.mode in ('conversation', 'workspace', 'custom', 'presentation'):
             def observe(predicate, label):
                 deadline = time.monotonic() + 15
                 while time.monotonic() < deadline:
@@ -315,11 +350,40 @@ def main():
                 actions.append(dict(operation='configuration file replacement', source='examples/minimal.lua', internal_ui_mutation=False))
                 key('F5')
                 current = observe(lambda s: s['custom_root'] and s['script_generation'] > 0 and not s['script_error'], 'installed custom root')
+            if args.mode == 'presentation':
+                current = observe(lambda s: not s['presentation_active'] and s['script_generation'] == 0 and s['script_error'], 'initial invalid theme retains default')
+                run('vd', 'shot', session, str(output / 'initial-invalid-default.png'))
+                module.write_text(PRESENTATION_MODULE)
+                actions.append(dict(operation='configuration file replacement', internal_ui_mutation=False))
+                key('F5')
+                current = observe(lambda s: s['presentation_active'] and s['script_generation'] > 0 and not s['script_error'], 'installed native theme')
+                assert_presentation_snapshot(current)
+                run('vd', 'shot', session, str(output / 'native-theme.png'))
             run('vd', 'text', session, window_id, 'Inspect café 世界 👩‍💻')
             current = observe(lambda s: s['draft'] == 'Inspect café 世界 👩‍💻' and enabled(s, 'command.send'), 'typed prompt enables Send')
             key('Return')
             current = observe(lambda s: s['run_status'] == 'awaiting_approval' and enabled(s, 'approval.allow') and any('const answer' in text for text in s['transcript']), 'rendered response and code awaiting approval')
             run('vd', 'shot', session, str(output / 'approval.png'))
+            if args.mode == 'presentation':
+                retained = current['run_id']
+                generation = current['script_generation']
+                module.write_text(PRESENTATION_MODULE.replace("sidebar_width=304", "sidebar_width=-1").replace("#101015", "#ffffff"))
+                key('F5')
+                current = observe(lambda s: s['script_error'] and s['script_generation'] == generation and s['run_id'] == retained, 'invalid layout retains entire theme and run')
+                assert_presentation_snapshot(current)
+                run('vd', 'shot', session, str(output / 'invalid-theme-last-good.png'))
+                module.write_text(PRESENTATION_MODULE)
+                key('F5')
+                current = observe(lambda s: s['script_generation'] > generation and not s['script_error'] and s['run_id'] == retained, 'valid theme reload preserves approval')
+                assert_presentation_snapshot(current)
+                key('F9')
+                current = observe(lambda s: not s['presentation_active'] and s['run_id'] == retained and s['run_status'] == 'awaiting_approval', 'theme off preserves accepted run')
+                if current['presentation']['layout']['sidebar_width'] == 304:
+                    raise RuntimeError('Theme off did not restore default presentation')
+                run('vd', 'shot', session, str(output / 'theme-disabled.png'))
+                key('F9')
+                current = observe(lambda s: s['presentation_active'] and s['run_id'] == retained, 'theme restored with same accepted run')
+                assert_presentation_snapshot(current)
             if args.mode == 'custom':
                 current = observe(lambda s: s['custom_root'] and '[custom]' in s['custom_render'] and 'const answer' in s['custom_render'], 'custom renderer displays actual Host output')
                 retained = current['run_id']
@@ -418,6 +482,9 @@ def main():
             current = observe(lambda s: s['thread_id'] == retained_thread and s['run_id'] == retained_run and s['run_status'] == retained_status and any('Inspection approved' in text for text in s['transcript']) and s['send_ready'], 'reopened durable conversation')
             if args.mode == 'custom':
                 current = observe(lambda s: s['custom_root'] and '[custom]' in s['custom_render'] and 'Inspection approved' in s['custom_render'] and s['run_id'] == retained_run, 'reopened custom renderer and retained cancelled run')
+            if args.mode == 'presentation':
+                current = observe(lambda s: s['presentation_active'] and not s['script_error'], 'reopened native theme')
+                assert_presentation_snapshot(current)
             manifest['conversation_reopened'] = current
             manifest['conversation_limits'] = ['Fixed fake adapter publishes a bounded observation burst; no paced-token latency claim.', 'Native controls and retained output verified through real Host; no provider authentication.']
             run('vd', 'shot', session, str(output / 'reopened.png'))

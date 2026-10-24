@@ -61,6 +61,22 @@ def run_smoke_fixture(value):
 
 
 class RunnerBoundaries(unittest.TestCase):
+    def test_theme_evidence_requires_native_actions_and_painted_layout(self):
+        snapshot = dict(custom_root=False, presentation_active=True,
+                        presentation=dict(colors=dict(background=dict(r=16, g=16, b=21),
+                                                      accent=dict(r=139, g=92, b=246)),
+                                          layout=dict(sidebar_width=304, content_width=760, radius=20)),
+                        targets=[dict(id='composer.input', pointer_bounds=[328, 500, 700, 90])])
+        m.assert_presentation_snapshot(snapshot)
+        for field, value in [('custom_root', True), ('presentation_active', False)]:
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                m.assert_presentation_snapshot(dict(snapshot, **{field: value}))
+        for geometry in ([100, 500, 700, 90], [328, 500, 900, 90], [328, 500, 700, 0]):
+            invalid = copy.deepcopy(snapshot)
+            invalid['targets'][0]['pointer_bounds'] = geometry
+            with self.subTest(geometry=geometry), self.assertRaises(RuntimeError):
+                m.assert_presentation_snapshot(invalid)
+
     def test_workspace_requires_distinct_roles_and_chronological_identity(self):
         snapshot = dict(transcript_message_ids=['u1', 'a1', 'a1'],
                         transcript_ordinals=[0, 1, 1], transcript_roles=['user', 'assistant', 'assistant'])
