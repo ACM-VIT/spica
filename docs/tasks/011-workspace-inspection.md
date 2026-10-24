@@ -100,5 +100,24 @@ the nearest actual `.git` marker against Git's discovered top-level root, refusi
 that wrong-checkout substitution. The initial failure log is preserved at
 `.artifacts/worktrees/fix-unborn-workspace/.artifacts/focused-0.log`; its test
 unexpected-success result also reported leaked result storage (not a successful
-capture ownership claim). Repaired runs have no reported leaks. Actual native
-startup/reopen and assembled integration checks remain pending, not accepted.
+capture ownership claim). Repaired runs have no reported leaks.
+
+Checkpoint `60e83b1f32ac1b86e1d67f43ee2fc692ef0c7df5` was frozen for the actual
+native evidence worker. ReleaseSafe binary SHA256:
+`e22f9f0ffd06dc6f908c032b7c227b27e116e6f19bec474da3c9c7ef658f90d1`.
+The single actual isolated Wayland/OpenGL run passed loaded conversation, real
+OpenCode 2.1.4 `opencode/big-pickle`, effort `default`, benign prompt completed
+with `OK`, clean shutdown and same durable thread/run after restart.
+The installed absolute runtime was `/home/ashman/.opencode/bin/opencode`.
+The disposable workspace received `git init` only, no seed commit. Every `.git`
+file hash stayed unchanged through prompt, restart and desktop cleanup; symbolic
+HEAD stayed `refs/heads/main`, HEAD verification remained exit128, refs/status
+empty. Both app exits were zero with no surviving owned processes.
+
+Raw manifest, exact argv/commands/environment, logs and reviewed ready/prompt/
+reopened screenshots:
+`.artifacts/unborn-startup/feature-60e83b1/manifest.json`.
+The fix owner reviewed those three screenshots and recorded assertions. This
+is actual fixed-path evidence, not a repeated run of the reported failing app.
+No X11/physical-latency, unrelated task009/FreeType or authenticated Codex claim.
+Assembled integration checks and the shared runnable-binary smoke remain pending.
