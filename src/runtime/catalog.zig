@@ -90,27 +90,49 @@ pub fn opencode(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire:
     for (output[0..count], 0..) |*model, index| {
         const identity = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model.selection.model_provider, model.selection.model_id });
         const configured = try call(wire, allocator, index + 3, "session/set_config_option", .{ .sessionId = session_id, .configId = "model", .value = identity });
-        const options = field(configured, "configOptions");
-        if (options != .array) return error.InvalidCatalog;
-        var actual_model = false;
-        for (options.array.items) |option| {
-            const id = text(field(option, "id"));
-            if (eq(id, "model")) actual_model = eq(text(field(option, "currentValue")), identity);
-            if (!eq(id, "effort")) continue;
-            const values = field(option, "options");
-            if (values != .array or values.array.items.len >= max_efforts) return error.InvalidCatalog;
-            const efforts = try retained.alloc([]const u8, values.array.items.len + 1);
-            efforts[0] = "default";
-            for (values.array.items, efforts[1..]) |value, *effort| {
-                const name = text(field(value, "value"));
-                if (name.len == 0 or name.len > 64) return error.InvalidCatalog;
-                effort.* = try retained.dupe(u8, name);
-            }
-            model.supported_efforts = efforts;
-        }
-        if (!actual_model) return error.SelectionMismatch;
+        try applyOpenCodeOptions(retained, model, identity, configured);
     }
     return count;
+}
+
+/// One advertised entry may fail exact negotiation. Its returned effort list
+/// belongs to a different model and must never contaminate this or other rows.
+pub fn applyOpenCodeOptions(retained: std.mem.Allocator, model: *c.Model, identity: []const u8, configured: Value) !void {
+    const options = field(configured, "configOptions");
+    if (options != .array) return error.InvalidCatalog;
+    var actual_model = false;
+    for (options.array.items) |option| {
+        if (eq(text(field(option, "id")), "model")) actual_model = eq(text(field(option, "currentValue")), identity);
+    }
+    if (!actual_model) {
+        model.readiness = .unavailable;
+        model.reason = "OpenCode returned a different model during discovery. Refresh to verify this entry; other verified models remain usable.";
+        return;
+    }
+    for (options.array.items) |option| {
+        if (!eq(text(field(option, "id")), "effort")) continue;
+        const values = field(option, "options");
+        if (values != .array or values.array.items.len > max_efforts) return error.InvalidCatalog;
+        var unique: [max_efforts][]const u8 = undefined;
+        unique[0] = "default";
+        var count: usize = 1;
+        for (values.array.items) |value| {
+            const name = text(field(value, "value"));
+            if (name.len == 0 or name.len > 64) return error.InvalidCatalog;
+            var found = false;
+            for (unique[0..count]) |old| if (eq(old, name)) {
+                found = true;
+                break;
+            };
+            if (found) continue;
+            if (count == unique.len) return error.InvalidCatalog;
+            unique[count] = name;
+            count += 1;
+        }
+        const efforts = try retained.alloc([]const u8, count);
+        for (unique[0..count], efforts) |name, *effort| effort.* = try retained.dupe(u8, name);
+        model.supported_efforts = efforts;
+    }
 }
 pub fn opencodeModels(allocator: std.mem.Allocator, input: c.Selection, session: Value, output: []c.Model) !usize {
     const options = field(session, "configOptions");
@@ -169,4 +191,26 @@ test "OpenCode grouped catalog filters unauthorized provider and bounds rows" {
     try std.testing.expectEqualStrings("one", output[0].selection.model_id);
     try std.testing.expectEqual(c.Readiness.unknown, output[0].readiness);
     try std.testing.expectError(error.CatalogLimit, opencodeModels(allocator, input, parsed.value, output[0..0]));
+}
+
+test "one mismatched OpenCode catalog row cannot poison exact selections or efforts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const initial: c.Model = .{ .selection = .{ .runtime_kind = "opencode", .required_runtime_version = "2.1.4", .model_provider = "fixture", .model_id = "requested", .effort = "default", .account_ref = "/isolated", .workspace = .{ .value = "workspace" } }, .supported_efforts = &.{"default"}, .display_name = "Requested", .readiness = .unknown, .reason = "Fixture negotiated catalog" };
+    var rejected = initial;
+    const mismatch = try std.json.parseFromSlice(Value, allocator, "{\"configOptions\":[{\"id\":\"model\",\"currentValue\":\"fixture/other\"},{\"id\":\"effort\",\"options\":[{\"value\":\"wrong-model-effort\"}]}]}", .{});
+    try applyOpenCodeOptions(allocator, &rejected, "fixture/requested", mismatch.value);
+    try std.testing.expectEqual(c.Readiness.unavailable, rejected.readiness);
+    try std.testing.expectEqualStrings("requested", rejected.selection.model_id);
+    try std.testing.expectEqualStrings("default", rejected.supported_efforts[0]);
+    try std.testing.expectEqual(@as(usize, 1), rejected.supported_efforts.len);
+    var verified = initial;
+    const exact = try std.json.parseFromSlice(Value, allocator, "{\"configOptions\":[{\"id\":\"effort\",\"options\":[{\"value\":\"high\"},{\"value\":\"default\"},{\"value\":\"high\"}]},{\"id\":\"model\",\"currentValue\":\"fixture/requested\"}]}", .{});
+    try applyOpenCodeOptions(allocator, &verified, "fixture/requested", exact.value);
+    try std.testing.expectEqual(c.Readiness.unknown, verified.readiness);
+    try std.testing.expectEqual(@as(usize, 2), verified.supported_efforts.len);
+    try std.testing.expectEqualStrings("default", verified.supported_efforts[0]);
+    try std.testing.expectEqualStrings("high", verified.supported_efforts[1]);
+    try std.testing.expectEqual(c.Readiness.unavailable, rejected.readiness);
 }
