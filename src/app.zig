@@ -850,6 +850,8 @@ const Conversation = struct {
         if (self.normal_startup and !self.runtime_configured) return "Choose a provider in Connection to get started.";
         if (self.login_inflight) return "Complete provider sign-in in Connection before sending.";
         if (self.catalog_refresh_pending or self.catalog_refresh_inflight) return "Loading configured provider models…";
+        if (self.run_state) |state| if (state == .unknown or state == .interrupted)
+            return "This chat has unresolved work. Start a new chat to continue; previous work will not be retried.";
         const selected = if (view.selected) |*identity| identity else return if (view.model_count == 0)
             "No models loaded. Open Connection and Refresh models."
         else
@@ -1628,7 +1630,10 @@ const Conversation = struct {
                 self.setup_login_after_configure = null;
                 self.submitted_setup_key = null;
             }
-            self.notice(&app.view, if (value.reason) |reason| rejectionMessage(reason) else "Command rejected. Open Connection to inspect provider status.");
+            const setup_busy = value.reason == .busy and (pending.kind == .configure or pending.kind == .refresh_models or pending.kind == .login);
+            self.notice(&app.view, if (setup_busy)
+                "A run is using a provider. Close Connection, open its chat and Stop it, then retry."
+            else if (value.reason) |reason| rejectionMessage(reason) else "Command rejected. Open Connection to inspect provider status.");
             self.refresh = self.thread.len != 0;
             return;
         }
@@ -2637,4 +2642,22 @@ test "rejected configuration withdraws queued sign-in without touching an older 
     try std.testing.expect(conversation.setup_login_after_configure == null);
     try std.testing.expect(conversation.submitted_setup_key == null);
     try std.testing.expect(app.view.notice != null);
+}
+
+test "unresolved chats explain new-chat recovery and setup busy names the live run" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    for ([_]types.RunState{ .unknown, .interrupted }) |state| {
+        conversation.run_state = state;
+        try std.testing.expect(std.mem.indexOf(u8, conversation.selectionDisabledReason(&app.view).?, "new chat") != null);
+        try std.testing.expect(!conversation.selectionNeedsSave(&app.view));
+    }
+    const id: [32]u8 = @splat('b');
+    conversation.command = .{ .ticket = .{ .value = 1 }, .kind = .refresh_models, .draft_revision = 0, .id = id };
+    conversation.catalog_refresh_inflight = true;
+    try conversation.receipt(&app, .{ .value = 1 }, .{ .command_id = .{ .value = &id }, .outcome = .rejected, .reason = .busy, .commit_sequence = 0 });
+    try std.testing.expect(conversation.command == null and !conversation.catalog_refresh_inflight);
+    try std.testing.expect(std.mem.indexOf(u8, app.view.notice.?, "Stop") != null);
 }

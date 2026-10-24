@@ -26,6 +26,15 @@ pub const Owner = struct {
     factory: ?Factory = null,
     workspace_root: ?[]const u8 = null,
     setup_factory: ?Factory = null,
+    runtime_registry: ?*const Registry = null,
+
+    fn liveRuntimeCount(self: *const Owner) usize {
+        var count: usize = 0;
+        if (self.runtime_registry) |registry| for (registry.entries) |entry| {
+            if (entry != null) count += 1;
+        };
+        return count;
+    }
 
     fn id(self: *Owner, allocator: std.mem.Allocator) ![]const u8 {
         var random: [16]u8 = undefined;
@@ -156,7 +165,11 @@ pub const Owner = struct {
             .runtime_configure, .runtime_refresh, .runtime_login => {
                 if (e.target != .absent or e.expected_revision != .absent) return .invalid_command;
                 if (self.setup_factory == null) return .capability_unavailable;
-                if (try db.scalar("SELECT count(*) FROM runs WHERE state NOT IN('completed','cancelled','failed')") != 0 or try db.scalar("SELECT count(*) FROM effects WHERE state IN('unknown','in_flight')") != 0) return .busy;
+                // Recovery keeps uncertain work in the journal, but it owns no
+                // process in this Host. It must not prevent account setup for
+                // other chats. Live adapters and accepted dispatches still do.
+                if (self.liveRuntimeCount() != 0) return .busy;
+                if (try db.scalar("SELECT EXISTS(SELECT 1 FROM runs WHERE state IN('queued','starting','streaming','awaiting_approval','cancel_requested')) OR EXISTS(SELECT 1 FROM effects WHERE state='in_flight')") != 0) return .busy;
                 // The command record commits explicit intent before Host performs
                 // any configuration, provider discovery or login side effect.
                 return null;
@@ -236,7 +249,7 @@ pub const Owner = struct {
                     for ([_]a.Capability{ .create, .start, .stream }) |capability|
                         if (discovery.capabilities[@intFromEnum(capability)].status != .supported) return .capability_unavailable;
                 } else if (!std.mem.eql(u8, p.selection.runtime_kind, "fake") or !std.mem.eql(u8, p.selection.required_runtime_version, "1") or p.selection.capability_revision != 1) return .capability_unavailable;
-                if (self.factory != null and try db.scalar("SELECT count(*) FROM runs WHERE state NOT IN('completed','cancelled','failed')") >= 3) return .admission_limit;
+                if (self.factory != null and (self.liveRuntimeCount() >= 3 or try db.scalar("SELECT count(*) FROM runs WHERE state IN('queued','starting','streaming','awaiting_approval','cancel_requested')") >= 3)) return .admission_limit;
                 if (try self.field(allocator, "SELECT id FROM runs WHERE thread_id=? AND (state IN('queued','starting','streaming','awaiting_approval','cancel_requested','unknown','interrupted') OR EXISTS(SELECT 1 FROM effects WHERE run_id=runs.id AND state IN('unknown','in_flight')))", &.{.{ .text = thread }}) != null) return .unresolved_effects;
                 const run = try self.id(allocator);
                 const session = try self.id(allocator);
@@ -1037,7 +1050,7 @@ pub const Host = struct {
         snapshot.database = null;
     }
     fn run(self: *Host) void {
-        var owner: Owner = .{ .database = &self.database, .io = self.io, .epoch = &self.epoch, .utc_ms = null, .factory = self.registry.?.factory, .workspace_root = self.options.workspace_root, .setup_factory = self.options.setup_factory };
+        var owner: Owner = .{ .database = &self.database, .io = self.io, .epoch = &self.epoch, .utc_ms = null, .factory = self.registry.?.factory, .workspace_root = self.options.workspace_root, .setup_factory = self.options.setup_factory, .runtime_registry = &self.registry.? };
         defer if (self.registry) |*registry| registry.deinit(&self.mcp.?);
         defer if (self.options.setup_factory) |setup| {
             if (setup.vtable.shutdownSetup) |call| call(setup.context);
@@ -1869,5 +1882,94 @@ test "thread cards read bounded UTF8 first-prompt previews and latest status aft
             break;
         }
         try std.testing.expect(received);
+    }
+}
+
+test "reopened uncertain runs do not block setup or replay claimed work" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = path_buffer[0..try temporary.dir.realPath(std.testing.io, &path_buffer)];
+    var database = try store.Store.open(std.testing.io, path);
+    defer database.close() catch {};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: Owner = .{ .database = &database, .io = std.testing.io, .epoch = "busy-before", .utc_ms = 1 };
+    const project = (try owner.command(allocator, .{ .command_id = .{ .value = "project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "Busy recovery" } } })).entity_ids.project.?;
+    const workspace = (try owner.command(allocator, .{ .command_id = .{ .value = "workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = try workspace_binding.capture(allocator, std.testing.io, path) } } })).entity_ids.workspace.?;
+    owner.factory = @import("domain/fake_factory.zig").factory(&owner);
+    owner.setup_factory = owner.factory;
+    const actions = [_]t.Payload{
+        .{ .runtime_configure = .{ .runtime_kind = .codex, .executable = "/fixture/codex", .account_directory = "/fixture/account", .workspace_root = path, .model_provider = "openai" } },
+        .{ .runtime_refresh = {} },
+        .{ .runtime_login = .{ .runtime_kind = .codex, .mode = .device } },
+    };
+    const thread = (try owner.command(allocator, .{ .command_id = .{ .value = "thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+    const sent = try owner.command(allocator, .{ .command_id = .{ .value = "send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "Offline uncertainty fixture", .selection = a.fakeSelection(workspace) } } });
+    try std.testing.expectEqual(.accepted, sent.outcome);
+    // Accepted but not-yet-spawned work owns the configuration as well.
+    for (actions, 0..) |payload, i| {
+        const receipt = try owner.command(allocator, .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "queued-{d}", .{i}) }, .target = .absent, .expected_revision = .absent, .payload = payload });
+        try std.testing.expectEqual(.busy, receipt.reason.?);
+    }
+    _ = (try owner.claimNext(allocator)).?;
+    try database.close();
+    database = try store.Store.open(std.testing.io, path);
+    owner.epoch = "busy-after";
+    try owner.recover();
+    const run_revisions = try database.scalar("SELECT sum(revision) FROM runs");
+    const effect_revisions = try database.scalar("SELECT sum(revision) FROM effects");
+    const events = try database.scalar("SELECT count(*) FROM events");
+    // All three actions are admitted after real recovery. Exact redelivery
+    // returns the original receipt and cannot grant a second setup side effect.
+    for (actions, 0..) |payload, i| {
+        const command: t.CommandEnvelope = .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "recovered-{d}", .{i}) }, .target = .absent, .expected_revision = .absent, .payload = payload };
+        const receipt = try owner.command(allocator, command);
+        try std.testing.expectEqual(.accepted, receipt.outcome);
+        try std.testing.expectEqual(receipt.commit_sequence, (try owner.command(allocator, command)).commit_sequence);
+        try std.testing.expect((try owner.claimNext(allocator)) == null);
+    }
+    try std.testing.expectEqual(run_revisions, try database.scalar("SELECT sum(revision) FROM runs"));
+    try std.testing.expectEqual(effect_revisions, try database.scalar("SELECT sum(revision) FROM effects"));
+    try std.testing.expectEqual(events, try database.scalar("SELECT count(*) FROM events"));
+    try std.testing.expectEqual(@as(i64, 1), try database.scalar("SELECT count(*) FROM runs WHERE state='unknown'"));
+    try std.testing.expectEqual(@as(i64, 1), try database.scalar("SELECT count(*) FROM effects WHERE state='unknown' AND outcome='crash_after_claim'"));
+    const retry = try owner.command(allocator, .{ .command_id = .{ .value = "unsafe-retry" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "Must not replay", .selection = a.fakeSelection(workspace) } } });
+    try std.testing.expectEqual(.unresolved_effects, retry.reason.?);
+    // In-flight authority still blocks setup even when the run is unknown.
+    try database.exec("UPDATE effects SET state='in_flight' WHERE kind='create_session'");
+    const blocked = try owner.command(allocator, .{ .command_id = .{ .value = "still-in-flight" }, .target = .absent, .expected_revision = .absent, .payload = actions[1] });
+    try std.testing.expectEqual(.busy, blocked.reason.?);
+    try database.exec("UPDATE effects SET state='unknown' WHERE kind='create_session'");
+    // A live adapter is independently authoritative. This sentinel entry is
+    // inspected only for occupancy; no adapter or arena method may be called.
+    var registry: Registry = .{ .allocator = std.testing.allocator, .factory = owner.factory.? };
+    registry.entries[0] = .{ .arena = undefined, .session = sent.entity_ids.session.?, .selection = a.fakeSelection(workspace), .adapter = undefined, .pending_open = null, .created_ms = 0 };
+    owner.runtime_registry = &registry;
+    for (actions, 0..) |payload, i| {
+        const receipt = try owner.command(allocator, .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "owned-{d}", .{i}) }, .target = .absent, .expected_revision = .absent, .payload = payload });
+        try std.testing.expectEqual(.busy, receipt.reason.?);
+    }
+    registry.entries[0] = null;
+    // Recovered runs do not use the three live execution slots. Recovery of
+    // unclaimed work must remain interrupted, with its calls still unclaimed.
+    for (0..4) |i| {
+        const next = (try owner.command(allocator, .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "thread-{d}", .{i}) }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+        const run = try owner.command(allocator, .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "send-{d}", .{i}) }, .target = .{ .thread = next }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "New isolated chat", .selection = a.fakeSelection(workspace) } } });
+        try std.testing.expectEqual(.accepted, run.outcome);
+        try owner.recover();
+        for (actions, 0..) |payload, j| {
+            const receipt = try owner.command(allocator, .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "interrupted-{d}-{d}", .{ i, j }) }, .target = .absent, .expected_revision = .absent, .payload = payload });
+            try std.testing.expectEqual(.accepted, receipt.outcome);
+        }
+        try std.testing.expect((try owner.claimNext(allocator)) == null);
+    }
+    try std.testing.expectEqual(@as(i64, 4), try database.scalar("SELECT count(*) FROM runs WHERE state='interrupted'"));
+    try std.testing.expectEqual(@as(i64, 1), try database.scalar("SELECT count(*) FROM runs WHERE state='unknown'"));
+    for (0..4) |i| {
+        const next = (try owner.command(allocator, .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "live-thread-{d}", .{i}) }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+        const run = try owner.command(allocator, .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "live-send-{d}", .{i}) }, .target = .{ .thread = next }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "Still bounded to three live runs", .selection = a.fakeSelection(workspace) } } });
+        if (i < 3) try std.testing.expectEqual(.accepted, run.outcome) else try std.testing.expectEqual(.admission_limit, run.reason.?);
     }
 }
