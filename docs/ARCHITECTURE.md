@@ -1,6 +1,6 @@
 # Architecture direction
 
-Status: the durable Host, provider adapters, bounded native conversation and protected Lua root/action bridge are implemented. The task ledger records their verification and limitations. The presentation API expansion below is under implementation; future surfaces are identified separately.
+Status: the durable Host, provider adapters, bounded native conversation and protected Lua root/action bridge are implemented. Shared presentation settings, native-root themes and custom-node styles are implemented and verified through native input. The task ledger records checks, resource measurements and limitations; future surfaces are identified separately.
 
 ## T3-compatible presentation
 
