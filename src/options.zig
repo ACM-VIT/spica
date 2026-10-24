@@ -133,8 +133,8 @@ pub const help =
     \\Real runtimes require --runtime-account-directory PATH --workspace PATH
     \\and --model-provider ID. Select discovered model/effort in the native picker;
     \\--model ID --effort VALUE optionally supplies an exact initial selection.
-    \\The native setup action configures isolated executable/account/workspace;
-    \\explicit Refresh discovers actual models without performing inference.
+    \\Configured real runtimes discover models on launch without performing inference.
+    \\The connection panel edits executable/account/workspace and refreshes discovery.
     \\Runtime account state is independent of the application database.
     \\--codex-auth status|browser|device queries/initiates supported isolated ChatGPT sign-in,
     \\prints the actual runtime response, then exits without opening the native UI.

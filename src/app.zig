@@ -8,6 +8,7 @@ const telemetry = @import("native/metrics.zig");
 const automation = @import("native/automation.zig");
 const domain = @import("domain.zig");
 const types = @import("domain/types.zig");
+const contract = @import("contract.zig");
 const presentation = @import("content/presentation.zig");
 const Id = @import("ui/transcript.zig").Id;
 const script = @import("script.zig");
@@ -70,6 +71,30 @@ pub const App = struct {
         self.conversation = try Conversation.create(self.view.allocator, io, host, file, wake, workspace);
         self.view.connected = true;
         self.view.status = "Opening durable conversation";
+    }
+
+    /// Explicit launch configuration only; never discovers accounts or sends a prompt.
+    /// Paths stay in the existing owned launch configuration, outside bounded IDs.
+    pub fn configureRuntime(self: *App, selection: contract.Selection, executable: []const u8) !void {
+        const conversation = self.conversation orelse return error.NoConversation;
+        var unbound = selection;
+        unbound.workspace = .{ .value = "" };
+        const identity = try Coding.Identity.from(unbound);
+        const fields = [_][]const u8{ executable, selection.account_ref, selection.workspace.value, selection.model_provider };
+        if (!std.mem.eql(u8, selection.runtime_kind, "codex") and !std.mem.eql(u8, selection.runtime_kind, "opencode")) return error.UnsupportedRuntime;
+        self.view.setup_runtime = if (std.mem.eql(u8, selection.runtime_kind, "codex")) .codex else .opencode;
+        for (fields, 0..) |field, index| {
+            if (field.len > self.view.setup_fields[index].len) {
+                self.view.setup_lengths[index] = 0;
+                conversation.notice(&self.view, "Launch configuration is active. A path exceeds the connection form's 512-byte limit; it was left empty, not shortened.");
+                continue;
+            }
+            @memcpy(self.view.setup_fields[index][0..field.len], field);
+            self.view.setup_lengths[index] = field.len;
+        }
+        conversation.launch_selection = identity;
+        conversation.catalog_refresh_pending = true;
+        self.view.send_disabled_reason = "Loading configured provider models…";
     }
 
     pub fn init(allocator: std.mem.Allocator) !App {
@@ -334,19 +359,20 @@ pub const App = struct {
         for (self.view.controls, 0..) |bounds, index| {
             self.snapshot.targets[index + 2].pointer_bounds = .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) };
             self.snapshot.targets[index + 2].enabled = switch (index) {
-                0 => self.view.can_send,
+                0 => self.view.can_send and self.view.editor.len != 0,
                 1 => self.view.can_cancel,
                 else => self.view.can_approve,
             };
         }
-        const extra_bounds = [_]c.SDL_FRect{ .{ .x = 16, .y = 68, .w = 184, .h = 30 }, .{ .x = 16, .y = 104, .w = 184, .h = 30 }, self.view.picker_bounds, self.view.effort_bounds, self.view.setup_bounds };
+        const extra_bounds = [_]c.SDL_FRect{ self.view.new_project_bounds, self.view.new_thread_bounds, self.view.picker_bounds, self.view.effort_bounds, self.view.setup_bounds };
         for (extra_bounds, 6..) |bounds, index| {
             self.snapshot.targets[index].pointer_bounds = .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) };
             self.snapshot.targets[index].enabled = self.view.custom_root == null and (index >= 8 or self.view.navigation_enabled);
         }
         self.snapshot.thread_targets = @splat(.{ .enabled = false });
         for (self.view.threads[0..self.view.thread_count], 0..) |*entry, index| {
-            self.snapshot.thread_targets[index] = .{ .id = entry.id.slice(), .role = "thread", .enabled = self.view.navigation_enabled, .pointer_bounds = .{ 24, @as(i32, @intCast(168 + self.view.project_count * 26 + index * 28)), 176, 28 } };
+            const bounds = self.view.threadRowBounds(index);
+            self.snapshot.thread_targets[index] = .{ .id = entry.id.slice(), .role = "thread", .enabled = self.view.custom_root == null and self.view.navigation_enabled and bounds.w > 0 and bounds.h > 0, .pointer_bounds = .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } };
         }
         const present_begin = if (self.metrics != null) c.SDL_GetTicksNS() else 0;
         const succeeded = c.SDL_RenderPresent(self.renderer);
@@ -401,6 +427,22 @@ pub const App = struct {
         self.snapshot.project_count = self.view.project_count;
         self.snapshot.thread_count = self.view.thread_count;
         self.snapshot.model_count = self.view.model_count;
+        self.snapshot.send_ready = self.view.can_send;
+        self.snapshot.send_disabled_reason = self.view.send_disabled_reason;
+        self.snapshot.picker_open = self.view.picker_open;
+        self.snapshot.setup_open = self.view.setup_open;
+        self.snapshot.setup_runtime = @tagName(self.view.setup_runtime);
+        const setup_ids = [_][]const u8{ "runtime.configure", "runtime.browser", "runtime.device", "runtime.refresh" };
+        for (self.view.setup_button_bounds, 0..) |bounds, index| {
+            const enabled = self.view.custom_root == null and self.view.setup_open and bounds.w > 0 and bounds.h > 0 and (index == 0 or index == 3 or self.view.setup_runtime == .codex);
+            self.snapshot.setup_targets[index] = .{ .id = setup_ids[index], .role = "button", .key = "", .enabled = enabled, .pointer_bounds = if (enabled) .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } else null };
+        }
+        for (0..4) |index| self.snapshot.setup_fields[index] = self.view.setup_fields[index][0..self.view.setup_lengths[index]];
+        self.snapshot.thread_labels = @splat("");
+        for (self.view.threads[0..self.view.thread_count], 0..) |*entry, index| self.snapshot.thread_labels[index] = entry.label[0..entry.len];
+        self.snapshot.selected_runtime = "";
+        self.snapshot.selected_model = "";
+        self.snapshot.selected_effort = "";
         self.snapshot.notice = self.view.notice;
         if (self.view.selected) |*selected| {
             self.snapshot.selected_runtime = selected.runtime_kind.slice();
@@ -649,12 +691,101 @@ const Conversation = struct {
     restored_pixel: ?f32 = null,
     restored_revision: ?u64 = null,
     configuration_pending: bool = false,
+    launch_selection: ?Coding.Identity = null,
+    catalog_refresh_pending: bool = false,
+    catalog_refresh_inflight: bool = false,
+    catalog_truncated: bool = false,
+    durable_selection: ?Coding.Identity = null,
+    attempted_selection: ?Coding.Identity = null,
+    notice_storage: [1024]u8 = undefined,
+    diagnostic_storage: [1024]u8 = undefined,
+    diagnostic_len: usize = 0,
+
+    fn notice(self: *Conversation, view: *Coding, message: []const u8) void {
+        const bounded = @import("text/utf8.zig").prefix(message, self.notice_storage.len);
+        @memcpy(self.notice_storage[0..bounded.len], bounded);
+        view.notice = self.notice_storage[0..bounded.len];
+    }
+
+    fn restoreSelection(self: *Conversation, view: *Coding, durable: ?contract.Selection) !void {
+        self.durable_selection = if (durable) |selection| try Coding.Identity.from(selection) else null;
+        if (view.selected != null) return;
+        if (self.durable_selection) |selection| {
+            view.selected = selection;
+        } else if (self.launch_selection) |launch| {
+            // The launch path stays owned by Conversation. Explicit connection
+            // changes clear this fallback before registering another workspace.
+            if (launch.model_id.len != 0 and launch.effort.len != 0) {
+                var bound = launch;
+                bound.workspace = self.workspace;
+                view.selected = bound;
+            }
+        }
+    }
+
+    fn selectionDisabledReason(self: *const Conversation, view: *const Coding) ?[]const u8 {
+        if (self.catalog_refresh_pending or self.catalog_refresh_inflight) return "Loading configured provider models…";
+        const selected = if (view.selected) |*identity| identity else return if (view.model_count == 0)
+            "No models loaded. Open Connection and Refresh models."
+        else
+            "Choose a model and effort before sending.";
+        if (!selected.workspace.eql(self.workspace.slice())) return "Selection belongs to another workspace. Choose a model again.";
+        for (view.models[0..view.model_count]) |*model| {
+            var candidate = model.identity;
+            candidate.effort = selected.effort;
+            if (!contract.equal(candidate.selection(), selected.selection())) continue;
+            if (model.readiness == .unavailable) return if (model.reason_len != 0) model.reason[0..model.reason_len] else "Selected model is unavailable. Open Connection to refresh or sign in.";
+            for (model.efforts[0..model.effort_count]) |effort| if (effort.eql(selected.effort.slice())) return null;
+            return "Selected effort is unsupported. Choose an effort for this model.";
+        }
+        return if (self.catalog_truncated)
+            "Selected model is outside the 32-model view limit. Narrow the connection's model provider."
+        else
+            "Selected model is absent from this catalog. Open Connection and Refresh models, or choose a model.";
+    }
+
+    fn selectionNeedsSave(self: *const Conversation, view: *const Coding) bool {
+        const selected = view.selected orelse return false;
+        if (self.selectionDisabledReason(view) != null) return false;
+        if (self.durable_selection) |durable| if (contract.equal(durable.selection(), selected.selection())) return false;
+        if (self.attempted_selection) |attempted| if (contract.equal(attempted.selection(), selected.selection())) return false;
+        return true;
+    }
+
+    fn rejectionMessage(reason: types.Reason) []const u8 {
+        return switch (reason) {
+            .selection_mismatch => "Model or effort no longer matches the provider. Refresh models and choose again.",
+            .authority_unavailable, .capability_unavailable => "Provider unavailable. Open Connection to check sign-in and refresh models.",
+            .workspace_mismatch => "Workspace changed. Reconnect to the intended checkout before sending.",
+            .revision_conflict => "Conversation changed. Wait for refresh, then retry your action.",
+            .busy => "Provider or conversation is busy. Wait for the current action to finish.",
+            .unresolved_effects => "Previous work has an unresolved outcome. Inspect its status before retrying.",
+            else => @tagName(reason),
+        };
+    }
+
+    fn recordRun(self: *Conversation, view: *Coding, row: @FieldType(types.Row, "run")) !void {
+        self.run = try Id.init(row.id.value);
+        self.run_revision = row.revision;
+        self.run_state = row.state;
+        view.status = @tagName(row.state);
+        if (view.notice) |message| {
+            if (message.ptr == self.diagnostic_storage[0..].ptr) view.notice = null;
+        }
+        const diagnostic = @import("text/utf8.zig").prefix(row.diagnostic, self.diagnostic_storage.len);
+        @memcpy(self.diagnostic_storage[0..diagnostic.len], diagnostic);
+        self.diagnostic_len = diagnostic.len;
+        if (diagnostic.len != 0) view.notice = self.diagnostic_storage[0..diagnostic.len];
+    }
 
     fn setup(self: *Conversation, app: *App, action: @typeInfo(@FieldType(Coding, "setup_action")).optional.child) !void {
         if (self.command != null or self.query != null) return error.WorkspaceBusy;
         switch (action) {
             .status => try self.ask(.runtime_status, .{ .runtime_status = {} }),
-            .refresh => try self.submit(.refresh_models, .absent, .absent, .{ .runtime_refresh = {} }, 0),
+            .refresh => {
+                try self.submit(.refresh_models, .absent, .absent, .{ .runtime_refresh = {} }, 0);
+                self.catalog_refresh_inflight = true;
+            },
             .browser, .device => try self.submit(.login, .absent, .absent, .{ .runtime_login = .{ .runtime_kind = if (app.view.setup_runtime == .codex) .codex else .opencode, .mode = if (action == .browser) .browser else .device } }, 0),
             .configure => try self.submit(.configure, .absent, .absent, .{ .runtime_configure = .{
                 .runtime_kind = if (app.view.setup_runtime == .codex) .codex else .opencode,
@@ -693,10 +824,14 @@ const Conversation = struct {
     }
 
     fn selectThread(self: *Conversation, app: *App, id: Id) !void {
+        const changed_thread = app.view.active_thread.len != 0 and !app.view.active_thread.eql(id.slice());
         try app.view.selectThread(id);
         self.thread = id;
         self.run = .{};
         self.run_state = null;
+        self.durable_selection = null;
+        self.attempted_selection = null;
+        if (changed_thread) app.view.notice = null;
         self.approval_live = false;
         app.view.task_count = 0;
         app.view.active_project = self.project;
@@ -890,7 +1025,7 @@ const Conversation = struct {
     }
 
     const QueryKind = enum { projects, workspaces, threads, thread, models, runtime_status, runs, approvals, tasks, messages, blocks, content };
-    const CommandKind = enum { project, workspace, thread, send, cancel, approval, configure, login, refresh_models };
+    const CommandKind = enum { project, workspace, thread, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
     fn create(allocator: std.mem.Allocator, io: std.Io, host: *domain.Host, file: std.Io.File, wake: *Wake, workspace_root: []const u8) !*Conversation {
@@ -943,6 +1078,10 @@ const Conversation = struct {
     fn act(self: *Conversation, app: *App, intent: @import("ui/coding.zig").Intent) !void {
         switch (intent) {
             .send => {
+                if (self.selectionDisabledReason(&app.view)) |reason| {
+                    self.notice(&app.view, reason);
+                    return;
+                }
                 const selected = if (app.view.selected) |*identity| identity.selection() else return error.ChooseModel;
                 try self.submit(.send, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .thread_send = .{ .text = app.view.editor.textBytes(), .selection = selected } }, app.view.revision);
                 app.view.follow_latest = true;
@@ -991,6 +1130,13 @@ const Conversation = struct {
                 .failure => |value| {
                     if (self.query) |pending| if (pending.ticket.value == value.ticket.value) {
                         self.query = null;
+                        if (pending.kind == .models or pending.kind == .runtime_status) {
+                            self.catalog_refresh_inflight = false;
+                            if (self.configuration_pending) {
+                                self.configuration_pending = false;
+                                self.catalog_refresh_pending = false;
+                            }
+                        }
                         if (value.failure.reason == .cursor_invalid) if (self.recoveryQuery(pending.kind)) |retry| {
                             try self.ask(retry.kind, retry.value);
                             app.view.notice = "History snapshot expired; restoring stable anchor";
@@ -1007,9 +1153,14 @@ const Conversation = struct {
                         }
                     };
                     if (self.command) |pending| if (pending.ticket.value == value.ticket.value) {
+                        if (pending.kind == .refresh_models) self.catalog_refresh_inflight = false;
                         self.command = null;
                     };
-                    app.view.notice = @tagName(value.failure.reason);
+                    self.notice(&app.view, switch (value.failure.reason) {
+                        .storage_unavailable => "Conversation storage unavailable. Check the selected state directory.",
+                        .outcome_unknown => "Provider outcome is unknown. Inspect the conversation before retrying.",
+                        else => @tagName(value.failure.reason),
+                    });
                     if (value.failure.refresh_required) self.refresh = true;
                 },
             }
@@ -1041,7 +1192,7 @@ const Conversation = struct {
                         if (self.history_first == null) self.history_first = .{ .key = tile.key, .cursor = .{ .block = tile.block.index, .byte = tile.start_byte }, .ordinal = self.blocks[self.block_index].ordinal };
                         var width: c_int = 0;
                         _ = c.SDL_GetWindowSize(app.window, &width, null);
-                        app.view.admitTile(app.text, tile, @min(960, @as(f32, @floatFromInt(width)) - 248), .{
+                        app.view.admitTile(app.text, tile, @min(900, @as(f32, @floatFromInt(width)) - Layout.sidebarWidth(@floatFromInt(width)) - 48), .{
                             .message = self.messages[self.message_index],
                             .block = self.blocks[self.block_index].id,
                             .ordinal = self.blocks[self.block_index].ordinal,
@@ -1112,7 +1263,15 @@ const Conversation = struct {
                 self.tile_request = null;
             }
         }
-        if (self.refresh and self.query == null and (self.worker_key == null or self.history_paused) and self.thread.len != 0) {
+        // All discovery runs on Host's worker. Wait for the current query chain;
+        // its output must not race a setup receipt that starts another chain.
+        if (self.catalog_refresh_pending and self.query == null and self.command == null and self.workspace.len != 0 and !self.refresh and (self.worker_key == null or self.history_paused)) {
+            try self.submit(.refresh_models, .absent, .absent, .{ .runtime_refresh = {} }, 0);
+            self.catalog_refresh_pending = false;
+            self.catalog_refresh_inflight = true;
+            app.dirty = true;
+        }
+        if (self.refresh and self.query == null and self.command == null and (self.worker_key == null or self.history_paused) and self.thread.len != 0) {
             self.refresh = false;
             if (app.view.follow_latest) {
                 self.history_paused = false;
@@ -1128,7 +1287,22 @@ const Conversation = struct {
             .completed, .cancelled, .failed, .interrupted, .unknown => true,
             else => false,
         } else true;
-        app.view.can_send = self.thread.len != 0 and app.view.selected != null and terminal and self.command == null and self.query == null and !self.refresh and (self.worker_key == null or self.history_paused);
+        const settled = self.command == null and self.query == null and !self.refresh and (self.worker_key == null or self.history_paused);
+        if (settled and terminal and self.thread.len != 0 and self.selectionNeedsSave(&app.view)) {
+            const selected = app.view.selected.?;
+            try self.submit(.selection, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .thread_select = .{ .selection = selected.selection() } }, 0);
+            self.attempted_selection = selected;
+            app.dirty = true;
+        }
+        app.view.send_disabled_reason = if (self.selectionDisabledReason(&app.view)) |reason| reason else if (self.thread.len == 0)
+            "Opening conversation…"
+        else if (!terminal)
+            "Wait for this run to finish, or cancel it."
+        else if (self.command != null or !settled)
+            "Updating conversation…"
+        else
+            null;
+        app.view.can_send = app.view.send_disabled_reason == null;
         app.view.can_cancel = self.run.len != 0 and !terminal and self.command == null;
         app.view.tasks_enabled = self.command == null and !self.refresh;
         app.view.can_approve = self.approval_live and self.command == null and !self.refresh;
@@ -1147,7 +1321,8 @@ const Conversation = struct {
         if (pending.ticket.value != ticket.value or !std.mem.eql(u8, &pending.id, value.command_id.value)) return error.UnexpectedCommandReceipt;
         self.command = null;
         if (value.outcome == .rejected) {
-            app.view.notice = if (value.reason) |reason| @tagName(reason) else "Command rejected";
+            if (pending.kind == .refresh_models) self.catalog_refresh_inflight = false;
+            self.notice(&app.view, if (value.reason) |reason| rejectionMessage(reason) else "Command rejected. Open Connection to inspect provider status.");
             self.refresh = self.thread.len != 0;
             return;
         }
@@ -1167,6 +1342,7 @@ const Conversation = struct {
                 try self.ask(.threads, .{ .threads = .{ .project = .{ .value = self.project.slice() }, .page = page } });
             },
             .send => {
+                app.view.notice = null;
                 if (app.view.revision == pending.draft_revision) {
                     try app.view.editor.setText("");
                     app.view.revision += 1;
@@ -1179,11 +1355,22 @@ const Conversation = struct {
                 self.approval_live = false;
                 self.refresh = true;
             },
+            .selection => {
+                self.durable_selection = self.attempted_selection;
+                self.attempted_selection = null;
+                self.refresh = true;
+            },
             .configure => {
                 self.configuration_pending = true;
+                self.launch_selection = null;
+                self.catalog_refresh_pending = true;
                 try self.ask(.runtime_status, .{ .runtime_status = {} });
             },
-            .login, .refresh_models => try self.ask(.runtime_status, .{ .runtime_status = {} }),
+            .login => {
+                self.catalog_refresh_pending = true;
+                try self.ask(.runtime_status, .{ .runtime_status = {} });
+            },
+            .refresh_models => try self.ask(.runtime_status, .{ .runtime_status = {} }),
         }
     }
 
@@ -1206,6 +1393,14 @@ const Conversation = struct {
                     const remaining = app.view.runtime_info[app.view.runtime_info_len..];
                     const written = std.fmt.bufPrint(remaining, "{s}: {s} {s}\n{s}\n", .{ status.runtime_kind, @tagName(status.readiness), status.reason, status.login }) catch continue;
                     app.view.runtime_info_len += written.len;
+                    if (status.readiness == .unavailable) {
+                        var message: [1024]u8 = undefined;
+                        self.notice(&app.view, std.fmt.bufPrint(&message, "Provider unavailable: {s}. Open Connection to check paths, sign-in, and Refresh models.", .{@import("text/utf8.zig").prefix(status.reason, 800)}) catch "Provider unavailable. Open Connection to check paths and sign-in.");
+                        if (self.configuration_pending) {
+                            self.configuration_pending = false;
+                            self.catalog_refresh_pending = false;
+                        }
+                    }
                     if (self.configuration_pending and status.workspace_root.len != 0 and status.binding != null) {
                         self.configuration_pending = false;
                         const root = try self.allocator.dupe(u8, status.workspace_root);
@@ -1218,6 +1413,7 @@ const Conversation = struct {
                 }
                 if (self.workspace.len != 0) {
                     app.view.model_count = 0;
+                    self.catalog_truncated = false;
                     try self.ask(.models, .{ .models = .{ .workspace = .{ .value = self.workspace.slice() }, .page = .{ .limit = 32, .max_bytes = 64 * 1024 } } });
                 }
             },
@@ -1227,19 +1423,25 @@ const Conversation = struct {
                     const model = row.model;
                     const target = &app.view.models[app.view.model_count];
                     target.* = .{ .identity = try Coding.Identity.from(model.selection), .readiness = model.readiness, .synthetic = model.synthetic };
-                    target.reason_len = @min(target.reason.len, model.reason.len);
+                    target.reason_len = @import("text/utf8.zig").prefix(model.reason, target.reason.len).len;
                     @memcpy(target.reason[0..target.reason_len], model.reason[0..target.reason_len]);
                     for (model.supported_efforts) |effort| {
                         if (target.effort_count == target.efforts.len) break;
                         target.efforts[target.effort_count] = if (effort.len == 0) .{} else try Id.init(effort);
                         target.effort_count += 1;
                     }
-                    if (app.view.selected == null) app.view.selected = target.identity;
+                    // Only the independent synthetic fixture has an implicit
+                    // default. A real catalog never changes an explicit choice.
+                    if (app.view.selected == null and self.launch_selection == null and target.synthetic and contract.isFakeSelection(target.identity.selection())) app.view.selected = target.identity;
                     app.view.model_count += 1;
                 }
                 if (value.next_cursor != null and app.view.model_count < app.view.models.len) {
                     try self.ask(.models, .{ .models = .{ .workspace = .{ .value = self.workspace.slice() }, .page = .{ .limit = 32, .max_bytes = 64 * 1024, .snapshot = value.snapshot_id, .cursor = value.next_cursor } } });
-                } else try self.askRuns();
+                } else {
+                    self.catalog_truncated = value.next_cursor != null;
+                    self.catalog_refresh_inflight = false;
+                    try self.askRuns();
+                }
             },
             .projects => {
                 for (value.items) |row| try addEntry(&app.view.projects, &app.view.project_count, row.project.id.value, row.project.display_name);
@@ -1266,7 +1468,9 @@ const Conversation = struct {
                 var selected = false;
                 for (value.items) |row| {
                     if (!std.mem.eql(u8, row.thread.workspace.value, self.workspace.slice())) continue;
-                    try addEntry(&app.view.threads, &app.view.thread_count, row.thread.id.value, row.thread.id.value);
+                    var label: [160]u8 = undefined;
+                    const name = try std.fmt.bufPrint(&label, "Chat {d}{s}{s}", .{ app.view.thread_count + 1, if (row.thread.selection != null) " · " else "", if (row.thread.selection) |selection| @import("text/utf8.zig").prefix(selection.model_id, 100) else "" });
+                    try addEntry(&app.view.threads, &app.view.thread_count, row.thread.id.value, name);
                     if (self.thread.len == 0) self.thread = try Id.init(row.thread.id.value);
                     selected = true;
                 }
@@ -1280,24 +1484,23 @@ const Conversation = struct {
                 if (value.items.len != 1) return error.MissingThread;
                 self.thread_revision = value.items[0].thread.revision;
                 self.workspace = try Id.init(value.items[0].thread.workspace.value);
-                if (app.view.selected == null) if (value.items[0].thread.selection) |selection| {
-                    app.view.selected = try Coding.Identity.from(selection);
+                try self.restoreSelection(&app.view, value.items[0].thread.selection);
+                var chat: []const u8 = "Chat";
+                for (app.view.threads[0..app.view.thread_count]) |*entry| if (entry.id.eql(self.thread.slice())) {
+                    chat = entry.label[0..entry.len];
+                    break;
                 };
-                const label = try std.fmt.bufPrint(&app.view.workspace_label, "{s}  •  {s}", .{ @import("text/utf8.zig").prefix(self.workspace_root, 384), self.thread.slice() });
+                const label = try std.fmt.bufPrint(&app.view.workspace_label, "{s}  •  {s}", .{ @import("text/utf8.zig").prefix(self.workspace_root, 320), chat });
                 app.view.workspace_label_len = label.len;
                 if (self.subscription == null and self.subscribe_ticket == null) self.subscribe_ticket = try self.host.subscribe(.{ .scope = .all, .after_position = value.snapshot_position, .max_batch_bytes = 16 * 1024 });
                 self.runs_cursor = null;
                 self.runs_snapshot = null;
                 app.view.model_count = 0;
+                self.catalog_truncated = false;
                 try self.ask(.models, .{ .models = .{ .workspace = .{ .value = self.workspace.slice() }, .page = .{ .limit = 32, .max_bytes = 64 * 1024 } } });
             },
             .runs => {
-                for (value.items) |row| {
-                    self.run = try Id.init(row.run.id.value);
-                    self.run_revision = row.run.revision;
-                    self.run_state = row.run.state;
-                    app.view.status = @tagName(row.run.state);
-                }
+                for (value.items) |row| try self.recordRun(&app.view, row.run);
                 if (self.run_state == null) app.view.status = "Ready";
                 if (value.next_cursor) |cursor| {
                     self.runs_cursor = try Id.init(cursor);
@@ -1690,4 +1893,143 @@ test "changed history revision restarts canonical block after Markdown append sh
         try std.testing.expectEqualStrings("History revision changed while away", view.notice.?);
         try std.testing.expect(!view.follow_latest);
     }
+}
+
+const usability_selection: contract.Selection = .{ .runtime_kind = "opencode", .required_runtime_version = "2.1.4", .model_provider = "fixture-provider", .model_id = "explicit-model", .effort = "high", .account_ref = "/isolated/account", .workspace = .{ .value = "durable-workspace" } };
+
+test "send requires complete catalog identity and negotiated effort without claiming entitlement" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    conversation.workspace = try Id.init(usability_selection.workspace.value);
+    view.selected = try Coding.Identity.from(usability_selection);
+    var catalog = usability_selection;
+    catalog.effort = "medium";
+    view.models[0] = .{ .identity = try Coding.Identity.from(catalog), .readiness = .unknown, .efforts = @splat(.{}), .effort_count = 2 };
+    view.models[0].efforts[0] = try Id.init("medium");
+    view.models[0].efforts[1] = try Id.init("high");
+    view.model_count = 1;
+    try std.testing.expect(conversation.selectionDisabledReason(&view) == null);
+    try std.testing.expectEqualStrings("high", view.selected.?.effort.slice());
+    view.models[0].readiness = .ready;
+    try std.testing.expect(conversation.selectionDisabledReason(&view) == null);
+    view.models[0].readiness = .unavailable;
+    try std.testing.expect(conversation.selectionDisabledReason(&view) != null);
+    view.models[0].readiness = .unknown;
+    inline for (.{ "runtime_kind", "required_runtime_version", "model_provider", "model_id", "account_ref", "workspace", "effort" }) |field| {
+        const old = @field(view.selected.?, field);
+        @field(view.selected.?, field) = try Id.init("different-identity");
+        try std.testing.expect(conversation.selectionDisabledReason(&view) != null);
+        @field(view.selected.?, field) = old;
+    }
+    view.selected.?.capability_revision += 1;
+    try std.testing.expect(conversation.selectionDisabledReason(&view) != null);
+    view.selected.?.capability_revision -= 1;
+    view.model_count = 0;
+    conversation.catalog_truncated = true;
+    try std.testing.expect(std.mem.indexOf(u8, conversation.selectionDisabledReason(&view).?, "32-model view limit") != null);
+    try std.testing.expect(contract.equal(view.selected.?.selection(), usability_selection));
+}
+
+test "launch seeds explicit connection without putting long paths in bounded workspace IDs" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    app.conversation = &conversation;
+    var launch = usability_selection;
+    var path: [700]u8 = @splat('p');
+    path[0] = '/';
+    launch.workspace.value = &path;
+    conversation.workspace_root = &path;
+    try app.configureRuntime(launch, &path);
+    try std.testing.expectEqual(.opencode, app.view.setup_runtime);
+    try std.testing.expectEqualStrings(launch.account_ref, app.view.setup_fields[1][0..app.view.setup_lengths[1]]);
+    try std.testing.expectEqualStrings(launch.model_provider, app.view.setup_fields[3][0..app.view.setup_lengths[3]]);
+    try std.testing.expectEqual(@as(usize, 0), app.view.setup_lengths[0]);
+    try std.testing.expectEqual(@as(usize, 0), app.view.setup_lengths[2]);
+    try std.testing.expect(app.view.notice != null);
+    try std.testing.expect(conversation.catalog_refresh_pending);
+    try std.testing.expectEqual(@as(u16, 0), conversation.launch_selection.?.workspace.len);
+    conversation.workspace = try Id.init("registered-id");
+    try conversation.restoreSelection(&app.view, null);
+    launch.workspace = .{ .value = conversation.workspace.slice() };
+    try std.testing.expect(contract.equal(launch, app.view.selected.?.selection()));
+    // A connection-only CLI launch asks for a model after discovery.
+    launch.model_id = "";
+    launch.effort = "";
+    try app.configureRuntime(launch, "/runtime");
+    app.view.selected = null;
+    try conversation.restoreSelection(&app.view, null);
+    try std.testing.expect(app.view.selected == null);
+}
+
+test "durable and retained choices take precedence over launch and survive catalog default changes" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    var root = [_]u8{'/'};
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = &root };
+    conversation.workspace = try Id.init(usability_selection.workspace.value);
+    var launch = usability_selection;
+    launch.model_id = "launch-model";
+    conversation.launch_selection = try Coding.Identity.from(launch);
+    try conversation.restoreSelection(&view, usability_selection);
+    try std.testing.expect(contract.equal(usability_selection, view.selected.?.selection()));
+    try view.selectThread(try Id.init("first"));
+    view.selected.?.effort = try Id.init("medium");
+    try view.selectThread(try Id.init("second"));
+    try conversation.restoreSelection(&view, null);
+    try std.testing.expectEqualStrings("launch-model", view.selected.?.model_id.slice());
+    try view.selectThread(try Id.init("first"));
+    // A refreshed durable row must not overwrite an unsent retained choice.
+    try conversation.restoreSelection(&view, usability_selection);
+    try std.testing.expectEqualStrings("explicit-model", view.selected.?.model_id.slice());
+    try std.testing.expectEqualStrings("medium", view.selected.?.effort.slice());
+}
+
+test "rejected selection persistence does not spin or overwrite the exact user choice" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    conversation.thread = try Id.init("thread");
+    conversation.workspace = try Id.init(usability_selection.workspace.value);
+    app.view.selected = try Coding.Identity.from(usability_selection);
+    app.view.models[0] = .{ .identity = app.view.selected.?, .readiness = .unknown, .efforts = @splat(.{}), .effort_count = 2 };
+    app.view.models[0].efforts[0] = try Id.init("high");
+    app.view.models[0].efforts[1] = try Id.init("medium");
+    app.view.model_count = 1;
+    try std.testing.expect(conversation.selectionNeedsSave(&app.view));
+    conversation.attempted_selection = app.view.selected;
+    const id = [_]u8{'a'} ** 32;
+    conversation.command = .{ .ticket = .{ .value = 7 }, .kind = .selection, .draft_revision = 0, .id = id };
+    try conversation.receipt(&app, .{ .value = 7 }, .{ .command_id = .{ .value = &id }, .outcome = .rejected, .reason = .busy, .commit_sequence = 1 });
+    try std.testing.expect(!conversation.selectionNeedsSave(&app.view));
+    try std.testing.expect(contract.equal(usability_selection, app.view.selected.?.selection()));
+    app.view.selected.?.effort = try Id.init("medium");
+    try std.testing.expect(conversation.selectionNeedsSave(&app.view));
+    conversation.attempted_selection = app.view.selected;
+    conversation.command = .{ .ticket = .{ .value = 8 }, .kind = .selection, .draft_revision = 0, .id = id };
+    try conversation.receipt(&app, .{ .value = 8 }, .{ .command_id = .{ .value = &id }, .outcome = .accepted, .commit_sequence = 2 });
+    try std.testing.expect(!conversation.selectionNeedsSave(&app.view));
+    try std.testing.expectEqualStrings("medium", conversation.durable_selection.?.effort.slice());
+}
+
+test "run diagnostics own bounded UTF8 bytes and clear when the latest run recovers" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    var diagnostic: [1030]u8 = @splat('x');
+    @memcpy(diagnostic[1023..1026], "€");
+    var row: @FieldType(types.Row, "run") = .{ .id = .{ .value = "run" }, .revision = 2, .thread = .{ .value = "thread" }, .session = .{ .value = "session" }, .state = .failed, .requested = usability_selection, .effective = null, .diagnostic = &diagnostic };
+    try conversation.recordRun(&view, row);
+    try std.testing.expectEqual(@as(usize, 1023), view.notice.?.len);
+    diagnostic[0] = 'y';
+    try std.testing.expectEqual(@as(u8, 'x'), view.notice.?[0]);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(view.notice.?));
+    row.state = .completed;
+    row.diagnostic = "";
+    try conversation.recordRun(&view, row);
+    try std.testing.expect(view.notice == null);
+    try std.testing.expectEqualStrings("completed", view.status);
 }

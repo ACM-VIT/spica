@@ -176,6 +176,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // Derived content is descriptor-owned and disappears even after a crash.
         try dir.deleteFile(threaded.io(), ".ui-projection");
         try app.connect(threaded.io(), host.?, spool, &wake, if (provider.selection) |selection| selection.workspace.value else workspace_buffer[0..workspace_length]);
+        if (provider.selection) |selection| try app.configureRuntime(selection, provider.configs[0].executable);
     }
     if (options.lua_module) |path| try app.configureLua(threaded.io(), path, &wake);
     if (options.automation_live) |path| try app.enableLive(threaded.io(), path);

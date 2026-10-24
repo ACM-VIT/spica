@@ -38,6 +38,7 @@ pub const View = struct {
     tasks_enabled: bool = false,
     task_cancel: ?TaskCancel = null,
     can_send: bool = false,
+    send_disabled_reason: ?[]const u8 = null,
     can_cancel: bool = false,
     can_approve: bool = false,
     intent: ?Intent = null,
@@ -66,11 +67,28 @@ pub const View = struct {
     model_count: usize = 0,
     selected: ?Identity = null,
     picker_open: bool = false,
+    picker_scroll: f32 = 0,
+    picker_menu: c.SDL_FRect = zero_rect,
+    picker_rows: c.SDL_FRect = zero_rect,
+    picker_hover: usize = 0,
+    sidebar_bounds: c.SDL_FRect = zero_rect,
+    sidebar_rows: c.SDL_FRect = zero_rect,
+    sidebar_scroll: f32 = 0,
+    new_project_bounds: c.SDL_FRect = zero_rect,
+    new_thread_bounds: c.SDL_FRect = zero_rect,
+    project_bounds: [16]c.SDL_FRect = @splat(zero_rect),
+    thread_bounds: [32]c.SDL_FRect = @splat(zero_rect),
     setup_open: bool = false,
     setup_runtime: enum { codex, opencode } = .codex,
     setup_fields: [4][512]u8 = undefined,
     setup_lengths: [4]usize = @splat(0),
     setup_field: usize = 0,
+    setup_select_all: bool = false,
+    setup_menu: c.SDL_FRect = zero_rect,
+    setup_runtime_bounds: c.SDL_FRect = zero_rect,
+    setup_close_bounds: c.SDL_FRect = zero_rect,
+    setup_field_bounds: [4]c.SDL_FRect = @splat(zero_rect),
+    setup_button_bounds: [4]c.SDL_FRect = @splat(zero_rect),
     setup_action: ?enum { configure, browser, device, status, refresh } = null,
     runtime_info: [4096]u8 = undefined,
     runtime_info_len: usize = 0,
@@ -90,6 +108,9 @@ pub const View = struct {
     navigation_enabled: bool = false,
     retained: [16]Retained = @splat(.{}),
     retained_clock: u64 = 0,
+    const zero_rect: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    pub const picker_row_height: f32 = 48;
+
     pub const Identity = struct {
         runtime_kind: transcript.Id = .{},
         required_runtime_version: transcript.Id = .{},
@@ -184,9 +205,11 @@ pub const View = struct {
     fn setupInsert(self: *View, bytes: []const u8) !void {
         if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
         const len = &self.setup_lengths[self.setup_field];
-        if (len.* + bytes.len > 512) return error.TextTooLarge;
-        @memcpy(self.setup_fields[self.setup_field][len.*..][0..bytes.len], bytes);
-        len.* += bytes.len;
+        const start = if (self.setup_select_all) 0 else len.*;
+        if (start + bytes.len > 512) return error.TextTooLarge;
+        @memcpy(self.setup_fields[self.setup_field][start..][0..bytes.len], bytes);
+        len.* = start + bytes.len;
+        self.setup_select_all = false;
     }
     pub const HistoryMove = enum { previous, next, first, latest };
     pub const ThreadHistory = struct {
@@ -270,7 +293,7 @@ pub const View = struct {
             .cancel => self.can_cancel,
             .allow, .deny => self.can_approve,
         };
-        if (enabled) self.intent = intent else self.notice = "Action unavailable in the current durable state";
+        if (enabled) self.intent = intent else self.notice = if (intent == .send) self.send_disabled_reason orelse (if (self.editor.len == 0) "Write a message before sending" else "Send is unavailable. Check the connection and selected model.") else "Action unavailable in the current durable state";
     }
 
     /// Worker completions carry explicit source/revision/generation identity.
@@ -388,6 +411,44 @@ pub const View = struct {
         };
     }
 
+    fn sameModel(a: Identity, b: Identity) bool {
+        return a.runtime_kind.eql(b.runtime_kind.slice()) and a.required_runtime_version.eql(b.required_runtime_version.slice()) and a.model_provider.eql(b.model_provider.slice()) and a.model_id.eql(b.model_id.slice()) and a.account_ref.eql(b.account_ref.slice()) and a.workspace.eql(b.workspace.slice()) and a.capability_revision == b.capability_revision;
+    }
+
+    fn pickerMaxScroll(self: *const View) f32 {
+        return @max(0, @as(f32, @floatFromInt(self.model_count)) * picker_row_height - self.picker_rows.h);
+    }
+
+    pub fn pickerIndexAt(self: *const View, x: f32, y: f32) ?usize {
+        if (!widgets.contains(self.picker_rows, x, y)) return null;
+        const index: usize = @intFromFloat((y - self.picker_rows.y + self.picker_scroll) / picker_row_height);
+        return if (index < self.model_count) index else null;
+    }
+
+    /// Visible intersection, shared by automation and pointer hit testing.
+    pub fn pickerRowBounds(self: *const View, index: usize) c.SDL_FRect {
+        if (index >= self.model_count) return zero_rect;
+        const top = self.picker_rows.y + @as(f32, @floatFromInt(index)) * picker_row_height - self.picker_scroll;
+        const bottom = @min(top + picker_row_height, self.picker_rows.y + self.picker_rows.h);
+        const y = @max(top, self.picker_rows.y);
+        return .{ .x = self.picker_rows.x, .y = y, .w = self.picker_rows.w, .h = @max(0, bottom - y) };
+    }
+
+    pub fn threadRowBounds(self: *const View, index: usize) c.SDL_FRect {
+        if (index >= self.thread_count) return zero_rect;
+        const row = self.thread_bounds[index];
+        const top = @max(row.y, self.sidebar_rows.y);
+        const bottom = @min(row.y + row.h, self.sidebar_rows.y + self.sidebar_rows.h);
+        return .{ .x = row.x, .y = top, .w = row.w, .h = @max(0, bottom - top) };
+    }
+
+    fn revealPickerRow(self: *View) void {
+        const top = @as(f32, @floatFromInt(self.picker_hover)) * picker_row_height;
+        if (top < self.picker_scroll) self.picker_scroll = top;
+        if (top + picker_row_height > self.picker_scroll + self.picker_rows.h) self.picker_scroll = top + picker_row_height - self.picker_rows.h;
+        self.picker_scroll = std.math.clamp(self.picker_scroll, 0, self.pickerMaxScroll());
+    }
+
     fn hasComposer(self: *const View) bool {
         const root = self.custom_root orelse return true;
         for (root.nodes[0..root.count]) |node| if (node.kind == 4) return true;
@@ -415,18 +476,41 @@ pub const View = struct {
                     const x = event.button.x;
                     const y = event.button.y;
                     if (self.setup_open) {
-                        if (y >= 140 and y < 332) self.setup_field = @min(3, @as(usize, @intFromFloat((y - 140) / 48)));
-                        if (y >= 100 and y < 132) self.setup_runtime = if (self.setup_runtime == .codex) .opencode else .codex;
-                        if (y >= 350 and y < 384) self.setup_action = if (x < 400) .configure else if (x < 540) .browser else if (x < 680) .device else .refresh;
+                        if (widgets.contains(self.setup_close_bounds, x, y)) self.setup_open = false;
+                        if (widgets.contains(self.setup_runtime_bounds, x, y)) self.setup_runtime = if (self.setup_runtime == .codex) .opencode else .codex;
+                        for (self.setup_field_bounds, 0..) |box, index| if (widgets.contains(box, x, y)) {
+                            self.setup_field = index;
+                            self.setup_select_all = true;
+                        };
+                        for (self.setup_button_bounds, 0..) |box, index| if (widgets.contains(box, x, y)) {
+                            if (self.setup_runtime == .opencode and (index == 1 or index == 2)) break;
+                            self.setup_action = switch (index) {
+                                0 => .configure,
+                                1 => .browser,
+                                2 => .device,
+                                else => .refresh,
+                            };
+                        };
+                        return true;
+                    }
+                    // An open menu owns pointer input, including outside dismissal.
+                    if (self.picker_open) {
+                        if (self.pickerIndexAt(x, y)) |index| self.selected = self.models[index].identity;
+                        self.picker_open = false;
                         return true;
                     }
                     if (widgets.contains(self.picker_bounds, x, y)) {
-                        self.picker_open = !self.picker_open;
+                        self.picker_open = true;
+                        self.picker_hover = 0;
+                        for (self.models[0..self.model_count], 0..) |*model, index| if (self.selected) |*selected| {
+                            if (sameModel(model.identity, selected.*)) self.picker_hover = index;
+                        };
+                        self.revealPickerRow();
                         return true;
                     }
                     if (widgets.contains(self.effort_bounds, x, y)) {
                         if (self.selected) |*selected| for (self.models[0..self.model_count]) |model| {
-                            if (!model.identity.model_id.eql(selected.model_id.slice()) or !model.identity.account_ref.eql(selected.account_ref.slice())) continue;
+                            if (!sameModel(model.identity, selected.*)) continue;
                             for (model.efforts[0..model.effort_count], 0..) |effort, index| if (effort.eql(selected.effort.slice())) {
                                 selected.effort = model.efforts[(index + 1) % model.effort_count];
                                 break;
@@ -436,30 +520,28 @@ pub const View = struct {
                     }
                     if (widgets.contains(self.setup_bounds, x, y)) {
                         self.setup_open = true;
+                        self.picker_open = false;
                         self.setup_action = .status;
+                        try self.focus(window, true);
                         return true;
                     }
                     if (widgets.contains(self.follow_bounds, x, y)) {
                         self.history_move = .latest;
                         return true;
                     }
-                    if (self.picker_open) {
-                        if (y >= 76 and y < 76 + @as(f32, @floatFromInt(self.model_count)) * 38) {
-                            const index: usize = @intFromFloat((y - 76) / 38);
-                            self.selected = self.models[index].identity;
+                    if (self.navigation_enabled and widgets.contains(self.sidebar_bounds, x, y)) {
+                        if (widgets.contains(self.new_project_bounds, x, y)) self.navigation = .new_project;
+                        if (widgets.contains(self.new_thread_bounds, x, y)) self.navigation = .new_thread;
+                        if (widgets.contains(self.sidebar_rows, x, y)) {
+                            for (self.project_bounds[0..self.project_count], 0..) |box, index| if (widgets.contains(box, x, y)) {
+                                self.navigation = .{ .project = index };
+                            };
+                            for (self.thread_bounds[0..self.thread_count], 0..) |box, index| if (widgets.contains(box, x, y)) {
+                                self.navigation = .{ .thread = index };
+                            };
                         }
-                        self.picker_open = false;
                         return true;
                     }
-                }
-                if (self.custom_root == null and self.navigation_enabled and event.button.x < 208) {
-                    const y = event.button.y;
-                    if (y >= 68 and y < 98) self.navigation = .new_project;
-                    if (y >= 104 and y < 134) self.navigation = .new_thread;
-                    if (y >= 148 and y < 148 + @as(f32, @floatFromInt(self.project_count)) * 26) self.navigation = .{ .project = @intFromFloat((y - 148) / 26) };
-                    const start = 168 + @as(f32, @floatFromInt(self.project_count)) * 26;
-                    if (y >= start and y < start + @as(f32, @floatFromInt(self.thread_count)) * 28) self.navigation = .{ .thread = @intFromFloat((y - start) / 28) };
-                    return true;
                 }
                 if (self.custom_root) |root| {
                     for (root.nodes[0..root.count], 0..) |node, index| {
@@ -510,6 +592,11 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_MOUSE_MOTION => {
+                if (self.custom_root == null and self.picker_open) {
+                    if (self.pickerIndexAt(event.motion.x, event.motion.y)) |index| self.picker_hover = index;
+                    return true;
+                }
+
                 if (self.transcript_drag) |index| {
                     const tile = &self.rich_tiles[index];
                     _ = tile.hit(std.math.clamp(event.motion.x, tile.bounds.x, tile.bounds.x + tile.bounds.w - 1), std.math.clamp(event.motion.y, tile.bounds.y, tile.bounds.y + tile.bounds.h - 1), true);
@@ -522,6 +609,17 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_MOUSE_WHEEL => {
+                const wheel_direction: f32 = if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) -1 else 1;
+                if (self.custom_root == null and self.setup_open) return true;
+                if (self.custom_root == null and self.picker_open) {
+                    if (widgets.contains(self.picker_menu, event.wheel.mouse_x, event.wheel.mouse_y)) self.picker_scroll = std.math.clamp(self.picker_scroll - event.wheel.y * wheel_direction * picker_row_height, 0, self.pickerMaxScroll());
+                    return true;
+                }
+                if (self.custom_root == null and widgets.contains(self.sidebar_bounds, event.wheel.mouse_x, event.wheel.mouse_y)) {
+                    const height = @as(f32, @floatFromInt(self.project_count)) * 30 + @as(f32, @floatFromInt(self.thread_count)) * 36 + 32;
+                    self.sidebar_scroll = std.math.clamp(self.sidebar_scroll - event.wheel.y * wheel_direction * 36, 0, @max(0, height - self.sidebar_rows.h));
+                    return true;
+                }
                 if (widgets.contains(self.transcript_bounds, event.wheel.mouse_x, event.wheel.mouse_y)) {
                     const direction: f32 = if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) -1 else 1;
                     if (event.wheel.y * direction > 0 and self.transcript_scroll == 0) self.history_move = .previous;
@@ -537,6 +635,7 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_TEXT_EDITING => {
+                if (self.custom_root == null and (self.setup_open or self.picker_open)) return true;
                 if (!self.hasComposer() or !self.focused or !self.window_active) return false;
                 const bytes = std.mem.span(event.edit.text);
                 self.preedit_changed = true;
@@ -550,6 +649,7 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_TEXT_INPUT => {
+                if (self.custom_root == null and self.picker_open) return true;
                 if (self.setup_open and self.custom_root == null) {
                     try self.setupInsert(std.mem.span(event.text.text));
                     return true;
@@ -568,11 +668,18 @@ pub const View = struct {
                 const shift = mods & c.SDL_KMOD_SHIFT != 0;
                 if (self.setup_open and self.custom_root == null) {
                     if (key == c.SDLK_ESCAPE) self.setup_open = false;
-                    if (key == c.SDLK_TAB) self.setup_field = (self.setup_field + 1) % 4;
+                    if (key == c.SDLK_TAB) {
+                        self.setup_field = (self.setup_field + (if (shift) @as(usize, 3) else 1)) % 4;
+                        self.setup_select_all = true;
+                    }
+                    if (ctrl and key == c.SDLK_A) self.setup_select_all = true;
                     if (key == c.SDLK_RETURN) self.setup_action = .configure;
-                    if (key == c.SDLK_BACKSPACE) {
+                    if (key == c.SDLK_BACKSPACE or (key == c.SDLK_DELETE and self.setup_select_all)) {
                         const len = &self.setup_lengths[self.setup_field];
-                        if (len.* > 0) {
+                        if (self.setup_select_all) {
+                            len.* = 0;
+                            self.setup_select_all = false;
+                        } else if (len.* > 0) {
                             len.* -= 1;
                             while (len.* > 0 and self.setup_fields[self.setup_field][len.*] & 0xc0 == 0x80) len.* -= 1;
                         }
@@ -582,6 +689,20 @@ pub const View = struct {
                         defer c.SDL_free(value);
                         try self.setupInsert(std.mem.span(value));
                     }
+                    return true;
+                }
+                if (self.picker_open and self.custom_root == null) {
+                    switch (key) {
+                        c.SDLK_ESCAPE => self.picker_open = false,
+                        c.SDLK_UP => self.picker_hover -|= 1,
+                        c.SDLK_DOWN => self.picker_hover = @min(self.model_count -| 1, self.picker_hover + 1),
+                        c.SDLK_RETURN => {
+                            if (self.picker_hover < self.model_count) self.selected = self.models[self.picker_hover].identity;
+                            self.picker_open = false;
+                        },
+                        else => {},
+                    }
+                    self.revealPickerRow();
                     return true;
                 }
                 if (!ctrl and mods & c.SDL_KMOD_ALT != 0 and self.window_active) {
@@ -692,48 +813,233 @@ pub const View = struct {
         self.preedit_changed = false;
     }
 
+    fn workspaceName(self: *const View) []const u8 {
+        const label = self.workspace_label[0..self.workspace_label_len];
+        const end = std.mem.indexOf(u8, label, "  •  ") orelse label.len;
+        const path = std.mem.trimEnd(u8, label[0..end], "/");
+        if (path.len == 0) return if (label.len == 0) "Workspace" else "/";
+        const start = if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| slash + 1 else 0;
+        return path[start..];
+    }
+
+    fn runtimeName(identity: *const Identity) []const u8 {
+        return if (identity.runtime_kind.eql("opencode")) "OpenCode" else if (identity.runtime_kind.eql("codex")) "Codex" else if (identity.runtime_kind.eql("fake")) "Demo" else identity.runtime_kind.slice();
+    }
+
+    const EmptyState = struct { description: []const u8, context: []const u8 };
+    fn emptyState(self: *const View, buffer: []u8) !EmptyState {
+        if (self.selected) |*selected| {
+            if (selected.runtime_kind.eql("fake")) return .{
+                .description = self.send_disabled_reason orelse "Try a message to explore the conversation controls.",
+                .context = "Demo is synthetic. Connect a coding provider to work on files.",
+            };
+            return .{
+                .description = self.send_disabled_reason orelse if (self.can_send) "Describe a change, ask a question, or continue your work." else "Preparing the selected model…",
+                .context = try std.fmt.bufPrint(buffer, "{s} · {s} · {s}", .{ runtimeName(selected), selected.model_id.slice(), self.workspaceName() }),
+            };
+        }
+        return .{
+            .description = self.send_disabled_reason orelse "Choose a model below to start a conversation.",
+            .context = "Manage your runtime and workspace in Connection.",
+        };
+    }
+
+    fn modelSubtitle(model: *const Model, buffer: []u8) ![]const u8 {
+        if (model.readiness == .unavailable and model.reason_len != 0) return std.fmt.bufPrint(buffer, "{s} · unavailable · {s}", .{ model.identity.model_provider.slice(), model.reason[0..model.reason_len] });
+        return std.fmt.bufPrint(buffer, "{s} · {d} effort option{s} · {s}", .{ model.identity.model_provider.slice(), model.effort_count, if (model.effort_count == 1) "" else "s", switch (model.readiness) {
+            .ready => "ready",
+            .unknown => "availability unverified",
+            .unavailable => "unavailable",
+        } });
+    }
+
+    fn drawChrome(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
+        const sidebar = Layout.sidebarWidth(bounds.header.width);
+        const height = bounds.composer.y + bounds.composer.height + 16;
+        self.sidebar_bounds = .{ .x = 0, .y = 0, .w = sidebar, .h = height };
+        try widgets.panel(renderer, self.sidebar_bounds, 0, .{ .r = 15, .g = 18, .b = 23 });
+        try self.labels.draw(text, "Spica", 20, 20, 18, foreground);
+        self.new_thread_bounds = .{ .x = 12, .y = 64, .w = sidebar - 24, .h = 34 };
+        self.new_project_bounds = .{ .x = 12, .y = 104, .w = sidebar - 24, .h = 30 };
+        try widgets.panel(renderer, self.new_thread_bounds, 6, .{ .r = 35, .g = 40, .b = 49 });
+        try self.labels.draw(text, "+ New chat", 24, 73, 13, foreground);
+        try self.labels.draw(text, "+ New project", 24, 112, 12, muted);
+        try self.labels.draw(text, "PROJECTS", 20, 151, 10, muted);
+        self.sidebar_rows = .{ .x = 8, .y = 174, .w = sidebar - 16, .h = @max(0, height - 230) };
+        const rows_height = @as(f32, @floatFromInt(self.project_count)) * 30 + @as(f32, @floatFromInt(self.thread_count)) * 36 + 32;
+        self.sidebar_scroll = std.math.clamp(self.sidebar_scroll, 0, @max(0, rows_height - self.sidebar_rows.h));
+        var clip = widgets.Clip.push(renderer, self.sidebar_rows);
+        defer clip.restore(renderer);
+        var y = self.sidebar_rows.y - self.sidebar_scroll;
+        self.project_bounds = @splat(zero_rect);
+        self.thread_bounds = @splat(zero_rect);
+        var project_name: []const u8 = "Workspace";
+        var thread_name: []const u8 = "New chat";
+        for (self.projects[0..self.project_count], 0..) |*entry, index| {
+            const active = entry.id.eql(self.active_project.slice());
+            if (active) project_name = entry.label[0..entry.len];
+            self.project_bounds[index] = .{ .x = 12, .y = y, .w = sidebar - 24, .h = 28 };
+            if (y + 28 > self.sidebar_rows.y and y < self.sidebar_rows.y + self.sidebar_rows.h) try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], 20, y + 7, sidebar - 40, 12, if (active) foreground else muted);
+            y += 30;
+        }
+        try self.labels.draw(text, "CHATS", 20, y + 12, 10, muted);
+        y += 32;
+        for (self.threads[0..self.thread_count], 0..) |*entry, index| {
+            const active = entry.id.eql(self.active_thread.slice());
+            if (active) thread_name = entry.label[0..entry.len];
+            const row = c.SDL_FRect{ .x = 12, .y = y, .w = sidebar - 24, .h = 32 };
+            self.thread_bounds[index] = row;
+            if (y + 32 > self.sidebar_rows.y and y < self.sidebar_rows.y + self.sidebar_rows.h) {
+                if (active) try widgets.panel(renderer, row, 6, .{ .r = 39, .g = 45, .b = 56 });
+                try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], 22, y + 8, sidebar - 44, 13, if (active) foreground else muted);
+            }
+            y += 36;
+        }
+        clip.restore(renderer);
+        try self.labels.draw(text, "Enter to send", 20, height - 44, 11, muted);
+        try self.labels.draw(text, "Shift+Enter newline", 20, height - 26, 10, muted);
+        self.setup_bounds = .{ .x = bounds.header.width - 134, .y = 16, .w = 118, .h = 32 };
+        try widgets.panel(renderer, self.setup_bounds, 5, .{ .r = 35, .g = 40, .b = 49 });
+        try self.labels.draw(text, "Connection", self.setup_bounds.x + 18, 25, 12, foreground);
+        var title: [512]u8 = undefined;
+        const label = try std.fmt.bufPrint(&title, "{s}  /  {s}", .{ project_name, thread_name });
+        const header_x = sidebar + 24;
+        try self.labels.drawFitted(renderer, text, label, header_x, 15, self.setup_bounds.x - header_x - 16, 16, foreground);
+        var workspace_info: [1024]u8 = undefined;
+        const workspace_status = try std.fmt.bufPrint(&workspace_info, "{s}  ·  {s}", .{ self.workspaceName(), @import("../text/utf8.zig").prefix(self.status, 128) });
+        try self.labels.drawFitted(renderer, text, workspace_status, header_x, 40, self.setup_bounds.x - header_x - 16, 11, muted);
+        self.follow_bounds = if (self.follow_latest) zero_rect else .{ .x = bounds.transcript.x + bounds.transcript.width - 128, .y = bounds.transcript.y + bounds.transcript.height - 32, .w = 128, .h = 28 };
+        for (self.tasks[0..self.task_count], 0..) |*task, index| {
+            const task_y = bounds.transcript.y + @as(f32, @floatFromInt(index)) * 24;
+            try self.labels.drawFitted(renderer, text, task.bytes[0..task.len], bounds.transcript.x, task_y, bounds.transcript.width - 84, 12, muted);
+            task.cancel_bounds = .{ .x = bounds.transcript.x + bounds.transcript.width - 76, .y = task_y, .w = 76, .h = 20 };
+            if (task.cancel != null) {
+                try widgets.panel(renderer, task.cancel_bounds, 3, .{ .r = 35, .g = 40, .b = 49 });
+                try self.labels.draw(text, "Cancel task", task.cancel_bounds.x + 4, task_y + 2, 11, foreground);
+            }
+        }
+    }
+
+    fn drawComposerControls(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, panel: c.SDL_FRect, foreground: Color, muted: Color) !void {
+        self.controls = @splat(zero_rect);
+        const y = panel.y + panel.h - 62;
+        const primary: usize = if (self.can_cancel) 1 else 0;
+        self.controls[primary] = .{ .x = panel.x + panel.w - 90, .y = y, .w = 80, .h = 30 };
+        self.effort_bounds = .{ .x = self.controls[primary].x - 114, .y = y, .w = 104, .h = 30 };
+        const model_x = panel.x + 10;
+        const model_width = @min(270, @max(0, self.effort_bounds.x - 10 - model_x));
+        self.picker_bounds = .{ .x = model_x, .y = y, .w = model_width, .h = 30 };
+        // Keep menu geometry current while closed, so first-open keyboard
+        // reveal uses the same viewport as the next paint.
+        const menu_height = @min(344, @max(96, y - 80));
+        self.picker_menu = .{ .x = panel.x, .y = y - menu_height - 6, .w = @min(600, panel.w), .h = menu_height };
+        self.picker_rows = .{ .x = self.picker_menu.x + 8, .y = self.picker_menu.y + 38, .w = self.picker_menu.w - 16, .h = menu_height - 64 };
+
+        try widgets.panel(renderer, self.picker_bounds, 5, .{ .r = 35, .g = 40, .b = 49 });
+        try widgets.panel(renderer, self.effort_bounds, 5, .{ .r = 35, .g = 40, .b = 49 });
+        var model_label: [512]u8 = undefined;
+        const label = if (self.selected) |*selected| try std.fmt.bufPrint(&model_label, "{s}  ▾", .{if (selected.runtime_kind.eql("fake")) "Demo · synthetic" else selected.model_id.slice()}) else "Choose model  ▾";
+        try self.labels.drawFitted(renderer, text, label, self.picker_bounds.x + 8, y + 8, model_width - 16, 12, foreground);
+        var effort_label: [320]u8 = undefined;
+        const effort = if (self.selected) |*selected| try std.fmt.bufPrint(&effort_label, "{s}  ↻", .{selected.effort.slice()}) else "Effort";
+        try self.labels.drawFitted(renderer, text, effort, self.effort_bounds.x + 8, y + 8, 86, 12, muted);
+        const enabled = if (primary == 1) self.can_cancel else self.can_send and self.editor.len != 0;
+        try widgets.panel(renderer, self.controls[primary], 5, if (enabled) .{ .r = 56, .g = 83, .b = 138 } else .{ .r = 35, .g = 40, .b = 49 });
+        try self.labels.draw(text, if (primary == 1) "Stop F6" else "Send ↑", self.controls[primary].x + 12, y + 8, 12, if (enabled) foreground else muted);
+        if (self.can_approve) {
+            try self.labels.drawFitted(renderer, text, "Approval needed", panel.x + 12, y - 28, panel.w - 206, 12, foreground);
+            for (2..4) |index| {
+                self.controls[index] = .{ .x = panel.x + panel.w - 188 + @as(f32, @floatFromInt(index - 2)) * 90, .y = y - 34, .w = 80, .h = 28 };
+                try widgets.panel(renderer, self.controls[index], 4, .{ .r = 51, .g = 69, .b = 105 });
+                try self.labels.draw(text, if (index == 2) "Allow F7" else "Deny F8", self.controls[index].x + 10, y - 27, 12, foreground);
+            }
+        }
+        const guidance = self.send_disabled_reason orelse if (self.can_cancel) "Working · Stop cancels the current run" else if (self.selected == null) "Choose a model, or open Connection to refresh models" else if (!self.can_send) self.status else if (self.editor.len == 0) "Write a message · Enter sends · Shift+Enter adds a line" else "Enter to send · Shift+Enter for a new line";
+        try self.labels.drawFitted(renderer, text, guidance, panel.x + 2, panel.y + panel.h - 16, panel.w - 4, 11, muted);
+    }
+
+    fn drawPicker(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
+        const height = @min(344, @max(96, self.picker_bounds.y - 80));
+        self.picker_menu = .{ .x = bounds.composer.x, .y = self.picker_bounds.y - height - 6, .w = @min(600, bounds.composer.width), .h = height };
+        const menu = self.picker_menu;
+        self.picker_rows = .{ .x = menu.x + 8, .y = menu.y + 38, .w = menu.w - 16, .h = menu.h - 64 };
+        self.picker_scroll = std.math.clamp(self.picker_scroll, 0, self.pickerMaxScroll());
+        try widgets.panel(renderer, menu, 8, .{ .r = 39, .g = 45, .b = 56 });
+        try self.labels.draw(text, "Choose model", menu.x + 14, menu.y + 12, 13, foreground);
+        var clip = widgets.Clip.push(renderer, self.picker_rows);
+        defer clip.restore(renderer);
+        if (self.model_count == 0) try self.labels.drawFitted(renderer, text, "No models. Open Connection → Refresh models.", self.picker_rows.x + 6, self.picker_rows.y + 10, self.picker_rows.w - 12, 12, foreground);
+        for (self.models[0..self.model_count], 0..) |*model, index| {
+            const y = self.picker_rows.y + @as(f32, @floatFromInt(index)) * picker_row_height - self.picker_scroll;
+            if (y + picker_row_height <= self.picker_rows.y or y >= self.picker_rows.y + self.picker_rows.h) continue;
+            if (index == self.picker_hover) try widgets.panel(renderer, .{ .x = self.picker_rows.x, .y = y, .w = self.picker_rows.w, .h = picker_row_height - 2 }, 4, .{ .r = 51, .g = 62, .b = 82 });
+            var buffer: [768]u8 = undefined;
+            const label = try std.fmt.bufPrint(&buffer, "{s}{s}", .{ model.identity.model_id.slice(), if (model.synthetic) " · synthetic test" else "" });
+            try self.labels.drawFitted(renderer, text, label, menu.x + 16, y + 5, menu.w - 32, 13, foreground);
+            const subtitle = try modelSubtitle(model, &buffer);
+            try self.labels.drawFitted(renderer, text, subtitle, menu.x + 16, y + 25, menu.w - 32, 11, muted);
+        }
+        clip.restore(renderer);
+        try self.labels.drawFitted(renderer, text, "Scroll for more · ↑ ↓ choose · Enter selects · Esc closes", menu.x + 14, menu.y + menu.h - 20, menu.w - 28, 10, muted);
+        if (self.pickerMaxScroll() > 0) {
+            const thumb_height = @max(18, self.picker_rows.h * self.picker_rows.h / (@as(f32, @floatFromInt(self.model_count)) * picker_row_height));
+            try widgets.panel(renderer, .{ .x = menu.x + menu.w - 5, .y = self.picker_rows.y + (self.picker_rows.h - thumb_height) * self.picker_scroll / self.pickerMaxScroll(), .w = 3, .h = thumb_height }, 1, muted);
+        }
+    }
+
+    fn drawSetup(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
+        const width = bounds.header.width;
+        const height = bounds.composer.y + bounds.composer.height + 16;
+        const menu_width = @min(800, width - 24);
+        const menu_height = @min(536, height - 24);
+        self.setup_menu = .{ .x = (width - menu_width) / 2, .y = (height - menu_height) / 2, .w = menu_width, .h = menu_height };
+        const menu = self.setup_menu;
+        try widgets.panel(renderer, menu, 8, .{ .r = 35, .g = 40, .b = 49 });
+        var clip = widgets.Clip.push(renderer, menu);
+        defer clip.restore(renderer);
+        try self.labels.draw(text, "Provider connection", menu.x + 16, menu.y + 15, 16, foreground);
+        self.setup_close_bounds = .{ .x = menu.x + menu.w - 82, .y = menu.y + 10, .w = 66, .h = 30 };
+        try widgets.panel(renderer, self.setup_close_bounds, 4, .{ .r = 51, .g = 59, .b = 73 });
+        try self.labels.draw(text, "Close Esc", self.setup_close_bounds.x + 7, menu.y + 19, 11, foreground);
+        self.setup_runtime_bounds = .{ .x = menu.x + 16, .y = menu.y + 48, .w = menu.w - 32, .h = 30 };
+        try widgets.panel(renderer, self.setup_runtime_bounds, 4, .{ .r = 27, .g = 32, .b = 41 });
+        try self.labels.draw(text, if (self.setup_runtime == .codex) "Runtime: Codex  ↻ click to switch" else "Runtime: OpenCode  ↻ click to switch", menu.x + 24, menu.y + 57, 13, foreground);
+        const names = [_][]const u8{ "Runtime executable · absolute path", "Isolated account directory · absolute path", "Workspace · absolute path", "Model provider · e.g. openai" };
+        for (names, 0..) |name, index| {
+            const y = menu.y + 88 + @as(f32, @floatFromInt(index)) * 48;
+            try self.labels.draw(text, name, menu.x + 16, y, 11, muted);
+            const box = c.SDL_FRect{ .x = menu.x + 16, .y = y + 15, .w = menu.w - 32, .h = 28 };
+            self.setup_field_bounds[index] = box;
+            try widgets.panel(renderer, box, 3, if (index == self.setup_field) .{ .r = 51, .g = 69, .b = 105 } else .{ .r = 27, .g = 32, .b = 41 });
+            try self.labels.drawFitted(renderer, text, self.setup_fields[index][0..self.setup_lengths[index]], box.x + 6, box.y + 6, box.w - 12, 12, foreground);
+        }
+        const names_buttons = [_][]const u8{ "Save connection", "Browser sign-in", "Device sign-in", "Refresh models" };
+        const button_width = (menu.w - 40) / 2;
+        for (names_buttons, 0..) |name, index| {
+            const box = c.SDL_FRect{ .x = menu.x + 16 + @as(f32, @floatFromInt(index % 2)) * (button_width + 8), .y = menu.y + 286 + @as(f32, @floatFromInt(index / 2)) * 38, .w = button_width, .h = 32 };
+            self.setup_button_bounds[index] = box;
+            const enabled = self.setup_runtime == .codex or (index != 1 and index != 2);
+            try widgets.panel(renderer, box, 4, if (enabled) .{ .r = 51, .g = 69, .b = 105 } else .{ .r = 27, .g = 32, .b = 41 });
+            try self.labels.draw(text, name, box.x + 12, box.y + 9, 12, if (enabled) foreground else muted);
+        }
+        try self.labels.drawFitted(renderer, text, "Tab changes field · Ctrl+A replaces · Paste supported · No credentials imported", menu.x + 16, menu.y + 368, menu.w - 32, 11, muted);
+        var start: usize = 0;
+        var y = menu.y + 390;
+        while (start < self.runtime_info_len and y + 18 < menu.y + menu.h - 8) : (y += 18) {
+            const rest = self.runtime_info[start..self.runtime_info_len];
+            const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+            const end = @import("../text/utf8.zig").prefix(rest[0..line_end], 100).len;
+            try self.labels.drawFitted(renderer, text, rest[0..end], menu.x + 16, y, menu.w - 32, 11, foreground);
+            start += end;
+            if (start < self.runtime_info_len and self.runtime_info[start] == '\n') start += 1;
+        }
+    }
+
     pub fn draw(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, window: *c.SDL_Window, bounds: Layout.Coding) !void {
         const foreground = Color{ .r = 231, .g = 235, .b = 242 };
         const muted = Color{ .r = 157, .g = 168, .b = 186 };
         if (!c.SDL_SetRenderDrawColor(renderer, 19, 22, 28, 255) or !c.SDL_RenderClear(renderer)) return error.CanvasDraw;
-        if (self.custom_root == null) {
-            try self.labels.draw(text, "SPICA", 24, 18, 18, foreground);
-            const model_width = std.math.clamp((bounds.header.width - 240) * 0.40, 140, 350);
-            self.picker_bounds.w = model_width;
-            self.effort_bounds = .{ .x = 248 + model_width, .y = 18, .w = 76, .h = 28 };
-            self.setup_bounds = .{ .x = self.effort_bounds.x + 84, .y = 18, .w = 112, .h = 28 };
-            self.follow_bounds = .{ .x = self.setup_bounds.x + 120, .y = 18, .w = 112, .h = 28 };
-            try self.labels.drawFitted(renderer, text, self.status, 110, 22, 124, 13, muted);
-            try self.labels.drawFitted(renderer, text, self.workspace_label[0..self.workspace_label_len], 240, 49, bounds.header.width - 260, 11, muted);
-            try widgets.panel(renderer, self.picker_bounds, 4, .{ .r = 35, .g = 40, .b = 49 });
-            var identity_label: [512]u8 = undefined;
-            const identity = if (self.selected) |*selected| try std.fmt.bufPrint(&identity_label, "{s} / {s}", .{ if (selected.runtime_kind.eql("fake")) "DEMO synthetic" else selected.runtime_kind.slice(), selected.model_id.slice() }) else "Choose model";
-            try self.labels.drawFitted(renderer, text, identity, 248, 24, self.picker_bounds.w - 16, 13, foreground);
-            try widgets.panel(renderer, self.effort_bounds, 4, .{ .r = 35, .g = 40, .b = 49 });
-            try self.labels.drawFitted(renderer, text, if (self.selected) |*selected| selected.effort.slice() else "Effort", self.effort_bounds.x + 8, 24, self.effort_bounds.w - 16, 13, foreground);
-            try widgets.panel(renderer, self.setup_bounds, 4, .{ .r = 51, .g = 69, .b = 105 });
-            try self.labels.draw(text, "Connect provider", self.setup_bounds.x + 4, 24, 12, foreground);
-            try widgets.panel(renderer, self.follow_bounds, 4, .{ .r = 35, .g = 40, .b = 49 });
-            try self.labels.drawFitted(renderer, text, if (self.follow_latest) "Following live" else "Resume live ↓", self.follow_bounds.x + 4, 24, self.follow_bounds.w - 8, 12, if (self.follow_latest) muted else foreground);
-            try self.labels.draw(text, "+ New project", 16, 74, 14, foreground);
-            try self.labels.draw(text, "+ New chat", 16, 110, 14, foreground);
-            for (self.projects[0..self.project_count], 0..) |*entry, index| {
-                try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], 16, 148 + @as(f32, @floatFromInt(index)) * 26, 184, 13, if (entry.id.eql(self.active_project.slice())) foreground else muted);
-            }
-            const start = 168 + @as(f32, @floatFromInt(self.project_count)) * 26;
-            for (self.threads[0..self.thread_count], 0..) |*entry, index| {
-                try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], 24, start + @as(f32, @floatFromInt(index)) * 28, 176, 13, if (entry.id.eql(self.active_thread.slice())) foreground else muted);
-            }
-            for (self.tasks[0..self.task_count], 0..) |*task, index| {
-                const y = bounds.transcript.y + @as(f32, @floatFromInt(index)) * 24;
-                try self.labels.drawFitted(renderer, text, task.bytes[0..task.len], bounds.transcript.x, y, bounds.transcript.width - 84, 12, muted);
-                task.cancel_bounds = .{ .x = bounds.transcript.x + bounds.transcript.width - 76, .y = y, .w = 76, .h = 20 };
-                if (task.cancel != null) {
-                    try widgets.panel(renderer, task.cancel_bounds, 3, if (self.tasks_enabled) .{ .r = 51, .g = 69, .b = 105 } else .{ .r = 35, .g = 40, .b = 49 });
-                    try self.labels.draw(text, "Cancel task", task.cancel_bounds.x + 4, y + 2, 11, muted);
-                }
-            }
-        }
+        if (self.custom_root == null) try self.drawChrome(renderer, text, bounds, foreground, muted);
         const task_height: f32 = if (self.custom_root == null) @as(f32, @floatFromInt(self.task_count)) * 24 else 0;
         self.transcript_bounds = .{ .x = bounds.transcript.x, .y = bounds.transcript.y + task_height, .w = bounds.transcript.width, .h = @max(0, bounds.transcript.height - task_height) };
         var transcript_clip = widgets.Clip.push(renderer, self.transcript_bounds);
@@ -800,22 +1106,29 @@ pub const View = struct {
                 tile_y += tile.height() + 8;
             }
             if (self.rich_count == 0) {
-                try self.labels.draw(text, "Your native coding workspace", bounds.transcript.x, self.transcript_bounds.y + 20, 22, foreground);
-                try self.labels.drawFitted(renderer, text, "Create chats in the sidebar. Drafts and history stay with each chat.", bounds.transcript.x, self.transcript_bounds.y + 58, bounds.transcript.width, 14, muted);
-                try self.labels.drawFitted(renderer, text, "Connect provider to authorize your runtime, isolated account and workspace.", bounds.transcript.x, self.transcript_bounds.y + 86, bounds.transcript.width, 14, muted);
-                try self.labels.drawFitted(renderer, text, "The synthetic Demo exercises controls only; it does not edit your project.", bounds.transcript.x, self.transcript_bounds.y + 114, bounds.transcript.width, 14, muted);
+                var context: [1024]u8 = undefined;
+                const empty = try self.emptyState(&context);
+                try self.labels.drawFitted(renderer, text, "What would you like to build?", bounds.transcript.x, self.transcript_bounds.y + 20, bounds.transcript.width, 22, foreground);
+                try self.labels.drawFitted(renderer, text, empty.description, bounds.transcript.x, self.transcript_bounds.y + 58, bounds.transcript.width, 14, muted);
+                try self.labels.drawFitted(renderer, text, empty.context, bounds.transcript.x, self.transcript_bounds.y + 86, bounds.transcript.width, 13, muted);
             }
         }
         transcript_clip.restore(renderer);
+        if (self.custom_root == null and !self.follow_latest) {
+            try widgets.panel(renderer, self.follow_bounds, 5, .{ .r = 51, .g = 62, .b = 82 });
+            try self.labels.draw(text, "Back to latest ↓", self.follow_bounds.x + 12, self.follow_bounds.y + 7, 12, foreground);
+        }
+
         const panel = c.SDL_FRect{ .x = bounds.composer.x, .y = bounds.composer.y, .w = bounds.composer.width, .h = bounds.composer.height };
         if (bounds.composer.width > 24 and bounds.composer.height > 40) {
-            try widgets.panel(renderer, panel, 10, if (self.focused) .{ .r = 103, .g = 129, .b = 210 } else .{ .r = 57, .g = 64, .b = 79 });
-            try widgets.panel(renderer, .{ .x = panel.x + 1, .y = panel.y + 1, .w = panel.w - 2, .h = panel.h - 2 }, 9, .{ .r = 27, .g = 32, .b = 41 });
-            const editor_bounds = c.SDL_FRect{ .x = panel.x, .y = panel.y, .w = panel.w, .h = panel.h - 40 };
+            try widgets.panel(renderer, .{ .x = panel.x, .y = panel.y, .w = panel.w, .h = panel.h - (if (self.custom_root == null) @as(f32, 24) else 0) }, 10, if (self.focused) .{ .r = 103, .g = 129, .b = 210 } else .{ .r = 57, .g = 64, .b = 79 });
+            try widgets.panel(renderer, .{ .x = panel.x + 1, .y = panel.y + 1, .w = panel.w - 2, .h = panel.h - (if (self.custom_root == null) @as(f32, 26) else 2) }, 9, .{ .r = 27, .g = 32, .b = 41 });
+            const editor_bounds = c.SDL_FRect{ .x = panel.x, .y = panel.y, .w = panel.w, .h = panel.h - (if (self.custom_root != null) @as(f32, 40) else if (self.can_approve) @as(f32, 108) else 70) };
             self.editor_view.bounds = editor_bounds;
             try self.editor_view.ensureLayout(text, &self.editor, panel.w, 16);
             try self.ensurePreedit(text, panel.w - 24);
             var clip = widgets.Clip.push(renderer, .{ .x = panel.x + 10, .y = panel.y + 8, .w = panel.w - 20, .h = editor_bounds.h - 12 });
+            if (self.editor.len == 0 and self.preedit_len == 0) try self.labels.drawFitted(renderer, text, "Ask for changes, or send a follow-up…", panel.x + 12, panel.y + 12, panel.w - 24, 15, muted);
             if (self.editor_view.layout) |layout| {
                 const content_height = c.spica_text_layout_height(layout);
                 const available = editor_bounds.h - 20;
@@ -853,16 +1166,20 @@ pub const View = struct {
                 }
             }
             clip.restore(renderer);
-            const names = [_][]const u8{ "Send", "Cancel F6", "Allow F7", "Deny F8" };
-            for (&self.controls, 0..) |*control, index| {
-                control.* = .{ .x = panel.x + 12 + @as(f32, @floatFromInt(index)) * 112, .y = panel.y + panel.h - 34, .w = 104, .h = 26 };
-                const enabled = switch (@as(Intent, @enumFromInt(index))) {
-                    .send => self.can_send,
-                    .cancel => self.can_cancel,
-                    .allow, .deny => self.can_approve,
-                };
-                try widgets.panel(renderer, control.*, 4, if (enabled) .{ .r = 51, .g = 69, .b = 105 } else .{ .r = 35, .g = 40, .b = 49 });
-                try self.labels.draw(text, names[index], control.x + 8, control.y + 5, 12, if (enabled) foreground else muted);
+            if (self.custom_root == null) {
+                try self.drawComposerControls(renderer, text, panel, foreground, muted);
+            } else {
+                const names = [_][]const u8{ "Send", "Cancel F6", "Allow F7", "Deny F8" };
+                for (&self.controls, 0..) |*control, index| {
+                    control.* = .{ .x = panel.x + 12 + @as(f32, @floatFromInt(index)) * 112, .y = panel.y + panel.h - 34, .w = 104, .h = 26 };
+                    const enabled = switch (@as(Intent, @enumFromInt(index))) {
+                        .send => self.can_send,
+                        .cancel => self.can_cancel,
+                        .allow, .deny => self.can_approve,
+                    };
+                    try widgets.panel(renderer, control.*, 4, if (enabled) .{ .r = 51, .g = 69, .b = 105 } else .{ .r = 35, .g = 40, .b = 49 });
+                    try self.labels.draw(text, names[index], control.x + 8, control.y + 5, 12, if (enabled) foreground else muted);
+                }
             }
         } else {
             self.controls = @splat(.{ .x = 0, .y = 0, .w = 0, .h = 0 });
@@ -878,43 +1195,8 @@ pub const View = struct {
             try self.labels.drawFitted(renderer, text, self.status, 24, 0, 600, 11, muted);
         }
         if (self.notice) |notice| try self.labels.drawFitted(renderer, text, notice, bounds.transcript.x, bounds.transcript.y, bounds.transcript.width, 12, muted);
-        if (self.custom_root == null and self.picker_open) {
-            const menu = c.SDL_FRect{ .x = 240, .y = 68, .w = @max(200, bounds.transcript.width), .h = @max(64, @as(f32, @floatFromInt(self.model_count)) * 38 + 16) };
-            try widgets.panel(renderer, menu, 6, .{ .r = 35, .g = 40, .b = 49 });
-            if (self.model_count == 0) try self.labels.draw(text, "No models. Open Connection, then Refresh models.", 252, 84, 14, foreground);
-            for (self.models[0..self.model_count], 0..) |*model, index| {
-                var buffer: [768]u8 = undefined;
-                const label = try std.fmt.bufPrint(&buffer, "{s} / {s}  [{s}]{s}", .{ model.identity.runtime_kind.slice(), model.identity.model_id.slice(), @tagName(model.readiness), if (model.synthetic) " — synthetic test provider" else "" });
-                const y = 76 + @as(f32, @floatFromInt(index)) * 38;
-                try self.labels.drawFitted(renderer, text, label, 252, y, menu.w - 24, 13, foreground);
-                try self.labels.drawFitted(renderer, text, model.reason[0..model.reason_len], 252, y + 17, menu.w - 24, 11, muted);
-            }
-        }
-        if (self.custom_root == null and self.setup_open) {
-            const menu = c.SDL_FRect{ .x = 224, .y = 68, .w = @max(480, bounds.transcript.width), .h = 460 };
-            try widgets.panel(renderer, menu, 8, .{ .r = 35, .g = 40, .b = 49 });
-            try self.labels.draw(text, "Connect an explicitly authorized runtime (Esc closes)", 240, 78, 15, foreground);
-            try self.labels.draw(text, if (self.setup_runtime == .codex) "Runtime: Codex (click to change)" else "Runtime: OpenCode (click to change)", 240, 106, 14, foreground);
-            const names = [_][]const u8{ "Absolute executable", "Absolute isolated account directory", "Absolute workspace root", "Model provider (for example openai)" };
-            for (names, 0..) |name, index| {
-                const y = 140 + @as(f32, @floatFromInt(index)) * 48;
-                try self.labels.draw(text, name, 240, y, 11, muted);
-                try widgets.panel(renderer, .{ .x = 240, .y = y + 16, .w = menu.w - 32, .h = 26 }, 3, if (index == self.setup_field) .{ .r = 51, .g = 69, .b = 105 } else .{ .r = 27, .g = 32, .b = 41 });
-                try self.labels.drawFitted(renderer, text, self.setup_fields[index][0..self.setup_lengths[index]], 246, y + 20, menu.w - 44, 13, foreground);
-            }
-            try self.labels.draw(text, "Save connection", 240, 358, 13, foreground);
-            try self.labels.draw(text, "Browser sign-in", 400, 358, 13, foreground);
-            try self.labels.draw(text, "Device sign-in", 540, 358, 13, foreground);
-            try self.labels.draw(text, "Refresh models", 680, 358, 13, foreground);
-            try self.labels.draw(text, "Tab changes field. Paste supported. No credentials are imported.", 240, 394, 12, muted);
-            var start: usize = 0;
-            var row: usize = 0;
-            while (start < self.runtime_info_len and row < 5) : (row += 1) {
-                const end = start + @import("../text/utf8.zig").prefix(self.runtime_info[start..self.runtime_info_len], 92).len;
-                try self.labels.drawFitted(renderer, text, self.runtime_info[start..end], 240, 416 + @as(f32, @floatFromInt(row)) * 18, menu.w - 32, 11, foreground);
-                start = end;
-            }
-        }
+        if (self.custom_root == null and self.picker_open) try self.drawPicker(renderer, text, bounds, foreground, muted);
+        if (self.custom_root == null and self.setup_open) try self.drawSetup(renderer, text, bounds, foreground, muted);
     }
 };
 
@@ -1111,4 +1393,218 @@ test "model identity copies complete selection without borrowed provider strings
     try std.testing.expectEqualStrings("high", selected.effort);
     try std.testing.expectEqualStrings("explicit-account", selected.account_ref);
     try std.testing.expectEqualStrings("selected-workspace", selected.workspace.value);
+}
+
+test "model picker clips pointer selection and scrolls to every bounded catalog row" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.model_count = view.models.len;
+    for (view.models[0..view.model_count], 0..) |*model, index| {
+        var name: [32]u8 = undefined;
+        model.* = .{ .identity = try View.Identity.from(.{ .model_provider = "fixture", .effort = "none", .model_id = try std.fmt.bufPrint(&name, "model-{d}", .{index}), .account_ref = "isolated", .workspace = .{ .value = "checkout" } }), .readiness = .ready };
+    }
+    view.picker_menu = .{ .x = 200, .y = 80, .w = 400, .h = 224 };
+    view.picker_rows = .{ .x = 208, .y = 118, .w = 384, .h = 160 };
+    view.picker_open = true;
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_MOUSE_WHEEL;
+    event.wheel.mouse_x = 230;
+    event.wheel.mouse_y = 140;
+    event.wheel.y = -100;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqual(view.pickerMaxScroll(), view.picker_scroll);
+    try std.testing.expectEqual(@as(?usize, 31), view.pickerIndexAt(240, 277));
+    try std.testing.expect(view.pickerIndexAt(100, 277) == null);
+    try std.testing.expect(view.pickerIndexAt(240, 280) == null);
+    try std.testing.expectEqual(@as(f32, 0), view.pickerRowBounds(0).h);
+    const final = view.pickerRowBounds(31);
+    try std.testing.expect(final.h > 0);
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    event.button.x = final.x + 4;
+    event.button.y = final.y + final.h / 2;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqualStrings("model-31", view.selected.?.model_id.slice());
+    try std.testing.expect(!view.picker_open);
+    view.picker_open = true;
+    event.button.x = 100;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqualStrings("model-31", view.selected.?.model_id.slice());
+    try std.testing.expect(!view.picker_open);
+    view.picker_open = true;
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_UP;
+    view.picker_hover = 31;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqual(@as(usize, 30), view.picker_hover);
+    event.key.key = c.SDLK_ESCAPE;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expect(!view.picker_open);
+}
+
+test "effort cycling respects complete runtime account and workspace identity" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    const selected = try View.Identity.from(.{ .runtime_kind = "codex", .model_provider = "openai", .model_id = "same-name", .effort = "medium", .account_ref = "selected-account", .workspace = .{ .value = "selected-checkout" } });
+    view.selected = selected;
+    view.model_count = 2;
+    view.models[0] = .{ .identity = selected, .readiness = .ready, .effort_count = 2 };
+    view.models[0].identity.workspace = try transcript.Id.init("another-checkout");
+    view.models[0].efforts[0] = try transcript.Id.init("medium");
+    view.models[0].efforts[1] = try transcript.Id.init("low");
+    view.models[1] = .{ .identity = selected, .readiness = .ready, .effort_count = 2 };
+    view.models[1].efforts[0] = try transcript.Id.init("medium");
+    view.models[1].efforts[1] = try transcript.Id.init("high");
+    view.effort_bounds = .{ .x = 300, .y = 400, .w = 100, .h = 30 };
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    event.button.x = 310;
+    event.button.y = 410;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqualStrings("high", view.selected.?.effort.slice());
+    try std.testing.expectEqualStrings("selected-checkout", view.selected.?.workspace.slice());
+    try std.testing.expectEqualStrings("selected-account", view.selected.?.account_ref.slice());
+}
+
+test "painted connection and composer controls fit minimum and regular windows" {
+    const foreground = Color{ .r = 231, .g = 235, .b = 242 };
+    const muted = Color{ .r = 157, .g = 168, .b = 186 };
+    for ([_][2]f32{ .{ 720, 480 }, .{ 900, 650 }, .{ 1100, 740 }, .{ 1280, 800 } }) |size| {
+        const surface = c.SDL_CreateSurface(@intFromFloat(size[0]), @intFromFloat(size[1]), c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+        defer c.SDL_DestroySurface(surface);
+        const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+        defer c.SDL_DestroyRenderer(renderer);
+        const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+        defer c.spica_text_destroy(text);
+        var layout = try Layout.init(std.testing.allocator, size[0], size[1]);
+        defer layout.deinit();
+        var view = try View.init(std.testing.allocator);
+        defer view.deinit();
+        const bounds = layout.coding(size[0]);
+        try view.drawChrome(renderer, text, bounds, foreground, muted);
+        const panel = c.SDL_FRect{ .x = bounds.composer.x, .y = bounds.composer.y, .w = bounds.composer.width, .h = bounds.composer.height };
+        try view.drawComposerControls(renderer, text, panel, foreground, muted);
+        try view.drawSetup(renderer, text, bounds, foreground, muted);
+        for (view.setup_field_bounds) |box| {
+            try std.testing.expect(box.x >= 0 and box.y >= 0 and box.x + box.w <= size[0] and box.y + box.h <= size[1]);
+        }
+        for (view.setup_button_bounds, 0..) |box, index| {
+            try std.testing.expect(box.x >= 0 and box.y >= 0 and box.x + box.w <= size[0] and box.y + box.h <= size[1]);
+            view.setup_open = true;
+            view.setup_action = null;
+            var event = std.mem.zeroes(c.SDL_Event);
+            event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+            event.button.button = c.SDL_BUTTON_LEFT;
+            event.button.x = box.x + box.w / 2;
+            event.button.y = box.y + box.h / 2;
+            try std.testing.expect(try view.handle(event, undefined, undefined));
+            try std.testing.expectEqual(index, switch (view.setup_action.?) {
+                .configure => @as(usize, 0),
+                .browser => 1,
+                .device => 2,
+                .refresh => 3,
+                .status => 4,
+            });
+        }
+        try std.testing.expect(view.picker_bounds.x + view.picker_bounds.w <= view.effort_bounds.x);
+        try std.testing.expect(view.effort_bounds.x + view.effort_bounds.w <= view.controls[0].x);
+        try std.testing.expect(view.controls[1].h == 0 and view.controls[2].h == 0 and view.controls[3].h == 0);
+        try std.testing.expect(view.picker_menu.y >= 0 and view.picker_menu.x + view.picker_menu.w <= size[0]);
+        // Exercise the full paint path, including the reduced editor height
+        // used while approval controls are visible, at every supported size.
+        view.setup_open = false;
+        view.focused = false;
+        view.window_active = false;
+        for (0..3) |state| {
+            view.can_send = state == 0;
+            view.can_cancel = state != 0;
+            view.can_approve = state == 2;
+            try view.draw(renderer, text, undefined, bounds);
+            const painted = [_]c.SDL_FRect{ view.editor_view.bounds, view.picker_bounds, view.effort_bounds, view.controls[0], view.controls[1], view.controls[2], view.controls[3] };
+            for (painted, 0..) |box, index| {
+                if (box.h == 0 or box.w == 0) continue;
+                try std.testing.expect(box.x >= panel.x and box.y >= panel.y and box.x + box.w <= panel.x + panel.w and box.y + box.h <= panel.y + panel.h);
+                for (painted[index + 1 ..]) |other| {
+                    if (other.h == 0 or other.w == 0) continue;
+                    try std.testing.expect(box.x + box.w <= other.x or other.x + other.w <= box.x or box.y + box.h <= other.y or other.y + other.h <= box.y);
+                }
+            }
+            const primary = view.controls[if (view.can_cancel) @as(usize, 1) else 0];
+            try std.testing.expect(view.picker_bounds.x + view.picker_bounds.w + 10 <= view.effort_bounds.x);
+            try std.testing.expect(view.effort_bounds.x + view.effort_bounds.w + 10 <= primary.x);
+        }
+        view.setup_open = true;
+        view.setup_runtime = .opencode;
+        view.setup_action = null;
+        const browser = view.setup_button_bounds[1];
+        var event = std.mem.zeroes(c.SDL_Event);
+        event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+        event.button.button = c.SDL_BUTTON_LEFT;
+        event.button.x = browser.x + 4;
+        event.button.y = browser.y + 4;
+        try std.testing.expect(try view.handle(event, undefined, undefined));
+        try std.testing.expect(view.setup_action == null);
+    }
+}
+
+test "setup replacement preserves UTF8 and rejects oversized replacement atomically" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.setupInsert("/tmp/old-account");
+    view.setup_select_all = true;
+    try view.setupInsert("/tmp/café/新");
+    try std.testing.expectEqualStrings("/tmp/café/新", view.setup_fields[0][0..view.setup_lengths[0]]);
+    view.setup_select_all = true;
+    try std.testing.expectError(error.TextTooLarge, view.setupInsert(&@as([513]u8, @splat('x'))));
+    try std.testing.expectEqualStrings("/tmp/café/新", view.setup_fields[0][0..view.setup_lengths[0]]);
+}
+
+test "empty workspace describes actual selection and keeps paths and demo guidance contextual" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    const workspace = "/tmp/isolated-account/project-café/  •  Chat 1";
+    @memcpy(view.workspace_label[0..workspace.len], workspace);
+    view.workspace_label_len = workspace.len;
+    try std.testing.expectEqualStrings("project-café", view.workspaceName());
+    try std.testing.expectEqualStrings(workspace, view.workspace_label[0..view.workspace_label_len]);
+    view.selected = try View.Identity.from(.{ .runtime_kind = "opencode", .model_provider = "explicit-provider", .model_id = "selected-model", .effort = "default", .account_ref = "isolated", .workspace = .{ .value = "opaque-workspace-binding" } });
+    view.can_send = true;
+    var buffer: [1024]u8 = undefined;
+    const ready = try view.emptyState(&buffer);
+    try std.testing.expectEqualStrings("Describe a change, ask a question, or continue your work.", ready.description);
+    try std.testing.expectEqualStrings("OpenCode · selected-model · project-café", ready.context);
+    view.can_send = false;
+    view.send_disabled_reason = "Loading models…";
+    const loading = try view.emptyState(&buffer);
+    try std.testing.expectEqualStrings("Loading models…", loading.description);
+    try std.testing.expectEqualStrings("OpenCode · selected-model · project-café", loading.context);
+    view.selected = null;
+    const unselected = try view.emptyState(&buffer);
+    try std.testing.expectEqualStrings("Loading models…", unselected.description);
+    try std.testing.expectEqualStrings("Manage your runtime and workspace in Connection.", unselected.context);
+    view.selected = try View.Identity.from(contract.fakeSelection(.{ .value = "fixture" }));
+    view.send_disabled_reason = null;
+    const fake = try view.emptyState(&buffer);
+    try std.testing.expectEqualStrings("Demo is synthetic. Connect a coding provider to work on files.", fake.context);
+}
+
+test "picker uses compact catalog metadata and retains actionable unavailable reasons" {
+    var model = View.Model{
+        .identity = try View.Identity.from(.{ .runtime_kind = "opencode", .model_provider = "explicit-provider", .model_id = "selected-model", .effort = "default", .account_ref = "isolated", .workspace = .{ .value = "checkout" } }),
+        .readiness = .unknown,
+        .effort_count = 2,
+    };
+    const discovery_detail = "negotiated catalog; account entitlement unverified; per-model variants require exact session negotiation";
+    @memcpy(model.reason[0..discovery_detail.len], discovery_detail);
+    model.reason_len = discovery_detail.len;
+    var buffer: [768]u8 = undefined;
+    try std.testing.expectEqualStrings("explicit-provider · 2 effort options · availability unverified", try View.modelSubtitle(&model, &buffer));
+    model.readiness = .ready;
+    try std.testing.expectEqualStrings("explicit-provider · 2 effort options · ready", try View.modelSubtitle(&model, &buffer));
+    const unavailable = "Sign in to the selected account";
+    @memcpy(model.reason[0..unavailable.len], unavailable);
+    model.reason_len = unavailable.len;
+    model.readiness = .unavailable;
+    try std.testing.expectEqualStrings("explicit-provider · unavailable · Sign in to the selected account", try View.modelSubtitle(&model, &buffer));
 }

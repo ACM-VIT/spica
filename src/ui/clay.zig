@@ -4,6 +4,7 @@ const c = @import("../native/bindings.zig").c;
 pub const Layout = struct {
     bytes: []u8,
     allocator: std.mem.Allocator,
+    height: f32,
 
     pub fn init(allocator: std.mem.Allocator, width: f32, height: f32) !Layout {
         c.Clay_SetMaxElementCount(1024);
@@ -16,7 +17,7 @@ pub const Layout = struct {
             .errorHandlerFunction = null,
             .userData = null,
         }) == null) return error.ClayInitialization;
-        return .{ .bytes = bytes, .allocator = allocator };
+        return .{ .bytes = bytes, .allocator = allocator, .height = height };
     }
 
     pub fn deinit(self: *Layout) void {
@@ -24,7 +25,8 @@ pub const Layout = struct {
         self.allocator.free(self.bytes);
     }
 
-    pub fn resize(_: *Layout, width: f32, height: f32) void {
+    pub fn resize(self: *Layout, width: f32, height: f32) void {
+        self.height = height;
         c.Clay_SetLayoutDimensions(.{ .width = width, .height = height });
     }
 
@@ -34,7 +36,11 @@ pub const Layout = struct {
         composer: c.Clay_BoundingBox,
     };
 
-    pub fn coding(_: *Layout, width: f32) Coding {
+    pub fn sidebarWidth(width: f32) f32 {
+        return if (width < 700) 148 else if (width < 1000) 184 else 224;
+    }
+
+    pub fn coding(self: *Layout, width: f32) Coding {
         c.Clay_BeginLayout();
         open("coding", grow(), grow(), c.CLAY_TOP_TO_BOTTOM);
         open("header", grow(), fixed(64), c.CLAY_LEFT_TO_RIGHT);
@@ -45,13 +51,13 @@ pub const Layout = struct {
         body.layout.layoutDirection = c.CLAY_TOP_TO_BOTTOM;
         body.layout.childAlignment.x = c.CLAY_ALIGN_X_CENTER;
         body.layout.childGap = 12;
-        body.layout.padding = .{ .left = 224, .right = 24, .top = 12, .bottom = 20 };
+        body.layout.padding = .{ .left = @intFromFloat(sidebarWidth(width) + 24), .right = 24, .top = 16, .bottom = 16 };
         c.Clay__OpenElement();
         c.Clay__ConfigureOpenElement(body);
-        const content_width = fixed(@min(960, @max(0, width - 248)));
+        const content_width = fixed(@min(900, @max(0, width - sidebarWidth(width) - 48)));
         open("transcript", content_width, grow(), c.CLAY_TOP_TO_BOTTOM);
         c.Clay__CloseElement();
-        open("composer", content_width, fixed(180), c.CLAY_TOP_TO_BOTTOM);
+        open("composer", content_width, fixed(std.math.clamp(self.height * 0.23, 136, 168)), c.CLAY_TOP_TO_BOTTOM);
         c.Clay__CloseElement();
         c.Clay__CloseElement();
         c.Clay__CloseElement();

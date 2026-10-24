@@ -64,10 +64,13 @@ zig-out/bin/spica --provider opencode \
   --state-directory /tmp/spica-opencode-conversation
 ```
 
-Create the workspace directory first. On a fresh launch, open **Connect provider**
-and click **Refresh models**, then close the connection panel and select the
-desired model and effort in the header. Discovery does not send a prompt; sending
-starts real provider work in the selected workspace. Choose IDs from your actual
+Create the workspace directory first. Configured real runtimes discover their
+models on launch without sending a prompt. An explicit `--model` / `--effort`
+selection is retained exactly; without those flags, choose a model beside the
+composer. The adjacent effort control cycles through that model's actual options.
+Sending starts real provider work in the selected workspace. **Connection** lets
+you edit the configured paths, refresh discovery or initiate Codex sign-in; the
+composer explains why sending is unavailable. Choose IDs from your actual
 account's catalog; the example requires access to that model. Reuse the same
 arguments to reopen your test conversation. Temporary account/project/state
 directories must remain available for that session.
