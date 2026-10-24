@@ -117,6 +117,9 @@ pub const Store = struct {
         // restored. Two supported runtime keys bound retained setup state.
         try result.exec("CREATE TABLE IF NOT EXISTS runtime_configurations(runtime_kind TEXT PRIMARY KEY CHECK(runtime_kind IN('codex','opencode')),configuration BLOB NOT NULL CHECK(length(configuration)<=32768))");
         try result.exec("CREATE TABLE IF NOT EXISTS thread_selections(thread_id TEXT PRIMARY KEY REFERENCES threads(id),selection BLOB NOT NULL CHECK(length(selection)<=16384))");
+        // The implicit rowid suffix supports latest selection/status lookups
+        // without scanning completed runs from other threads.
+        try result.exec("CREATE INDEX IF NOT EXISTS runs_by_thread ON runs(thread_id)");
         // Only diagnostic observations enter this index; streamed content never
         // accumulates in the run-status lookup. Correlation was normalized by Owner.
         try result.exec("CREATE INDEX IF NOT EXISTS observation_diagnostics ON observations(session_id,json_extract(CAST(correlation AS TEXT),'$.run.value'),commit_sequence DESC) WHERE evidence IS NOT NULL");

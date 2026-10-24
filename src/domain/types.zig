@@ -179,7 +179,18 @@ pub const RuntimeStatus = struct {
 pub const Row = union(enum) {
     project: struct { id: ProjectId, revision: Revision, display_name: []const u8 },
     workspace: struct { id: adapter.WorkspaceId, revision: Revision, project: ProjectId, binding: WorkspaceBinding },
-    thread: struct { id: ThreadId, revision: Revision, project: ProjectId, workspace: adapter.WorkspaceId, session: ?adapter.RuntimeSessionId, selection: ?adapter.Selection = null },
+    thread: struct {
+        id: ThreadId,
+        revision: Revision,
+        project: ProjectId,
+        workspace: adapter.WorkspaceId,
+        session: ?adapter.RuntimeSessionId,
+        selection: ?adapter.Selection = null,
+        /// At most 160 UTF-8 bytes from the first user prompt, read without
+        /// decoding history. Presentation may collapse whitespace for a title.
+        title_preview: []const u8 = "",
+        latest_run_state: ?RunState = null,
+    },
     message: struct {
         message_id: adapter.MessageId,
         revision: Revision,

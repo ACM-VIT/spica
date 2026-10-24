@@ -12,6 +12,10 @@ const Mcp = @import("orchestration_mcp.zig").Server;
 pub const coordinator_tools = @import("orchestration_tools.zig");
 pub const workspace_binding = @import("domain/workspace.zig");
 
+// Every nested lookup is a point/range lookup on an existing primary/unique
+// index (plus runs_by_thread). The preview reads only a prefix of one chunk.
+const thread_columns = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)),coalesce((SELECT substr(bytes,1,163) FROM chunks WHERE block_id=(SELECT id FROM blocks WHERE message_id=(SELECT id FROM messages WHERE thread_id=threads.id AND ordinal=0 AND role='user') AND ordinal=0) AND byte_offset=0),''),(SELECT state FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1) FROM threads ";
+
 /// Internal single-thread reducer. Every returned slice belongs to the operation
 /// allocator; callers must copy before resetting it. Never call from the UI.
 pub const Owner = struct {
@@ -1466,14 +1470,14 @@ pub const Host = struct {
                 n = 1;
             },
             .threads => |v| {
-                sql = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)) FROM threads WHERE project_id=? AND rowid>max(?,coalesce((SELECT rowid FROM threads WHERE id=?),0)) ORDER BY rowid LIMIT ?";
+                sql = thread_columns ++ "WHERE project_id=? AND rowid>max(?,coalesce((SELECT rowid FROM threads WHERE id=?),0)) ORDER BY rowid LIMIT ?";
                 values[0] = .{ .text = v.project.value };
                 values[1] = .{ .integer = @intCast(cursor) };
                 values[2] = if (v.anchor) |anchor| .{ .text = anchor.value } else .null;
                 n = 3;
             },
             .thread => |v| {
-                sql = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)) FROM threads WHERE id=? AND rowid>? LIMIT ?";
+                sql = thread_columns ++ "WHERE id=? AND rowid>? LIMIT ?";
                 values[0] = .{ .text = v.value };
                 n = 1;
             },
@@ -1566,7 +1570,7 @@ pub const Host = struct {
             const row: t.Row = switch (q) {
                 .projects => .{ .project = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .display_name = try text(allocator, s, 3) } },
                 .workspaces => .{ .workspace = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .binding = try t.decode(t.WorkspaceBinding, try s.bytes(4), allocator) } },
-                .threads, .thread => .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator) } },
+                .threads, .thread => .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator), .title_preview = try allocator.dupe(u8, @import("text/utf8.zig").prefix(try s.bytes(7), 160)), .latest_run_state = if (s.isNull(8)) null else try enumeration(t.RunState, s, 8) } },
                 .blocks => .{ .block = try descriptor(allocator, s) },
                 .messages => blk: {
                     const message_id = a.MessageId{ .value = try text(allocator, s, 1) };
@@ -1770,4 +1774,66 @@ test "session-only open rejection closes starting claim and preserves indexed ru
         return;
     }
     return error.HostQueryTimeout;
+}
+
+test "thread cards read bounded UTF8 first-prompt previews and latest status after reopen" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    const path = path_buffer[0..path_len];
+    var database = try store.Store.open(std.testing.io, path);
+    var database_live = true;
+    defer if (database_live) database.close() catch {};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: Owner = .{ .database = &database, .io = std.testing.io, .epoch = "thread-preview", .utc_ms = 1 };
+    const project = (try owner.command(allocator, .{ .command_id = .{ .value = "project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "Card fixture" } } })).entity_ids.project.?;
+    const workspace = (try owner.command(allocator, .{ .command_id = .{ .value = "workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = try workspace_binding.capture(allocator, std.testing.io, path) } } })).entity_ids.workspace.?;
+    const thread = (try owner.command(allocator, .{ .command_id = .{ .value = "thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+    const prompt = [_]u8{'a'} ** 159 ++ "🎉\n" ++ [_]u8{'z'} ** 2400;
+    const sent = try owner.command(allocator, .{ .command_id = .{ .value = "send-first" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = prompt, .selection = a.fakeSelection(workspace) } } });
+    try std.testing.expectEqual(.accepted, sent.outcome);
+    try database.execute("UPDATE runs SET state='completed' WHERE id=?", &.{.{ .text = sent.entity_ids.run.?.value }});
+    const second = try owner.command(allocator, .{ .command_id = .{ .value = "send-again" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "A later prompt must not replace the title", .selection = a.fakeSelection(workspace) } } });
+    try std.testing.expectEqual(.accepted, second.outcome);
+    _ = try owner.command(allocator, .{ .command_id = .{ .value = "empty-thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } });
+    const plan = try database.prepare("EXPLAIN QUERY PLAN SELECT state FROM runs WHERE thread_id=? ORDER BY rowid DESC LIMIT 1", &.{.{ .text = thread.value }});
+    {
+        defer plan.deinit();
+        try std.testing.expect(try plan.step());
+        try std.testing.expect(std.mem.indexOf(u8, try plan.bytes(3), "runs_by_thread") != null);
+    }
+    try database.close();
+    database_live = false;
+    const host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path });
+    defer host.destroy();
+    const backing = try allocator.alloc(u8, 262144);
+    for ([_]t.Query{ .{ .thread = thread }, .{ .threads = .{ .project = project } } }) |query| {
+        const ticket = try host.query(query);
+        var received = false;
+        for (0..2000) |_| {
+            var output: [1]t.Output = undefined;
+            const drained = host.drain(&output, backing);
+            if (drained.output_count == 0) {
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+                continue;
+            }
+            try std.testing.expect(output[0] == .query_page);
+            try std.testing.expectEqual(ticket, output[0].query_page.ticket);
+            const rows = output[0].query_page.page.items;
+            try std.testing.expectEqual(@as(usize, if (query == .thread) 1 else 2), rows.len);
+            try std.testing.expectEqualStrings(prompt[0..159], rows[0].thread.title_preview);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(rows[0].thread.title_preview));
+            try std.testing.expectEqual(t.RunState.interrupted, rows[0].thread.latest_run_state.?);
+            if (rows.len == 2) {
+                try std.testing.expectEqualStrings("", rows[1].thread.title_preview);
+                try std.testing.expect(rows[1].thread.latest_run_state == null);
+            }
+            received = true;
+            break;
+        }
+        try std.testing.expect(received);
+    }
 }
