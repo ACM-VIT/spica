@@ -10,6 +10,8 @@ pub const Options = struct {
     automation_live: ?[]const u8 = null,
     lua_module: ?[]const u8 = null,
     provider: enum { fake, codex, opencode } = .fake,
+    /// Ordinary startup is configured in-app; explicit fake is a fixture opt-in.
+    provider_explicit: bool = false,
     runtime_account_directory: ?[]const u8 = null,
     model: ?[]const u8 = null,
     model_provider: ?[]const u8 = null,
@@ -32,6 +34,7 @@ pub const Options = struct {
             } else if (std.mem.eql(u8, flag, "--provider")) {
                 index += 1;
                 if (index == args.len) return error.MissingOptionValue;
+                options.provider_explicit = true;
                 options.provider = std.meta.stringToEnum(@TypeOf(options.provider), args[index]) orelse return error.InvalidProvider;
             } else if (std.mem.eql(u8, flag, "--additional-provider")) {
                 index += 1;
@@ -125,11 +128,12 @@ pub const help =
     \\Spica — native coding workspace
     \\Usage: spica [--state-directory DIRECTORY] [--quit-after-ms MILLISECONDS]
     \\
-    \\--state-directory overrides the independent durable fake-provider conversation.
+    \\--state-directory overrides the independent durable application state.
     \\Default: $XDG_DATA_HOME/spica-native/conversation ($HOME/.local/share fallback).
     \\Enter sends; Shift+Enter inserts newline. F6 cancels; F7 allows; F8 denies.
     \\--lua-module PATH selects a custom Lua root/renderer. F5 reloads; F9 toggles default/custom.
-    \\--provider fake|codex|opencode selects the runtime (default fake).
+    \\--provider fake|codex|opencode selects an explicit runtime (fake is a synthetic fixture).
+    \\Ordinary launch opens in-app setup and restores saved provider settings.
     \\Real runtimes require --runtime-account-directory PATH --workspace PATH
     \\and --model-provider ID. Select discovered model/effort in the native picker;
     \\--model ID --effort VALUE optionally supplies an exact initial selection.
@@ -204,4 +208,20 @@ test "setup-only native startup leaves inference selection explicit" {
     try std.testing.expectEqual(.device, (try Options.parse(&(base ++ .{ "--codex-auth", "device" }))).codex_auth);
     try std.testing.expectError(error.CompleteInitialSelectionRequired, Options.parse(&(base ++ .{ "--model", "explicit-model" })));
     try std.testing.expectError(error.CompleteInitialSelectionRequired, Options.parse(&(base ++ .{ "--effort", "medium" })));
+}
+
+test "ordinary launch and explicit fixture provider remain distinct" {
+    const ordinary = try Options.parse(&.{"spica"});
+    try std.testing.expect(!ordinary.provider_explicit);
+    try std.testing.expect(ordinary.model == null and ordinary.effort == null);
+    const fixture_options = try Options.parse(&.{ "spica", "--provider", "fake" });
+    try std.testing.expect(fixture_options.provider_explicit);
+    try std.testing.expectEqual(.fake, fixture_options.provider);
+    const real = try Options.parse(&.{ "spica", "--provider", "opencode", "--runtime-account-directory", "/tmp/账户", "--workspace", "/tmp/项目", "--model-provider", "opencode-go" });
+    try std.testing.expect(real.provider_explicit);
+    try std.testing.expect(real.model == null and real.effort == null);
+}
+
+test {
+    _ = @import("startup.zig");
 }

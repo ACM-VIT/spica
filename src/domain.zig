@@ -848,6 +848,8 @@ pub const Host = struct {
         /// app session receives a distinct Host-owned process/session object.
         factory: ?Factory = null,
         setup_factory: ?Factory = null,
+        /// Explicit CLI runtime selection wins over remembered settings.
+        restore_configuration: bool = true,
         selection: ?a.Selection = null,
         workspace_root: ?[]const u8 = null,
     };
@@ -879,6 +881,8 @@ pub const Host = struct {
     subscriptions: [4]Subscription = undefined,
     epoch: [32]u8 = undefined,
     path: [:0]u8,
+    restore_arena: std.heap.ArenaAllocator,
+    restore_status: ?a.RuntimeStatus = null,
 
     pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Host {
         const l = options.limits;
@@ -894,7 +898,8 @@ pub const Host = struct {
         const n = try dir.realPath(io, &filename);
         const path = try std.fmt.allocPrintSentinel(allocator, "{s}/conversation.sqlite3", .{filename[0..n]}, 0);
         errdefer allocator.free(path);
-        self.* = .{ .allocator = allocator, .io = io, .options = options, .database = database, .path = path };
+        self.* = .{ .allocator = allocator, .io = io, .options = options, .database = database, .path = path, .restore_arena = std.heap.ArenaAllocator.init(allocator) };
+        errdefer self.restore_arena.deinit();
         const factory = options.factory orelse @import("domain/fake_factory.zig").factory(self);
         self.mcp = try Mcp.init();
         self.registry = .{ .allocator = allocator, .factory = factory };
@@ -907,18 +912,29 @@ pub const Host = struct {
         try owner.recover();
         // Restore explicit configuration only. Never replay refresh, sign-in,
         // accepted inference, or an interrupted setup effect.
-        if (options.setup_factory) |setup| {
-            const stored = try database.prepare("SELECT configuration FROM runtime_configurations ORDER BY runtime_kind", &.{});
+        if (options.restore_configuration) if (options.setup_factory) |setup| {
+            const stored = try database.prepare("SELECT runtime_kind,configuration FROM runtime_configurations ORDER BY CASE WHEN runtime_kind=(SELECT active_runtime_kind FROM runtime_preferences WHERE singleton=1) THEN 1 ELSE 0 END,runtime_kind", &.{});
             defer stored.deinit();
             while (try stored.step()) {
                 _ = arena.reset(.retain_capacity);
-                const configuration = try t.decode(a.RuntimeSetup, try stored.bytes(0), arena.allocator());
-                setup.runtimeAction(allocator, io, .{ .configure = configuration }) catch continue;
+                const retained = self.restore_arena.allocator();
+                // Even a broken saved configuration must not route through the
+                // synthetic fixture. The last (active) entry owns public status.
                 self.registry.?.factory = setup;
                 self.options.factory = setup;
-                self.options.workspace_root = setup.runtimeStatus().workspace_root;
+                self.restore_status = null;
+                const kind = try stored.bytes(0);
+                const configuration = t.decode(a.RuntimeSetup, try stored.bytes(1), arena.allocator()) catch {
+                    self.restore_status = try common.clone(retained, a.RuntimeStatus{ .runtime_kind = kind, .configurations = setup.runtimeStatus().configurations, .readiness = .unavailable, .reason = "Saved provider settings are invalid. Edit and save the connection to repair them." });
+                    self.options.workspace_root = null;
+                    continue;
+                };
+                setup.runtimeAction(allocator, io, .{ .restore = configuration }) catch |err| {
+                    self.restore_status = try common.clone(retained, a.RuntimeStatus{ .runtime_kind = @tagName(configuration.runtime_kind), .configuration = configuration, .configurations = setup.runtimeStatus().configurations, .workspace_root = configuration.workspace_root, .readiness = .unavailable, .reason = try std.fmt.allocPrint(retained, "Saved provider setup could not be restored: {s}. Edit and save the connection.", .{@errorName(err)}) });
+                };
+                self.options.workspace_root = if (self.restore_status) |status| status.workspace_root else setup.runtimeStatus().workspace_root;
             }
-        }
+        };
         self.thread = try std.Thread.spawn(.{}, run, .{self});
         return self;
     }
@@ -933,6 +949,7 @@ pub const Host = struct {
         if (self.mcp) |*server| server.deinit();
         for (&self.subscriptions) |*sub| sub.arena.deinit();
         self.database.close() catch {};
+        self.restore_arena.deinit();
         self.allocator.free(self.path);
         self.allocator.destroy(self);
     }
@@ -1217,12 +1234,11 @@ pub const Host = struct {
                         // Release completed adapters with their original factory
                         // before switching execution routing/configuration.
                         self.registry.?.deinit(&self.mcp.?);
+                        if (value == .configure or value == .login) self.restore_status = null;
                         const applied = if (setup.runtimeAction(self.allocator, self.io, value)) |_| true else |_| false;
                         if (value == .configure and applied) {
-                            var configuration = value.configure;
-                            configuration.workspace_root = setup.runtimeStatus().workspace_root;
-                            configuration.account_directory = try std.Io.Dir.cwd().realPathFileAlloc(self.io, configuration.account_directory, allocator);
-                            try self.database.execute("INSERT INTO runtime_configurations VALUES(?,?) ON CONFLICT(runtime_kind) DO UPDATE SET configuration=excluded.configuration", &.{ .{ .text = @tagName(configuration.runtime_kind) }, .{ .blob = try Owner.encoded(allocator, configuration) } });
+                            const configuration = setup.runtimeStatus().configuration orelse return error.InvalidConfiguration;
+                            try self.database.saveRuntimeConfiguration(@tagName(configuration.runtime_kind), try Owner.encoded(allocator, configuration));
                             self.registry.?.factory = setup;
                             owner.factory = setup;
                             self.options.factory = setup;
@@ -1407,9 +1423,11 @@ pub const Host = struct {
         var n: usize = 0;
         switch (q) {
             .runtime_status => {
-                const status = if (self.options.setup_factory) |setup| setup.runtimeStatus() else a.RuntimeStatus{};
+                const borrowed = self.restore_status orelse if (self.options.setup_factory) |setup| setup.runtimeStatus() else a.RuntimeStatus{};
+                if (borrowed.configurations.len > 2) return error.ConfigurationLimit;
+                const status = try common.clone(allocator, borrowed);
                 const binding = if (status.workspace_root.len != 0) workspace_binding.capture(allocator, self.io, status.workspace_root) catch null else null;
-                rows[0] = .{ .runtime_status = .{ .runtime_kind = status.runtime_kind, .readiness = status.readiness, .reason = status.reason, .login = status.login, .workspace_root = status.workspace_root, .binding = binding, .supported_login_modes = if (std.mem.eql(u8, status.runtime_kind, "codex")) &.{ "browser", "device" } else &.{} } };
+                rows[0] = .{ .runtime_status = .{ .configuration = status.configuration, .configurations = status.configurations, .login_pending = status.login_pending, .runtime_kind = status.runtime_kind, .readiness = status.readiness, .reason = status.reason, .login = status.login, .workspace_root = status.workspace_root, .binding = binding, .supported_login_modes = if (std.mem.eql(u8, status.runtime_kind, "codex")) &.{ "browser", "device" } else &.{} } };
                 result.items = rows[0..1];
                 return result;
             },

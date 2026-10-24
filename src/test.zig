@@ -14,6 +14,7 @@ test {
     _ = @import("ui/transcript.zig");
     _ = @import("content/presentation.zig");
     _ = @import("options.zig");
+    _ = @import("startup.zig");
     _ = @import("text/edit.zig");
     _ = @import("text/composer.zig");
     _ = @import("text/utf8.zig");

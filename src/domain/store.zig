@@ -10,7 +10,7 @@ extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, Closed };
 pub const application_id = 0x53504334;
-pub const schema_version = 3;
+pub const schema_version = 4;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
 
 pub const Statement = struct {
@@ -116,6 +116,11 @@ pub const Store = struct {
         // Commands record intent; only successful explicit configuration is
         // restored. Two supported runtime keys bound retained setup state.
         try result.exec("CREATE TABLE IF NOT EXISTS runtime_configurations(runtime_kind TEXT PRIMARY KEY CHECK(runtime_kind IN('codex','opencode')),configuration BLOB NOT NULL CHECK(length(configuration)<=32768))");
+        if (fresh or version < 4) {
+            try result.exec("BEGIN IMMEDIATE");
+            errdefer result.exec("ROLLBACK") catch {};
+            try result.exec("CREATE TABLE IF NOT EXISTS runtime_preferences(singleton INTEGER PRIMARY KEY CHECK(singleton=1),active_runtime_kind TEXT NOT NULL REFERENCES runtime_configurations(runtime_kind)); INSERT OR IGNORE INTO runtime_preferences SELECT 1,runtime_kind FROM runtime_configurations ORDER BY runtime_kind DESC LIMIT 1; UPDATE meta SET schema_version=4 WHERE singleton=1; PRAGMA user_version=4; COMMIT");
+        } else if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='runtime_preferences'") != 1) return error.Corrupt;
         try result.exec("CREATE TABLE IF NOT EXISTS thread_selections(thread_id TEXT PRIMARY KEY REFERENCES threads(id),selection BLOB NOT NULL CHECK(length(selection)<=16384))");
         // The implicit rowid suffix supports latest selection/status lookups
         // without scanning completed runs from other threads.
@@ -130,6 +135,15 @@ pub const Store = struct {
         _ = c.sqlite3_limit(database, c.SQLITE_LIMIT_SQL_LENGTH, 64 * 1024);
         try result.installChangeJournal();
         return result;
+    }
+    /// Save successful setup and active routing atomically. The catalog and
+    /// per-thread selections are separate state and are never inferred here.
+    pub fn saveRuntimeConfiguration(self: *Store, kind: []const u8, configuration: []const u8) !void {
+        try self.begin();
+        errdefer self.rollback() catch {};
+        try self.execute("INSERT INTO runtime_configurations VALUES(?,?) ON CONFLICT(runtime_kind) DO UPDATE SET configuration=excluded.configuration", &.{ .{ .text = kind }, .{ .blob = configuration } });
+        try self.execute("INSERT INTO runtime_preferences VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET active_runtime_kind=excluded.active_runtime_kind", &.{.{ .text = kind }});
+        try self.commit();
     }
     pub fn close(self: *Store) Error!void {
         if (self.closed) return;

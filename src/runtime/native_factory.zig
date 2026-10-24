@@ -14,6 +14,10 @@ pub const NativeFactory = struct {
         selection: c.Selection,
         executable: [:0]const u8,
         environment: []const [:0]const u8,
+
+        pub fn setup(self: Config) c.RuntimeSetup {
+            return .{ .runtime_kind = if (std.mem.eql(u8, self.selection.runtime_kind, "codex")) .codex else .opencode, .executable = self.executable, .account_directory = self.selection.account_ref, .workspace_root = self.selection.workspace.value, .model_provider = self.selection.model_provider };
+        }
     };
     configs: []const Config,
     owned_configs: [2]Config = undefined,
@@ -24,6 +28,7 @@ pub const NativeFactory = struct {
     catalog_count: usize = 0,
     catalog_authoritative: bool = false,
     status: c.RuntimeStatus = .{},
+    status_configurations: [2]c.RuntimeSetup = undefined,
     login_instance: ?common.Adapter = null,
     login_allocator: ?std.mem.Allocator = null,
     login_started: u64 = 0,
@@ -145,7 +150,13 @@ pub const NativeFactory = struct {
         return self.catalog_models[0..self.catalog_count];
     }
     fn runtimeStatus(p: *anyopaque) c.RuntimeStatus {
-        return cast(p).status;
+        const self = cast(p);
+        var status = self.status;
+        status.login_pending = self.login_instance != null;
+        const count = @min(self.configs.len, self.status_configurations.len);
+        for (self.configs[0..count], self.status_configurations[0..count]) |config, *setup| setup.* = config.setup();
+        status.configurations = self.status_configurations[0..count];
+        return status;
     }
     fn stopLogin(self: *NativeFactory) void {
         if (self.login_instance) |instance| {
@@ -195,6 +206,7 @@ pub const NativeFactory = struct {
     fn action(p: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: c.RuntimeAction) !void {
         const self = cast(p);
         self.performAction(allocator, io, request) catch |err| {
+            if (err == error.RuntimeBusy) return err;
             self.status.reason = @errorName(err);
             self.status.readiness = .unavailable;
             self.catalog_count = 0;
@@ -203,10 +215,13 @@ pub const NativeFactory = struct {
         };
     }
     fn performAction(self: *NativeFactory, allocator: std.mem.Allocator, io: std.Io, request: c.RuntimeAction) !void {
+        // Refresh cannot destroy the runtime that owns an in-progress sign-in.
+        if (request == .refresh and self.login_instance != null) return error.RuntimeBusy;
         self.status.login = "";
         self.stopLogin();
         switch (request) {
-            .configure => |setup| {
+            .configure, .restore => |setup| {
+                const restoring = request == .restore;
                 if (!std.fs.path.isAbsolute(setup.executable) or !std.fs.path.isAbsolute(setup.account_directory) or !std.fs.path.isAbsolute(setup.workspace_root) or setup.model_provider.len == 0) return error.AbsoluteRuntimePathsRequired;
                 if (setup.executable.len > 4096 or setup.account_directory.len > 4096 or setup.workspace_root.len > 4096 or setup.model_provider.len > 128) return error.ConfigurationLimit;
                 if (self.configs.len > 2 or std.mem.indexOfScalar(u8, setup.executable, 0) != null or std.mem.indexOfScalar(u8, setup.account_directory, 0) != null or std.mem.indexOfScalar(u8, setup.workspace_root, 0) != null or std.mem.indexOfScalar(u8, setup.model_provider, 0) != null) return error.InvalidConfiguration;
@@ -219,13 +234,17 @@ pub const NativeFactory = struct {
                 if (index >= 2) return error.ConfigurationLimit;
                 // Validate and canonicalize in operation storage before replacing
                 // any currently configured identity.
-                try std.Io.Dir.cwd().createDirPath(io, setup.account_directory);
-                const account_root = try std.Io.Dir.cwd().realPathFileAlloc(io, setup.account_directory, allocator);
+                if (!restoring) try std.Io.Dir.cwd().createDirPath(io, setup.account_directory);
+                // Preserve the sentinel in both branches so free includes the
+                // terminator allocated by realPathFileAlloc.
+                const account_root: [:0]u8 = if (restoring) try allocator.dupeZ(u8, setup.account_directory) else try std.Io.Dir.cwd().realPathFileAlloc(io, setup.account_directory, allocator);
                 defer allocator.free(account_root);
-                const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, setup.workspace_root, allocator);
+                const workspace: [:0]u8 = if (restoring) try allocator.dupeZ(u8, setup.workspace_root) else try std.Io.Dir.cwd().realPathFileAlloc(io, setup.workspace_root, allocator);
                 defer allocator.free(workspace);
-                const directory = try std.Io.Dir.cwd().openDir(io, workspace, .{});
-                directory.close(io);
+                if (!restoring) {
+                    const directory = try std.Io.Dir.cwd().openDir(io, workspace, .{});
+                    directory.close(io);
+                }
                 if (std.mem.eql(u8, workspace, account_root)) return error.AccountDirectoryIsWorkspace;
                 for (self.configs, 0..) |config, i| if (i != index and std.mem.eql(u8, config.selection.account_ref, account_root)) return error.SeparateRuntimeAccountsRequired;
                 const generation = self.config_generation[index] ^ 1;
@@ -249,26 +268,37 @@ pub const NativeFactory = struct {
                 self.configs = self.owned_configs[0..@max(self.configs.len, index + 1)];
                 self.catalog_count = 0;
                 self.catalog_authoritative = true;
-                self.status = .{ .runtime_kind = kind, .workspace_root = self.owned_configs[index].selection.workspace.value, .reason = "Configured explicitly; refresh catalog to discover models and account readiness." };
+                const installed = self.owned_configs[index];
+                self.status = .{ .runtime_kind = kind, .workspace_root = installed.selection.workspace.value, .configuration = installed.setup(), .reason = if (restoring) "Saved setup restored. Save or sign in explicitly to discover available models." else "Configured explicitly; refresh catalog to discover models and account readiness." };
+                if (restoring) {
+                    // Retain the saved fields even if software/workspace moved.
+                    // Never inspect or create the account while restoring.
+                    std.Io.Dir.cwd().access(io, installed.executable, .{ .execute = true }) catch return error.RuntimeExecutableUnavailable;
+                    const directory = std.Io.Dir.cwd().openDir(io, workspace, .{}) catch return error.RuntimeWorkspaceUnavailable;
+                    directory.close(io);
+                }
             },
             .refresh => {
                 self.catalog_count = 0;
                 self.catalog_authoritative = true;
                 var retained = std.heap.FixedBufferAllocator.init(&self.catalog_storage);
-                const catalog = @import("catalog.zig");
                 const scratch_bytes = try allocator.alloc(u8, 4 * 1024 * 1024);
                 defer allocator.free(scratch_bytes);
-                for (self.configs) |config| {
-                    var scratch_fixed = std.heap.FixedBufferAllocator.init(scratch_bytes);
-                    const scratch = scratch_fixed.allocator();
-                    const codex = std.mem.eql(u8, config.selection.runtime_kind, "codex");
-                    const root = try scratch.dupeZ(u8, config.selection.workspace.value);
-                    var wire = try transport.Transport.init(allocator, .{ .argv = if (codex) &.{ config.executable, "app-server", "--stdio" } else &.{ config.executable, "acp" }, .cwd = root, .environment = config.environment });
-                    defer wire.deinit();
-                    const output = self.catalog_models[self.catalog_count..];
-                    self.catalog_count += if (codex) try catalog.codex(scratch, retained.allocator(), &wire, config.selection, output) else try catalog.opencode(scratch, retained.allocator(), &wire, config.selection, root, output);
-                }
+                // Active configuration controls readiness and is discovered first.
+                // A stale secondary runtime must not erase its usable catalog.
+                var active: ?usize = null;
+                for (self.configs, 0..) |config, i| if (std.mem.eql(u8, config.selection.runtime_kind, self.status.runtime_kind)) {
+                    active = i;
+                    break;
+                };
+                const active_index = active orelse return error.ActiveRuntimeNotConfigured;
+                self.catalog_count = try self.refreshConfig(allocator, retained.allocator(), scratch_bytes, self.configs[active_index], self.catalog_models[0..]);
                 if (self.catalog_count == 0) return error.NoConfiguredModels;
+                for (self.configs, 0..) |config, i| {
+                    if (i == active_index) continue;
+                    const count = self.refreshConfig(allocator, retained.allocator(), scratch_bytes, config, self.catalog_models[self.catalog_count..]) catch continue;
+                    self.catalog_count += count;
+                }
                 self.status.readiness = self.catalog_models[0].readiness;
                 self.status.reason = self.catalog_models[0].reason;
             },
@@ -298,7 +328,11 @@ pub const NativeFactory = struct {
                     if (runtime.diagnostic.len != 0) return error.AccountStatusFailed;
                     self.status.runtime_kind = "codex";
                     self.status.workspace_root = config.selection.workspace.value;
+                    self.status.configuration = config.setup();
                     self.status.readiness = .unknown;
+                    // A prior ready account is not completion of this newly
+                    // requested flow; wait for its account update.
+                    runtime.readiness = .unknown;
                     try runtime.startLogin(login.mode == .device);
                     self.login_instance = instance;
                     self.login_allocator = allocator;
@@ -309,6 +343,16 @@ pub const NativeFactory = struct {
                 return error.CodexNotConfigured;
             },
         }
+    }
+    fn refreshConfig(_: *NativeFactory, allocator: std.mem.Allocator, retained: std.mem.Allocator, scratch_bytes: []u8, config: Config, output: []c.Model) !usize {
+        var scratch_fixed = std.heap.FixedBufferAllocator.init(scratch_bytes);
+        const scratch = scratch_fixed.allocator();
+        const codex = std.mem.eql(u8, config.selection.runtime_kind, "codex");
+        const root = try scratch.dupeZ(u8, config.selection.workspace.value);
+        var wire = try transport.Transport.init(allocator, .{ .argv = if (codex) &.{ config.executable, "app-server", "--stdio" } else &.{ config.executable, "acp" }, .cwd = root, .environment = config.environment });
+        defer wire.deinit();
+        const catalog = @import("catalog.zig");
+        return if (codex) try catalog.codex(scratch, retained, &wire, config.selection, output) else try catalog.opencode(scratch, retained, &wire, config.selection, root, output);
     }
     pub fn asFactory(self: *NativeFactory) common.Factory {
         return .{ .context = self, .vtable = &.{ .discover = discovery, .accountStatus = account, .resolveSelection = resolve, .create = createInstance, .destroy = destroyInstance, .models = models, .runtimeStatus = runtimeStatus, .runtimeAction = action, .pumpSetup = pumpSetup, .shutdownSetup = shutdownSetup } };

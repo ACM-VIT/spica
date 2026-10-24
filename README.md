@@ -1,6 +1,6 @@
 # Spica — native agent workspace
 
-A fresh rewrite branch using Spica's Zig/SDL3/Clay and Unicode text foundations. T3 Code is a behavior reference. The native coding interface uses a durable Host with session-scoped fake, Codex app-server and OpenCode ACP factories; real-provider use requires explicit runtime/account/model/workspace selection.
+A fresh rewrite branch using Spica's Zig/SDL3/Clay and Unicode text foundations. T3 Code is a behavior reference. The native coding interface uses a durable Host with session-scoped fake, Codex app-server and OpenCode ACP factories; ordinary launch configures providers in the app and remembers the connection and per-thread model selection.
 
 ## Start the development loop
 
@@ -19,27 +19,42 @@ python3 build/driver.py run      # native starter window
 ./tools/eval-starter --mode editor # private Unicode/clipboard/focus input scenario
 ```
 
-The default native coding UI opens its independent fake-provider conversation:
+Launch normally—no provider flags are required:
 
 ```bash
-zig-out/bin/spica --state-directory /tmp/spica-disposable-conversation
-./tools/eval-starter --mode conversation --output .artifacts/conversation-NEW
+zig-out/bin/spica
 ```
 
-Enter sends, Shift+Enter inserts newline, F6 cancels, F7 allows the current live
-approval, F8 denies, and Ctrl+Q closes. Reopening that directory retains committed
-output and run status. Ordinary launch uses `$XDG_DATA_HOME/spica-native/conversation`
-(or `$HOME/.local/share/spica-native/conversation`); legacy histories are never
-discovered or migrated. `--state-directory` selects isolated state explicitly.
+On first launch, choose **Codex** or **OpenCode**, confirm your existing project
+folder, then **Connect & discover**. Executable and separate managed account
+paths are filled in automatically; **Advanced** lets you change them. Codex
+supports ChatGPT browser/device sign-in in this panel. OpenCode currently needs
+an already authorized account directory selected in Advanced; its sign-in is
+not implemented in Spica. No existing credentials or histories are imported.
+Choose an actual model beside the composer after discovery, then its effort.
+The app remembers successful connection settings and exact per-thread choices.
+Later launches restore the configured workspace and discover models without
+sending a prompt. **Connection** in the sidebar reopens setup.
 
-For a short manual test, send a Unicode prompt, exercise approval/cancel, then
-create another chat from the sidebar and check that switching restores your draft.
-The flat sidebar shows first-prompt titles and actual project/branch metadata.
-Search filters loaded thread metadata; the project filter scopes the list without
-switching your conversation. New thread follows that explicit scope.
-Close and reopen with the same state directory to check retained output. The
-default provider is a synthetic fixture; use an explicit real provider below for
-an actual coding task.
+Enter sends, Shift+Enter inserts newline, F6 cancels, F7 allows the current live
+approval, F8 denies, and Ctrl+Q closes. The sidebar supports loaded-thread title
+search and project scope. Switching chats retains drafts, selection and undo.
+Ordinary launch stores independent app state under
+`$XDG_DATA_HOME/spica-native/conversation` (or
+`$HOME/.local/share/spica-native/conversation`); `--state-directory` overrides it.
+
+For offline testing, explicitly choose the synthetic provider:
+
+```bash
+zig-out/bin/spica --provider fake --state-directory /tmp/spica-disposable-conversation
+./tools/eval-starter --mode conversation --output .artifacts/conversation-NEW
+./tools/eval-provider-setup --output .artifacts/provider-setup/native-NEW
+```
+
+The provider-setup evaluator operates the actual app on a private desktop with
+an isolated data directory and offline protocol fixtures. It tests fresh launch,
+provider drafts, errors, device-code completion, model selection, Send and
+restart, without external authentication or paid inference.
 
 Select the minimal user module with `--lua-module examples/minimal.lua`. F5
 reloads that file; F9 switches between its root/renderer and the native default.
@@ -94,8 +109,8 @@ composer. The adjacent effort control opens that model's actual options.
 Sending starts real provider work in the selected workspace. **Connection** lets
 you edit the configured paths, refresh discovery or initiate Codex sign-in; the
 composer explains why sending is unavailable. Choose IDs from your actual
-account's catalog; the example requires access to that model. Reuse the same
-arguments to reopen your test conversation. Temporary account/project/state
+account's catalog; the example requires access to that model. Use plain launch with the same state directory after saving the connection
+in the panel, or retain explicit launch arguments for a disposable CLI session. Temporary account/project/state
 directories must remain available for that session.
 
 For an OpenCode coordinator with an explicitly authorized Codex child runtime:

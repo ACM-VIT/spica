@@ -35,7 +35,7 @@ const NativeProvider = struct {
             if (std.mem.eql(u8, self.configs[0].selection.account_ref, self.configs[1].selection.account_ref)) return error.SeparateRuntimeAccountsRequired;
             count = 2;
         }
-        self.factory = .{ .configs = self.configs[0..count], .status = .{ .runtime_kind = @tagName(options.provider), .workspace_root = workspace, .reason = "Explicit startup configuration; refresh native picker for actual catalog/account readiness." } };
+        self.factory = .{ .configs = self.configs[0..count], .status = .{ .runtime_kind = @tagName(options.provider), .workspace_root = workspace, .configuration = self.configs[0].setup(), .reason = "Explicit startup configuration; refresh native picker for actual catalog/account readiness." } };
     }
     fn accountConfig(a: std.mem.Allocator, io: std.Io, input: contract.Selection, executable_override: ?[]const u8) !NativeFactory.Config {
         // Only the selected tool's explicit managed state, never another tool's auth.
@@ -166,7 +166,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer app.disconnect();
     {
         const directory = options.state_directory orelse try options_module.defaultStateDirectory(arena.allocator(), init.environ.getPosix("XDG_DATA_HOME"), init.environ.getPosix("HOME"));
-        host = try Host.create(std.heap.page_allocator, threaded.io(), .{ .state_directory = directory, .wake = Wake.notify, .wake_context = &wake, .factory = if (options.provider != .fake) provider.factory.?.asFactory() else null, .setup_factory = provider.factory.?.asFactory(), .selection = provider.selection, .workspace_root = provider.workspace_root });
+        host = try Host.create(std.heap.page_allocator, threaded.io(), .{ .state_directory = directory, .wake = Wake.notify, .wake_context = &wake, .factory = if (options.provider != .fake) provider.factory.?.asFactory() else null, .setup_factory = provider.factory.?.asFactory(), .restore_configuration = !options.provider_explicit, .selection = provider.selection, .workspace_root = provider.workspace_root });
         const dir = try std.Io.Dir.cwd().openDir(threaded.io(), directory, .{});
         defer dir.close(threaded.io());
         var workspace_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -176,7 +176,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // Derived content is descriptor-owned and disappears even after a crash.
         try dir.deleteFile(threaded.io(), ".ui-projection");
         try app.connect(threaded.io(), host.?, spool, &wake, if (provider.selection) |selection| selection.workspace.value else workspace_buffer[0..workspace_length]);
-        if (provider.selection) |selection| try app.configureRuntime(selection, provider.configs[0].executable);
+        if (!options.provider_explicit) {
+            const setup_defaults = try @import("startup.zig").defaults(arena.allocator(), threaded.io(), workspace_buffer[0..workspace_length], init.environ.getPosix("PATH"), init.environ.getPosix("HOME"));
+            try app.configureStartup(setup_defaults);
+        } else if (provider.selection) |selection| try app.configureRuntime(selection, provider.configs[0].executable);
     }
     if (options.lua_module) |path| try app.configureLua(threaded.io(), path, &wake);
     if (options.automation_live) |path| try app.enableLive(threaded.io(), path);

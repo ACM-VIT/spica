@@ -96,10 +96,17 @@ pub const RuntimeSetup = struct {
 pub const RuntimeLogin = struct { runtime_kind: RuntimeKind, mode: enum { browser, device } };
 pub const RuntimeAction = union(enum) {
     configure: RuntimeSetup,
+    /// Restore saved metadata without creating account state or running a provider.
+    restore: RuntimeSetup,
     refresh: void,
     login: RuntimeLogin,
 };
 pub const RuntimeStatus = struct {
+    login_pending: bool = false,
+    /// Borrowed from the factory until its next setup action.
+    configuration: ?RuntimeSetup = null,
+    /// At most two saved setups, borrowed until the next status query or action.
+    configurations: []const RuntimeSetup = &.{},
     runtime_kind: []const u8 = "",
     readiness: Readiness = .unknown,
     reason: []const u8 = "Configure a runtime, then explicitly refresh its catalog.",

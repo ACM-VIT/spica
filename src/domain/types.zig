@@ -168,6 +168,11 @@ pub const BlockDescriptor = struct {
     tool_id: ?adapter.ToolCallId = null,
 };
 pub const RuntimeStatus = struct {
+    login_pending: bool = false,
+    /// Owned by the query projection, borrowed by its consumer.
+    configuration: ?adapter.RuntimeSetup = null,
+    /// At most two saved setups, deeply owned by the query projection.
+    configurations: []const adapter.RuntimeSetup = &.{},
     runtime_kind: []const u8,
     readiness: adapter.Readiness,
     reason: []const u8,

@@ -32,6 +32,11 @@ pub const Wake = struct {
     }
 };
 
+fn setupTarget(id: []const u8, role: []const u8, bounds: c.SDL_FRect, open: bool) automation.Target {
+    const enabled = open and bounds.w > 0 and bounds.h > 0;
+    return .{ .id = id, .role = role, .key = "", .enabled = enabled, .pointer_bounds = if (enabled) .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } else null };
+}
+
 /// Native lifetime and input dispatch. Replaceable presentation owns no domain.
 pub const App = struct {
     window: *c.SDL_Window,
@@ -90,21 +95,32 @@ pub const App = struct {
         var unbound = selection;
         unbound.workspace = .{ .value = "" };
         const identity = try Coding.Identity.from(unbound);
-        const fields = [_][]const u8{ executable, selection.account_ref, selection.workspace.value, selection.model_provider };
         if (!std.mem.eql(u8, selection.runtime_kind, "codex") and !std.mem.eql(u8, selection.runtime_kind, "opencode")) return error.UnsupportedRuntime;
-        self.view.setup_runtime = if (std.mem.eql(u8, selection.runtime_kind, "codex")) .codex else .opencode;
-        for (fields, 0..) |field, index| {
-            if (field.len > self.view.setup_fields[index].len) {
-                self.view.setup_lengths[index] = 0;
-                conversation.notice(&self.view, "Launch configuration is active. A path exceeds the connection form's 512-byte limit; it was left empty, not shortened.");
-                continue;
-            }
-            @memcpy(self.view.setup_fields[index][0..field.len], field);
-            self.view.setup_lengths[index] = field.len;
-        }
+        if (!self.view.configureSetup(.{
+            .runtime_kind = if (std.mem.eql(u8, selection.runtime_kind, "codex")) .codex else .opencode,
+            .executable = executable,
+            .account_directory = selection.account_ref,
+            .workspace_root = selection.workspace.value,
+            .model_provider = selection.model_provider,
+        })) conversation.notice(&self.view, "Launch configuration is active. A path exceeds the connection form's 512-byte limit; it was left empty, not shortened.");
         conversation.launch_selection = identity;
         conversation.catalog_refresh_pending = true;
         self.view.send_disabled_reason = "Loading configured provider models…";
+    }
+
+    /// Ordinary startup probes Host-owned saved configuration before creating a
+    /// conversation. Defaults seed an editable form; they authorize no process.
+    pub fn configureStartup(self: *App, defaults: [2]contract.RuntimeSetup) !void {
+        const conversation = self.conversation orelse return error.NoConversation;
+        conversation.normal_startup = true;
+        conversation.startup_probe_pending = true;
+        conversation.runtime_configured = false;
+        self.view.selected = null;
+        self.view.can_send = false;
+        self.view.navigation_enabled = false;
+        self.view.send_disabled_reason = "Choose a provider in Connection to get started.";
+        self.view.status = "Loading saved connection";
+        if (!self.view.setSetupDefaults(defaults)) conversation.notice(&self.view, "A default path exceeds the connection form's 512-byte limit. Open Advanced and enter a shorter explicit path.");
     }
 
     pub fn init(allocator: std.mem.Allocator) !App {
@@ -185,12 +201,13 @@ pub const App = struct {
                 self.dirty = false;
             }
             var event: c.SDL_Event = undefined;
-            if (deadline) |due| {
+            var next_wake = deadline;
+            if (self.conversation) |conversation| if (conversation.login_inflight and conversation.query == null and conversation.command == null) {
+                next_wake = if (next_wake) |due| @min(due, conversation.login_poll_due) else conversation.login_poll_due;
+            };
+            if (next_wake) |due| {
                 const now = c.SDL_GetTicks();
-                if (now >= due) {
-                    self.snapshot.close_reason = "deadline";
-                    break;
-                }
+                if (now >= due) continue;
                 const timeout: c_int = @intCast(@min(due - now, std.math.maxInt(c_int)));
                 _ = c.SDL_ClearError();
                 if (!c.SDL_WaitEventTimeout(&event, timeout)) {
@@ -442,6 +459,8 @@ pub const App = struct {
             self.snapshot.run_id = conversation.run.slice();
             self.snapshot.approval_id = if (conversation.approval_live) conversation.approval.slice() else "";
             self.snapshot.pending_command = conversation.command != null;
+            self.snapshot.workspace_root = conversation.workspace_root;
+            self.snapshot.login_pending = conversation.login_inflight;
         }
         self.snapshot.transcript = @splat("");
         self.snapshot.transcript_roles = @splat("");
@@ -465,6 +484,13 @@ pub const App = struct {
         self.snapshot.picker_open = self.view.picker_open;
         self.snapshot.setup_open = self.view.setup_open;
         self.snapshot.setup_runtime = @tagName(self.view.setup_runtime);
+        self.snapshot.runtime_info = self.view.runtime_info[0..self.view.runtime_info_len];
+        self.snapshot.login_url = self.view.login_url[0..self.view.login_url_len];
+        self.snapshot.login_code = self.view.login_code[0..self.view.login_code_len];
+        for (self.view.setup_provider_bounds, 0..) |bounds, index| self.snapshot.setup_provider_targets[index] = setupTarget(if (index == 0) "runtime.codex" else "runtime.opencode", "button", bounds, self.view.setup_open);
+        for (self.view.setup_field_bounds, 0..) |bounds, index| self.snapshot.setup_field_targets[index] = setupTarget(([_][]const u8{ "runtime.executable", "runtime.account", "runtime.workspace", "runtime.model_provider" })[index], "textbox", bounds, self.view.setup_open);
+        self.snapshot.setup_advanced_target = setupTarget("runtime.advanced", "button", self.view.setup_advanced_bounds, self.view.setup_open);
+        self.snapshot.setup_login_target = setupTarget("runtime.open_login", "button", self.view.setup_login_bounds, self.view.setup_open and self.view.login_url_len != 0);
         const setup_ids = [_][]const u8{ "runtime.configure", "runtime.browser", "runtime.device", "runtime.refresh" };
         for (self.view.setup_button_bounds, 0..) |bounds, index| {
             const enabled = self.view.custom_root == null and self.view.setup_open and bounds.w > 0 and bounds.h > 0 and (index == 0 or index == 3 or self.view.setup_runtime == .codex);
@@ -740,8 +766,17 @@ const Conversation = struct {
     copy_pending: ?presentation.Selection = null,
     restored_pixel: ?f32 = null,
     restored_revision: ?u64 = null,
+    normal_startup: bool = false,
+    startup_probe_pending: bool = false,
+    runtime_configured: bool = false,
+    startup_runtime: ?contract.RuntimeKind = null,
+    startup_account: [4096]u8 = undefined,
+    startup_account_len: usize = 0,
+    close_setup_after_refresh: bool = false,
     configuration_pending: bool = false,
     launch_selection: ?Coding.Identity = null,
+    login_inflight: bool = false,
+    login_poll_due: u64 = 0,
     catalog_refresh_pending: bool = false,
     catalog_refresh_inflight: bool = false,
     catalog_truncated: bool = false,
@@ -774,6 +809,8 @@ const Conversation = struct {
     }
 
     fn selectionDisabledReason(self: *const Conversation, view: *const Coding) ?[]const u8 {
+        if (self.normal_startup and !self.runtime_configured) return "Choose a provider in Connection to get started.";
+        if (self.login_inflight) return "Complete provider sign-in in Connection before sending.";
         if (self.catalog_refresh_pending or self.catalog_refresh_inflight) return "Loading configured provider models…";
         const selected = if (view.selected) |*identity| identity else return if (view.model_count == 0)
             "No models loaded. Open Connection and Refresh models."
@@ -792,6 +829,69 @@ const Conversation = struct {
             "Selected model is outside the 32-model view limit. Narrow the connection's model provider."
         else
             "Selected model is absent from this catalog. Open Connection and Refresh models, or choose a model.";
+    }
+
+    /// Copy borrowed status before the query page is drained again. Restoring a
+    /// workspace never uses the application state directory as a fallback.
+    fn restoreStartup(self: *Conversation, view: *Coding, status: types.RuntimeStatus) !bool {
+        for (status.configurations) |saved| {
+            if (!view.configureSetup(saved)) self.notice(view, "A saved connection path exceeds the 512-byte form limit. Open Advanced to edit it.");
+        }
+        const configuration = status.configuration orelse {
+            self.notice(view, if (status.readiness == .unavailable) status.reason else "Choose Codex or OpenCode, confirm your workspace, then Connect.");
+            return false;
+        };
+        if (!view.configureSetup(configuration)) self.notice(view, "Saved connection is retained. A path exceeds the 512-byte form limit; use an explicit shorter path to edit it.");
+        if (status.binding == null or status.workspace_root.len == 0) {
+            self.notice(view, "Saved workspace is unavailable. Check its path in Connection, then Connect again.");
+            return false;
+        }
+        const root = try self.allocator.dupe(u8, status.workspace_root);
+        self.allocator.free(self.workspace_root);
+        self.workspace_root = root;
+        self.workspace_branch = try displayId(status.binding.?.expected_branch);
+        self.runtime_configured = true;
+        self.startup_runtime = configuration.runtime_kind;
+        if (configuration.account_directory.len <= self.startup_account.len) {
+            @memcpy(self.startup_account[0..configuration.account_directory.len], configuration.account_directory);
+            self.startup_account_len = configuration.account_directory.len;
+        }
+        self.catalog_refresh_pending = status.readiness != .unavailable;
+        if (status.readiness == .unavailable) {
+            self.notice(view, status.reason);
+            view.setup_open = true;
+        }
+        return true;
+    }
+
+    fn updateLogin(self: *Conversation, view: *Coding, payload: []const u8) void {
+        _ = self;
+        view.login_url_len = 0;
+        view.login_code_len = 0;
+        if (payload.len == 0) return;
+        var storage: [8192]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&storage);
+        const parsed = std.json.parseFromSlice(std.json.Value, fixed.allocator(), payload, .{}) catch return;
+        const result = parsed.value;
+        if (result != .object) return;
+        for ([_][]const u8{ "authUrl", "verificationUrl", "verificationUri", "verification_uri" }) |key| {
+            const value = result.object.get(key) orelse continue;
+            if (value != .string or value.string.len == 0 or value.string.len > view.login_url.len) continue;
+            // Only web sign-in destinations can be opened by this UI action.
+            if (!std.mem.startsWith(u8, value.string, "https://") and !std.mem.startsWith(u8, value.string, "http://localhost:")) continue;
+            if (std.mem.indexOfScalar(u8, value.string, 0) != null) continue;
+            @memcpy(view.login_url[0..value.string.len], value.string);
+            view.login_url_len = value.string.len;
+            break;
+        }
+        for ([_][]const u8{ "userCode", "user_code" }) |key| {
+            const value = result.object.get(key) orelse continue;
+            if (value != .string or value.string.len > view.login_code.len) continue;
+            if (!std.unicode.utf8ValidateSlice(value.string)) continue;
+            @memcpy(view.login_code[0..value.string.len], value.string);
+            view.login_code_len = value.string.len;
+            break;
+        }
     }
 
     fn selectionNeedsSave(self: *const Conversation, view: *const Coding) bool {
@@ -833,6 +933,19 @@ const Conversation = struct {
 
     fn setup(self: *Conversation, app: *App, action: @typeInfo(@FieldType(Coding, "setup_action")).optional.child) !void {
         if (self.command != null or self.query != null) return error.WorkspaceBusy;
+        if (action == .open_login) {
+            if (app.view.login_url_len != 0) {
+                var url: [2049]u8 = undefined;
+                @memcpy(url[0..app.view.login_url_len], app.view.login_url[0..app.view.login_url_len]);
+                url[app.view.login_url_len] = 0;
+                if (!c.SDL_OpenURL(@ptrCast(&url))) return error.OpenSignInPageFailed;
+            }
+            return;
+        }
+        if (self.normal_startup and !self.runtime_configured and action != .configure and action != .status) {
+            self.notice(&app.view, "Connect this provider first, then sign in or refresh its models.");
+            return;
+        }
         switch (action) {
             .status => try self.ask(.runtime_status, .{ .runtime_status = {} }),
             .refresh => {
@@ -840,6 +953,7 @@ const Conversation = struct {
                 self.catalog_refresh_inflight = true;
             },
             .browser, .device => try self.submit(.login, .absent, .absent, .{ .runtime_login = .{ .runtime_kind = if (app.view.setup_runtime == .codex) .codex else .opencode, .mode = if (action == .browser) .browser else .device } }, 0),
+            .open_login => unreachable,
             .configure => try self.submit(.configure, .absent, .absent, .{ .runtime_configure = .{
                 .runtime_kind = if (app.view.setup_runtime == .codex) .codex else .opencode,
                 .executable = app.view.setup_fields[0][0..app.view.setup_lengths[0]],
@@ -1147,7 +1261,7 @@ const Conversation = struct {
         }
     }
 
-    const QueryKind = enum { projects, workspaces, threads, cards, thread, models, runtime_status, runs, approvals, tasks, messages, blocks, content };
+    const QueryKind = enum { projects, workspaces, threads, cards, thread, models, runtime_status, startup_status, runs, approvals, tasks, messages, blocks, content };
     const CommandKind = enum { project, workspace, thread, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
@@ -1253,7 +1367,7 @@ const Conversation = struct {
                 .failure => |value| {
                     if (self.query) |pending| if (pending.ticket.value == value.ticket.value) {
                         self.query = null;
-                        if (pending.kind == .models or pending.kind == .runtime_status) {
+                        if (pending.kind == .models or pending.kind == .runtime_status or pending.kind == .startup_status) {
                             self.catalog_refresh_inflight = false;
                             if (self.configuration_pending) {
                                 self.configuration_pending = false;
@@ -1386,9 +1500,15 @@ const Conversation = struct {
                 self.tile_request = null;
             }
         }
+        // Only an explicit sign-in needs a short-lived UI status timer. Normal
+        // idle remains event-driven; the Host owns the authentication process.
+        if (self.login_inflight and self.query == null and self.command == null and c.SDL_GetTicks() >= self.login_poll_due) {
+            self.login_poll_due = c.SDL_GetTicks() + 500;
+            try self.ask(.runtime_status, .{ .runtime_status = {} });
+        }
         // All discovery runs on Host's worker. Wait for the current query chain;
         // its output must not race a setup receipt that starts another chain.
-        if (self.catalog_refresh_pending and self.query == null and self.command == null and self.workspace.len != 0 and !self.refresh and (self.worker_key == null or self.history_paused)) {
+        if (!self.login_inflight and self.catalog_refresh_pending and self.query == null and self.command == null and self.workspace.len != 0 and !self.refresh and (self.worker_key == null or self.history_paused)) {
             try self.submit(.refresh_models, .absent, .absent, .{ .runtime_refresh = {} }, 0);
             self.catalog_refresh_pending = false;
             self.catalog_refresh_inflight = true;
@@ -1430,7 +1550,7 @@ const Conversation = struct {
         app.view.can_cancel = self.run.len != 0 and !terminal and self.command == null;
         app.view.tasks_enabled = self.command == null and !self.refresh;
         app.view.can_approve = self.approval_live and self.command == null and !self.refresh;
-        app.view.navigation_enabled = self.command == null and self.query == null and !self.refresh and !self.source_pending and (self.worker_key == null or self.history_paused);
+        app.view.navigation_enabled = (!self.normal_startup or self.runtime_configured) and self.command == null and self.query == null and !self.refresh and !self.source_pending and (self.worker_key == null or self.history_paused);
         if (self.pending_history_move) |move| {
             if (self.query == null and !self.source_pending and (self.history_paused or self.worker_key == null)) {
                 self.pending_history_move = null;
@@ -1487,12 +1607,15 @@ const Conversation = struct {
             },
             .configure => {
                 self.configuration_pending = true;
+                self.close_setup_after_refresh = true;
                 self.launch_selection = null;
                 self.catalog_refresh_pending = true;
                 try self.ask(.runtime_status, .{ .runtime_status = {} });
             },
             .login => {
-                self.catalog_refresh_pending = true;
+                self.login_inflight = true;
+                self.login_poll_due = c.SDL_GetTicks() + 500;
+                self.catalog_refresh_pending = false;
                 try self.ask(.runtime_status, .{ .runtime_status = {} });
             },
             .refresh_models => try self.ask(.runtime_status, .{ .runtime_status = {} }),
@@ -1513,14 +1636,33 @@ const Conversation = struct {
 
     fn consume(self: *Conversation, app: *App, kind: QueryKind, value: types.QueryPage) !void {
         switch (kind) {
-            .runtime_status => {
+            .runtime_status, .startup_status => {
                 app.view.runtime_info_len = 0;
                 for (value.items) |row| {
                     const status = row.runtime_status;
+                    if (self.login_inflight) {
+                        self.login_inflight = status.login_pending;
+                        if (!status.login_pending and status.readiness == .ready) {
+                            self.catalog_refresh_pending = true;
+                            self.close_setup_after_refresh = true;
+                        }
+                    }
+                    self.login_poll_due = c.SDL_GetTicks() + 500;
+                    self.updateLogin(&app.view, status.login);
                     const remaining = app.view.runtime_info[app.view.runtime_info_len..];
-                    const written = std.fmt.bufPrint(remaining, "{s}: {s} {s}\n{s}\n", .{ status.runtime_kind, @tagName(status.readiness), status.reason, status.login }) catch continue;
+                    const written = std.fmt.bufPrint(remaining, "{s}: {s}\n{s}\n", .{ status.runtime_kind, @tagName(status.readiness), @import("text/utf8.zig").prefix(status.reason, 3000) }) catch continue;
                     app.view.runtime_info_len += written.len;
+                    if (kind == .startup_status) {
+                        if (try self.restoreStartup(&app.view, status)) {
+                            try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
+                        } else {
+                            app.view.setup_open = true;
+                            app.view.status = "Choose a provider";
+                        }
+                        return;
+                    }
                     if (status.readiness == .unavailable) {
+                        self.close_setup_after_refresh = false;
                         var message: [1024]u8 = undefined;
                         self.notice(&app.view, std.fmt.bufPrint(&message, "Provider unavailable: {s}. Open Connection to check paths, sign-in, and Refresh models.", .{@import("text/utf8.zig").prefix(status.reason, 800)}) catch "Provider unavailable. Open Connection to check paths and sign-in.");
                         if (self.configuration_pending) {
@@ -1534,10 +1676,23 @@ const Conversation = struct {
                         const root = try self.allocator.dupe(u8, status.workspace_root);
                         self.allocator.free(self.workspace_root);
                         self.workspace_root = root;
+                        self.runtime_configured = true;
                         app.view.selected = null;
+                        app.view.thread_count = 0;
+                        app.view.scope_project = .{};
+                        self.refresh = false;
+                        if (self.project.len == 0) {
+                            try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
+                            return;
+                        }
                         try self.submit(.workspace, .absent, .absent, .{ .workspace_register = .{ .project = .{ .value = self.project.slice() }, .binding = status.binding.? } }, 0);
                         return;
                     }
+                }
+                if (kind == .startup_status) {
+                    app.view.setup_open = true;
+                    app.view.status = "Choose a provider";
+                    return;
                 }
                 if (self.workspace.len != 0) {
                     app.view.model_count = 0;
@@ -1549,6 +1704,7 @@ const Conversation = struct {
                 for (value.items) |row| {
                     if (app.view.model_count == app.view.models.len) break;
                     const model = row.model;
+                    if (self.normal_startup and model.synthetic) continue;
                     const target = &app.view.models[app.view.model_count];
                     target.* = .{ .identity = try Coding.Identity.from(model.selection), .readiness = model.readiness, .synthetic = model.synthetic };
                     target.reason_len = @import("text/utf8.zig").prefix(model.reason, target.reason.len).len;
@@ -1568,10 +1724,19 @@ const Conversation = struct {
                 } else {
                     self.catalog_truncated = value.next_cursor != null;
                     self.catalog_refresh_inflight = false;
+                    if (self.close_setup_after_refresh and !self.catalog_refresh_pending and app.view.model_count != 0) {
+                        self.close_setup_after_refresh = false;
+                        app.view.setup_open = false;
+                    }
                     try self.askRuns();
                 }
             },
             .projects => {
+                if (self.startup_probe_pending) {
+                    self.startup_probe_pending = false;
+                    try self.ask(.startup_status, .{ .runtime_status = {} });
+                    return;
+                }
                 for (value.items) |row| try addEntry(&app.view.projects, &app.view.project_count, row.project.id.value, row.project.display_name);
                 if (value.items.len == 0) try self.submit(.project, .absent, .absent, .{ .project_create = .{ .display_name = "Native coding workspace" } }, 0) else {
                     self.project = try Id.init(value.items[0].project.id.value);
@@ -1604,12 +1769,19 @@ const Conversation = struct {
                     self.card_rows_seen += 1;
                     if (!std.mem.eql(u8, row.thread.workspace_root, self.workspace_root)) continue;
                     try self.updateThreadCard(&app.view, row.thread);
-                    if (self.thread.len == 0 and std.mem.eql(u8, row.thread.project.value, self.project.slice())) self.thread = try Id.init(row.thread.id.value);
+                    if (std.mem.eql(u8, row.thread.project.value, self.project.slice())) {
+                        if (self.startup_runtime) |runtime| {
+                            if (row.thread.selection) |selection| {
+                                if (std.mem.eql(u8, selection.runtime_kind, @tagName(runtime)) and std.mem.eql(u8, selection.account_ref, self.startup_account[0..self.startup_account_len])) self.thread = try Id.init(row.thread.id.value);
+                            }
+                        } else if (self.thread.len == 0) self.thread = try Id.init(row.thread.id.value);
+                    }
                 }
                 if (value.next_cursor != null and app.view.thread_count < app.view.threads.len and self.card_rows_seen < 128) {
                     try self.ask(kind, .{ .threads = .{ .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = value.next_cursor } } });
                 } else {
                     if (value.next_cursor != null) self.notice(&app.view, "Showing a bounded thread page for this workspace. More threads remain outside this view.");
+                    self.startup_runtime = null;
                     if (kind == .cards) {
                         try self.ask(.thread, .{ .thread = .{ .value = self.thread.slice() } });
                     } else if (self.thread.len != 0) {
@@ -2269,4 +2441,62 @@ test "thread cards own real titles and workspace metadata across refresh" {
     const full_branch = [_]u8{'b'} ** 255 ++ "é";
     try std.testing.expectEqual(@as(u16, 255), (try Conversation.displayId(full_branch)).len);
     try std.testing.expectEqual(@as(usize, 257), full_branch.len);
+}
+
+test "ordinary startup seeds independent provider forms and blocks synthetic execution" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    app.conversation = &conversation;
+    const defaults: [2]contract.RuntimeSetup = .{
+        .{ .runtime_kind = .codex, .executable = "/bin/codex", .account_directory = "/managed/codex", .workspace_root = "/project", .model_provider = "openai" },
+        .{ .runtime_kind = .opencode, .executable = "/bin/opencode", .account_directory = "/managed/opencode", .workspace_root = "/project", .model_provider = "opencode" },
+    };
+    try app.configureStartup(defaults);
+    try std.testing.expect(conversation.normal_startup and conversation.startup_probe_pending);
+    try std.testing.expect(!conversation.runtime_configured);
+    try std.testing.expect(!app.view.can_send and !app.view.navigation_enabled);
+    try std.testing.expect(app.view.selected == null);
+    // A retained fixture choice cannot bypass ordinary-mode admission.
+    var fake = usability_selection;
+    fake.runtime_kind = "fake";
+    app.view.selected = try Coding.Identity.from(fake);
+    try std.testing.expectEqualStrings("Choose a provider in Connection to get started.", conversation.selectionDisabledReason(&app.view).?);
+}
+
+test "saved startup owns actual workspace and configuration without selecting a model" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = try std.testing.allocator.dupe(u8, "/application-state") };
+    defer std.testing.allocator.free(conversation.workspace_root);
+    const configuration: contract.RuntimeSetup = .{ .runtime_kind = .opencode, .executable = "/bin/opencode", .account_directory = "/managed/opencode", .workspace_root = "/actual-project", .model_provider = "fixture" };
+    var status: types.RuntimeStatus = .{ .runtime_kind = "opencode", .readiness = .unknown, .reason = "Restored", .login = "", .workspace_root = "/actual-project", .configuration = configuration, .binding = .{ .canonical_root = "/actual-project", .filesystem_identity = "fixture", .repository_identity = "", .checkout_identity = "", .expected_branch = "", .base_revision = "", .non_git = true } };
+    try std.testing.expect(try conversation.restoreStartup(&view, status));
+    try std.testing.expectEqualStrings("/actual-project", conversation.workspace_root);
+    try std.testing.expect(conversation.workspace_root.ptr != status.workspace_root.ptr);
+    try std.testing.expectEqualStrings("/managed/opencode", view.setup_fields[1][0..view.setup_lengths[1]]);
+    try std.testing.expectEqual(.opencode, view.setup_runtime);
+    try std.testing.expect(conversation.catalog_refresh_pending and conversation.runtime_configured);
+    try std.testing.expect(view.selected == null);
+    status.binding = null;
+    status.workspace_root = "/missing-project";
+    try std.testing.expect(!try conversation.restoreStartup(&view, status));
+    try std.testing.expectEqualStrings("/actual-project", conversation.workspace_root);
+    try std.testing.expect(std.mem.indexOf(u8, view.notice.?, "Saved workspace is unavailable") != null);
+}
+
+test "sign-in fields retain complete bounded web URL and Unicode device code" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    var conversation: Conversation = undefined;
+    conversation.updateLogin(&view, "{\"verificationUri\":\"https://example.invalid/device\",\"userCode\":\"世界-123\"}");
+    try std.testing.expectEqualStrings("https://example.invalid/device", view.login_url[0..view.login_url_len]);
+    try std.testing.expectEqualStrings("世界-123", view.login_code[0..view.login_code_len]);
+    conversation.updateLogin(&view, "{\"authUrl\":\"file:///not-a-signin\",\"userCode\":\"new\"}");
+    try std.testing.expectEqual(@as(usize, 0), view.login_url_len);
+    try std.testing.expectEqualStrings("new", view.login_code[0..view.login_code_len]);
+    conversation.updateLogin(&view, "invalid JSON");
+    try std.testing.expectEqual(@as(usize, 0), view.login_url_len);
+    try std.testing.expectEqual(@as(usize, 0), view.login_code_len);
 }

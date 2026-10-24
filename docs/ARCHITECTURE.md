@@ -54,3 +54,30 @@ Keep renderer investigations independent of the domain/API. GPU/native rendering
 ## Explicit product scope
 
 Codex (including supported ChatGPT sign-in), OpenCode, and a bounded app-owned coordinator/worker workflow are requested product features. OMP remains the development harness. The initial app orchestrator supports delegate/message/wait/cancel, results, review disposition, explicit runtime/model/workspace selection and recovery. Cross-runtime execution follows the two adapter gates. A universal unattended automation platform is not required. See [integration design and verified sources](PROVIDERS_AND_ORCHESTRATION.md).
+
+
+## Ordinary startup and provider setup
+
+Plain launch probes the Host's saved runtime configuration before creating a
+workspace or thread. An unconfigured app opens Connection with provider-specific
+editable defaults: executable metadata from PATH/user install locations, canonical
+current directory, and separate app-managed account directories. Preparing the
+form creates no account state and starts no runtime. Connect is the explicit
+configuration action; only successful configuration becomes the durable active
+provider. Per-thread model and effort selections remain separate durable values.
+
+The Host restores saved settings without replaying login or inference, exposes
+owned bounded status/configuration projections, and retains actionable failures.
+The App binds its conversation to that restored workspace before loading threads,
+then requests metadata discovery on the Host worker. Discovery runs the active
+runtime first and isolates failures in the secondary runtime. Installed software
+and a catalog never imply model entitlement; the user selects an exact model.
+Explicit `--provider` remains an override, including the isolated fake fixture.
+
+Codex authentication belongs to the Host, independent of UI reloads. An explicit
+browser/device action starts supported sign-in. The UI observes status at a
+500ms cadence only while that sign-in is active, displays the returned URL/code,
+and opens its web page only on user action. Refresh cannot stop pending sign-in;
+completion schedules catalog discovery. OpenCode account login is currently
+unsupported in this panel; a previously authorized account directory can be
+selected in Advanced. No credentials or legacy histories are discovered/imported.
