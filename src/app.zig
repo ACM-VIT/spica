@@ -768,6 +768,7 @@ const Conversation = struct {
     restored_revision: ?u64 = null,
     normal_startup: bool = false,
     startup_probe_pending: bool = false,
+    bootstrap_after_catalog: bool = false,
     runtime_configured: bool = false,
     startup_runtime: ?contract.RuntimeKind = null,
     startup_account: [4096]u8 = undefined,
@@ -1658,7 +1659,14 @@ const Conversation = struct {
                     app.view.runtime_info_len += written.len;
                     if (kind == .startup_status) {
                         if (try self.restoreStartup(&app.view, status)) {
-                            try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
+                            if (self.catalog_refresh_pending) {
+                                // Discover before history snapshots are captured;
+                                // catalog commits must not invalidate startup reads.
+                                self.catalog_refresh_pending = false;
+                                self.catalog_refresh_inflight = true;
+                                self.bootstrap_after_catalog = true;
+                                try self.submit(.refresh_models, .absent, .absent, .{ .runtime_refresh = {} }, 0);
+                            } else try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
                         } else {
                             app.view.setup_open = true;
                             app.view.status = "Choose a provider";
@@ -1666,6 +1674,7 @@ const Conversation = struct {
                         return;
                     }
                     if (status.readiness == .unavailable) {
+                        if (self.bootstrap_after_catalog) app.view.setup_open = true;
                         self.close_setup_after_refresh = false;
                         var message: [1024]u8 = undefined;
                         self.notice(&app.view, std.fmt.bufPrint(&message, "Provider unavailable: {s}. Open Connection to check paths, sign-in, and Refresh models.", .{@import("text/utf8.zig").prefix(status.reason, 800)}) catch "Provider unavailable. Open Connection to check paths and sign-in.");
@@ -1692,6 +1701,11 @@ const Conversation = struct {
                         try self.submit(.workspace, .absent, .absent, .{ .workspace_register = .{ .project = .{ .value = self.project.slice() }, .binding = status.binding.? } }, 0);
                         return;
                     }
+                }
+                if (self.bootstrap_after_catalog) {
+                    self.bootstrap_after_catalog = false;
+                    try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
+                    return;
                 }
                 if (kind == .startup_status) {
                     app.view.setup_open = true;
