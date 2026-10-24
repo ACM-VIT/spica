@@ -108,6 +108,10 @@ pub const View = struct {
     project_bounds: [16]c.SDL_FRect = @splat(zero_rect),
     thread_bounds: [32]c.SDL_FRect = @splat(zero_rect),
     setup_open: bool = false,
+    setup_busy: bool = false,
+    setup_login_pending: bool = false,
+    /// Borrowed App-owned, stable bounded notice; never owns runtime state.
+    setup_feedback: ?[]const u8 = null,
     setup_runtime: contract.RuntimeKind = .codex,
     setup_fields: [4][512]u8 = undefined,
     setup_lengths: [4]usize = @splat(0),
@@ -193,6 +197,13 @@ pub const View = struct {
 
     fn setupIndex(self: *const View) usize {
         return if (self.setup_runtime == .codex) 0 else 1;
+    }
+
+    /// Public button order: configure/browser/device/refresh. Opening the
+    /// returned login URL is independent of command/query/auth availability.
+    pub fn setupActionEnabled(self: *const View, index: usize) bool {
+        if (index >= self.setup_button_bounds.len or self.setup_busy or self.setup_login_pending) return false;
+        return self.setup_runtime == .codex or (index != 1 and index != 2);
     }
 
     fn saveSetupDraft(self: *View) void {
@@ -683,7 +694,7 @@ pub const View = struct {
                             self.setup_select_all = true;
                         };
                         for (self.setup_button_bounds, 0..) |box, index| if (widgets.contains(box, x, y)) {
-                            if (self.setup_runtime == .opencode and (index == 1 or index == 2)) break;
+                            if (!self.setupActionEnabled(index)) break;
                             self.setup_action = switch (index) {
                                 0 => .configure,
                                 1 => .browser,
@@ -948,7 +959,7 @@ pub const View = struct {
                         self.setup_select_all = true;
                     }
                     if (ctrl and key == c.SDLK_A) self.setup_select_all = true;
-                    if (key == c.SDLK_RETURN) {
+                    if (key == c.SDLK_RETURN and self.setupActionEnabled(0)) {
                         self.setup_action = .configure;
                         self.setup_advanced_open = false;
                         self.setup_field = 2;
@@ -1564,7 +1575,8 @@ pub const View = struct {
         try widgets.panel(renderer, menu, @min(self.design.layout.radius, 8), self.design.colors.raised);
         var clip = widgets.Clip.push(renderer, menu);
         defer clip.restore(renderer);
-        try self.labels.draw(text, "Connection setup", menu.x + 16, menu.y + 15, 16, foreground);
+        const title = if (self.setup_login_pending) "Connection setup · Sign-in pending" else if (self.setup_busy) "Connection setup · Working…" else "Connection setup";
+        try self.labels.drawFitted(renderer, text, title, menu.x + 16, menu.y + 15, menu.w - 116, 16, foreground);
         try widgets.panel(renderer, self.setup_close_bounds, @min(self.design.layout.radius, 4), self.design.colors.surface);
         try self.labels.draw(text, "Close Esc", self.setup_close_bounds.x + 7, menu.y + 19, 11, foreground);
         for (self.setup_provider_bounds, 0..) |box, index| {
@@ -1588,8 +1600,8 @@ pub const View = struct {
         const names_buttons = [_][]const u8{ "Connect & discover", "Sign in with browser", "Use device code", "Refresh models" };
         for (names_buttons, 0..) |name, index| {
             const box = self.setup_button_bounds[index];
-            const enabled = self.setup_runtime == .codex or (index != 1 and index != 2);
-            try widgets.panel(renderer, box, @min(self.design.layout.radius, 4), if (index == 0) self.design.colors.selection else self.design.colors.surface);
+            const enabled = self.setupActionEnabled(index);
+            try widgets.panel(renderer, box, @min(self.design.layout.radius, 4), if (index == 0 and enabled) self.design.colors.selection else self.design.colors.surface);
             try self.labels.draw(text, name, box.x + 12, box.y + 9, 12, if (enabled) foreground else muted);
         }
         var status_y = geometry.status_y;
@@ -1601,28 +1613,50 @@ pub const View = struct {
                 try self.labels.draw(text, "Code:", menu.x + 208, geometry.guidance_y + 8, 11, muted);
                 try self.labels.drawFitted(renderer, text, self.login_code[0..self.login_code_len], menu.x + 244, geometry.guidance_y + 6, menu.w - 260, 14, foreground);
             }
-            try self.labels.drawFitted(renderer, text, self.login_url[0..self.login_url_len], menu.x + 16, status_y, menu.w - 32, 11, muted);
-            status_y += 18;
         } else {
             const guidance = if (self.setup_runtime == .codex)
-                "Connect saves settings and finds models. Connect first, then sign in with ChatGPT."
+                "Connect finds models. Sign-in and Refresh also apply the settings shown above."
             else
                 "OpenCode sign-in is not supported here. Select a preauthorized account in Advanced.";
             try self.labels.drawFitted(renderer, text, guidance, menu.x + 16, geometry.guidance_y, menu.w - 32, 11, muted);
             try self.labels.drawFitted(renderer, text, "Choose a model beside the composer after connecting. No model is selected for you.", menu.x + 16, geometry.guidance_y + 17, menu.w - 32, 11, muted);
         }
-        // Keep bounded raw failure diagnostics visible below structured login
-        // details. Long runtime strings never enter the label cache wholesale.
+        // Actionable App feedback wins the bounded space below the controls,
+        // including Advanced at 720x480. Raw URL text is secondary to errors;
+        // the explicit open-page control and device code always stay visible.
+        if (self.setup_feedback) |feedback| status_y = try self.drawSetupDiagnostic(renderer, text, feedback, status_y, menu, foreground);
+        status_y = try self.drawSetupDiagnostic(renderer, text, self.runtime_info[0..self.runtime_info_len], status_y, menu, foreground);
+        if (self.setup_runtime == .codex and self.login_url_len != 0 and status_y + 14 <= menu.y + menu.h - 6)
+            try self.labels.drawFitted(renderer, text, self.login_url[0..self.login_url_len], menu.x + 16, status_y, menu.w - 32, 11, muted);
+    }
+
+    fn drawSetupDiagnostic(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bytes: []const u8, top: f32, menu: c.SDL_FRect, foreground: Color) !f32 {
         var start: usize = 0;
-        var y = status_y;
-        while (start < self.runtime_info_len and y + 14 <= menu.y + menu.h - 6) : (y += 16) {
-            const rest = self.runtime_info[start..self.runtime_info_len];
+        var y = top;
+        while (start < bytes.len and y + 14 <= menu.y + menu.h - 6) : (y += 16) {
+            const rest = bytes[start..];
             const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-            const end = @import("../text/utf8.zig").prefix(rest[0..line_end], 100).len;
+            const utf8 = @import("../text/utf8.zig");
+            // Bound shaping/cache keys, then fit a scalar-aligned prefix by
+            // binary search. Continue on the next row instead of clipping out
+            // the actionable suffix of a wide diagnostic.
+            const bounded = utf8.prefix(rest[0..line_end], 100);
+            var end = bounded.len;
+            if (try self.labels.width(text, bounded, 11) > menu.w - 32) {
+                var low: usize = 0;
+                var high = bounded.len;
+                while (low < high) {
+                    const middle = low + (high - low + 1) / 2;
+                    if (try self.labels.width(text, utf8.prefix(bounded, middle), 11) <= menu.w - 32) low = middle else high = middle - 1;
+                }
+                end = utf8.prefix(bounded, low).len;
+            }
+            if (end == 0 and line_end != 0) break;
             try self.labels.drawFitted(renderer, text, rest[0..end], menu.x + 16, y, menu.w - 32, 11, foreground);
             start += end;
-            if (start < self.runtime_info_len and self.runtime_info[start] == '\n') start += 1;
+            if (start < bytes.len and bytes[start] == '\n') start += 1;
         }
+        return y;
     }
 
     fn drawSetupField(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, index: usize, foreground: Color, muted: Color) !void {
@@ -2325,6 +2359,68 @@ test "connection keyboard navigates visible fields and deletes whole Unicode cha
     try std.testing.expect(!view.setup_advanced_open);
 }
 
+test "connection availability rejects busy pointer and keyboard actions without consuming drafts or login URL" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try std.testing.expect(view.setSetupDefaults(setup_fixture_defaults));
+    view.setup_open = true;
+    const geometry = Layout.setup(720, 480, true);
+    view.setup_button_bounds = geometry.buttons;
+    view.setup_login_bounds = .{ .x = geometry.menu.x + 16, .y = geometry.guidance_y, .w = 180, .h = 28 };
+    const url = "https://example.invalid/sign-in";
+    @memcpy(view.login_url[0..url.len], url);
+    view.login_url_len = url.len;
+    var click = std.mem.zeroes(c.SDL_Event);
+    click.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    click.button.button = c.SDL_BUTTON_LEFT;
+    var key = std.mem.zeroes(c.SDL_Event);
+    key.type = c.SDL_EVENT_KEY_DOWN;
+    for ([_]contract.RuntimeKind{ .codex, .opencode }) |runtime| {
+        view.selectSetupProvider(runtime);
+        const draft = view.setup_fields[2];
+        for ([_]bool{ false, true }) |busy| for ([_]bool{ false, true }) |login_pending| {
+            view.setup_busy = busy;
+            view.setup_login_pending = login_pending;
+            for (geometry.buttons, 0..) |box, index| {
+                const enabled = !busy and !login_pending and (runtime == .codex or index == 0 or index == 3);
+                try std.testing.expectEqual(enabled, view.setupActionEnabled(index));
+                view.setup_action = null;
+                view.setup_advanced_open = true;
+                click.button.x = box.x + box.w / 2;
+                click.button.y = box.y + box.h / 2;
+                try std.testing.expect(try view.handle(click, undefined, undefined));
+                try std.testing.expectEqual(enabled, view.setup_action != null);
+                try std.testing.expectEqual(!enabled, view.setup_advanced_open);
+            }
+            view.setup_action = null;
+            view.setup_advanced_open = true;
+            key.key.key = c.SDLK_RETURN;
+            key.key.mod = 0;
+            try std.testing.expect(try view.handle(key, undefined, undefined));
+            try std.testing.expectEqual(!busy and !login_pending, view.setup_action != null);
+            try std.testing.expectEqual(busy or login_pending, view.setup_advanced_open);
+            view.setup_action = null;
+            click.button.x = view.setup_login_bounds.x + 10;
+            click.button.y = view.setup_login_bounds.y + 10;
+            try std.testing.expect(try view.handle(click, undefined, undefined));
+            try std.testing.expectEqual(runtime == .codex, view.setup_action == .open_login);
+            view.setup_action = null;
+            key.key.key = c.SDLK_L;
+            key.key.mod = c.SDL_KMOD_CTRL;
+            try std.testing.expect(try view.handle(key, undefined, undefined));
+            try std.testing.expectEqual(runtime == .codex, view.setup_action == .open_login);
+            try std.testing.expectEqualSlices(u8, draft[0..view.setup_lengths[2]], view.setup_fields[2][0..view.setup_lengths[2]]);
+        };
+    }
+    try std.testing.expect(!view.setupActionEnabled(4));
+    try std.testing.expect(!view.setupActionEnabled(std.math.maxInt(usize)));
+    view.setup_runtime = .codex;
+    view.login_url_len = 0;
+    view.setup_action = null;
+    try std.testing.expect(try view.handle(key, undefined, undefined));
+    try std.testing.expect(view.setup_action == null);
+}
+
 test "connection paints provider choices advanced fields and explicit sign-in page at every supported size" {
     const Pixel = struct {
         fn expect(surface: *c.SDL_Surface, box: c.SDL_FRect, color: Color) !void {
@@ -2388,6 +2484,15 @@ test "connection paints provider choices advanced fields and explicit sign-in pa
                         try std.testing.expect(view.setup_action == null);
                     }
                 }
+                for ([_]bool{ false, true }) |busy| for ([_]bool{ false, true }) |login_pending| {
+                    view.setup_busy = busy;
+                    view.setup_login_pending = login_pending;
+                    try view.drawSetup(renderer, text, bounds, fg, muted);
+                    try std.testing.expect(c.SDL_RenderPresent(renderer));
+                    try Pixel.expect(surface, view.setup_button_bounds[0], if (view.setupActionEnabled(0)) view.design.colors.selection else view.design.colors.surface);
+                };
+                view.setup_busy = false;
+                view.setup_login_pending = false;
             }
             view.selectSetupProvider(.codex);
         }
@@ -2435,6 +2540,74 @@ test "connection paints provider choices advanced fields and explicit sign-in pa
         var stats: c.SpicaTextStats = undefined;
         try std.testing.expect(c.spica_text_get_stats(text, &stats));
         try std.testing.expectEqual(@as(c_uint, 1), stats.face_count);
+    }
+}
+
+test "minimum Advanced paints exact actionable feedback below pending sign-in without clipping its second line" {
+    const surface = c.SDL_CreateSurface(720, 480, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(text);
+    var layout = try Layout.init(std.testing.allocator, 720, 480);
+    defer layout.deinit();
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    const bounds = layout.coding(720);
+    const geometry = Layout.setup(720, 480, true);
+    view.setup_advanced_open = true;
+    view.setup_busy = true;
+    view.setup_login_pending = true;
+    const lines = [_][]const u8{ "Codex sign-in failed: invalid account folder.", "Open Advanced and choose a writable account folder." };
+    const runtime_lines = [_][]const u8{ "codex: unavailable", "Choose a writable account folder." };
+    const status = runtime_lines[0] ++ "\n" ++ runtime_lines[1];
+    const url = "https://example.invalid/sign-in";
+    @memcpy(view.login_url[0..url.len], url);
+    const code = "TEST-1234";
+    @memcpy(view.login_code[0..code.len], code);
+    view.login_code_len = code.len;
+    const fg = view.design.colors.foreground;
+    const muted = view.design.colors.muted;
+    for ([_]bool{ false, true }) |feedback| {
+        view.setup_feedback = if (feedback) lines[0] ++ "\n" ++ lines[1] else null;
+        @memcpy(view.runtime_info[0..status.len], status);
+        view.runtime_info_len = status.len;
+        view.login_url_len = url.len;
+        try view.drawSetup(renderer, text, bounds, fg, muted);
+        try std.testing.expect(c.SDL_RenderPresent(renderer));
+        try std.testing.expect(view.setup_login_bounds.y + view.setup_login_bounds.h <= geometry.status_y);
+        try std.testing.expect(geometry.status_y + 32 <= geometry.menu.y + geometry.menu.h - 6);
+        for (geometry.fields) |box| try std.testing.expect(box.y + box.h <= geometry.buttons[0].y);
+        const region = c.SDL_Rect{ .x = @intFromFloat(geometry.menu.x + 16), .y = @intFromFloat(geometry.status_y), .w = @intFromFloat(geometry.menu.w - 32), .h = 32 };
+        const actual = c.SDL_RenderReadPixels(renderer, &region) orelse return error.ReadPixels;
+        defer c.SDL_DestroySurface(actual);
+        // Paint an independent expected pair of complete strings over the empty
+        // modal. Comparing every diagnostic pixel catches missing/clipped glyphs,
+        // stale runtime status, a URL overwriting feedback, and wrong row placement.
+        view.setup_feedback = null;
+        view.runtime_info_len = 0;
+        view.login_url_len = 0;
+        try view.drawSetup(renderer, text, bounds, fg, muted);
+        try widgets.panel(renderer, .{ .x = @floatFromInt(region.x), .y = @floatFromInt(region.y), .w = @floatFromInt(region.w), .h = @floatFromInt(region.h) }, 0, view.design.colors.raised);
+        for (if (feedback) lines else runtime_lines, 0..) |line, row| try view.labels.draw(text, line, geometry.menu.x + 16, geometry.status_y + @as(f32, @floatFromInt(row)) * 16, 11, fg);
+        try std.testing.expect(c.SDL_RenderPresent(renderer));
+        const expected = c.SDL_RenderReadPixels(renderer, &region) orelse return error.ReadPixels;
+        defer c.SDL_DestroySurface(expected);
+        var ink: [2]usize = @splat(0);
+        var y: c_int = 0;
+        while (y < region.h) : (y += 1) {
+            var x: c_int = 0;
+            while (x < region.w) : (x += 1) {
+                var a: [4]u8 = undefined;
+                var b: [4]u8 = undefined;
+                try std.testing.expect(c.SDL_ReadSurfacePixel(actual, x, y, &a[0], &a[1], &a[2], &a[3]));
+                try std.testing.expect(c.SDL_ReadSurfacePixel(expected, x, y, &b[0], &b[1], &b[2], &b[3]));
+                try std.testing.expectEqual(a, b);
+                if (a[0] != view.design.colors.raised.r or a[1] != view.design.colors.raised.g or a[2] != view.design.colors.raised.b) ink[@intCast(@divTrunc(y, 16))] += 1;
+            }
+        }
+        try std.testing.expect(ink[0] > 20 and ink[1] > 20);
     }
 }
 

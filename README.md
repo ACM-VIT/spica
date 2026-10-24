@@ -28,7 +28,10 @@ zig-out/bin/spica
 On first launch, choose **Codex** or **OpenCode**, confirm your existing project
 folder, then **Connect & discover**. Executable and separate managed account
 paths are filled in automatically; **Advanced** lets you change them. Codex
-supports ChatGPT browser/device sign-in in this panel. OpenCode currently needs
+supports ChatGPT browser/device sign-in in this panel. Sign-in and Refresh apply
+the displayed provider/account/workspace fields before proceeding; you can
+start Codex sign-in directly. Pending actions are visibly disabled and failures
+appear inside the setup panel. OpenCode currently needs
 an already authorized account directory selected in Advanced; its sign-in is
 not implemented in Spica. No existing credentials or histories are imported.
 Choose an actual model beside the composer after discovery, then its effort.

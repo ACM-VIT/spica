@@ -104,6 +104,7 @@ pub const App = struct {
             .model_provider = selection.model_provider,
         })) conversation.notice(&self.view, "Launch configuration is active. A path exceeds the connection form's 512-byte limit; it was left empty, not shortened.");
         conversation.launch_selection = identity;
+        conversation.configured_setup_key = Conversation.setupKey(Conversation.setupConfiguration(&self.view));
         conversation.catalog_refresh_pending = true;
         self.view.send_disabled_reason = "Loading configured provider models…";
     }
@@ -493,7 +494,7 @@ pub const App = struct {
         self.snapshot.setup_login_target = setupTarget("runtime.open_login", "button", self.view.setup_login_bounds, self.view.setup_open and self.view.login_url_len != 0);
         const setup_ids = [_][]const u8{ "runtime.configure", "runtime.browser", "runtime.device", "runtime.refresh" };
         for (self.view.setup_button_bounds, 0..) |bounds, index| {
-            const enabled = self.view.custom_root == null and self.view.setup_open and bounds.w > 0 and bounds.h > 0 and (index == 0 or index == 3 or self.view.setup_runtime == .codex);
+            const enabled = self.view.custom_root == null and self.view.setup_open and bounds.w > 0 and bounds.h > 0 and self.view.setupActionEnabled(index);
             self.snapshot.setup_targets[index] = .{ .id = setup_ids[index], .role = "button", .key = "", .enabled = enabled, .pointer_bounds = if (enabled) .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } else null };
         }
         for (0..4) |index| self.snapshot.setup_fields[index] = self.view.setup_fields[index][0..self.view.setup_lengths[index]];
@@ -775,6 +776,9 @@ const Conversation = struct {
     startup_account_len: usize = 0,
     close_setup_after_refresh: bool = false,
     configuration_pending: bool = false,
+    configured_setup_key: ?[32]u8 = null,
+    submitted_setup_key: ?[32]u8 = null,
+    setup_login_after_configure: ?contract.RuntimeLogin = null,
     launch_selection: ?Coding.Identity = null,
     login_inflight: bool = false,
     login_poll_due: u64 = 0,
@@ -791,6 +795,39 @@ const Conversation = struct {
         const bounded = @import("text/utf8.zig").prefix(message, self.notice_storage.len);
         @memcpy(self.notice_storage[0..bounded.len], bounded);
         view.notice = self.notice_storage[0..bounded.len];
+    }
+
+    fn setupConfiguration(view: *const Coding) contract.RuntimeSetup {
+        return .{
+            .runtime_kind = if (view.setup_runtime == .codex) .codex else .opencode,
+            .executable = view.setup_fields[0][0..view.setup_lengths[0]],
+            .account_directory = view.setup_fields[1][0..view.setup_lengths[1]],
+            .workspace_root = view.setup_fields[2][0..view.setup_lengths[2]],
+            .model_provider = view.setup_fields[3][0..view.setup_lengths[3]],
+        };
+    }
+
+    // Compare complete configurations without retaining borrowed form storage.
+    // A click on sign-in or refresh must target the displayed draft, including
+    // its account and workspace, rather than a previously connected provider.
+    fn setupKey(configuration: contract.RuntimeSetup) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        for ([_][]const u8{ @tagName(configuration.runtime_kind), configuration.executable, configuration.account_directory, configuration.workspace_root, configuration.model_provider }) |field| {
+            hash.update(field);
+            hash.update(&.{0});
+        }
+        return hash.finalResult();
+    }
+
+    fn setupNeedsConfigure(self: *const Conversation, configuration: contract.RuntimeSetup) bool {
+        const applied = self.configured_setup_key orelse return true;
+        return !self.runtime_configured or !std.mem.eql(u8, &applied, &setupKey(configuration));
+    }
+
+    fn configureSetup(self: *Conversation, configuration: contract.RuntimeSetup, login: ?contract.RuntimeLogin) !void {
+        try self.submit(.configure, .absent, .absent, .{ .runtime_configure = configuration }, 0);
+        self.submitted_setup_key = setupKey(configuration);
+        self.setup_login_after_configure = login;
     }
 
     fn restoreSelection(self: *Conversation, view: *Coding, durable: ?contract.Selection) !void {
@@ -852,6 +889,7 @@ const Conversation = struct {
         self.workspace_root = root;
         self.workspace_branch = try displayId(status.binding.?.expected_branch);
         self.runtime_configured = true;
+        self.configured_setup_key = setupKey(configuration);
         self.startup_runtime = configuration.runtime_kind;
         if (configuration.account_directory.len <= self.startup_account.len) {
             @memcpy(self.startup_account[0..configuration.account_directory.len], configuration.account_directory);
@@ -933,7 +971,6 @@ const Conversation = struct {
     }
 
     fn setup(self: *Conversation, app: *App, action: @typeInfo(@FieldType(Coding, "setup_action")).optional.child) !void {
-        if (self.command != null or self.query != null) return error.WorkspaceBusy;
         if (action == .open_login) {
             if (app.view.login_url_len != 0) {
                 var url: [2049]u8 = undefined;
@@ -943,26 +980,29 @@ const Conversation = struct {
             }
             return;
         }
-        if (self.normal_startup and !self.runtime_configured and action != .configure and action != .status) {
-            self.notice(&app.view, "Connect this provider first, then sign in or refresh its models.");
-            return;
-        }
+        if (self.command != null or self.query != null or self.login_inflight or self.setup_login_after_configure != null) return error.WorkspaceBusy;
+        const configuration = setupConfiguration(&app.view);
         switch (action) {
             .status => try self.ask(.runtime_status, .{ .runtime_status = {} }),
             .refresh => {
-                try self.submit(.refresh_models, .absent, .absent, .{ .runtime_refresh = {} }, 0);
-                self.catalog_refresh_inflight = true;
+                if (self.setupNeedsConfigure(configuration)) {
+                    try self.configureSetup(configuration, null);
+                } else {
+                    try self.submit(.refresh_models, .absent, .absent, .{ .runtime_refresh = {} }, 0);
+                    self.catalog_refresh_inflight = true;
+                }
             },
-            .browser, .device => try self.submit(.login, .absent, .absent, .{ .runtime_login = .{ .runtime_kind = if (app.view.setup_runtime == .codex) .codex else .opencode, .mode = if (action == .browser) .browser else .device } }, 0),
+            .browser, .device => {
+                if (configuration.runtime_kind != .codex) return error.SignInUnsupported;
+                const login: contract.RuntimeLogin = .{ .runtime_kind = .codex, .mode = if (action == .browser) .browser else .device };
+                if (self.setupNeedsConfigure(configuration)) {
+                    try self.configureSetup(configuration, login);
+                } else try self.submit(.login, .absent, .absent, .{ .runtime_login = login }, 0);
+            },
             .open_login => unreachable,
-            .configure => try self.submit(.configure, .absent, .absent, .{ .runtime_configure = .{
-                .runtime_kind = if (app.view.setup_runtime == .codex) .codex else .opencode,
-                .executable = app.view.setup_fields[0][0..app.view.setup_lengths[0]],
-                .account_directory = app.view.setup_fields[1][0..app.view.setup_lengths[1]],
-                .workspace_root = app.view.setup_fields[2][0..app.view.setup_lengths[2]],
-                .model_provider = app.view.setup_fields[3][0..app.view.setup_lengths[3]],
-            } }, 0),
+            .configure => try self.configureSetup(configuration, null),
         }
+        app.view.notice = null;
     }
     fn navigateWorkspace(self: *Conversation, app: *App, navigation: Coding.Navigation) !void {
         if (!app.view.navigation_enabled) return error.WorkspaceBusy;
@@ -1373,6 +1413,8 @@ const Conversation = struct {
                             if (self.configuration_pending) {
                                 self.configuration_pending = false;
                                 self.catalog_refresh_pending = false;
+                                self.setup_login_after_configure = null;
+                                self.submitted_setup_key = null;
                             }
                         }
                         if (value.failure.reason == .cursor_invalid) if (self.recoveryQuery(pending.kind)) |retry| {
@@ -1392,6 +1434,10 @@ const Conversation = struct {
                     };
                     if (self.command) |pending| if (pending.ticket.value == value.ticket.value) {
                         if (pending.kind == .refresh_models) self.catalog_refresh_inflight = false;
+                        if (pending.kind == .configure) {
+                            self.setup_login_after_configure = null;
+                            self.submitted_setup_key = null;
+                        }
                         self.command = null;
                     };
                     self.notice(&app.view, switch (value.failure.reason) {
@@ -1503,13 +1549,21 @@ const Conversation = struct {
         }
         // Only an explicit sign-in needs a short-lived UI status timer. Normal
         // idle remains event-driven; the Host owns the authentication process.
+        if (self.setup_login_after_configure) |login| {
+            if (!self.configuration_pending and self.runtime_configured and self.query == null and self.command == null and self.workspace.len != 0 and !self.refresh) {
+                try self.submit(.login, .absent, .absent, .{ .runtime_login = login }, 0);
+                self.setup_login_after_configure = null;
+                self.catalog_refresh_pending = false;
+                app.dirty = true;
+            }
+        }
         if (self.login_inflight and self.query == null and self.command == null and c.SDL_GetTicks() >= self.login_poll_due) {
             self.login_poll_due = c.SDL_GetTicks() + 500;
             try self.ask(.runtime_status, .{ .runtime_status = {} });
         }
         // All discovery runs on Host's worker. Wait for the current query chain;
         // its output must not race a setup receipt that starts another chain.
-        if (!self.login_inflight and self.catalog_refresh_pending and self.query == null and self.command == null and self.workspace.len != 0 and !self.refresh and (self.worker_key == null or self.history_paused)) {
+        if (!self.login_inflight and self.setup_login_after_configure == null and self.catalog_refresh_pending and self.query == null and self.command == null and self.workspace.len != 0 and !self.refresh and (self.worker_key == null or self.history_paused)) {
             try self.submit(.refresh_models, .absent, .absent, .{ .runtime_refresh = {} }, 0);
             self.catalog_refresh_pending = false;
             self.catalog_refresh_inflight = true;
@@ -1552,6 +1606,9 @@ const Conversation = struct {
         app.view.tasks_enabled = self.command == null and !self.refresh;
         app.view.can_approve = self.approval_live and self.command == null and !self.refresh;
         app.view.navigation_enabled = (!self.normal_startup or self.runtime_configured) and self.command == null and self.query == null and !self.refresh and !self.source_pending and (self.worker_key == null or self.history_paused);
+        app.view.setup_busy = self.command != null or self.query != null or self.setup_login_after_configure != null;
+        app.view.setup_login_pending = self.login_inflight;
+        app.view.setup_feedback = app.view.notice;
         if (self.pending_history_move) |move| {
             if (self.query == null and !self.source_pending and (self.history_paused or self.worker_key == null)) {
                 self.pending_history_move = null;
@@ -1567,6 +1624,10 @@ const Conversation = struct {
         self.command = null;
         if (value.outcome == .rejected) {
             if (pending.kind == .refresh_models) self.catalog_refresh_inflight = false;
+            if (pending.kind == .configure) {
+                self.setup_login_after_configure = null;
+                self.submitted_setup_key = null;
+            }
             self.notice(&app.view, if (value.reason) |reason| rejectionMessage(reason) else "Command rejected. Open Connection to inspect provider status.");
             self.refresh = self.thread.len != 0;
             return;
@@ -1615,6 +1676,7 @@ const Conversation = struct {
                 try self.ask(.runtime_status, .{ .runtime_status = {} });
             },
             .login => {
+                app.view.notice = null;
                 self.login_inflight = true;
                 self.login_poll_due = c.SDL_GetTicks() + 500;
                 self.catalog_refresh_pending = false;
@@ -1677,14 +1739,29 @@ const Conversation = struct {
                         if (self.bootstrap_after_catalog) app.view.setup_open = true;
                         self.close_setup_after_refresh = false;
                         var message: [1024]u8 = undefined;
-                        self.notice(&app.view, std.fmt.bufPrint(&message, "Provider unavailable: {s}. Open Connection to check paths, sign-in, and Refresh models.", .{@import("text/utf8.zig").prefix(status.reason, 800)}) catch "Provider unavailable. Open Connection to check paths and sign-in.");
+                        self.notice(&app.view, if (self.configuration_pending)
+                            std.fmt.bufPrint(&message, "Connection settings were not applied: {s}. Check the fields above and try again.", .{@import("text/utf8.zig").prefix(status.reason, 800)}) catch "Connection settings were not applied. Check the fields above."
+                        else
+                            std.fmt.bufPrint(&message, "Provider unavailable: {s}. Check sign-in and Refresh models.", .{@import("text/utf8.zig").prefix(status.reason, 800)}) catch "Provider unavailable. Check paths and sign-in.");
                         if (self.configuration_pending) {
                             self.configuration_pending = false;
                             self.catalog_refresh_pending = false;
+                            self.setup_login_after_configure = null;
+                            self.submitted_setup_key = null;
                         }
                     }
                     if (self.configuration_pending and status.workspace_root.len != 0 and status.binding != null) {
                         self.configuration_pending = false;
+                        if (status.configuration) |configuration| {
+                            self.configured_setup_key = setupKey(configuration);
+                            if (self.submitted_setup_key) |submitted| {
+                                const shown = setupKey(setupConfiguration(&app.view));
+                                // Canonicalize only the submitted draft; edits or
+                                // provider switches made while waiting remain local.
+                                if (std.mem.eql(u8, &shown, &submitted)) _ = app.view.configureSetup(configuration);
+                            }
+                        }
+                        self.submitted_setup_key = null;
                         self.workspace_branch = try displayId(status.binding.?.expected_branch);
                         const root = try self.allocator.dupe(u8, status.workspace_root);
                         self.allocator.free(self.workspace_root);
@@ -2520,4 +2597,44 @@ test "sign-in fields retain complete bounded web URL and Unicode device code" {
     conversation.updateLogin(&view, "invalid JSON");
     try std.testing.expectEqual(@as(usize, 0), view.login_url_len);
     try std.testing.expectEqual(@as(usize, 0), view.login_code_len);
+}
+
+test "setup actions bind to complete displayed configuration rather than saved account" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    const applied: contract.RuntimeSetup = .{ .runtime_kind = .codex, .executable = "/bin/codex", .account_directory = "/managed/first", .workspace_root = "/project/café", .model_provider = "openai" };
+    try std.testing.expect(view.configureSetup(applied));
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    try std.testing.expect(conversation.setupNeedsConfigure(Conversation.setupConfiguration(&view)));
+    conversation.runtime_configured = true;
+    conversation.configured_setup_key = Conversation.setupKey(applied);
+    try std.testing.expect(!conversation.setupNeedsConfigure(Conversation.setupConfiguration(&view)));
+    inline for (.{ "executable", "account_directory", "workspace_root", "model_provider" }) |field| {
+        var changed = applied;
+        @field(changed, field) = "/different/世界";
+        try std.testing.expect(view.configureSetup(changed));
+        try std.testing.expect(conversation.setupNeedsConfigure(Conversation.setupConfiguration(&view)));
+    }
+    var changed = applied;
+    changed.runtime_kind = .opencode;
+    try std.testing.expect(view.configureSetup(changed));
+    try std.testing.expect(conversation.setupNeedsConfigure(Conversation.setupConfiguration(&view)));
+    try std.testing.expect(view.configureSetup(applied));
+    try std.testing.expect(!conversation.setupNeedsConfigure(Conversation.setupConfiguration(&view)));
+}
+
+test "rejected configuration withdraws queued sign-in without touching an older account" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    const id: [32]u8 = @splat('c');
+    conversation.command = .{ .ticket = .{ .value = 1 }, .kind = .configure, .draft_revision = 0, .id = id };
+    conversation.submitted_setup_key = @splat(1);
+    conversation.setup_login_after_configure = .{ .runtime_kind = .codex, .mode = .device };
+    try conversation.receipt(&app, .{ .value = 1 }, .{ .command_id = .{ .value = &id }, .outcome = .rejected, .commit_sequence = 0 });
+    try std.testing.expect(conversation.command == null);
+    try std.testing.expect(conversation.setup_login_after_configure == null);
+    try std.testing.expect(conversation.submitted_setup_key == null);
+    try std.testing.expect(app.view.notice != null);
 }

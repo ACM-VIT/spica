@@ -59,12 +59,15 @@ pub const Layout = struct {
         const x = menu.x + 16;
         const inner_width = @max(0, menu.w - 32);
         const half = @max(0, (inner_width - 8) / 2);
+        // Recover two diagnostic rows in the minimum Advanced window without
+        // shrinking fields/buttons or moving the ordinary form's controls.
+        const compact = advanced and menu_height < 500;
         var fields: [4]c.SDL_FRect = @splat(.{ .x = 0, .y = 0, .w = 0, .h = 0 });
         fields[2] = .{ .x = x, .y = menu.y + 120, .w = inner_width, .h = 32 };
         if (advanced) for ([_]usize{ 0, 1, 3 }, 0..) |index, row| {
-            fields[index] = .{ .x = x + 112, .y = menu.y + 202 + @as(f32, @floatFromInt(row)) * 38, .w = @max(0, inner_width - 112), .h = 28 };
+            fields[index] = .{ .x = x + 112, .y = menu.y + (if (compact) @as(f32, 196) else 202) + @as(f32, @floatFromInt(row)) * (if (compact) @as(f32, 34) else 38), .w = @max(0, inner_width - 112), .h = 28 };
         };
-        const action_y = menu.y + (if (advanced) @as(f32, 318) else 202);
+        const action_y = menu.y + (if (compact) @as(f32, 300) else if (advanced) @as(f32, 318) else 202);
         return .{
             .menu = menu,
             .close = .{ .x = menu.x + menu.w - 82, .y = menu.y + 10, .w = 66, .h = 30 },
