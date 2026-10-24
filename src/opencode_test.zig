@@ -169,7 +169,7 @@ test "ACP fragmented UTF8 scalars are retained exactly and incomplete completion
     try std.testing.expectError(error.IncompleteUtf8, consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"stopReason\":\"end_turn\"}}"));
 }
 
-test "ACP large tool result streams exact canonical content then one terminal event" {
+test "ACP large tool result streams exact readable text then one terminal event" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -177,9 +177,9 @@ test "ACP large tool result streams exact canonical content then one terminal ev
     try prompting(&runtime, a);
     defer runtime.shutdown();
     const body = try a.alloc(u8, 9000);
-    @memset(body, 'z');
+    for (0..3000) |index| @memcpy(body[index * 3 ..][0..3], "界");
     const wire = try std.json.Stringify.valueAlloc(a, .{ .jsonrpc = "2.0", .method = "session/update", .params = .{ .sessionId = "ses_upstream", .update = .{ .sessionUpdate = "tool_call_update", .toolCallId = "large-tool", .status = "completed", .content = .{.{ .type = "text", .text = body }} } } }, .{});
-    const expected = try std.json.Stringify.valueAlloc(a, .{.{ .type = "text", .text = body }}, .{});
+    const expected = body;
     var current = (try consume(&runtime, a, wire)).?;
     var offset: usize = 0;
     while (current.body == .chunk) {
@@ -188,6 +188,7 @@ test "ACP large tool result streams exact canonical content then one terminal ev
         try std.testing.expectEqualStrings("large-tool", chunk.block.value);
         try std.testing.expectEqual(offset, chunk.offset);
         try std.testing.expect(chunk.text.len <= 2048 and c.frameBytes(current) <= 4096);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(chunk.text));
         try std.testing.expectEqualSlices(u8, expected[offset..][0..chunk.text.len], chunk.text);
         offset += chunk.text.len;
         current = (try runtime.poll(a)).?;
@@ -198,6 +199,65 @@ test "ACP large tool result streams exact canonical content then one terminal ev
     try std.testing.expectEqualStrings("", current.body.tool_completed.result);
     try std.testing.expect((try runtime.poll(a)) == null);
     try std.testing.expectEqual(@as(usize, 1), runtime.transport.polls);
+}
+
+test "ACP readable tool output retains file changes and unfamiliar content without JSON wrapping text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var runtime: Runtime = undefined;
+    try prompting(&runtime, a);
+    defer runtime.shutdown();
+    const wire = try std.json.Stringify.valueAlloc(a, .{ .jsonrpc = "2.0", .method = "session/update", .params = .{ .sessionId = "ses_upstream", .update = .{
+        .sessionUpdate = "tool_call_update",
+        .toolCallId = "file-tool",
+        .status = "completed",
+        .content = .{
+            .{ .type = "content", .content = .{ .type = "text", .text = "Updated café.txt" } },
+            .{ .type = "diff", .path = "/tmp/café.txt", .oldText = "before 世界", .newText = "after 世界" },
+            .{ .type = "future", .detail = "retain me" },
+        },
+    } } }, .{});
+    const result = (try consume(&runtime, a, wire)).?;
+    try std.testing.expectEqualStrings("Updated café.txt\n\nFile: /tmp/café.txt\nBefore:\n```\nbefore 世界\n```\nAfter:\n```\nafter 世界\n```\n\n{\"type\":\"future\",\"detail\":\"retain me\"}", result.body.chunk.text);
+    try std.testing.expectEqualStrings("file-tool", result.correlation.tool.?.value);
+    try std.testing.expect((try runtime.poll(a)).?.body == .tool_completed);
+    const empty = (try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"ses_upstream\",\"update\":{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"empty\",\"status\":\"failed\"}}}")).?;
+    try std.testing.expectEqual(.failed, empty.body.tool_completed.outcome);
+    try std.testing.expect((try runtime.poll(a)) == null);
+}
+
+test "ACP tool file creation deletion and formatting overflow preserve bounded admission" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var runtime: Runtime = undefined;
+    try prompting(&runtime, a);
+    defer runtime.shutdown();
+    for ([_]struct { before: ?[]const u8, after: ?[]const u8, expected: []const u8 }{
+        .{ .before = null, .after = "new 世界\n", .expected = "File: /tmp/file\nAfter:\n```\nnew 世界\n\n```" },
+        .{ .before = "old 世界\n", .after = null, .expected = "File: /tmp/file\nBefore:\n```\nold 世界\n\n```\nDeleted" },
+    }) |case| {
+        const wire = try std.json.Stringify.valueAlloc(a, .{ .jsonrpc = "2.0", .method = "session/update", .params = .{ .sessionId = "ses_upstream", .update = .{
+            .sessionUpdate = "tool_call_update",
+            .toolCallId = "file-tool",
+            .status = "completed",
+            .content = .{.{ .type = "diff", .path = "/tmp/file", .oldText = case.before, .newText = case.after }},
+        } } }, .{});
+        const result = (try consume(&runtime, a, wire)).?;
+        try std.testing.expectEqualStrings(case.expected, result.body.chunk.text);
+        try std.testing.expect((try runtime.poll(a)).?.body == .tool_completed);
+    }
+    const body = try a.alloc(u8, runtime.pending_bytes.len);
+    @memset(body, 'x');
+    const oversized = try std.json.Stringify.valueAlloc(a, .{ .jsonrpc = "2.0", .method = "session/update", .params = .{ .sessionId = "ses_upstream", .update = .{
+        .sessionUpdate = "tool_call_update",
+        .toolCallId = "too-large",
+        .status = "completed",
+        .content = .{.{ .type = "diff", .path = "/tmp/file", .oldText = @as(?[]const u8, null), .newText = body }},
+    } } }, .{});
+    try std.testing.expectError(error.FrameTooLarge, consume(&runtime, a, oversized));
+    try std.testing.expectEqual(.none, runtime.pending_kind);
 }
 
 test "ACP opaque workspace identity stays separate from explicit cwd" {
@@ -339,7 +399,7 @@ fn toolUpdate(runtime: *Runtime, a: std.mem.Allocator, tool: []const u8, status:
         .method = "session/update",
         .params = .{
             .sessionId = "ses_upstream",
-            .update = .{ .sessionUpdate = "tool_call_update", .toolCallId = tool, .status = status, .title = "controlled printf", .rawInput = if (input) |command| .{ .command = command } else null, .content = .{} },
+            .update = .{ .sessionUpdate = "tool_call_update", .toolCallId = tool, .status = status, .title = "controlled printf", .rawInput = if (input) |command| .{ .command = command } else null, .content = .{.{ .type = "content", .content = .{ .type = "text", .text = "proof" } }} },
         },
     }, .{});
     return consume(runtime, a, bytes);
@@ -364,6 +424,7 @@ test "ACP approved tool authority survives postdecision status updates and inter
     try std.testing.expectError(error.ActionChanged, toolUpdate(&runtime, a, "tool-A", "completed", "different command"));
     const result = (try toolUpdate(&runtime, a, "tool-A", "completed", null)).?;
     try std.testing.expect(result.body == .chunk);
+    try std.testing.expectEqualStrings("proof", result.body.chunk.text);
     try std.testing.expectEqualStrings("tool-A", result.correlation.tool.?.value);
     const terminal = (try runtime.poll(a)).?;
     try std.testing.expect(terminal.body == .tool_completed);

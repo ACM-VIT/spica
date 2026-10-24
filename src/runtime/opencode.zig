@@ -27,6 +27,34 @@ fn eq(a: []const u8, b: []const u8) bool {
 }
 const clone = common.clone;
 
+/// ACP content becomes shared text blocks. Keep ordinary text readable and
+/// retain both sides of file changes; preserve unfamiliar payloads verbatim as
+/// JSON until the shared contract has a renderer for them. The caller supplies
+/// the existing fixed pending buffer, so formatting cannot grow retained memory.
+fn writeToolContent(writer: *std.Io.Writer, content: Value) !void {
+    if (content == .null) return;
+    if (content != .array) return std.json.Stringify.value(content, .{}, writer);
+    for (content.array.items, 0..) |item, index| {
+        if (index != 0) try writer.writeAll("\n\n");
+        const kind = text(field(item, "type"));
+        const block = if (eq(kind, "content")) field(item, "content") else item;
+        if (eq(text(field(block, "type")), "text") and field(block, "text") == .string) {
+            try writer.writeAll(text(field(block, "text")));
+        } else if (eq(kind, "diff") and field(item, "path") == .string and
+            (field(item, "oldText") == .null or field(item, "oldText") == .string) and
+            (field(item, "newText") == .null or field(item, "newText") == .string))
+        {
+            try writer.print("File: {s}\n", .{text(field(item, "path"))});
+            const before = field(item, "oldText");
+            const after = field(item, "newText");
+            if (before == .string) try writer.print("Before:\n```\n{s}\n```\n", .{before.string});
+            if (after == .string) {
+                try writer.print("After:\n```\n{s}\n```", .{after.string});
+            } else try writer.writeAll("Deleted");
+        } else try std.json.Stringify.value(item, .{}, writer);
+    }
+}
+
 /// Transport supplies bounded JSONL IO. Initialize at final address.
 pub fn RuntimeFor(comptime Transport: type) type {
     return struct {
@@ -523,7 +551,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
                         link = &entry.next;
                     }
                     var writer = std.Io.Writer.fixed(&self.pending_bytes);
-                    std.json.Stringify.value(field(update, "content"), .{}, &writer) catch return error.FrameTooLarge;
+                    writeToolContent(&writer, field(update, "content")) catch return error.FrameTooLarge;
                     @memcpy(self.pending_tool[0..tool_id.len], tool_id);
                     self.pending_tool_len = tool_id.len;
                     self.pending_tool_failed = eq(status, "failed");
