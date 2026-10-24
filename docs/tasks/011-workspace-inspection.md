@@ -120,4 +120,29 @@ reopened screenshots:
 The fix owner reviewed those three screenshots and recorded assertions. This
 is actual fixed-path evidence, not a repeated run of the reported failing app.
 No X11/physical-latency, unrelated task009/FreeType or authenticated Codex claim.
-Assembled integration checks and the shared runnable-binary smoke remain pending.
+
+After actual source/diff/evidence review, producer evidence checkpoint `52b28cc`
+was no-ff integrated as `0a55e41ba41e86f8b6d930f3cd5ae8b1c4e3af77`.
+The assembled shared `./tools/check` passed once: formatting94 files, normal
+`build/driver.py` Debug/ReleaseSafe executable builds, each156 native passes/
+two skips plus four image tests, Python35/two skips and CLI help smoke.
+Exact command/result and raw log:
+`.artifacts/worktrees/fix-unborn-workspace/.artifacts/integration-check.json`.
+This refreshed the actual shared `zig-out/bin/spica` using normal builds:
+ReleaseSafe SHA256
+`c87d76409640dcb70d6676f40c34f3eae0ce157969214d2baa3b12dae647a522`.
+The refreshed shared binary then passed one actual startup-only smoke (no
+duplicate inference prompt): fresh `git init` workspace, visible Ready
+conversation/active composer, clean close/reopen of the same durable thread,
+zero admission errors, both exits zero and no surviving owned processes.
+All `.git` hashes remained unchanged through startup/restart/cleanup, with
+`refs/heads/main`, unresolved HEAD, empty refs and clean status.
+Reviewed shared ready/reopened screenshots and exact evidence:
+`.artifacts/unborn-startup/integrated-0a55e41/manifest.json`.
+
+The development executable in the shared branch now carries the exercised fix.
+No seed commit, fabricated revision, non-Git fallback, user-root/account mutation,
+or unrelated roadmap/native-library change was used. Status remains review;
+Astra retains acceptance. Sole source repair count: one. LSP was unavailable
+(`xd://lsp`: no such tool); bounded source reference searches established affected
+field consumers and preserved the public capture signature/byte codec.
