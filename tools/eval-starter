@@ -211,7 +211,7 @@ def assert_presentation_snapshot(snapshot):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / '.artifacts/starter')
-    parser.add_argument('--mode', choices=('smoke', 'editor', 'capacity', 'conversation', 'workspace', 'custom', 'presentation', 'measure'), default='smoke')
+    parser.add_argument('--mode', choices=('smoke', 'editor', 'capacity', 'conversation', 'workspace', 'custom', 'presentation', 'sidebar', 'measure'), default='smoke')
     parser.add_argument('--binary', type=Path, help='Explicit frozen binary; requires --binary-sha256 and --source-sha256')
     parser.add_argument('--binary-sha256')
     parser.add_argument('--source-sha256')
@@ -268,7 +268,7 @@ def main():
             argv = ['env', 'XDG_DATA_HOME=' + str(output / 'xdg-data'), *argv]
         else:
             argv += ['--state-directory', str(output / 'conversation-state')]
-        if args.mode in ('conversation', 'workspace', 'custom', 'presentation'):
+        if args.mode in ('conversation', 'workspace', 'custom', 'presentation', 'sidebar'):
             argv += ['--automation-live', str(output / 'live.json')]
         if args.mode in ('custom', 'presentation'):
             module = output / 'custom.lua'
@@ -302,7 +302,7 @@ def main():
         ipc(f'[con_id={window_id}] floating enable')
         ipc(f'[con_id={window_id}] resize set width 1100 px height 740 px')
         run('vd', 'shot', session, str(output / 'before.png'))
-        if args.mode in ('conversation', 'workspace', 'custom', 'presentation'):
+        if args.mode in ('conversation', 'workspace', 'custom', 'presentation', 'sidebar'):
             def observe(predicate, label):
                 deadline = time.monotonic() + 15
                 while time.monotonic() < deadline:
@@ -312,8 +312,10 @@ def main():
                         return snapshot
                     time.sleep(.05)
                 raise RuntimeError('Native conversation did not reach ' + label)
-            def target(snapshot, name):
-                value = next(t for t in snapshot['targets'] + snapshot.get('thread_targets', []) if t['id'] == name)
+            def target(snapshot, name, index=0):
+                groups = ('targets', 'thread_targets', 'sidebar_targets', 'scope_targets', 'effort_targets')
+                matches = [t for group in groups for t in snapshot.get(group, []) if t['id'] == name]
+                value = matches[index]
                 if not value['enabled'] or value['pointer_bounds'] is None:
                     raise RuntimeError('Painted control unavailable: ' + name)
                 x, y, w, h = value['pointer_bounds']
@@ -467,6 +469,88 @@ def main():
                 current = observe(lambda s: s['thread_id'] == original_thread and s['send_ready'], 'execution target restored')
                 run('vd', 'shot', session, str(output / 'workspace-drafts.png'))
                 retained_thread, retained_run = current['thread_id'], current['run_id']
+            if args.mode == 'sidebar':
+                original_thread = current['thread_id']
+                original_project = current['project_id']
+                def visible(s):
+                    return [t['id'] for t in s['thread_targets'] if t['enabled']]
+                def card_label(s, thread):
+                    index = next(i for i, t in enumerate(s['thread_targets']) if t['id'] == thread)
+                    return s['thread_labels'][index]
+                if card_label(current, original_thread) != 'Inspect café 世界 👩‍💻':
+                    raise RuntimeError('Card does not show its actual first prompt')
+                target(current, 'workspace.new_thread')
+                current = observe(lambda s: s['thread_id'] != original_thread and s['send_ready'], 'second flat-feed thread')
+                second_thread = current['thread_id']
+                run('vd', 'text', session, window_id, 'Repair sidebar café')
+                key('Return')
+                current = observe(lambda s: s['run_status'] == 'awaiting_approval' and enabled(s, 'run.cancel'), 'second card approval')
+                target(current, 'run.cancel')
+                current = observe(lambda s: s['run_status'] == 'cancelled' and s['send_ready'] and card_label(s, second_thread) == 'Repair sidebar café', 'second prompt title retained')
+                target(current, 'workspace.new_project')
+                current = observe(lambda s: s['project_id'] != original_project and s['send_ready'], 'new project in same workspace')
+                other_project, other_thread = current['project_id'], current['thread_id']
+                run('vd', 'text', session, window_id, 'Second project 世界')
+                key('Return')
+                current = observe(lambda s: s['run_status'] == 'awaiting_approval' and enabled(s, 'approval.allow'), 'other project approval')
+                target(current, 'approval.allow')
+                current = observe(lambda s: s['run_status'] == 'completed' and s['send_ready'], 'other project completed')
+                if not {original_thread, second_thread, other_thread}.issubset(visible(current)):
+                    raise RuntimeError('Flat feed omitted a project sharing the explicit workspace')
+                target(current, 'composer.input')
+                run('vd', 'text', session, window_id, 'Keep this draft é')
+                current = observe(lambda s: s['draft'] == 'Keep this draft é', 'draft before search')
+                target(current, 'sidebar.search')
+                run('vd', 'text', session, window_id, 'CAFé')
+                current = observe(lambda s: s['sidebar_search'] == 'CAFé' and len(visible(s)) == 2, 'bounded Unicode title search')
+                if current['draft'] != 'Keep this draft é' or current['thread_id'] != other_thread:
+                    raise RuntimeError('Search changed the composer or execution target')
+                run('vd', 'shot', session, str(output / 'search.png'))
+                key('ctrl+a')
+                run('vd', 'text', session, window_id, 'No matching thread')
+                current = observe(lambda s: s['sidebar_search'] == 'No matching thread' and not visible(s), 'empty search results hide hit targets')
+                run('vd', 'shot', session, str(output / 'no-results.png'))
+                key('Escape')
+                current = observe(lambda s: not s['sidebar_search'] and not s['sidebar_search_focused'] and s['draft'] == 'Keep this draft é', 'Escape clears search and preserves draft')
+                target(current, 'sidebar.search')
+                run('vd', 'text', session, window_id, 'Repair')
+                current = observe(lambda s: visible(s) == [second_thread], 'search keeps original navigation index')
+                key('Down')
+                key('Return')
+                current = observe(lambda s: s['thread_id'] == second_thread and not s['sidebar_search'] and s['send_ready'], 'keyboard search navigates correct card')
+                target(current, other_thread)
+                current = observe(lambda s: s['thread_id'] == other_thread and s['draft'] == 'Keep this draft é' and s['send_ready'], 'draft survives search navigation')
+                target(current, 'sidebar.scope')
+                current = observe(lambda s: s['sidebar_scope_open'] and not visible(s), 'scope overlay disables covered card targets')
+                run('vd', 'shot', session, str(output / 'scope.png'))
+                target(current, original_project)
+                current = observe(lambda s: not s['sidebar_scope_open'] and s['sidebar_scope_project'] == original_project, 'scope selects actual project ID')
+                if current['thread_id'] != other_thread or current['draft'] != 'Keep this draft é' or set(visible(current)) != {original_thread, second_thread}:
+                    raise RuntimeError('Scope changed execution or filtered wrong project')
+                target(current, 'workspace.new_thread')
+                current = observe(lambda s: s['project_id'] == original_project and s['thread_id'] not in (original_thread, second_thread, other_thread) and s['send_ready'], 'new thread follows explicitly scoped project')
+                target(current, 'sidebar.scope')
+                current = observe(lambda s: s['sidebar_scope_open'], 'reopen scope')
+                target(current, 'scope.all')
+                current = observe(lambda s: not s['sidebar_scope_open'] and not s['sidebar_scope_project'], 'all projects restored')
+                target(current, other_thread)
+                current = observe(lambda s: s['thread_id'] == other_thread and s['draft'] == 'Keep this draft é' and s['send_ready'], 'cross-project execution and draft restored')
+                selection = (current['selected_runtime'], current['selected_model'], current['selected_effort'])
+                target(current, 'models.effort')
+                current = observe(lambda s: s['effort_open'], 'effort opens actual option menu')
+                run('vd', 'shot', session, str(output / 'effort.png'))
+                target(current, 'effort.option', 0)
+                current = observe(lambda s: not s['effort_open'] and s['send_ready'], 'effort selection closes menu')
+                if (current['selected_runtime'], current['selected_model'], current['selected_effort']) != selection:
+                    raise RuntimeError('Effort choice changed the selected model identity')
+                for width, height in ((720, 480), (900, 650), (1100, 740), (1280, 800)):
+                    frame = current['frame_id']
+                    ipc(f'[con_id={window_id}] resize set width {width} px height {height} px')
+                    current = observe(lambda s: s['frame_id'] > frame, f'sidebar resized {width}')
+                    run('vd', 'shot', session, str(output / f'sidebar-{width}.png'))
+                target(current, original_thread)
+                current = observe(lambda s: s['thread_id'] == original_thread and s['run_id'] == retained_run and s['send_ready'], 'original durable thread restored before restart')
+                manifest['sidebar_verified'] = ['flat same-root cross-project cards', 'actual first-prompt UTF8 titles', 'title search and no-result hit admission', 'keyboard filtered navigation', 'project scope preserves execution and draft', 'scoped thread creation', 'effort menu preserves selection', 'four window sizes']
             retained_status = current['run_status']
             key('ctrl+q')
             wait_windows(session, False)
