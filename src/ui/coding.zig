@@ -937,9 +937,16 @@ pub const View = struct {
 
         try widgets.panel(renderer, self.picker_bounds, 5, .{ .r = 35, .g = 40, .b = 49 });
         try widgets.panel(renderer, self.effort_bounds, 5, .{ .r = 35, .g = 40, .b = 49 });
-        var model_label: [512]u8 = undefined;
-        const label = if (self.selected) |*selected| try std.fmt.bufPrint(&model_label, "{s}  ▾", .{if (selected.runtime_kind.eql("fake")) "Demo · synthetic" else selected.model_id.slice()}) else "Choose model  ▾";
-        try self.labels.drawFitted(renderer, text, label, self.picker_bounds.x + 8, y + 8, model_width - 16, 12, foreground);
+        const label = if (self.selected) |*selected| (if (selected.runtime_kind.eql("fake")) "Demo · synthetic" else selected.model_id.slice()) else "Choose model";
+        try self.labels.drawFitted(renderer, text, label, self.picker_bounds.x + 8, y + 8, model_width - 32, 12, foreground);
+        // A native chevron avoids system font discovery for a decorative glyph
+        // absent from the bundled proportional font. No extra face or buffer.
+        const chevron = [_]c.SDL_FPoint{
+            .{ .x = self.picker_bounds.x + model_width - 18, .y = y + 13 },
+            .{ .x = self.picker_bounds.x + model_width - 14, .y = y + 17 },
+            .{ .x = self.picker_bounds.x + model_width - 10, .y = y + 13 },
+        };
+        if (!c.SDL_SetRenderDrawColor(renderer, foreground.r, foreground.g, foreground.b, 255) or !c.SDL_RenderLines(renderer, &chevron, chevron.len)) return error.ChevronDraw;
         var effort_label: [320]u8 = undefined;
         const effort = if (self.selected) |*selected| try std.fmt.bufPrint(&effort_label, "{s}  ↻", .{selected.effort.slice()}) else "Effort";
         try self.labels.drawFitted(renderer, text, effort, self.effort_bounds.x + 8, y + 8, 86, 12, muted);
@@ -1534,6 +1541,11 @@ test "painted connection and composer controls fit minimum and regular windows" 
             try std.testing.expect(view.picker_bounds.x + view.picker_bounds.w + 10 <= view.effort_bounds.x);
             try std.testing.expect(view.effort_bounds.x + view.effort_bounds.w + 10 <= primary.x);
         }
+        var stats: c.SpicaTextStats = undefined;
+        try std.testing.expect(c.spica_text_get_stats(text, &stats));
+        // Default chrome, setup and empty states fit the bundled face. UI
+        // decoration must not trigger OS font discovery and its retained heap.
+        try std.testing.expectEqual(@as(c_uint, 1), stats.face_count);
         view.setup_open = true;
         view.setup_runtime = .opencode;
         view.setup_action = null;
