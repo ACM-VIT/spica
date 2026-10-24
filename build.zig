@@ -42,6 +42,20 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| smoke_run.addArgs(args);
     b.step("domain-smoke", "Exercise the actual isolated SQLite storage consumer").dependOn(&smoke_run.step);
 
+    // Explicit worker/CLI slice: no domain storage, native UI or provider graph.
+    const inspection_tests_module = b.createModule(.{ .root_source_file = b.path("src/inspection_test.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const inspection_tests = b.addTest(.{ .name = "workspace-inspection-tests", .root_module = inspection_tests_module });
+    const inspection_test_run = b.addRunArtifact(inspection_tests);
+    inspection_test_run.has_side_effects = true;
+    b.step("test-workspace-inspection", "Run bounded read-only Git workspace regressions").dependOn(&inspection_test_run.step);
+    const inspection_module = b.createModule(.{ .root_source_file = b.path("src/inspection_smoke.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const inspection_exe = b.addExecutable(.{ .name = "inspect-workspace", .root_module = inspection_module });
+    const inspection_install = b.addInstallArtifact(inspection_exe, .{});
+    b.step("build-workspace-inspection", "Install the isolated read-only workspace consumer").dependOn(&inspection_install.step);
+    const inspection_run = b.addRunArtifact(inspection_exe);
+    if (b.args) |args| inspection_run.addArgs(args);
+    b.step("inspect-workspace", "Inspect an explicitly selected checkout").dependOn(&inspection_run.step);
+
     // Core editing checks need Unicode segmentation, not the renderer/content stack.
     const core_module = b.createModule(.{ .root_source_file = b.path("src/core_test.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core_module.addIncludePath(b.path(b.fmt("{s}/include", .{prefix})));
