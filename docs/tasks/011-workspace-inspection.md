@@ -20,7 +20,7 @@ The callable `tools/inspect-workspace` delegates to an isolated Zig consumer, wi
 
 Defaults: 4 MiB scratch, 128 KiB status/target-list output, 256 KiB diff, 2,048 files, 5 s whole-operation deadline including capture/verification. Hard configurable caps: 8 MiB scratch, 1 MiB output, 2 MiB diff, 8,192 files, 30 s. Return `StreamTooLong`, `FileLimit`, `OutOfMemory` or `InspectionTimeout`; no partial semantic success. Caller-owned result storage has explicit `deinit`. Existing identity capture retains its 16 KiB Git-output/4 KiB stderr limits. Deadline cancellation reaps its subprocess; it is cooperative OS I/O cancellation, not a hard real-time guarantee.
 
-Benign `GIT_EDITOR`, `GIT_PAGER` and `GIT_TERMINAL_PROMPT` are allowed (fixed read-only commands never edit/prompt and disable paging); all other `GIT_*` variables are refused. Git executable resolution follows the explicit process environment/PATH convention, not an application sandbox. Repository paths are required to be checkout roots, not subdirectories. Diff accepts a single tracked, canonical owned relative file, including index deletions and literal pathspec punctuation; untracked content returns `UntrackedDiffUnavailable`. Existing symlink path components are conservatively refused. Capture currently requires a resolvable HEAD; unborn/broken repository metadata and unavailable Git remain explicit errors. Changed branch/HEAD/filesystem identity invalidates a retained binding. Before/after verification detects drift but does not make concurrent filesystem changes atomic.
+Benign `GIT_EDITOR`, `GIT_PAGER` and `GIT_TERMINAL_PROMPT` are allowed (fixed read-only commands never edit/prompt and disable paging); all other `GIT_*` variables are refused. Git executable resolution follows the explicit process environment/PATH convention, not an application sandbox. Repository paths are required to be checkout roots, not subdirectories. Diff accepts a single tracked, canonical owned relative file, including index deletions and literal pathspec punctuation; untracked content returns `UntrackedDiffUnavailable`. Existing symlink path components are conservatively refused. Capture supports a valid unborn symbolic branch with an absent branch ref: `non_git=false`, actual common/git-directory identities and branch, and empty `base_revision`. Staged diff uses the actual index without requiring HEAD in that state. Malformed metadata, missing referenced objects, detached missing HEAD and unavailable Git remain explicit errors. First commit or changed branch/HEAD/filesystem identity invalidates a retained binding. Before/after verification detects drift but does not make concurrent filesystem changes atomic.
 
 Usage after `zig build build-workspace-inspection -Doptimize=ReleaseSafe`:
 
@@ -70,3 +70,35 @@ shared recovered tooling and staged 011 backend only: task009 and its separate
 partial FreeType remediation were **not** merged or accepted. No native desktop,
 provider or performance attempt occurred. Full 011 public/UI/external-tool
 acceptance remains 009-dependent.
+
+## Unborn repository startup repair
+
+Current focused owner/Git owner: UnbornWorkspaceFix; evidence worker:
+UnbornStartupMeasure (ignored artifacts only). Actual model:
+openai-codex/gpt-6.1-sol, no fallback/advisor. Scope is solely valid unborn
+repository capture/verify, affected inspection/tests and launch documentation;
+no task009/FreeType work. Private branch `task/fix-unborn-workspace`, worktree
+`.artifacts/worktrees/fix-unborn-workspace`, recorded clean base
+`e21fa8d08062444ae46dc0bc568483b8f88de4ae`.
+
+The reported native startup traces are ground truth; the unchanged failing app
+was not rerun. Capture proves an absent symbolic branch ref rather than treating
+any failed HEAD lookup as unborn. Subprocess output buffers are freed explicitly.
+Regression scenarios use real disposable Git repositories for fresh/staged
+capture, reopen, staged/unstaged inspection, branch replacement, first commit,
+detached HEAD and malformed/missing-object refusal. Existing byte codec and
+public capture signature remain unchanged.
+
+Focused commands `zig build test-workspace-inspection build-workspace-inspection
+-Doptimize=Debug --summary all` and the corresponding `ReleaseSafe` command
+passed 13/13 tests each; `zig build -Doptimize=ReleaseSafe --summary all` built the
+native candidate. Logs and exact commands:
+`.artifacts/worktrees/fix-unborn-workspace/.artifacts/repair1/focused.json`.
+One substantive repair followed the initial focused run: Git discovery skipped
+a malformed nested `.git/HEAD` and found the parent checkout. Capture now checks
+the nearest actual `.git` marker against Git's discovered top-level root, refusing
+that wrong-checkout substitution. The initial failure log is preserved at
+`.artifacts/worktrees/fix-unborn-workspace/.artifacts/focused-0.log`; its test
+unexpected-success result also reported leaked result storage (not a successful
+capture ownership claim). Repaired runs have no reported leaks. Actual native
+startup/reopen and assembled integration checks remain pending, not accepted.

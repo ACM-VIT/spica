@@ -4,7 +4,8 @@ const t = @import("types.zig");
 const c = @cImport({
     @cInclude("sys/stat.h");
 });
-fn git(allocator: std.mem.Allocator, io: std.Io, root: []const u8, args: []const []const u8) ![]const u8 {
+/// Returns owned output, or null only for Git's explicit "missing ref" status.
+fn gitRef(allocator: std.mem.Allocator, io: std.Io, root: []const u8, args: []const []const u8, allow_missing: bool) !?[]const u8 {
     var argv: [12][]const u8 = undefined;
     argv[0] = "git";
     argv[1] = "-C";
@@ -12,8 +13,26 @@ fn git(allocator: std.mem.Allocator, io: std.Io, root: []const u8, args: []const
     if (args.len > argv.len - 3) return error.Limit;
     @memcpy(argv[3..][0..args.len], args);
     const result = try std.process.run(allocator, io, .{ .argv = argv[0 .. args.len + 3], .stdout_limit = .limited(16384), .stderr_limit = .limited(4096) });
-    if (result.term != .exited or result.term.exited != 0) return error.NotRepository;
-    return std.mem.trimEnd(u8, result.stdout, "\r\n");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited) return error.NotRepository;
+    if (allow_missing and result.term.exited == 1) return null;
+    if (result.term.exited != 0) return error.NotRepository;
+    return try allocator.dupe(u8, std.mem.trimEnd(u8, result.stdout, "\r\n"));
+}
+fn git(allocator: std.mem.Allocator, io: std.Io, root: []const u8, args: []const []const u8) ![]const u8 {
+    return (try gitRef(allocator, io, root, args, false)).?;
+}
+fn gitMarkerRoot(allocator: std.mem.Allocator, root: []const u8) !?[]const u8 {
+    var ancestor = root;
+    while (true) {
+        const marker = try std.fmt.allocPrintSentinel(allocator, "{s}/.git", .{ancestor}, 0);
+        defer allocator.free(marker);
+        var identity: c.struct_stat = undefined;
+        if (c.lstat(marker, &identity) == 0) return ancestor;
+        if (std.c._errno().* != @intFromEnum(std.c.E.NOENT)) return error.WorkspaceUnavailable;
+        ancestor = std.fs.path.dirname(ancestor) orelse return null;
+    }
 }
 pub fn capture(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !t.WorkspaceBinding {
     const directory = try std.Io.Dir.cwd().openDir(io, root, .{});
@@ -21,7 +40,9 @@ pub fn capture(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !t.Wo
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const n = try directory.realPath(io, &buffer);
     const canonical = try allocator.dupe(u8, buffer[0..n]);
+    errdefer allocator.free(canonical);
     const path = try allocator.dupeZ(u8, canonical);
+    defer allocator.free(path);
     var identity: c.struct_stat = undefined;
     if (c.stat(path, &identity) != 0) return error.WorkspaceUnavailable;
     var binding: t.WorkspaceBinding = .{
@@ -33,19 +54,55 @@ pub fn capture(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !t.Wo
         .base_revision = "",
         .non_git = true,
     };
+    errdefer allocator.free(binding.filesystem_identity);
+    const marker_root = try gitMarkerRoot(allocator, canonical);
     const common = git(allocator, io, canonical, &.{ "rev-parse", "--path-format=absolute", "--git-common-dir" }) catch |err| switch (err) {
-        error.NotRepository => return binding,
+        error.NotRepository => {
+            if (marker_root != null) return error.NotRepository;
+            return binding;
+        },
         else => return err,
     };
     binding.repository_identity = common;
+    errdefer allocator.free(common);
+    if (marker_root) |expected_root| {
+        // Git discovery can skip a damaged nested .git and find a parent repo.
+        // Never substitute that parent's checkout for the requested identity.
+        const top = try git(allocator, io, canonical, &.{ "rev-parse", "--show-toplevel" });
+        defer allocator.free(top);
+        if (!std.mem.eql(u8, top, expected_root)) return error.NotRepository;
+    }
     binding.checkout_identity = try git(allocator, io, canonical, &.{ "rev-parse", "--absolute-git-dir" });
-    binding.base_revision = try git(allocator, io, canonical, &.{ "rev-parse", "--verify", "HEAD" });
-    binding.expected_branch = try git(allocator, io, canonical, &.{ "rev-parse", "--abbrev-ref", "HEAD" });
+    errdefer allocator.free(binding.checkout_identity);
+    binding.base_revision = git(allocator, io, canonical, &.{ "rev-parse", "--verify", "HEAD^{commit}" }) catch |err| switch (err) {
+        error.NotRepository => blk: {
+            // A failed HEAD lookup alone does not prove an unborn repository:
+            // require a valid symbolic branch whose ref is genuinely absent.
+            const ref = try git(allocator, io, canonical, &.{ "symbolic-ref", "--quiet", "HEAD" });
+            defer allocator.free(ref);
+            if (!std.mem.startsWith(u8, ref, "refs/heads/")) return error.NotRepository;
+            const checked = try git(allocator, io, canonical, &.{ "check-ref-format", ref });
+            defer allocator.free(checked);
+            if (try gitRef(allocator, io, canonical, &.{ "show-ref", "--verify", "--quiet", ref }, true)) |resolved| {
+                allocator.free(resolved);
+                return error.NotRepository;
+            }
+            break :blk "";
+        },
+        else => return err,
+    };
+    errdefer if (binding.base_revision.len != 0) allocator.free(binding.base_revision);
+    binding.expected_branch = if (binding.base_revision.len == 0)
+        try git(allocator, io, canonical, &.{ "symbolic-ref", "--quiet", "--short", "HEAD" })
+    else
+        try git(allocator, io, canonical, &.{ "rev-parse", "--abbrev-ref", "HEAD" });
     binding.non_git = false;
     return binding;
 }
 pub fn verify(allocator: std.mem.Allocator, io: std.Io, binding: t.WorkspaceBinding) !bool {
-    const actual = try capture(allocator, io, binding.canonical_root);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const actual = try capture(arena.allocator(), io, binding.canonical_root);
     return t.adapter.equal(actual, binding);
 }
 

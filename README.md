@@ -68,6 +68,11 @@ model provider and canonical account directory, an explicit model/effort, and a
 registered workspace. Model/effort are never silently copied or substituted.
 The Host bounds one coordinator and two children with independent process state.
 
+The workspace may be a newly initialized Git repository with no commit (`git init`
+is sufficient). Spica retains its actual symbolic branch and checkout identity;
+creating the first commit or changing that branch invalidates an earlier captured
+workspace binding. Broken Git metadata remains an error, not a non-Git workspace.
+
 Before Codex inference, sign in to the **same selected Codex directory**:
 
 ```bash
