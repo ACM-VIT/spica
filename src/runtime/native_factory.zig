@@ -5,6 +5,7 @@ const common = @import("adapter.zig");
 const transport = @import("transport.zig");
 const Codex = @import("codex.zig");
 const OpenCode = @import("opencode.zig");
+const catalog = @import("catalog.zig");
 const fake_factory = @import("../domain/fake_factory.zig");
 
 pub const NativeFactory = struct {
@@ -28,6 +29,8 @@ pub const NativeFactory = struct {
     catalog_count: usize = 0,
     catalog_authoritative: bool = false,
     status: c.RuntimeStatus = .{},
+    status_reason: [1024]u8 = undefined,
+    action_diagnostic: catalog.RpcDiagnostic = .{},
     status_configurations: [2]c.RuntimeSetup = undefined,
     login_instance: ?common.Adapter = null,
     login_allocator: ?std.mem.Allocator = null,
@@ -177,12 +180,11 @@ pub const NativeFactory = struct {
             self.stopLogin();
             return false;
         };
-        // Login strings live in the runtime until the next explicit action.
+        // Borrow login strings only while this runtime remains alive.
         self.status.login = runtime.login;
         self.status.readiness = runtime.readiness;
-        if (runtime.diagnostic.len != 0) self.status.reason = runtime.diagnostic;
         if (runtime.diagnostic.len != 0) {
-            self.status.reason = "Sign-in failed; explicitly initiate again.";
+            self.rememberReason(runtime.diagnostic);
             self.status.readiness = .unavailable;
             self.stopLogin();
             return false;
@@ -205,9 +207,10 @@ pub const NativeFactory = struct {
     }
     fn action(p: *anyopaque, allocator: std.mem.Allocator, io: std.Io, request: c.RuntimeAction) !void {
         const self = cast(p);
+        self.action_diagnostic.len = 0;
         self.performAction(allocator, io, request) catch |err| {
             if (err == error.RuntimeBusy) return err;
-            self.status.reason = @errorName(err);
+            self.rememberReason(if (self.action_diagnostic.len != 0) self.action_diagnostic.slice() else @errorName(err));
             self.status.readiness = .unavailable;
             self.catalog_count = 0;
             self.catalog_authoritative = true;
@@ -294,13 +297,18 @@ pub const NativeFactory = struct {
                 const active_index = active orelse return error.ActiveRuntimeNotConfigured;
                 self.catalog_count = try self.refreshConfig(allocator, retained.allocator(), scratch_bytes, self.configs[active_index], self.catalog_models[0..]);
                 if (self.catalog_count == 0) return error.NoConfiguredModels;
+                var representative = self.catalog_models[0];
+                for (self.catalog_models[0..self.catalog_count]) |model| {
+                    if (model.readiness == .ready or (representative.readiness == .unavailable and model.readiness != .unavailable)) representative = model;
+                    if (representative.readiness == .ready) break;
+                }
+                self.status.readiness = representative.readiness;
+                self.status.reason = representative.reason;
                 for (self.configs, 0..) |config, i| {
                     if (i == active_index) continue;
                     const count = self.refreshConfig(allocator, retained.allocator(), scratch_bytes, config, self.catalog_models[self.catalog_count..]) catch continue;
                     self.catalog_count += count;
                 }
-                self.status.readiness = self.catalog_models[0].readiness;
-                self.status.reason = self.catalog_models[0].reason;
             },
             .login => |login| {
                 if (login.runtime_kind != .codex) return error.SignInUnsupported;
@@ -320,12 +328,18 @@ pub const NativeFactory = struct {
                     const runtime: *Codex.Runtime = @ptrCast(@alignCast(instance.context));
                     const start = transport.c.spica_monotonic_ms();
                     while (!runtime.initialized or runtime.pending != null) {
-                        if (runtime.diagnostic.len != 0) return error.AccountStatusFailed;
+                        if (runtime.diagnostic.len != 0) {
+                            self.action_diagnostic = runtime.setup_diagnostic;
+                            return error.AccountStatusFailed;
+                        }
                         try runtime.pump();
                         if (runtime.disconnected or transport.c.spica_monotonic_ms() - start > 15000) return error.InitializeTimeout;
                         _ = transport.c.spica_process_poll(&runtime.wire.process, -1, @intFromBool(runtime.wire.input_len != 0), 20);
                     }
-                    if (runtime.diagnostic.len != 0) return error.AccountStatusFailed;
+                    if (runtime.diagnostic.len != 0) {
+                        self.action_diagnostic = runtime.setup_diagnostic;
+                        return error.AccountStatusFailed;
+                    }
                     self.status.runtime_kind = "codex";
                     self.status.workspace_root = config.selection.workspace.value;
                     self.status.configuration = config.setup();
@@ -344,15 +358,25 @@ pub const NativeFactory = struct {
             },
         }
     }
-    fn refreshConfig(_: *NativeFactory, allocator: std.mem.Allocator, retained: std.mem.Allocator, scratch_bytes: []u8, config: Config, output: []c.Model) !usize {
+    fn refreshConfig(self: *NativeFactory, allocator: std.mem.Allocator, retained: std.mem.Allocator, scratch_bytes: []u8, config: Config, output: []c.Model) !usize {
         var scratch_fixed = std.heap.FixedBufferAllocator.init(scratch_bytes);
         const scratch = scratch_fixed.allocator();
         const codex = std.mem.eql(u8, config.selection.runtime_kind, "codex");
         const root = try scratch.dupeZ(u8, config.selection.workspace.value);
         var wire = try transport.Transport.init(allocator, .{ .argv = if (codex) &.{ config.executable, "app-server", "--stdio" } else &.{ config.executable, "acp" }, .cwd = root, .environment = config.environment });
         defer wire.deinit();
-        const catalog = @import("catalog.zig");
-        return if (codex) try catalog.codex(scratch, retained, &wire, config.selection, output) else try catalog.opencode(scratch, retained, &wire, config.selection, root, output);
+        var diagnostic: catalog.RpcDiagnostic = .{};
+        const result = if (codex) catalog.codexWithDiagnostic(scratch, retained, &wire, config.selection, output, &diagnostic) else catalog.opencodeWithDiagnostic(scratch, retained, &wire, config.selection, root, output, &diagnostic);
+        return result catch |err| {
+            self.action_diagnostic = diagnostic;
+            return err;
+        };
+    }
+    fn rememberReason(self: *NativeFactory, reason: []const u8) void {
+        var len = @min(reason.len, self.status_reason.len);
+        while (len < reason.len and len > 0 and reason[len] & 0xc0 == 0x80) len -= 1;
+        @memcpy(self.status_reason[0..len], reason[0..len]);
+        self.status.reason = self.status_reason[0..len];
     }
     pub fn asFactory(self: *NativeFactory) common.Factory {
         return .{ .context = self, .vtable = &.{ .discover = discovery, .accountStatus = account, .resolveSelection = resolve, .create = createInstance, .destroy = destroyInstance, .models = models, .runtimeStatus = runtimeStatus, .runtimeAction = action, .pumpSetup = pumpSetup, .shutdownSetup = shutdownSetup } };

@@ -576,3 +576,178 @@ test "broken saved setup remains visible with original fields and never silently
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(io, inactive.account_directory, .{}));
     }
 }
+
+// Per-test offline process: no installed accounts, credentials or inference.
+const rejection_fixture =
+    \\#!/usr/bin/python3
+    \\import json, os, sys
+    \\scenario = os.environ['SPICA_TEST_SCENARIO']
+    \\def emit(value):
+    \\    print(json.dumps(value, ensure_ascii=False), flush=True)
+    \\def options(identity='opencode/one'):
+    \\    return [dict(id='model', currentValue=identity, options=[dict(value='opencode/'+name, name=name) for name in ['one', 'two', 'three']]), dict(id='effort', options=[dict(value='high')])]
+    \\for line in sys.stdin:
+    \\    request = json.loads(line)
+    \\    if 'id' not in request:
+    \\        continue
+    \\    method, params, ident = request['method'], request.get('params', {}), request['id']
+    \\    def reply(result):
+    \\        emit(dict(id=ident, result=result))
+    \\    def reject(message):
+    \\        emit(dict(id=ident, error=dict(code=-32001, message=message, data=dict(access_token='PRIVATE-TOKEN'))))
+    \\    if method == 'initialize':
+    \\        reply(dict(userAgent='fixture/0.163.0', protocolVersion=1, agentInfo=dict(version='2.1.4')))
+    \\    elif method == 'account/read':
+    \\        if scenario == 'account-rpc':
+    \\            reject('Account service denied fixture request')
+    \\        else:
+    \\            reply(dict(account=dict(type='chatgpt')))
+    \\    elif method == 'account/login/start':
+    \\        reply(dict(loginId='fixture-login', verificationUrl='https://example.invalid', userCode='FIXTURE'))
+    \\        emit(dict(method='account/login/completed', params=dict(loginId='old-login', success=False, error='Stale failure')))
+    \\        emit(dict(method='account/login/completed', params=dict(loginId='fixture-login', success=False, error='Device authorization denied: 界\nretry explicitly')))
+    \\        emit(dict(method='account/updated', params={}))
+    \\    elif method == 'model/list':
+    \\        reject('Catalog service denied fixture request')
+    \\    elif method == 'session/new':
+    \\        reply(dict(sessionId='fixture-session', configOptions=options()))
+    \\    elif method == 'session/set_config_option':
+    \\        index = ident - 3
+    \\        if scenario == 'reject-'+str(index):
+    \\            reject('Selected model is unavailable: 界')
+    \\        elif scenario == 'mismatch-'+str(index):
+    \\            reply(dict(configOptions=options('opencode/foreign')))
+    \\        elif scenario == 'disconnect-'+str(index):
+    \\            sys.exit(0)
+    \\        else:
+    \\            reply(dict(configOptions=options(params['value'])))
+;
+
+fn writeRejectionFixture(temporary: std.testing.TmpDir, allocator: std.mem.Allocator) ![:0]const u8 {
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "runtime-fixture", .data = rejection_fixture });
+    const file = try temporary.dir.openFile(std.testing.io, "runtime-fixture", .{});
+    defer file.close(std.testing.io);
+    try file.setPermissions(std.testing.io, .fromMode(0o700));
+    return temporary.dir.realPathFileAlloc(std.testing.io, "runtime-fixture", allocator);
+}
+
+test "factory failed sign-in retains actual diagnostic after runtime destruction and pending clears" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var codex = selection;
+    codex.workspace.value = root;
+    var configured: native.NativeFactory = .{ .configs = &.{.{ .selection = codex, .executable = try writeRejectionFixture(temporary, a), .environment = &.{"SPICA_TEST_SCENARIO=login-failure"} }}, .status = .{ .runtime_kind = "codex", .workspace_root = root } };
+    const factory = configured.asFactory();
+    defer factory.vtable.shutdownSetup.?(factory.context);
+    try factory.runtimeAction(std.testing.allocator, std.testing.io, .{ .login = .{ .runtime_kind = .codex, .mode = .device } });
+    const clock = @import("runtime/transport.zig").c;
+    const started = clock.spica_monotonic_ms();
+    while (factory.runtimeStatus().login_pending and clock.spica_monotonic_ms() - started < 3000) {
+        _ = factory.vtable.pumpSetup.?(factory.context);
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake);
+    }
+    const status = factory.runtimeStatus();
+    try std.testing.expect(!status.login_pending);
+    try std.testing.expect(configured.login_instance == null);
+    try std.testing.expectEqual(.unavailable, status.readiness);
+    try std.testing.expectEqualStrings("", status.login);
+    try std.testing.expect(std.mem.indexOf(u8, status.reason, "Device authorization denied: 界 retry explicitly") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status.reason, "Stale failure") == null);
+    try std.testing.expectEqual(@intFromPtr(&configured.status_reason), @intFromPtr(status.reason.ptr));
+    // Repeated status observation after process/allocator destruction retains
+    // the owned reason, with no new login or background work.
+    for (0..20) |_| {
+        try std.testing.expect(!factory.vtable.pumpSetup.?(factory.context));
+        try std.testing.expectEqualStrings(status.reason, factory.runtimeStatus().reason);
+    }
+}
+
+test "factory setup and catalog RPC rejection reasons survive scratch and instance teardown" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var codex = selection;
+    codex.workspace.value = root;
+    const executable = try writeRejectionFixture(temporary, a);
+    for ([_]bool{ true, false }) |account_rpc| {
+        var configured: native.NativeFactory = .{ .configs = &.{.{ .selection = codex, .executable = executable, .environment = &.{if (account_rpc) "SPICA_TEST_SCENARIO=account-rpc" else "SPICA_TEST_SCENARIO=catalog-rpc"} }}, .status = .{ .runtime_kind = "codex", .workspace_root = root } };
+        const factory = configured.asFactory();
+        if (account_rpc) {
+            try std.testing.expectError(error.AccountStatusFailed, factory.runtimeAction(std.testing.allocator, std.testing.io, .{ .login = .{ .runtime_kind = .codex, .mode = .device } }));
+        } else {
+            try std.testing.expectError(error.CatalogRpcRejected, factory.runtimeAction(std.testing.allocator, std.testing.io, .refresh));
+        }
+        const status = factory.runtimeStatus();
+        try std.testing.expectEqual(.unavailable, status.readiness);
+        try std.testing.expect(!status.login_pending);
+        try std.testing.expectEqual(@as(usize, 0), factory.models().len);
+        try std.testing.expect(std.mem.indexOf(u8, status.reason, if (account_rpc) "Account service denied fixture request" else "Catalog service denied fixture request") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status.reason, "-32001") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status.reason, "PRIVATE-TOKEN") == null);
+        try std.testing.expectEqual(@intFromPtr(&configured.status_reason), @intFromPtr(status.reason.ptr));
+    }
+}
+
+test "OpenCode rejected or mismatched first middle last row retains exact good rows and active status" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const executable = try writeRejectionFixture(temporary, a);
+    var opencode = selection;
+    opencode.runtime_kind = "opencode";
+    opencode.required_runtime_version = "2.1.4";
+    opencode.model_provider = "opencode";
+    opencode.workspace.value = root;
+    for ([_][]const u8{ "reject", "mismatch", "disconnect" }) |mode| {
+        for (0..3) |bad| {
+            const scenario = try std.fmt.allocPrintSentinel(a, "SPICA_TEST_SCENARIO={s}-{d}", .{ mode, bad }, 0);
+            var configured: native.NativeFactory = .{ .configs = &.{.{ .selection = opencode, .executable = executable, .environment = &.{scenario} }}, .status = .{ .runtime_kind = "opencode", .workspace_root = root } };
+            const factory = configured.asFactory();
+            if (std.mem.eql(u8, mode, "disconnect")) {
+                try std.testing.expectError(error.ProviderDisconnected, factory.runtimeAction(std.testing.allocator, std.testing.io, .refresh));
+                try std.testing.expectEqual(@as(usize, 0), factory.models().len);
+                try std.testing.expectEqual(.unavailable, factory.runtimeStatus().readiness);
+                continue;
+            }
+            try factory.runtimeAction(std.testing.allocator, std.testing.io, .refresh);
+            try std.testing.expectEqual(@as(usize, 3), factory.models().len);
+            // The first unavailable row cannot make later verified rows look
+            // globally unavailable. Unknown is the honest entitlement status.
+            try std.testing.expectEqual(.unknown, factory.runtimeStatus().readiness);
+            for (factory.models(), [_][]const u8{ "one", "two", "three" }, 0..) |model, name, i| {
+                try std.testing.expectEqualStrings(name, model.selection.model_id);
+                try std.testing.expectEqualStrings("opencode", model.selection.model_provider);
+                try std.testing.expectEqualStrings(selection.account_ref, model.selection.account_ref);
+                try std.testing.expectEqualStrings("default", model.selection.effort);
+                if (i == bad) {
+                    try std.testing.expectEqual(.unavailable, model.readiness);
+                    try std.testing.expectEqual(@as(usize, 1), model.supported_efforts.len);
+                    if (std.mem.eql(u8, mode, "reject")) {
+                        try std.testing.expect(std.mem.indexOf(u8, model.reason, "Selected model is unavailable: 界") != null);
+                        try std.testing.expect(std.mem.indexOf(u8, model.reason, "session/set_config_option rejected (-32001)") != null);
+                        try std.testing.expect(std.mem.indexOf(u8, model.reason, "PRIVATE-TOKEN") == null);
+                    } else try std.testing.expect(std.mem.indexOf(u8, model.reason, "different model") != null);
+                } else {
+                    try std.testing.expectEqual(.unknown, model.readiness);
+                    try std.testing.expectEqual(@as(usize, 2), model.supported_efforts.len);
+                    try std.testing.expectEqualStrings("high", model.supported_efforts[1]);
+                    try std.testing.expectEqualStrings(model.reason, factory.runtimeStatus().reason);
+                }
+                var requested = model.selection;
+                requested.effort = "high";
+                const resolved = factory.resolveSelection(requested);
+                try std.testing.expectEqual(if (i == bad) c.Readiness.unavailable else c.Readiness.unknown, resolved.readiness);
+            }
+        }
+    }
+}

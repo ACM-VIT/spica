@@ -4,6 +4,7 @@ const c = @import("../contract.zig");
 const adapter = @import("adapter.zig");
 const transport = @import("transport.zig");
 const Value = std.json.Value;
+const RpcDiagnostic = @import("catalog.zig").RpcDiagnostic;
 fn field(v: Value, key: []const u8) Value {
     return if (v == .object) v.object.get(key) orelse .null else .null;
 }
@@ -46,6 +47,11 @@ pub fn RuntimeFor(comptime T: type) type {
         initialized: bool = false,
         readiness: c.Readiness = .unknown,
         login: []const u8 = "",
+        login_id: []const u8 = "",
+        login_active: bool = false,
+        login_completed: bool = false,
+        account_refresh: bool = false,
+        setup_diagnostic: RpcDiagnostic = .{},
         diagnostic: []const u8 = "",
         turn_error_bytes: [2048]u8 = undefined,
         turn_error_len: usize = 0,
@@ -96,6 +102,13 @@ pub fn RuntimeFor(comptime T: type) type {
         pub fn startLogin(self: *Self, device_code: bool) !void {
             if (!self.initialized) return error.NotInitialized;
             try self.rpc(.login, .{ .type = if (device_code) @as([]const u8, "chatgptDeviceCode") else "chatgpt" }, self.correlation);
+            self.login = "";
+            self.login_id = "";
+            self.login_active = true;
+            self.login_completed = false;
+            self.account_refresh = false;
+            self.diagnostic = "";
+            self.readiness = .unknown;
         }
         pub fn discover(_: *Self) c.Discovery {
             var caps = [_]c.CapabilityInfo{.{ .status = .unsupported, .evidence = "Codex adapter unsupported surface" }} ** @typeInfo(c.Capability).@"enum".fields.len;
@@ -242,7 +255,17 @@ pub fn RuntimeFor(comptime T: type) type {
                 self.pending = null;
                 const failure = field(value, "error");
                 if (failure != .null) {
-                    self.diagnostic = try std.json.Stringify.valueAlloc(self.state.allocator(), failure, .{});
+                    if (pending.kind == .initialize or pending.kind == .account or pending.kind == .login) {
+                        self.setup_diagnostic.remember(switch (pending.kind) {
+                            .initialize => "initialize",
+                            .account => "account/read",
+                            .login => "account/login/start",
+                            else => unreachable,
+                        }, failure);
+                        self.diagnostic = self.setup_diagnostic.slice();
+                        self.login_active = false;
+                        self.readiness = .unavailable;
+                    } else self.diagnostic = try std.json.Stringify.valueAlloc(self.state.allocator(), failure, .{});
                     if (self.correlation.session.value.len != 0) {
                         var end = @min(self.diagnostic.len, 2048);
                         while (end < self.diagnostic.len and end > 0 and self.diagnostic[end] & 0xc0 == 0x80) end -= 1;
@@ -260,9 +283,17 @@ pub fn RuntimeFor(comptime T: type) type {
                     },
                     .account => {
                         const account = field(result, "account");
-                        self.readiness = if (eq(text(field(account, "type")), "chatgpt")) .ready else .unavailable;
+                        // During explicit login, existing account readiness does not
+                        // complete the newly requested flow.
+                        if (self.diagnostic.len == 0 and (!self.login_active or self.login_completed)) {
+                            self.readiness = if (eq(text(field(account, "type")), "chatgpt")) .ready else .unavailable;
+                            if (self.login_completed) self.login_active = false;
+                        }
                     },
                     .login => {
+                        const login_id = text(field(result, "loginId"));
+                        if (login_id.len == 0 or login_id.len > 256) return error.InvalidLogin;
+                        self.login_id = try self.state.allocator().dupe(u8, login_id);
                         self.login = try std.json.Stringify.valueAlloc(self.state.allocator(), result, .{});
                     },
                     .open, .restore => {
@@ -287,10 +318,34 @@ pub fn RuntimeFor(comptime T: type) type {
                     },
                     .cancel => {},
                 }
+                try self.refreshAccount();
                 return;
             }
-            if (eq(method, "account/login/completed") or eq(method, "account/updated")) {
-                if (self.pending == null) try self.rpc(.account, .{ .refreshToken = false }, self.correlation);
+            if (eq(method, "account/login/completed")) {
+                if (!self.login_active or self.login_id.len == 0 or !eq(text(field(params, "loginId")), self.login_id)) return;
+                const success = field(params, "success");
+                if (success != .bool) return error.InvalidLogin;
+                if (!success.bool) {
+                    self.setup_diagnostic.remember("account/login/completed", field(params, "error"));
+                    self.diagnostic = self.setup_diagnostic.slice();
+                    self.readiness = .unavailable;
+                    self.login_active = false;
+                    self.login_completed = false;
+                    self.account_refresh = false;
+                } else {
+                    self.login_completed = true;
+                    self.account_refresh = true;
+                    try self.refreshAccount();
+                }
+                return;
+            }
+            if (eq(method, "account/updated")) {
+                // Coalesce refreshes while any RPC is pending; a failed login
+                // must not be overwritten by an unrelated account update.
+                if (self.diagnostic.len == 0) {
+                    self.account_refresh = true;
+                    try self.refreshAccount();
+                }
                 return;
             }
             const thread_id = text(field(params, "threadId"));
@@ -386,6 +441,11 @@ pub fn RuntimeFor(comptime T: type) type {
                 defer self.allocator.free(reply_json);
                 try self.wire.send(reply_json);
             }
+        }
+        fn refreshAccount(self: *Self) !void {
+            if (!self.account_refresh or self.pending != null or self.diagnostic.len != 0) return;
+            self.account_refresh = false;
+            try self.rpc(.account, .{ .refreshToken = false }, self.correlation);
         }
         pub fn asAdapter(self: *Self) adapter.Adapter {
             return .{ .context = self, .vtable = &.{ .discover = discoverAny, .accountStatus = accountAny, .resolveSelection = selectionAny, .dispatch = dispatchAny, .pump = pumpAny, .poll = pollAny, .shutdown = shutdownAny, .pollTool = pollToolAny, .respondTool = respondToolAny, .ready = readyAny } };

@@ -15,7 +15,43 @@ pub fn text(v: Value) []const u8 {
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
-fn call(wire: *transport.Transport, allocator: std.mem.Allocator, id: u64, method: []const u8, params: anytype) !Value {
+/// Reusable, owned diagnostic: retain only method/code/message, never error.data.
+pub const RpcDiagnostic = struct {
+    bytes: [1024]u8 = undefined,
+    len: usize = 0,
+    pub fn slice(self: *const RpcDiagnostic) []const u8 {
+        return self.bytes[0..self.len];
+    }
+    pub fn remember(self: *RpcDiagnostic, method: []const u8, failure: Value) void {
+        self.len = 0;
+        self.append(method, 96);
+        self.append(" rejected", 16);
+        const code = field(failure, "code");
+        if (code == .integer) {
+            var number: [32]u8 = undefined;
+            const printed = std.fmt.bufPrint(&number, " ({d})", .{code.integer}) catch "";
+            self.append(printed, number.len);
+        } else if (code == .string) {
+            self.append(" (", 2);
+            self.append(code.string, 64);
+            self.append(")", 1);
+        }
+        const message = if (failure == .string) failure.string else text(field(failure, "message"));
+        if (message.len != 0) {
+            self.append(": ", 2);
+            self.append(message, 768);
+        }
+    }
+    fn append(self: *RpcDiagnostic, bytes: []const u8, limit: usize) void {
+        var end = @min(bytes.len, @min(limit, self.bytes.len - self.len));
+        while (end < bytes.len and end > 0 and bytes[end] & 0xc0 == 0x80) end -= 1;
+        for (bytes[0..end]) |byte| {
+            self.bytes[self.len] = if (byte < 0x20 or byte == 0x7f) ' ' else byte;
+            self.len += 1;
+        }
+    }
+};
+fn call(wire: *transport.Transport, allocator: std.mem.Allocator, diagnostic: *RpcDiagnostic, id: u64, method: []const u8, params: anytype) !Value {
     const bytes = try std.json.Stringify.valueAlloc(allocator, .{ .jsonrpc = "2.0", .id = id, .method = method, .params = params }, .{});
     try wire.send(bytes);
     const start = transport.c.spica_monotonic_ms();
@@ -25,7 +61,10 @@ fn call(wire: *transport.Transport, allocator: std.mem.Allocator, id: u64, metho
             const frame = try std.json.parseFromSlice(Value, allocator, line, .{ .allocate = .alloc_always });
             const actual = field(frame.value, "id");
             if (actual != .integer or actual.integer != id) continue;
-            if (field(frame.value, "error") != .null) return error.CatalogRpcRejected;
+            if (field(frame.value, "error") != .null) {
+                diagnostic.remember(method, field(frame.value, "error"));
+                return error.CatalogRpcRejected;
+            }
             return field(frame.value, "result");
         }
         if (wire.exited) return error.ProviderDisconnected;
@@ -34,16 +73,20 @@ fn call(wire: *transport.Transport, allocator: std.mem.Allocator, id: u64, metho
     return error.CatalogTimeout;
 }
 pub fn codex(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire: *transport.Transport, selection: c.Selection, output: []c.Model) !usize {
-    const init = try call(wire, allocator, 1, "initialize", .{ .clientInfo = .{ .name = "spica", .version = "1" }, .capabilities = .{ .experimentalApi = true } });
+    var diagnostic: RpcDiagnostic = .{};
+    return codexWithDiagnostic(allocator, retained, wire, selection, output, &diagnostic);
+}
+pub fn codexWithDiagnostic(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire: *transport.Transport, selection: c.Selection, output: []c.Model, diagnostic: *RpcDiagnostic) !usize {
+    const init = try call(wire, allocator, diagnostic, 1, "initialize", .{ .clientInfo = .{ .name = "spica", .version = "1" }, .capabilities = .{ .experimentalApi = true } });
     if (std.mem.indexOf(u8, text(field(init, "userAgent")), "0.163.0") == null) return error.RuntimeVersionMismatch;
     try wire.send("{\"method\":\"initialized\",\"params\":{}}");
-    const account = try call(wire, allocator, 2, "account/read", .{ .refreshToken = false });
+    const account = try call(wire, allocator, diagnostic, 2, "account/read", .{ .refreshToken = false });
     const readiness: c.Readiness = if (eq(text(field(field(account, "account"), "type")), "chatgpt")) .ready else .unavailable;
     var cursor: ?[]const u8 = null;
     var count: usize = 0;
     var id: u64 = 3;
     while (id < 131) : (id += 1) {
-        const result = try call(wire, allocator, id, "model/list", .{ .cursor = cursor, .limit = @as(u32, 32), .includeHidden = false });
+        const result = try call(wire, allocator, diagnostic, id, "model/list", .{ .cursor = cursor, .limit = @as(u32, 32), .includeHidden = false });
         const data = field(result, "data");
         if (data != .array) return error.InvalidCatalog;
         for (data.array.items) |model| {
@@ -79,9 +122,13 @@ pub fn codexModel(allocator: std.mem.Allocator, input: c.Selection, model: Value
     return .{ .selection = try common.clone(allocator, selection), .supported_efforts = efforts, .display_name = try allocator.dupe(u8, text(field(model, "displayName"))), .readiness = readiness, .reason = if (readiness == .ready) "Codex model/list; account ready, entitlement not proven" else "Codex model/list succeeded; selected isolated account requires ChatGPT sign-in" };
 }
 pub fn opencode(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire: *transport.Transport, selection: c.Selection, cwd: []const u8, output: []c.Model) !usize {
-    const init = try call(wire, allocator, 1, "initialize", .{ .protocolVersion = 1, .clientCapabilities = Value{ .object = .empty }, .clientInfo = .{ .name = "spica", .version = "1" } });
+    var diagnostic: RpcDiagnostic = .{};
+    return opencodeWithDiagnostic(allocator, retained, wire, selection, cwd, output, &diagnostic);
+}
+pub fn opencodeWithDiagnostic(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire: *transport.Transport, selection: c.Selection, cwd: []const u8, output: []c.Model, diagnostic: *RpcDiagnostic) !usize {
+    const init = try call(wire, allocator, diagnostic, 1, "initialize", .{ .protocolVersion = 1, .clientCapabilities = Value{ .object = .empty }, .clientInfo = .{ .name = "spica", .version = "1" } });
     if (field(init, "protocolVersion") != .integer or field(init, "protocolVersion").integer != 1 or !eq(text(field(field(init, "agentInfo"), "version")), "2.1.4")) return error.RuntimeVersionMismatch;
-    const session = try call(wire, allocator, 2, "session/new", .{ .cwd = cwd, .mcpServers = @as([0]Value, .{}) });
+    const session = try call(wire, allocator, diagnostic, 2, "session/new", .{ .cwd = cwd, .mcpServers = @as([0]Value, .{}) });
     const count = try opencodeModels(retained, selection, session, output);
     const session_id = text(field(session, "sessionId"));
     if (session_id.len == 0) return error.InvalidCatalog;
@@ -89,7 +136,13 @@ pub fn opencode(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire:
     // current model's option list onto every other catalog item.
     for (output[0..count], 0..) |*model, index| {
         const identity = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model.selection.model_provider, model.selection.model_id });
-        const configured = try call(wire, allocator, index + 3, "session/set_config_option", .{ .sessionId = session_id, .configId = "model", .value = identity });
+        const configured = call(wire, allocator, diagnostic, index + 3, "session/set_config_option", .{ .sessionId = session_id, .configId = "model", .value = identity }) catch |err| {
+            if (err != error.CatalogRpcRejected) return err;
+            model.readiness = .unavailable;
+            model.reason = try retained.dupe(u8, diagnostic.slice());
+            diagnostic.len = 0;
+            continue;
+        };
         try applyOpenCodeOptions(retained, model, identity, configured);
     }
     return count;
@@ -213,4 +266,23 @@ test "one mismatched OpenCode catalog row cannot poison exact selections or effo
     try std.testing.expectEqualStrings("default", verified.supported_efforts[0]);
     try std.testing.expectEqualStrings("high", verified.supported_efforts[1]);
     try std.testing.expectEqual(c.Readiness.unavailable, rejected.readiness);
+}
+
+test "RPC diagnostic bounds UTF8 sanitizes controls and excludes structured private fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const encoded = try std.json.Stringify.valueAlloc(a, .{ .code = -32001, .message = "denied 界\n" ** 400, .data = .{ .access_token = "PRIVATE-TOKEN", .history = "PRIVATE-HISTORY" } }, .{});
+    const parsed = try std.json.parseFromSlice(Value, a, encoded, .{ .allocate = .alloc_always });
+    var diagnostic: RpcDiagnostic = .{};
+    diagnostic.remember("model/list", parsed.value);
+    try std.testing.expect(diagnostic.len <= diagnostic.bytes.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(diagnostic.slice()));
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.slice(), "model/list rejected (-32001): denied 界") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.slice(), "PRIVATE") == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, diagnostic.slice(), '\n') == null);
+    const saved = try a.dupe(u8, diagnostic.slice());
+    // Mutating the source JSON does not change retained diagnostic bytes.
+    @memset(@constCast(parsed.value.object.get("message").?.string), 'x');
+    try std.testing.expectEqualStrings(saved, diagnostic.slice());
 }

@@ -294,3 +294,96 @@ test "Codex retry can recover successfully and oversized structured error stays 
     // Only the next turn's ID, not the oversized error, enters retained state.
     try std.testing.expectEqual(retained + "next-turn".len, runtime.state.end_index);
 }
+
+fn loginFixture(a: std.mem.Allocator, wire: *Mock, runtime: *codex.RuntimeFor(Mock)) !void {
+    try wire.input.append(a, "{\"id\":1,\"result\":{\"userAgent\":\"codex/0.163.0\"}}");
+    try wire.input.append(a, "{\"id\":2,\"result\":{\"account\":{\"type\":\"chatgpt\"}}}");
+    try runtime.pump();
+    try std.testing.expectEqual(c.Readiness.ready, runtime.readiness);
+    try runtime.startLogin(true);
+    try std.testing.expectEqual(c.Readiness.unknown, runtime.readiness);
+    try wire.input.append(a, "{\"id\":3,\"result\":{\"loginId\":\"current\",\"verificationUrl\":\"https://example.invalid\",\"userCode\":\"FIXTURE\"}}");
+    try runtime.pump();
+}
+
+test "Codex matched failed login is immediate owned bounded and cannot inherit account readiness" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(a, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "login-failure" });
+    defer runtime.deinit();
+    try loginFixture(a, &wire, &runtime);
+    // An account update while login is outstanding can refresh metadata but
+    // cannot treat the previously signed-in account as this flow's completion.
+    try wire.input.append(a, "{\"method\":\"account/updated\",\"params\":{}}");
+    try runtime.pump();
+    try std.testing.expect(runtime.pending.?.kind == .account);
+    try wire.input.append(a, "{\"id\":4,\"result\":{\"account\":{\"type\":\"chatgpt\"}}}");
+    try runtime.pump();
+    try std.testing.expectEqual(c.Readiness.unknown, runtime.readiness);
+    try wire.input.append(a, "{\"method\":\"account/updated\",\"params\":{}}");
+    try runtime.pump();
+    const retained = runtime.state.end_index;
+    const failure = try std.json.Stringify.valueAlloc(a, .{ .method = "account/login/completed", .params = .{ .loginId = "current", .success = false, .@"error" = "Sign-in denied: 界\n" ** 300 } }, .{});
+    try wire.input.append(a, failure);
+    try runtime.pump();
+    try std.testing.expectEqual(c.Readiness.unavailable, runtime.readiness);
+    try std.testing.expect(!runtime.login_active);
+    try std.testing.expect(runtime.diagnostic.len <= 1024);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(runtime.diagnostic));
+    try std.testing.expect(std.mem.indexOf(u8, runtime.diagnostic, "Sign-in denied: 界") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, runtime.diagnostic, '\n') == null);
+    const saved = try a.dupe(u8, runtime.diagnostic);
+    // Drain a previously requested account read and late notifications after
+    // the parse arena was reset. Neither may erase the matched failure.
+    try wire.input.append(a, "{\"id\":5,\"result\":{\"account\":{\"type\":\"chatgpt\"}}}");
+    try wire.input.append(a, "{\"method\":\"account/updated\",\"params\":{}}");
+    try wire.input.append(a, "{\"method\":\"account/login/completed\",\"params\":{\"loginId\":\"current\",\"success\":true}}");
+    try runtime.pump();
+    try std.testing.expectEqualStrings(saved, runtime.diagnostic);
+    try std.testing.expectEqual(c.Readiness.unavailable, runtime.readiness);
+    try std.testing.expectEqual(retained, runtime.state.end_index);
+    try std.testing.expect(runtime.pending == null);
+}
+
+test "Codex stale login completions are ignored and success refresh survives a pending request" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(a, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "login-success" });
+    defer runtime.deinit();
+    try loginFixture(a, &wire, &runtime);
+    const sent = wire.lines.items.len;
+    for ([_]bool{ false, true }) |success| {
+        try wire.input.append(a, try std.json.Stringify.valueAlloc(a, .{ .method = "account/login/completed", .params = .{ .loginId = "superseded", .success = success, .@"error" = "stale denial" } }, .{}));
+    }
+    try runtime.pump();
+    try std.testing.expectEqual(sent, wire.lines.items.len);
+    try std.testing.expectEqual(c.Readiness.unknown, runtime.readiness);
+    try std.testing.expectEqualStrings("", runtime.diagnostic);
+    try wire.input.append(a, "{\"method\":\"account/updated\",\"params\":{}}");
+    try runtime.pump();
+    try wire.input.append(a, "{\"method\":\"account/login/completed\",\"params\":{\"loginId\":\"current\",\"success\":true}}");
+    try runtime.pump();
+    try std.testing.expect(runtime.account_refresh);
+    try std.testing.expectEqual(@as(u64, 4), runtime.pending.?.id);
+    try wire.input.append(a, "{\"method\":\"account/updated\",\"params\":{}}");
+    try runtime.pump();
+    try std.testing.expect(runtime.account_refresh);
+    try wire.input.append(a, "{\"id\":4,\"result\":{\"account\":null}}");
+    try runtime.pump();
+    try std.testing.expectEqual(@as(u64, 5), runtime.pending.?.id);
+    try std.testing.expect(!runtime.account_refresh);
+    try wire.input.append(a, "{\"id\":5,\"result\":{\"account\":{\"type\":\"chatgpt\"}}}");
+    try runtime.pump();
+    try std.testing.expectEqual(c.Readiness.ready, runtime.readiness);
+    try std.testing.expectEqualStrings("", runtime.diagnostic);
+    try std.testing.expect(runtime.pending == null);
+    try std.testing.expect(!runtime.login_active);
+    // A completion from that now-finished flow cannot poison readiness.
+    try wire.input.append(a, "{\"method\":\"account/login/completed\",\"params\":{\"loginId\":\"current\",\"success\":false,\"error\":\"duplicate\"}}");
+    try runtime.pump();
+    try std.testing.expectEqual(c.Readiness.ready, runtime.readiness);
+}
