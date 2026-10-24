@@ -38,6 +38,8 @@ Choose an actual model beside the composer after discovery, then its effort.
 The app remembers successful connection settings and exact per-thread choices.
 Later launches restore the configured workspace and discover models without
 sending a prompt. **Connection** in the sidebar reopens setup.
+Interrupted or uncertain old runs retain their status without blocking provider
+setup. Open a new chat to continue; the old work is never automatically retried.
 
 Enter sends, Shift+Enter inserts newline, F6 cancels, F7 allows the current live
 approval, F8 denies, and Ctrl+Q closes. The sidebar supports loaded-thread title

@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import shutil
+import sqlite3
 import tempfile
 import time
 
@@ -72,7 +73,7 @@ def main():
         def click(snapshot, name):
             if name in ('runtime.configure', 'runtime.browser', 'runtime.device', 'runtime.refresh'):
                 snapshot = observe(lambda s: next(t for t in s['setup_targets'] if t['id'] == name)['enabled'], 'action-ready-' + name.replace('.', '-'))
-            targets = [item for group in ('targets', 'setup_targets', 'setup_provider_targets', 'setup_field_targets')
+            targets = [item for group in ('targets', 'setup_targets', 'setup_provider_targets', 'setup_field_targets', 'thread_targets', 'sidebar_targets')
                        for item in snapshot.get(group, [])]
             targets += [snapshot['setup_advanced_target'], snapshot['setup_login_target']]
             target = next(item for item in targets if item['id'] == name)
@@ -141,6 +142,7 @@ def main():
         current = observe(lambda s: s['run_status'] == 'completed' and any('Offline setup worked' in t for t in s['transcript']), 'completed')
         shot('completed')
         thread = current['thread_id']
+        completed_thread = thread
         key('ctrl+q')
         m.wait_windows(session, False)
         shutil.copyfile(output / 'metrics.json', output / 'first-metrics.json')
@@ -224,6 +226,58 @@ def main():
             key('Escape')
         key('ctrl+q')
         m.wait_windows(session, False)
+        if not args.opencode_account:
+            # Deliberately seed an abrupt-disconnect journal in this evaluator's
+            # disposable offline database while the app is stopped. This is
+            # fixture construction, separate from the real input below.
+            database = output / 'data/spica-native/conversation/conversation.sqlite3'
+            with sqlite3.connect(database) as db:
+                run = db.execute('SELECT id FROM runs WHERE thread_id=?', (completed_thread,)).fetchone()[0]
+                db.execute("UPDATE runs SET state='streaming' WHERE id=?", (run,))
+                db.execute("UPDATE effects SET state='in_flight' WHERE run_id=? AND kind='start'", (run,))
+            manifest['recovery_fixture'] = dict(run=run, thread=completed_thread,
+                construction='Offline stopped-app SQL fixture; streaming run with in-flight start. No external effect replay.')
+            window = launch()
+            current = observe(lambda s: s['model_count'] >= 2 and not s['pending_command'] and not s['notice'], 'recovered-catalog')
+            with sqlite3.connect(database) as db:
+                recovered = db.execute('SELECT state,revision FROM runs WHERE id=?', (run,)).fetchone()
+                effects = db.execute('SELECT id,state,revision,outcome FROM effects WHERE run_id=? ORDER BY id', (run,)).fetchall()
+                assert recovered[0] == 'unknown' and any(e[1] == 'unknown' for e in effects)
+            click(current, 'runtime.setup')
+            current = observe(lambda s: s['setup_open'], 'recovered-connection')
+            click(current, 'runtime.refresh')
+            current = observe(lambda s: s['model_count'] >= 2 and not s['pending_command'] and not s['notice'], 'recovered-refresh')
+            click(current, 'runtime.configure')
+            current = observe(lambda s: not s['setup_open'] and s['model_count'] >= 2 and not s['pending_command'], 'recovered-configure')
+            click(current, 'runtime.setup')
+            current = observe(lambda s: s['setup_open'], 'recovered-login-setup')
+            click(current, 'runtime.codex')
+            current = observe(lambda s: s['setup_runtime'] == 'codex', 'recovered-codex')
+            click(current, 'runtime.device')
+            current = observe(lambda s: s['login_pending'] and s['login_code'] == 'TEST-1234', 'recovered-login')
+            current = observe(lambda s: not s['login_pending'] and not s['setup_open'] and s['model_count'] >= 2, 'recovered-login-complete')
+            click(current, completed_thread)
+            current = observe(lambda s: s['thread_id'] == completed_thread and s['run_status'] == 'unknown' and not s['send_ready'], 'unresolved-chat')
+            assert 'new chat' in current['send_disabled_reason'].lower()
+            shot('unresolved-chat')
+            current = observe(lambda s: next(t for t in s['targets'] if t['id'] == 'workspace.new_thread')['enabled'], 'recovery-navigation-ready')
+            click(current, 'workspace.new_thread')
+            current = observe(lambda s: s['thread_id'] != completed_thread and s['thread_id'] and not s['pending_command'], 'recovery-new-chat')
+            click(current, 'models.picker')
+            current = observe(lambda s: s['picker_open'], 'recovery-picker')
+            key('Return')
+            current = observe(lambda s: s['send_ready'], 'recovery-selected')
+            m.run('vd', 'text', session, window, 'Continue safely in a new chat café 世界')
+            current = observe(lambda s: s['draft'] == 'Continue safely in a new chat café 世界', 'recovery-new-draft')
+            key('Return')
+            current = observe(lambda s: s['run_status'] == 'completed', 'recovery-new-completed')
+            shot('recovery-new-completed')
+            with sqlite3.connect(database) as db:
+                assert db.execute('SELECT state,revision FROM runs WHERE id=?', (run,)).fetchone() == recovered
+                assert db.execute('SELECT id,state,revision,outcome FROM effects WHERE run_id=? ORDER BY id', (run,)).fetchall() == effects
+            key('ctrl+q')
+            m.wait_windows(session, False)
+            manifest['recovery_fixture']['preserved_uncertainty'] = True
         if m.source_fingerprint() != manifest['source_sha256'] or m.sha(binary) != manifest['binary_sha256']:
             raise RuntimeError('Candidate changed during native check')
         manifest['passed'] = True
