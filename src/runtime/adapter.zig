@@ -69,6 +69,11 @@ pub const Factory = struct {
         resolveSelection: *const fn (*anyopaque, c.Selection) c.SelectionResult,
         create: *const fn (*anyopaque, std.mem.Allocator, c.Selection, []const u8, c.RuntimeSessionId, ?Bridge) anyerror!Adapter,
         destroy: *const fn (*anyopaque, std.mem.Allocator, Adapter) void,
+        models: ?*const fn (*anyopaque) []const c.Model = null,
+        runtimeStatus: ?*const fn (*anyopaque) c.RuntimeStatus = null,
+        runtimeAction: ?*const fn (*anyopaque, std.mem.Allocator, std.Io, c.RuntimeAction) anyerror!void = null,
+        pumpSetup: ?*const fn (*anyopaque) bool = null,
+        shutdownSetup: ?*const fn (*anyopaque) void = null,
     };
     pub fn discover(self: Factory, selection: c.Selection) c.Discovery {
         return self.vtable.discover(self.context, selection);
@@ -85,12 +90,27 @@ pub const Factory = struct {
     pub fn destroy(self: Factory, allocator: std.mem.Allocator, instance: Adapter) void {
         self.vtable.destroy(self.context, allocator, instance);
     }
+    pub fn models(self: Factory) []const c.Model {
+        return if (self.vtable.models) |call| call(self.context) else &.{};
+    }
+    pub fn runtimeStatus(self: Factory) c.RuntimeStatus {
+        return if (self.vtable.runtimeStatus) |call| call(self.context) else .{};
+    }
+    /// Explicit Host-owned action, only after committing its command intent.
+    pub fn runtimeAction(self: Factory, allocator: std.mem.Allocator, io: std.Io, action: c.RuntimeAction) !void {
+        const call = self.vtable.runtimeAction orelse return error.UnsupportedRuntimeSetup;
+        try call(self.context, allocator, io, action);
+    }
 };
 /// Copies every borrowed string in a contract frame; use an arena for disposal.
 pub fn clone(allocator: std.mem.Allocator, value: anytype) !@TypeOf(value) {
     const T = @TypeOf(value);
     return switch (@typeInfo(T)) {
-        .pointer => try allocator.dupe(u8, value),
+        .pointer => |pointer| if (pointer.child == u8) try allocator.dupe(u8, value) else blk: {
+            const result = try allocator.alloc(pointer.child, value.len);
+            for (value, result) |input, *output| output.* = try clone(allocator, input);
+            break :blk result;
+        },
         .optional => if (value) |v| try clone(allocator, v) else null,
         .@"struct" => blk: {
             var result: T = undefined;

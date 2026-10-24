@@ -19,12 +19,15 @@ const NativeProvider = struct {
     configs: [2]NativeFactory.Config = undefined,
 
     fn init(self: *NativeProvider, a: std.mem.Allocator, io: std.Io, options: options_module.Options) !void {
-        if (options.provider == .fake) return;
+        if (options.provider == .fake) {
+            self.factory = .{ .configs = &.{} };
+            return;
+        }
         const workspace_dir = try std.Io.Dir.cwd().openDir(io, options.workspace.?, .{});
         defer workspace_dir.close(io);
         const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, options.workspace.?, a);
         self.workspace_root = workspace;
-        self.configs[0] = try accountConfig(a, io, .{ .runtime_kind = @tagName(options.provider), .required_runtime_version = if (options.provider == .codex) "0.163.0" else "2.1.4", .model_provider = options.model_provider.?, .model_id = options.model.?, .effort = options.effort.?, .account_ref = options.runtime_account_directory.?, .workspace = .{ .value = workspace } }, options.runtime_executable);
+        self.configs[0] = try accountConfig(a, io, .{ .runtime_kind = @tagName(options.provider), .required_runtime_version = if (options.provider == .codex) "0.163.0" else "2.1.4", .model_provider = options.model_provider.?, .model_id = options.model orelse "", .effort = options.effort orelse "", .account_ref = options.runtime_account_directory.?, .workspace = .{ .value = workspace } }, options.runtime_executable);
         self.selection = self.configs[0].selection;
         var count: usize = 1;
         if (options.additional_provider) |kind| {
@@ -32,7 +35,7 @@ const NativeProvider = struct {
             if (std.mem.eql(u8, self.configs[0].selection.account_ref, self.configs[1].selection.account_ref)) return error.SeparateRuntimeAccountsRequired;
             count = 2;
         }
-        self.factory = .{ .configs = self.configs[0..count] };
+        self.factory = .{ .configs = self.configs[0..count], .status = .{ .runtime_kind = @tagName(options.provider), .workspace_root = workspace, .reason = "Explicit startup configuration; refresh native picker for actual catalog/account readiness." } };
     }
     fn accountConfig(a: std.mem.Allocator, io: std.Io, input: contract.Selection, executable_override: ?[]const u8) !NativeFactory.Config {
         // Only the selected tool's explicit managed state, never another tool's auth.
@@ -60,7 +63,10 @@ const NativeProvider = struct {
     }
     fn authenticate(self: *NativeProvider, a: std.mem.Allocator, io: std.Io, mode: @FieldType(options_module.Options, "codex_auth")) !void {
         const factory = if (self.factory) |*value| value.asFactory() else return error.CodexAuthRequiresCodex;
-        const adapter = try factory.create(a, self.selection.?, self.workspace_root.?, .{ .value = "authentication" }, null);
+        var authentication = self.selection.?;
+        authentication.model_id = "authentication-only";
+        authentication.effort = "authentication-only";
+        const adapter = try factory.create(a, authentication, self.workspace_root.?, .{ .value = "authentication" }, null);
         defer factory.destroy(a, adapter);
         defer adapter.shutdown();
         const runtime: *Codex.Runtime = @ptrCast(@alignCast(adapter.context));
@@ -160,7 +166,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer app.disconnect();
     {
         const directory = options.state_directory orelse try options_module.defaultStateDirectory(arena.allocator(), init.environ.getPosix("XDG_DATA_HOME"), init.environ.getPosix("HOME"));
-        host = try Host.create(std.heap.page_allocator, threaded.io(), .{ .state_directory = directory, .wake = Wake.notify, .wake_context = &wake, .factory = if (provider.factory) |*factory| factory.asFactory() else null, .selection = provider.selection, .workspace_root = provider.workspace_root });
+        host = try Host.create(std.heap.page_allocator, threaded.io(), .{ .state_directory = directory, .wake = Wake.notify, .wake_context = &wake, .factory = if (options.provider != .fake) provider.factory.?.asFactory() else null, .setup_factory = provider.factory.?.asFactory(), .selection = provider.selection, .workspace_root = provider.workspace_root });
         const dir = try std.Io.Dir.cwd().openDir(threaded.io(), directory, .{});
         defer dir.close(threaded.io());
         var workspace_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;

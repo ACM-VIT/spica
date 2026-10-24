@@ -19,8 +19,10 @@ pub const Config = struct {
     instance: []const u8,
     /// Only advertise tools when a consumer actually drains/responds to tool calls.
     tools: []const Tool = &.{},
+    tool_bindings: []const ToolBinding = &.{},
 };
 pub const Tool = struct { type: []const u8 = "function", name: []const u8, description: []const u8, inputSchema: Value };
+pub const ToolBinding = struct { wire_name: []const u8, application_name: []const u8 };
 pub const ToolCall = adapter.ToolCall;
 pub const Runtime = RuntimeFor(transport.Transport);
 pub fn RuntimeFor(comptime T: type) type {
@@ -102,6 +104,7 @@ pub fn RuntimeFor(comptime T: type) type {
             return .{ .requested = selection, .effective = null, .readiness = if (self.matchesSelection(selection)) self.readiness else .unavailable };
         }
         pub fn dispatch(self: *Self, allocator: std.mem.Allocator, request: c.Request) !c.Receipt {
+            if (self.disconnected) return .{ .outcome = .rejected, .detail = "Codex disconnected" };
             if (!self.initialized or self.pending != null) return .{ .outcome = .rejected, .detail = "Codex initialization/request pending" };
             switch (request) {
                 .open => |open| switch (open) {
@@ -116,18 +119,18 @@ pub fn RuntimeFor(comptime T: type) type {
                 },
                 .attach => |p| try self.restore(p.session),
                 .start => |p| {
-                    if (self.session == null or !eq(p.correlation.session.value, self.session.?.id.value) or self.turn.len != 0) return error.InvalidCorrelation;
+                    if (p.correlation.run == null or p.correlation.effect == null or self.session == null or !eq(p.correlation.session.value, self.session.?.id.value) or self.turn.len != 0) return error.InvalidCorrelation;
                     self.correlation = try adapter.clone(self.state.allocator(), p.correlation);
                     self.offset = 0;
                     try self.rpc(.start, .{ .threadId = self.session.?.upstream.value, .input = .{.{ .type = "text", .text = p.prompt }}, .model = self.config.selection.model_id, .effort = self.config.selection.effort, .cwd = self.config.cwd }, self.correlation);
                 },
                 .cancel => |p| {
-                    if (self.turn.len == 0 or !eq(p.correlation.session.value, self.correlation.session.value)) return error.InvalidCorrelation;
+                    if (self.turn.len == 0 or !eq(p.correlation.session.value, self.correlation.session.value) or !c.equal(p.correlation.run, self.correlation.run)) return error.InvalidCorrelation;
                     try self.rpc(.cancel, .{ .threadId = self.session.?.upstream.value, .turnId = self.turn }, p.correlation);
                 },
                 .respond_approval => |p| {
                     const approval = self.approval orelse return error.InvalidCorrelation;
-                    if (!c.equal(p.correlation.approval, approval.evidence.correlation.approval) or !eq(p.action_digest, approval.evidence.action_digest)) return error.InvalidCorrelation;
+                    if (!c.equal(p.correlation.session, approval.evidence.correlation.session) or !c.equal(p.correlation.run, approval.evidence.correlation.run) or !c.equal(p.correlation.tool, approval.evidence.correlation.tool) or !c.equal(p.correlation.approval, approval.evidence.correlation.approval) or !eq(p.action_digest, approval.evidence.action_digest)) return error.InvalidCorrelation;
                     try self.reply(approval.id_json, .{ .decision = if (p.decision == .allow) @as([]const u8, "accept") else "decline" });
                     self.approval = null;
                 },
@@ -139,7 +142,7 @@ pub fn RuntimeFor(comptime T: type) type {
             if (self.session != null or self.readiness != .ready) return error.SessionUnavailable;
             self.session = try adapter.clone(self.state.allocator(), session);
             self.correlation = .{ .session = self.session.?.id };
-            try self.rpc(.restore, .{ .threadId = session.upstream.value, .model = self.config.selection.model_id, .modelProvider = self.config.selection.model_provider, .cwd = self.config.cwd }, self.correlation);
+            try self.rpc(.restore, .{ .threadId = session.upstream.value, .model = self.config.selection.model_id, .modelProvider = self.config.selection.model_provider, .cwd = self.config.cwd, .config = .{ .model_reasoning_effort = self.config.selection.effort } }, self.correlation);
         }
         fn reply(self: *Self, id_json: []const u8, result: anytype) !void {
             const body = try std.json.Stringify.valueAlloc(self.allocator, result, .{});
@@ -197,7 +200,7 @@ pub fn RuntimeFor(comptime T: type) type {
         }
         fn disconnect(self: *Self, reason: []const u8) !void {
             if (self.disconnected) return;
-            if (self.correlation.run != null) try self.emit(.{ .disconnect = .{ .reason = reason, .continuity = .unknown } });
+            if (self.correlation.session.value.len != 0) try self.emit(.{ .disconnect = .{ .reason = reason, .continuity = .unknown } });
             self.disconnected = true;
             self.approval = null;
             self.tool = null;
@@ -214,7 +217,11 @@ pub fn RuntimeFor(comptime T: type) type {
                 const failure = field(value, "error");
                 if (failure != .null) {
                     self.diagnostic = try std.json.Stringify.valueAlloc(self.state.allocator(), failure, .{});
-                    if (self.correlation.run != null) try self.emit(.{ .failure = .{ .code = "rpc_error", .detail = self.diagnostic } });
+                    if (self.correlation.session.value.len != 0) {
+                        var end = @min(self.diagnostic.len, 2048);
+                        while (end < self.diagnostic.len and end > 0 and self.diagnostic[end] & 0xc0 == 0x80) end -= 1;
+                        try self.emit(.{ .failure = .{ .code = "rpc_error", .detail = self.diagnostic[0..end] } });
+                    }
                     return;
                 }
                 const result = field(value, "result");
@@ -248,6 +255,7 @@ pub fn RuntimeFor(comptime T: type) type {
                     .start => {
                         const turn_id = text(field(field(result, "turn"), "id"));
                         if (turn_id.len == 0) return error.InvalidTurn;
+                        if (self.turn.len != 0 and !eq(self.turn, turn_id)) return error.InvalidCorrelation;
                         self.turn = try self.state.allocator().dupe(u8, turn_id);
                         self.correlation.upstream_turn = .{ .value = self.turn };
                     },
@@ -263,7 +271,12 @@ pub fn RuntimeFor(comptime T: type) type {
             if (self.session == null or !eq(thread_id, self.session.?.upstream.value)) return;
             const turn_id = text(field(params, "turnId"));
             if (turn_id.len != 0 and self.turn.len != 0 and !eq(turn_id, self.turn)) return error.InvalidCorrelation;
-            if (eq(method, "item/agentMessage/delta")) {
+            if (eq(method, "turn/started")) {
+                const started = text(field(field(params, "turn"), "id"));
+                if (started.len == 0 or self.correlation.run == null or (self.turn.len != 0 and !eq(self.turn, started))) return error.InvalidCorrelation;
+                if (self.turn.len == 0) self.turn = try self.state.allocator().dupe(u8, started);
+                self.correlation.upstream_turn = .{ .value = self.turn };
+            } else if (eq(method, "item/agentMessage/delta")) {
                 const delta = text(field(params, "delta"));
                 var start: usize = 0;
                 while (start < delta.len) {
@@ -308,9 +321,18 @@ pub fn RuntimeFor(comptime T: type) type {
                 try self.emit(.{ .approval = evidence });
             } else if (eq(method, "item/tool/call")) {
                 if (self.tool != null) return error.TooManyToolCalls;
-                if (self.correlation.run == null or self.correlation.session.value.len == 0) return error.InvalidCorrelation;
+                if (self.correlation.run == null or self.correlation.session.value.len == 0 or self.turn.len == 0 or !eq(turn_id, self.turn) or text(field(params, "callId")).len == 0 or text(field(params, "tool")).len == 0 or (field(value, "id") != .integer and field(value, "id") != .string)) return error.InvalidCorrelation;
                 const a = self.state.allocator();
-                self.tool = .{ .request_id_json = try std.json.Stringify.valueAlloc(a, field(value, "id"), .{}), .call_id = try a.dupe(u8, text(field(params, "callId"))), .name = try a.dupe(u8, text(field(params, "tool"))), .arguments_json = try std.json.Stringify.valueAlloc(a, field(params, "arguments"), .{}), .correlation = self.correlation };
+                const wire_name = text(field(params, "tool"));
+                var application_name: ?[]const u8 = null;
+                for (self.config.tools) |registered| {
+                    if (eq(registered.name, wire_name)) application_name = registered.name;
+                }
+                for (self.config.tool_bindings) |binding| {
+                    if (eq(binding.wire_name, wire_name)) application_name = binding.application_name;
+                }
+                const name = application_name orelse return error.UnknownTool;
+                self.tool = .{ .request_id_json = try std.json.Stringify.valueAlloc(a, field(value, "id"), .{}), .call_id = try a.dupe(u8, text(field(params, "callId"))), .name = try a.dupe(u8, name), .arguments_json = try std.json.Stringify.valueAlloc(a, field(params, "arguments"), .{}), .correlation = self.correlation };
             } else if (field(value, "id") != .null) {
                 const id_json = try std.json.Stringify.valueAlloc(self.allocator, field(value, "id"), .{});
                 defer self.allocator.free(id_json);

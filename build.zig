@@ -41,6 +41,22 @@ pub fn build(b: *std.Build) void {
     const smoke_run = b.addRunArtifact(domain_smoke);
     if (b.args) |args| smoke_run.addArgs(args);
     b.step("domain-smoke", "Exercise the actual isolated SQLite storage consumer").dependOn(&smoke_run.step);
+    const catalog_module = b.createModule(.{ .root_source_file = b.path("src/provider_catalog_smoke.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    storageDependencies(b, catalog_module);
+    catalog_module.addIncludePath(b.path("src/runtime"));
+    catalog_module.addCSourceFile(.{ .file = b.path("src/platform/process_posix.c"), .flags = &.{ "-std=c11", "-O2" } });
+    catalog_module.addCSourceFile(.{ .file = b.path(if (target.result.os.tag == .macos) "src/platform/process_macos.c" else "src/platform/process_linux.c"), .flags = &.{ "-std=c11", "-O2" } });
+    const catalog_smoke = b.addExecutable(.{ .name = "provider-catalog-smoke", .root_module = catalog_module });
+    const catalog_install = b.addInstallArtifact(catalog_smoke, .{});
+    b.step("build-provider-catalog-smoke", "Build metadata-only actual public Host consumer").dependOn(&catalog_install.step);
+    const orchestration_module = b.createModule(.{ .root_source_file = b.path("src/orchestration_smoke.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    storageDependencies(b, orchestration_module);
+    orchestration_module.addIncludePath(b.path("src/runtime"));
+    orchestration_module.addCSourceFile(.{ .file = b.path("src/platform/process_posix.c"), .flags = &.{ "-std=c11", "-O2" } });
+    orchestration_module.addCSourceFile(.{ .file = b.path(if (target.result.os.tag == .macos) "src/platform/process_macos.c" else "src/platform/process_linux.c"), .flags = &.{ "-std=c11", "-O2" } });
+    const orchestration_smoke = b.addExecutable(.{ .name = "orchestration-smoke", .root_module = orchestration_module });
+    const orchestration_install = b.addInstallArtifact(orchestration_smoke, .{});
+    b.step("build-orchestration-smoke", "Build the opt-in installed-provider coordinator/child gate").dependOn(&orchestration_install.step);
 
     // Explicit worker/CLI slice: no domain storage, native UI or provider graph.
     const inspection_tests_module = b.createModule(.{ .root_source_file = b.path("src/inspection_test.zig"), .target = target, .optimize = optimize, .link_libc = true });

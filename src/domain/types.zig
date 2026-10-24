@@ -65,6 +65,10 @@ pub const Payload = union(enum) {
     workspace_register: struct { project: ProjectId, binding: WorkspaceBinding },
     thread_create: struct { project: ProjectId, workspace: adapter.WorkspaceId },
     thread_send: struct { text: []const u8, selection: adapter.Selection },
+    thread_select: struct { selection: adapter.Selection },
+    runtime_configure: adapter.RuntimeSetup,
+    runtime_refresh: void,
+    runtime_login: adapter.RuntimeLogin,
     approval_respond: struct { decision: enum { allow, deny }, action_digest: []const u8 },
     run_cancel: struct { reason: []const u8 },
     run_reconcile: struct {
@@ -137,7 +141,10 @@ pub const Page = struct {
     cursor: ?[]const u8 = null,
 };
 pub const Query = union(enum) {
+    // Provider effects require explicit commands; these queries are cache-only.
     projects: Page,
+    models: struct { workspace: adapter.WorkspaceId, page: Page = .{} },
+    runtime_status: void,
     workspaces: struct { project: ProjectId, page: Page = .{} },
     threads: struct { project: ProjectId, anchor: ?ThreadId = null, page: Page = .{} },
     thread: ThreadId,
@@ -160,10 +167,19 @@ pub const BlockDescriptor = struct {
     revision: Revision,
     tool_id: ?adapter.ToolCallId = null,
 };
+pub const RuntimeStatus = struct {
+    runtime_kind: []const u8,
+    readiness: adapter.Readiness,
+    reason: []const u8,
+    login: []const u8,
+    workspace_root: []const u8,
+    binding: ?WorkspaceBinding = null,
+    supported_login_modes: []const []const u8 = &.{},
+};
 pub const Row = union(enum) {
     project: struct { id: ProjectId, revision: Revision, display_name: []const u8 },
     workspace: struct { id: adapter.WorkspaceId, revision: Revision, project: ProjectId, binding: WorkspaceBinding },
-    thread: struct { id: ThreadId, revision: Revision, project: ProjectId, workspace: adapter.WorkspaceId, session: ?adapter.RuntimeSessionId },
+    thread: struct { id: ThreadId, revision: Revision, project: ProjectId, workspace: adapter.WorkspaceId, session: ?adapter.RuntimeSessionId, selection: ?adapter.Selection = null },
     message: struct {
         message_id: adapter.MessageId,
         revision: Revision,
@@ -176,11 +192,13 @@ pub const Row = union(enum) {
     },
     block: BlockDescriptor,
     content: struct { block_id: adapter.BlockId, revision: Revision, start_byte: u64, end_byte: u64, next_byte: ?u64, bytes: []const u8 },
-    run: struct { id: adapter.RunId, revision: Revision, thread: ThreadId, session: adapter.RuntimeSessionId, state: RunState, requested: adapter.Selection, effective: ?adapter.Selection },
+    run: struct { id: adapter.RunId, revision: Revision, thread: ThreadId, session: adapter.RuntimeSessionId, state: RunState, requested: adapter.Selection, effective: ?adapter.Selection, diagnostic: []const u8 = "" },
     effect: struct { id: adapter.EffectId, revision: Revision, run: adapter.RunId, kind: EffectKind, state: EffectState, outcome: []const u8 },
     tool: struct { id: adapter.ToolCallId, revision: Revision, run: adapter.RunId, name: []const u8, action_digest: []const u8, outcome: ToolOutcome, result_block: ?adapter.BlockId },
     approval: struct { id: adapter.ApprovalId, revision: Revision, run: adapter.RunId, state: ApprovalState, evidence: adapter.ApprovalEvidence, live: bool },
     capabilities: adapter.Discovery,
+    model: adapter.Model,
+    runtime_status: RuntimeStatus,
     task: struct { task: orchestration.Task, state: RunState, revision: Revision },
 };
 pub const QueryPage = struct {

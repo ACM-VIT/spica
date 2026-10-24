@@ -23,7 +23,7 @@ test "Codex initialize account create stream approval cancel exit" {
     defer arena.deinit();
     const a = arena.allocator();
     var wire: Mock = .{ .allocator = a };
-    var runtime = try codex.RuntimeFor(Mock).init(a, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "test" });
+    var runtime = try codex.RuntimeFor(Mock).init(a, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "test", .tool_bindings = &.{.{ .wire_name = "task_list", .application_name = "task.list" }} });
     defer runtime.deinit();
     try wire.input.append(a, "{\"id\":1,\"result\":{\"userAgent\":\"codex/0.163.0\"}}");
     try runtime.pump();
@@ -50,10 +50,11 @@ test "Codex initialize account create stream approval cancel exit" {
     try std.testing.expectError(error.InvalidCorrelation, runtime.dispatch(a, .{ .respond_approval = .{ .correlation = approval.correlation, .action_digest = "wrong", .decision = .allow } }));
     _ = try runtime.dispatch(a, .{ .respond_approval = .{ .correlation = approval.correlation, .action_digest = approval.action_digest, .decision = .deny } });
     try std.testing.expect(std.mem.indexOf(u8, wire.lines.items[wire.lines.items.len - 1], "decline") != null);
-    try wire.input.append(a, "{\"id\":\"tool-rpc\",\"method\":\"item/tool/call\",\"params\":{\"threadId\":\"upstream\",\"callId\":\"call-1\",\"tool\":\"task.list\",\"arguments\":{\"parent_run\":\"run\"}}}");
+    try wire.input.append(a, "{\"id\":\"tool-rpc\",\"method\":\"item/tool/call\",\"params\":{\"threadId\":\"upstream\",\"turnId\":\"turn\",\"callId\":\"call-1\",\"tool\":\"task_list\",\"arguments\":{\"parent_run\":\"run\"}}}");
     try runtime.pump();
     const call = (try runtime.asAdapter().pollTool(a)).?;
     try std.testing.expectEqualStrings("call-1", call.call_id);
+    try std.testing.expectEqualStrings("task.list", call.name);
     try std.testing.expectEqualStrings("run", call.correlation.run.?.value);
     try std.testing.expectError(error.InvalidCorrelation, runtime.asAdapter().respondTool("wrong", true, "{}"));
     try runtime.asAdapter().respondTool(call.request_id_json, true, "{\"tasks\":[]}");
@@ -99,4 +100,64 @@ test "Codex installed isolated handshake and unsigned account" {
         _ = transport.c.spica_process_poll(&wire.process, -1, @intFromBool(wire.input_len != 0), 20);
     }
     return error.HandshakeTimeout;
+}
+
+test "Codex resume retains explicit effort and tool callbacks reject stale turn authority" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var wire: Mock = .{ .allocator = allocator };
+    var runtime = try codex.RuntimeFor(Mock).init(allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "resume-fixture" });
+    defer runtime.deinit();
+    try wire.input.append(allocator, "{\"id\":1,\"result\":{\"userAgent\":\"codex/0.163.0\"}}");
+    try wire.input.append(allocator, "{\"id\":2,\"result\":{\"account\":{\"type\":\"chatgpt\"}}}");
+    try runtime.pump();
+    _ = try runtime.dispatch(allocator, .{ .attach = .{ .session = .{ .id = .{ .value = "session" }, .instance = .{ .value = "resume-fixture" }, .upstream = .{ .value = "upstream" } } } });
+    const sent = try std.json.parseFromSlice(std.json.Value, allocator, wire.lines.items[wire.lines.items.len - 1], .{});
+    try std.testing.expectEqualStrings("medium", sent.value.object.get("params").?.object.get("config").?.object.get("model_reasoning_effort").?.string);
+    try wire.input.append(allocator, "{\"id\":3,\"result\":{\"thread\":{\"id\":\"upstream\"},\"model\":\"gpt-6.1-sol\",\"modelProvider\":\"openai\",\"cwd\":\"/tmp/project\",\"reasoningEffort\":\"medium\"}}");
+    try runtime.pump();
+    _ = try runtime.poll(allocator);
+    _ = try runtime.poll(allocator);
+    _ = try runtime.dispatch(allocator, .{ .start = .{ .correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "run" }, .effect = .{ .value = "start" } }, .prompt = "fixture" } });
+    try wire.input.append(allocator, "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"upstream\",\"turn\":{\"id\":\"turn\"}}}");
+    try wire.input.append(allocator, "{\"id\":4,\"result\":{\"turn\":{\"id\":\"turn\"}}}");
+    try runtime.pump();
+    try std.testing.expectEqualStrings("turn", runtime.turn);
+    var wrong: c.Correlation = runtime.correlation;
+    wrong.run = .{ .value = "another-run" };
+    try std.testing.expectError(error.InvalidCorrelation, runtime.dispatch(allocator, .{ .cancel = .{ .correlation = wrong, .reason = "stale" } }));
+    try wire.input.append(allocator, "{\"id\":\"tool\",\"method\":\"item/tool/call\",\"params\":{\"threadId\":\"upstream\",\"turnId\":\"old-turn\",\"callId\":\"call\",\"tool\":\"task.list\",\"arguments\":{}}}");
+    try std.testing.expectError(error.InvalidCorrelation, runtime.pump());
+    try std.testing.expect(runtime.disconnected);
+    try std.testing.expect((try runtime.pollTool(allocator)) == null);
+}
+
+test "Codex open and restore RPC errors publish session correlated failure before any run" {
+    for ([_]bool{ false, true }) |restore| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var wire: Mock = .{ .allocator = allocator };
+        var runtime = try codex.RuntimeFor(Mock).init(allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "rpc-rejection" });
+        defer runtime.deinit();
+        try wire.input.append(allocator, "{\"id\":1,\"result\":{\"userAgent\":\"codex/0.163.0\"}}");
+        try wire.input.append(allocator, "{\"id\":2,\"result\":{\"account\":{\"type\":\"chatgpt\"}}}");
+        try runtime.pump();
+        if (restore) {
+            _ = try runtime.dispatch(allocator, .{ .attach = .{ .session = .{ .id = .{ .value = "session" }, .instance = .{ .value = "fixture" }, .upstream = .{ .value = "upstream" } } } });
+        } else {
+            _ = try runtime.dispatch(allocator, .{ .open = .{ .create = .{ .effect = .{ .value = "open" }, .session = .{ .value = "session" }, .selection = selection } } });
+        }
+        try wire.input.append(allocator, "{\"id\":3,\"error\":{\"code\":-32600,\"message\":\"dynamic tool name rejected\"}}");
+        try runtime.pump();
+        const failure = (try runtime.poll(allocator)).?;
+        try std.testing.expect(failure.body == .failure);
+        try std.testing.expect(failure.correlation.run == null);
+        try std.testing.expectEqualStrings("session", failure.correlation.session.value);
+        if (!restore) try std.testing.expectEqualStrings("open", failure.correlation.effect.?.value);
+        try std.testing.expect(std.mem.indexOf(u8, failure.body.failure.detail, "dynamic tool name rejected") != null);
+        try std.testing.expect((try runtime.poll(allocator)) == null);
+        try std.testing.expect(runtime.pending == null);
+    }
 }

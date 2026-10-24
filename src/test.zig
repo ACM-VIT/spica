@@ -1,6 +1,7 @@
 test {
     _ = @import("runtime/adapter.zig");
     _ = @import("runtime/transport.zig");
+    _ = @import("runtime/catalog.zig");
     _ = @import("runtime/codex_test.zig");
     _ = @import("provider_factory_test.zig");
     _ = @import("opencode_bridge_test.zig");

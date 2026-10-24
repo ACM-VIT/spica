@@ -98,6 +98,52 @@ libunibreak, not SDL/fonts/a display. Linux CI bootstraps the locked sources bef
 running the same default check. Host prerequisites are documented, not vendored;
 the build is not claimed to be hermetic.
 
+### Installed-provider orchestration gate
+
+Build the opt-in consumer with
+`python3 build/driver.py build-orchestration-smoke -Doptimize=Debug`, then run
+`zig-out/bin/orchestration-smoke CONFIG.json REPORT.json`. This performs real
+inference: the first runtime coordinates one child per configured runtime through
+the app's tools. It checks exact effective selections, child output, structured
+result/review commands, and a read-only reopen without a provider factory.
+It does not run as part of `./tools/check`.
+
+Supply explicit absolute executable/account/workspace/state paths, actual model
+IDs and supported efforts. The state directory must be fresh; the account
+directories must already exist, and Codex must be signed in through its supported
+flow. Existing credentials may be used only when explicitly authorized. No
+credentials belong in this configuration or report. For example:
+
+```json
+{
+  "workspace": "/tmp/spica-disposable-project",
+  "state_directory": "/tmp/spica-orchestration-new-state",
+  "candidate": "revision-and-source-fingerprint-under-test",
+  "runtimes": [
+    {
+      "kind": "codex",
+      "executable": "/usr/bin/codex",
+      "account_directory": "/tmp/spica-codex-account",
+      "model_provider": "openai",
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    },
+    {
+      "kind": "opencode",
+      "executable": "/absolute/path/to/opencode",
+      "account_directory": "/tmp/spica-opencode-account",
+      "model_provider": "opencode",
+      "model": "big-pickle",
+      "effort": "default"
+    }
+  ]
+}
+```
+
+Use one entry to exercise a single provider. The gate neither changes shared
+accounts nor imports histories. It stops on failed/ambiguous runs and keeps their
+durable state for inspection; a model listing alone never establishes access.
+
 ## What to build next
 
 [ROADMAP.md](docs/ROADMAP.md) is the ordered backlog. The durable conversation, protected custom-root bridge, native provider factories and bounded orchestration are implemented in the current shipping loop. Task records distinguish compiled/protocol/consumer evidence from live authenticated provider and human acceptance; absent Codex sign-in or model entitlement is not a successful mixed inference run.

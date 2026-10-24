@@ -97,7 +97,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
             self.turn = std.heap.FixedBufferAllocator.init(&self.turn_storage);
             self.selection = try clone(self.retained.allocator(), config.selection);
             self.correlation = .{ .session = .{ .value = "unopened" } };
-            try self.rpc("initialize", .{ .protocolVersion = 1, .clientCapabilities = .{}, .clientInfo = .{ .name = "spica", .version = "1" } });
+            try self.rpc("initialize", .{ .protocolVersion = 1, .clientCapabilities = Value{ .object = .empty }, .clientInfo = .{ .name = "spica", .version = "1" } });
             self.phase = .initializing;
         }
         pub fn shutdown(self: *Self) void {
@@ -360,7 +360,12 @@ pub fn RuntimeFor(comptime Transport: type) type {
                 const failure = field(frame, "error");
                 if (failure != .null) {
                     self.phase = .failed;
-                    return try self.observation(allocator, "rpc/error", .{ .failure = .{ .code = "opencode_rpc_error", .detail = text(field(failure, "message")) } });
+                    const structured = if (field(failure, "data") != .null) try std.json.Stringify.valueAlloc(self.allocator, failure, .{}) else null;
+                    defer if (structured) |bytes| self.allocator.free(bytes);
+                    const diagnostic = structured orelse text(field(failure, "message"));
+                    var end = @min(diagnostic.len, 2048);
+                    while (end < diagnostic.len and end > 0 and diagnostic[end] & 0xc0 == 0x80) end -= 1;
+                    return try self.observation(allocator, "rpc/error", .{ .failure = .{ .code = "opencode_rpc_error", .detail = diagnostic[0..end] } });
                 }
                 const result = field(frame, "result");
                 switch (self.phase) {
@@ -398,7 +403,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
                         }
                     },
                     .effort => {
-                        if (!configMatches(result, "effort", "", self.selection.effort)) return error.SelectionUnavailable;
+                        if (!configMatches(result, "effort", "", self.selection.effort) or !configMatches(result, "model", self.selection.model_provider, self.selection.model_id)) return error.SelectionUnavailable;
                         self.phase = .ready;
                         self.effective = true;
                         return try self.observation(allocator, "session/selected", .{ .session = self.session.? });

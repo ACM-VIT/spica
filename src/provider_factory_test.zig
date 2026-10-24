@@ -100,6 +100,12 @@ fn spawnedCreation(a: std.mem.Allocator, executable: [:0]const u8) !void {
         const adapter = try factory.create(a, chosen, "/tmp", .{ .value = "post-spawn-allocation" }, .{ .url = "http://127.0.0.1/mcp/session", .token = "isolated-fixture" });
         defer factory.destroy(a, adapter);
         defer adapter.shutdown();
+        if (std.mem.eql(u8, kind, "codex")) {
+            const runtime: *@import("runtime/codex.zig").Runtime = @ptrCast(@alignCast(adapter.context));
+            try std.testing.expectEqualStrings("task_delegate", runtime.config.tools[0].name);
+            try std.testing.expectEqualStrings("task.delegate", runtime.config.tool_bindings[0].application_name);
+            try std.testing.expectEqualStrings("task_delegate", runtime.config.tool_bindings[0].wire_name);
+        }
     }
 }
 
@@ -168,4 +174,74 @@ test "mixed factory authorizes runtime account provider and retains explicit chi
     const runtime: *@import("runtime/opencode.zig").Runtime = @ptrCast(@alignCast(opencode.context));
     try std.testing.expect(c.equal(runtime.selection, child));
     try std.testing.expect(codex.vtable != opencode.vtable);
+}
+
+test "refreshed catalog is exact and rejects stale model effort account and provider" {
+    var config: native.NativeFactory = .{ .configs = &.{.{ .selection = selection, .executable = "/does/not/exist", .environment = &.{} }}, .catalog_authoritative = true };
+    config.catalog_models[0] = .{ .selection = selection, .supported_efforts = &.{ "medium", "high" }, .display_name = "Protocol model", .readiness = .unavailable, .reason = "Actual account unready" };
+    config.catalog_count = 1;
+    const factory = config.asFactory();
+    try std.testing.expectEqual(.unavailable, factory.accountStatus(selection).readiness);
+    config.catalog_models[0].readiness = .ready;
+    try std.testing.expectEqual(.ready, factory.accountStatus(selection).readiness);
+    var other = selection;
+    other.effort = "high";
+    try std.testing.expectEqual(.ready, factory.accountStatus(other).readiness);
+    other.effort = "unnegotiated";
+    try std.testing.expectEqual(.unavailable, factory.accountStatus(other).readiness);
+    other = selection;
+    other.model_id = "stale-model";
+    try std.testing.expectEqual(.unavailable, factory.accountStatus(other).readiness);
+    other = selection;
+    other.account_ref = "/unauthorized";
+    try std.testing.expectEqual(.unavailable, factory.accountStatus(other).readiness);
+    other = selection;
+    other.model_provider = "unauthorized";
+    try std.testing.expectEqual(.unavailable, factory.accountStatus(other).readiness);
+    config.catalog_count = 0;
+    try std.testing.expectEqual(.unavailable, factory.accountStatus(selection).readiness);
+}
+
+fn configuredSetup(allocator: std.mem.Allocator, workspace: []const u8, account: []const u8) !void {
+    var native_factory: native.NativeFactory = .{ .configs = &.{} };
+    const factory = native_factory.asFactory();
+    const setup: c.RuntimeSetup = .{ .runtime_kind = .codex, .executable = "/not/a/provider", .account_directory = account, .workspace_root = workspace, .model_provider = "openai" };
+    try factory.runtimeAction(allocator, std.testing.io, .{ .configure = setup });
+    // Replacing a setup repeatedly must release operation paths and keep the
+    // previous generation intact on any partial allocation failure.
+    try factory.runtimeAction(allocator, std.testing.io, .{ .configure = setup });
+    try std.testing.expectEqualStrings(workspace, factory.runtimeStatus().workspace_root);
+    try std.testing.expectEqualStrings(account, native_factory.configs[0].selection.account_ref);
+    try std.testing.expectEqual(@as(usize, 0), factory.models().len);
+    try std.testing.expect(native_factory.catalog_authoritative);
+    var selected = native_factory.configs[0].selection;
+    selected.model_id = "unrefreshed";
+    selected.effort = "medium";
+    try std.testing.expectEqual(.unavailable, factory.accountStatus(selected).readiness);
+}
+
+test "runtime setup releases operation paths under allocation failure and repeated replacement" {
+    var workspace = std.testing.tmpDir(.{});
+    defer workspace.cleanup();
+    var account = std.testing.tmpDir(.{});
+    defer account.cleanup();
+    const root = try workspace.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const account_root = try account.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(account_root);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, configuredSetup, .{ root, account_root });
+}
+
+test "failed explicit setup invalidates catalog admission without replacing authorization" {
+    var native_factory: native.NativeFactory = .{ .configs = &.{.{ .selection = selection, .executable = "/does/not/exist", .environment = &.{} }} };
+    const factory = native_factory.asFactory();
+    try std.testing.expectError(error.AbsoluteRuntimePathsRequired, factory.runtimeAction(std.testing.allocator, std.testing.io, .{ .configure = .{ .runtime_kind = .codex, .executable = "relative", .account_directory = "/unused", .workspace_root = "/unused", .model_provider = "openai" } }));
+    try std.testing.expectEqualStrings(selection.account_ref, native_factory.configs[0].selection.account_ref);
+    try std.testing.expectEqual(.unavailable, factory.accountStatus(selection).readiness);
+}
+
+test {
+    _ = @import("runtime/codex_test.zig");
+    _ = @import("opencode_test.zig");
+    _ = @import("opencode_bridge_test.zig");
 }

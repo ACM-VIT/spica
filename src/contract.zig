@@ -69,6 +69,43 @@ pub const Selection = struct {
     workspace: WorkspaceId,
     capability_revision: u32 = 1,
 };
+/// The local fixture remains independent of configured external runtimes.
+pub fn fakeSelection(workspace: WorkspaceId) Selection {
+    return .{ .model_provider = "fake", .model_id = "fixture", .effort = "none", .account_ref = "fixture", .workspace = workspace };
+}
+pub fn isFakeSelection(selection: Selection) bool {
+    return equal(selection, fakeSelection(selection.workspace));
+}
+/// Catalog entries are protocol evidence, not account entitlement.
+pub const Model = struct {
+    selection: Selection,
+    supported_efforts: []const []const u8,
+    display_name: []const u8,
+    readiness: Readiness,
+    reason: []const u8,
+    synthetic: bool = false,
+};
+pub const RuntimeKind = enum { codex, opencode };
+pub const RuntimeSetup = struct {
+    runtime_kind: RuntimeKind,
+    executable: []const u8,
+    account_directory: []const u8,
+    workspace_root: []const u8,
+    model_provider: []const u8,
+};
+pub const RuntimeLogin = struct { runtime_kind: RuntimeKind, mode: enum { browser, device } };
+pub const RuntimeAction = union(enum) {
+    configure: RuntimeSetup,
+    refresh: void,
+    login: RuntimeLogin,
+};
+pub const RuntimeStatus = struct {
+    runtime_kind: []const u8 = "",
+    readiness: Readiness = .unknown,
+    reason: []const u8 = "Configure a runtime, then explicitly refresh its catalog.",
+    login: []const u8 = "",
+    workspace_root: []const u8 = "",
+};
 pub const SelectionResult = struct {
     requested: Selection,
     // null is explicitly unverified, never inferred from requested identity.

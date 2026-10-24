@@ -83,7 +83,8 @@ pub const Options = struct {
         }
         if (options.codex_auth != .none and options.provider != .codex and !options.help) return error.CodexAuthRequiresCodex;
         if (options.provider != .fake and !options.help) {
-            if (options.runtime_account_directory == null or options.model == null or options.model_provider == null or options.effort == null or options.workspace == null) return error.ExplicitRuntimeSelectionRequired;
+            if ((options.model == null) != (options.effort == null)) return error.CompleteInitialSelectionRequired;
+            if (options.runtime_account_directory == null or options.model_provider == null or options.workspace == null) return error.ExplicitRuntimeSelectionRequired;
             if (!std.fs.path.isAbsolute(options.runtime_account_directory.?) or !std.fs.path.isAbsolute(options.workspace.?)) return error.AbsoluteRuntimePathsRequired;
         }
         if (!options.help) {
@@ -130,7 +131,10 @@ pub const help =
     \\--lua-module PATH selects a custom Lua root/renderer. F5 reloads; F9 toggles default/custom.
     \\--provider fake|codex|opencode selects the runtime (default fake).
     \\Real runtimes require --runtime-account-directory PATH --workspace PATH
-    \\and explicit --model-provider ID --model ID --effort VALUE.
+    \\and --model-provider ID. Select discovered model/effort in the native picker;
+    \\--model ID --effort VALUE optionally supplies an exact initial selection.
+    \\The native setup action configures isolated executable/account/workspace;
+    \\explicit Refresh discovers actual models without performing inference.
     \\Runtime account state is independent of the application database.
     \\--codex-auth status|browser|device queries/initiates supported isolated ChatGPT sign-in,
     \\prints the actual runtime response, then exits without opening the native UI.
@@ -191,4 +195,13 @@ test "mixed runtime authorization requires distinct explicit account and provide
     try std.testing.expectError(error.AdditionalProviderRequired, Options.parse(&(primary ++ .{ "--additional-runtime-account-directory", "/tmp/other" })));
     try std.testing.expectError(error.DuplicateAdditionalProvider, Options.parse(&(primary ++ .{ "--additional-provider", "opencode", "--additional-provider", "opencode" })));
     try std.testing.expectError(error.AbsoluteRuntimeExecutableRequired, Options.parse(&(primary ++ .{ "--additional-provider", "opencode", "--additional-runtime-account-directory", "/tmp/opencode-account", "--additional-model-provider", "opencode", "--additional-runtime-executable", "relative" })));
+}
+
+test "setup-only native startup leaves inference selection explicit" {
+    const base = [_][:0]const u8{ "spica", "--provider", "codex", "--runtime-account-directory", "/tmp/account", "--workspace", "/tmp/project", "--model-provider", "openai" };
+    const setup = try Options.parse(&base);
+    try std.testing.expect(setup.model == null and setup.effort == null);
+    try std.testing.expectEqual(.device, (try Options.parse(&(base ++ .{ "--codex-auth", "device" }))).codex_auth);
+    try std.testing.expectError(error.CompleteInitialSelectionRequired, Options.parse(&(base ++ .{ "--model", "explicit-model" })));
+    try std.testing.expectError(error.CompleteInitialSelectionRequired, Options.parse(&(base ++ .{ "--effort", "medium" })));
 }

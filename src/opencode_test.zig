@@ -392,3 +392,34 @@ test "ACP permission authority index is bounded by turn storage and reset per tu
     }
     return error.ExpectedBoundedAuthorityStorage;
 }
+
+test "ACP effort acknowledgement must retain exact model and initialize uses an object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var runtime: Runtime = undefined;
+    try runtime.init(std.testing.allocator, .{}, .{ .selection = selection, .cwd = "/tmp/spica", .instance = .{ .value = "test" }, .account = .{ .reference = selection.account_ref, .readiness = .unknown } });
+    defer runtime.shutdown();
+    const initialize = try std.json.parseFromSlice(std.json.Value, allocator, runtime.transport.sent[0..runtime.transport.len], .{});
+    try std.testing.expect(initialize.value.object.get("params").?.object.get("clientCapabilities").? == .object);
+    runtime.session = .{ .id = correlation.session, .instance = .{ .value = "test" }, .upstream = .{ .value = "upstream" } };
+    runtime.selection.effort = "high";
+    runtime.phase = .effort;
+    try std.testing.expectError(error.SelectionUnavailable, consume(&runtime, allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"configOptions\":[{\"id\":\"model\",\"currentValue\":\"opencode/substituted\"},{\"id\":\"effort\",\"currentValue\":\"high\"}]}}"));
+    _ = try consume(&runtime, allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"configOptions\":[{\"id\":\"model\",\"currentValue\":\"opencode/big-pickle\"},{\"id\":\"effort\",\"currentValue\":\"high\"}]}}");
+    try std.testing.expect(runtime.resolveSelection(runtime.selection).effective != null);
+}
+
+test "ACP failure preserves provider error data in bounded diagnostic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var runtime: Runtime = undefined;
+    try prompting(&runtime, allocator);
+    defer runtime.shutdown();
+    const failed = (try consume(&runtime, allocator, "{\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"code\":-32603,\"message\":\"Internal error\",\"data\":{\"type\":\"provider.free-limit\",\"status\":429}}}")).?;
+    try std.testing.expect(failed.body == .failure);
+    try std.testing.expect(failed.body.failure.detail.len <= 2048);
+    try std.testing.expect(std.mem.indexOf(u8, failed.body.failure.detail, "provider.free-limit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed.body.failure.detail, "429") != null);
+}

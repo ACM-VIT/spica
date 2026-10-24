@@ -21,6 +21,7 @@ pub const Owner = struct {
     utc_ms: ?u64,
     factory: ?Factory = null,
     workspace_root: ?[]const u8 = null,
+    setup_factory: ?Factory = null,
 
     fn id(self: *Owner, allocator: std.mem.Allocator) ![]const u8 {
         var random: [16]u8 = undefined;
@@ -148,6 +149,14 @@ pub const Owner = struct {
         var revision_value: u64 = 1;
         switch (e.payload) {
             .unsupported => return .unsupported_kind,
+            .runtime_configure, .runtime_refresh, .runtime_login => {
+                if (e.target != .absent or e.expected_revision != .absent) return .invalid_command;
+                if (self.setup_factory == null) return .capability_unavailable;
+                if (try db.scalar("SELECT count(*) FROM runs WHERE state NOT IN('completed','cancelled','failed')") != 0 or try db.scalar("SELECT count(*) FROM effects WHERE state IN('unknown','in_flight')") != 0) return .busy;
+                // The command record commits explicit intent before Host performs
+                // any configuration, provider discovery or login side effect.
+                return null;
+            },
             .project_create => |p| {
                 if (e.target != .absent or e.expected_revision != .absent or p.display_name.len == 0) return .invalid_command;
                 const key = try self.id(allocator);
@@ -172,6 +181,31 @@ pub const Owner = struct {
                 try db.execute("INSERT INTO threads(id,revision,project_id,workspace_id) VALUES(?,1,?,?)", &.{ .{ .text = key }, .{ .text = p.project.value }, .{ .text = p.workspace.value } });
                 r.entity_ids.thread = .{ .value = key };
                 aggregate = .{ .thread = r.entity_ids.thread.? };
+            },
+            .thread_select => |p| {
+                if (e.target != .thread or e.expected_revision != .revision) return .invalid_command;
+                const workspace = try self.field(allocator, "SELECT workspace_id FROM threads WHERE id=?", &.{.{ .text = e.target.thread.value }}) orelse return .not_found;
+                if (!std.mem.eql(u8, workspace, p.selection.workspace.value)) return .workspace_mismatch;
+                if (try self.field(allocator, "SELECT id FROM runs WHERE thread_id=? AND state NOT IN('completed','cancelled','failed')", &.{.{ .text = e.target.thread.value }}) != null) return .busy;
+                var supported = false;
+                if (self.factory) |factory| {
+                    for (factory.models()) |model| {
+                        var candidate = model.selection;
+                        candidate.workspace = p.selection.workspace;
+                        candidate.effort = p.selection.effort;
+                        if (!a.equal(candidate, p.selection)) continue;
+                        for (model.supported_efforts) |effort| if (std.mem.eql(u8, effort, p.selection.effort)) {
+                            supported = true;
+                        };
+                    }
+                }
+                if (std.mem.eql(u8, p.selection.runtime_kind, "fake") and std.mem.eql(u8, p.selection.required_runtime_version, "1") and std.mem.eql(u8, p.selection.model_provider, "fake") and std.mem.eql(u8, p.selection.model_id, "fixture") and std.mem.eql(u8, p.selection.account_ref, "fixture") and std.mem.eql(u8, p.selection.effort, "none") and p.selection.capability_revision == 1) supported = true;
+                if (!supported) return .selection_mismatch;
+                try db.execute("INSERT INTO thread_selections VALUES(?,?) ON CONFLICT(thread_id) DO UPDATE SET selection=excluded.selection", &.{ .{ .text = e.target.thread.value }, .{ .blob = try encoded(allocator, p.selection) } });
+                try db.execute("UPDATE threads SET revision=revision+1 WHERE id=?", &.{.{ .text = e.target.thread.value }});
+                aggregate = .{ .thread = e.target.thread };
+                revision_value = e.expected_revision.revision + 1;
+                r.entity_ids.thread = e.target.thread;
             },
             .thread_send => |p| {
                 if (e.target != .thread or e.expected_revision != .revision or p.text.len == 0) return .invalid_command;
@@ -211,6 +245,7 @@ pub const Owner = struct {
                 const request: a.Request = .{ .start = .{ .correlation = .{ .effect = .{ .value = start }, .run = .{ .value = run }, .session = .{ .value = session } }, .prompt = p.text } };
                 if (a.frameBytes(request) > 4096) return .admission_limit;
                 const selection = try encoded(allocator, p.selection);
+                try db.execute("INSERT INTO thread_selections VALUES(?,?) ON CONFLICT(thread_id) DO UPDATE SET selection=excluded.selection", &.{ .{ .text = thread }, .{ .blob = selection } });
                 try db.execute("INSERT INTO sessions(id,revision,workspace_id,selection) VALUES(?,1,?,?)", &.{ .{ .text = session }, .{ .text = workspace }, .{ .blob = selection } });
                 try db.execute("INSERT INTO runs(id,revision,thread_id,session_id,state,requested) VALUES(?,1,?,?,'queued',?)", &.{ .{ .text = run }, .{ .text = thread }, .{ .text = session }, .{ .blob = selection } });
                 const ordinal = try db.prepare("SELECT next_ordinal FROM threads WHERE id=?", &.{.{ .text = thread }});
@@ -608,7 +643,13 @@ pub const Owner = struct {
             .cancelled => |cancelled| if (!terminal) {
                 next_state = if (cancelled.tools_stopped) "cancelled" else "unknown";
             },
-            .failure => if (!terminal) {
+            .failure => |failure| if (!terminal) {
+                // A definitive rejection before session publication resolves the
+                // committed open claim; no dependent start may remain runnable.
+                if (observation.correlation.effect) |effect| {
+                    try db.execute("UPDATE effects SET state='failed',outcome=?,evidence=?,revision=revision+1 WHERE id=? AND run_id=? AND state='in_flight'", &.{ .{ .blob = failure.detail }, .{ .blob = try encoded(allocator, observation.body) }, .{ .text = effect.value }, .{ .text = run.value } });
+                }
+                try db.execute("UPDATE effects SET state='withdrawn',revision=revision+1 WHERE run_id=? AND state='planned'", &.{.{ .text = run.value }});
                 next_state = "failed";
             },
             .disconnect, .ambiguous => if (!terminal) {
@@ -638,7 +679,10 @@ pub const Owner = struct {
                 if (!std.mem.eql(u8, current_state, "cancel_requested")) next_state = "starting";
             },
         }
-        try db.execute("INSERT INTO observations(session_id,upstream_event,runtime_version,correlation,digest,cursor,commit_sequence) VALUES(?,?,?,?,?,?,?)", &.{ .{ .text = session.value }, .{ .text = observation.upstream_event }, .{ .text = observation.runtime_version }, .{ .blob = try encoded(allocator, observation.correlation) }, .{ .blob = &digest }, if (observation.cursor) |v| .{ .blob = v.value } else .null, .{ .integer = @intCast(sequence) } });
+        try db.execute("INSERT INTO observations(session_id,upstream_event,runtime_version,correlation,digest,evidence,cursor,commit_sequence) VALUES(?,?,?,?,?,?,?,?)", &.{ .{ .text = session.value }, .{ .text = observation.upstream_event }, .{ .text = observation.runtime_version }, .{ .blob = try encoded(allocator, observation.correlation) }, .{ .blob = &digest }, switch (observation.body) {
+            .failure, .disconnect, .ambiguous => .{ .blob = try encoded(allocator, observation.body) },
+            else => .null,
+        }, if (observation.cursor) |v| .{ .blob = v.value } else .null, .{ .integer = @intCast(sequence) } });
         // Cursor advances only in the transaction containing the canonical bytes.
         if (observation.cursor) |cursor| {
             const session_revision = try db.prepare("SELECT revision FROM sessions WHERE id=?", &.{.{ .text = session.value }});
@@ -799,6 +843,7 @@ pub const Host = struct {
         /// Main retains factory/config through Host.destroy. Each committed
         /// app session receives a distinct Host-owned process/session object.
         factory: ?Factory = null,
+        setup_factory: ?Factory = null,
         selection: ?a.Selection = null,
         workspace_root: ?[]const u8 = null,
     };
@@ -813,6 +858,7 @@ pub const Host = struct {
     database: store.Store,
     registry: ?Registry = null,
     mcp: ?Mcp = null,
+    setup_active: bool = false,
     thread: ?std.Thread = null,
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
@@ -855,6 +901,20 @@ pub const Host = struct {
         var owner: Owner = .{ .database = &self.database, .io = io, .epoch = "", .utc_ms = null };
         @memcpy(&self.epoch, try owner.id(arena.allocator()));
         try owner.recover();
+        // Restore explicit configuration only. Never replay refresh, sign-in,
+        // accepted inference, or an interrupted setup effect.
+        if (options.setup_factory) |setup| {
+            const stored = try database.prepare("SELECT configuration FROM runtime_configurations ORDER BY runtime_kind", &.{});
+            defer stored.deinit();
+            while (try stored.step()) {
+                _ = arena.reset(.retain_capacity);
+                const configuration = try t.decode(a.RuntimeSetup, try stored.bytes(0), arena.allocator());
+                setup.runtimeAction(allocator, io, .{ .configure = configuration }) catch continue;
+                self.registry.?.factory = setup;
+                self.options.factory = setup;
+                self.options.workspace_root = setup.runtimeStatus().workspace_root;
+            }
+        }
         self.thread = try std.Thread.spawn(.{}, run, .{self});
         return self;
     }
@@ -956,14 +1016,17 @@ pub const Host = struct {
         snapshot.database = null;
     }
     fn run(self: *Host) void {
-        var owner: Owner = .{ .database = &self.database, .io = self.io, .epoch = &self.epoch, .utc_ms = null, .factory = self.registry.?.factory, .workspace_root = self.options.workspace_root };
+        var owner: Owner = .{ .database = &self.database, .io = self.io, .epoch = &self.epoch, .utc_ms = null, .factory = self.registry.?.factory, .workspace_root = self.options.workspace_root, .setup_factory = self.options.setup_factory };
         defer if (self.registry) |*registry| registry.deinit(&self.mcp.?);
+        defer if (self.options.setup_factory) |setup| {
+            if (setup.vtable.shutdownSetup) |call| call(setup.context);
+        };
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         var operation_memory: [2 * 1024 * 1024]u8 = undefined;
         while (true) {
             self.mutex.lockUncancelable(self.io);
-            while (!self.closed and self.request_count == 0 and self.options.factory == null) self.changed.waitUncancelable(self.io, &self.mutex);
+            while (!self.closed and self.request_count == 0 and self.options.factory == null and !self.setup_active) self.changed.waitUncancelable(self.io, &self.mutex);
             if (self.closed) {
                 self.mutex.unlock(self.io);
                 return;
@@ -1010,10 +1073,13 @@ pub const Host = struct {
                 self.pumpRuntimes(&owner, &arena) catch {};
             }
             self.pumpRuntimes(&owner, &arena) catch {};
+            if (self.options.setup_factory) |setup| {
+                self.setup_active = if (setup.vtable.pumpSetup) |call| call(setup.context) else false;
+            }
             self.deliverSubscriptions(allocator) catch {};
             // Admission and shutdown wake immediately; absent transport wake
             // support, pending protocol frames are sampled at a bounded 10ms.
-            if (frame == null and self.options.factory != null)
+            if (frame == null and (self.options.factory != null or self.setup_active))
                 self.runtime_wake.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch {};
         }
     }
@@ -1133,7 +1199,36 @@ pub const Host = struct {
                 const used = try self.database.scalar("PRAGMA page_count");
                 const page_size = try self.database.scalar("PRAGMA page_size");
                 if (@as(u64, @intCast(used)) *| @as(u64, @intCast(page_size)) >= self.options.limits.durable_bytes) return error.Limit;
-                try self.publish(.{ .command_receipt = .{ .ticket = ticket, .receipt = try owner.command(allocator, command) } });
+                const before_sequence: u64 = @intCast(try self.database.scalar("SELECT next_sequence FROM meta WHERE singleton=1"));
+                const receipt = try owner.command(allocator, command);
+                if (receipt.outcome == .accepted and receipt.commit_sequence >= before_sequence) {
+                    const action: ?a.RuntimeAction = switch (command.payload) {
+                        .runtime_configure => |v| .{ .configure = v },
+                        .runtime_refresh => .refresh,
+                        .runtime_login => |v| .{ .login = v },
+                        else => null,
+                    };
+                    if (action) |value| {
+                        const setup = self.options.setup_factory.?;
+                        // Release completed adapters with their original factory
+                        // before switching execution routing/configuration.
+                        self.registry.?.deinit(&self.mcp.?);
+                        const applied = if (setup.runtimeAction(self.allocator, self.io, value)) |_| true else |_| false;
+                        if (value == .configure and applied) {
+                            var configuration = value.configure;
+                            configuration.workspace_root = setup.runtimeStatus().workspace_root;
+                            configuration.account_directory = try std.Io.Dir.cwd().realPathFileAlloc(self.io, configuration.account_directory, allocator);
+                            try self.database.execute("INSERT INTO runtime_configurations VALUES(?,?) ON CONFLICT(runtime_kind) DO UPDATE SET configuration=excluded.configuration", &.{ .{ .text = @tagName(configuration.runtime_kind) }, .{ .blob = try Owner.encoded(allocator, configuration) } });
+                            self.registry.?.factory = setup;
+                            owner.factory = setup;
+                            self.options.factory = setup;
+                            owner.workspace_root = setup.runtimeStatus().workspace_root;
+                            self.options.workspace_root = owner.workspace_root;
+                        }
+                        for (&self.snapshots) |*snapshot| self.closeSnapshot(snapshot);
+                    }
+                }
+                try self.publish(.{ .command_receipt = .{ .ticket = ticket, .receipt = receipt } });
             },
             .query => |q| try self.publish(.{ .query_page = .{ .ticket = ticket, .page = try self.project(allocator, q) } }),
             .subscribe => |subscription| {
@@ -1257,6 +1352,7 @@ pub const Host = struct {
     fn project(self: *Host, allocator: std.mem.Allocator, q: t.Query) !t.QueryPage {
         const page: t.Page = switch (q) {
             .projects => |p| p,
+            .models => |v| v.page,
             .workspaces => |v| v.page,
             .threads => |v| v.page,
             .messages => |v| v.page,
@@ -1267,7 +1363,7 @@ pub const Host = struct {
             .tools => |v| v.page,
             .approvals => |v| v.page,
             .task_list => |v| v.page,
-            .thread, .capabilities, .task_wait => .{},
+            .thread, .capabilities, .runtime_status, .task_wait => .{},
         };
         if (page.limit == 0 or page.limit > self.options.limits.page_rows or page.max_bytes == 0 or page.max_bytes > self.options.limits.page_bytes) return error.InvalidQuery;
         const snapshot = try self.snapshotFor(page);
@@ -1282,6 +1378,7 @@ pub const Host = struct {
         var identity_query = q;
         switch (identity_query) {
             .projects => |*v| v.* = .{},
+            .models => |*v| v.page = .{},
             .workspaces => |*v| v.page = .{},
             .threads => |*v| v.page = .{},
             .messages => |*v| v.page = .{},
@@ -1305,6 +1402,48 @@ pub const Host = struct {
         var values: [5]V = undefined;
         var n: usize = 0;
         switch (q) {
+            .runtime_status => {
+                const status = if (self.options.setup_factory) |setup| setup.runtimeStatus() else a.RuntimeStatus{};
+                const binding = if (status.workspace_root.len != 0) workspace_binding.capture(allocator, self.io, status.workspace_root) catch null else null;
+                rows[0] = .{ .runtime_status = .{ .runtime_kind = status.runtime_kind, .readiness = status.readiness, .reason = status.reason, .login = status.login, .workspace_root = status.workspace_root, .binding = binding, .supported_login_modes = if (std.mem.eql(u8, status.runtime_kind, "codex")) &.{ "browser", "device" } else &.{} } };
+                result.items = rows[0..1];
+                return result;
+            },
+            .models => |v| {
+                if (v.workspace.value.len == 0) return error.InvalidQuery;
+                // Metadata pages are invalidated on any committed command,
+                // including a refresh; never continue a stale catalog snapshot.
+                if ((try self.database.position()).order(snapshot.value.position) != .eq) return error.CursorInvalid;
+                const configured = if (self.options.setup_factory) |setup| setup.models() else &.{};
+                const fake_models = [_]a.Model{.{
+                    .selection = self.selectionFor(v.workspace),
+                    .supported_efforts = &.{"none"},
+                    .display_name = "Fake provider (synthetic fixture)",
+                    .readiness = .ready,
+                    .reason = "Synthetic local fixture; no provider inference or account",
+                    .synthetic = true,
+                }};
+                const catalog = if (self.options.factory == null) &fake_models else configured;
+                var index: usize = @intCast(cursor);
+                if (index > catalog.len) return error.CursorInvalid;
+                var encoded_row: [65536]u8 = undefined;
+                while (index < catalog.len and count < page.limit) : (index += 1) {
+                    var model = catalog[index];
+                    model.selection.workspace = v.workspace;
+                    const row: t.Row = .{ .model = model };
+                    const size = (try t.encode(row, &encoded_row)).len;
+                    if (size > page.max_bytes - bytes_used) {
+                        if (count == 0) return error.Limit;
+                        break;
+                    }
+                    rows[count] = row;
+                    count += 1;
+                    bytes_used += size;
+                }
+                if (index < catalog.len) result.next_cursor = try Owner.encoded(allocator, Cursor{ .query = identity, .key = index });
+                result.items = rows[0..count];
+                return result;
+            },
             .capabilities => {
                 rows[0] = .{ .capabilities = self.registry.?.factory.discover(self.selectionFor(.{ .value = "" })) };
                 result.items = rows[0..1];
@@ -1327,14 +1466,14 @@ pub const Host = struct {
                 n = 1;
             },
             .threads => |v| {
-                sql = "SELECT rowid,id,revision,project_id,workspace_id,session_id FROM threads WHERE project_id=? AND rowid>max(?,coalesce((SELECT rowid FROM threads WHERE id=?),0)) ORDER BY rowid LIMIT ?";
+                sql = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)) FROM threads WHERE project_id=? AND rowid>max(?,coalesce((SELECT rowid FROM threads WHERE id=?),0)) ORDER BY rowid LIMIT ?";
                 values[0] = .{ .text = v.project.value };
                 values[1] = .{ .integer = @intCast(cursor) };
                 values[2] = if (v.anchor) |anchor| .{ .text = anchor.value } else .null;
                 n = 3;
             },
             .thread => |v| {
-                sql = "SELECT rowid,id,revision,project_id,workspace_id,session_id FROM threads WHERE id=? AND rowid>? LIMIT ?";
+                sql = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)) FROM threads WHERE id=? AND rowid>? LIMIT ?";
                 values[0] = .{ .text = v.value };
                 n = 1;
             },
@@ -1358,7 +1497,7 @@ pub const Host = struct {
                 n = 1;
             },
             .runs => |v| {
-                sql = "SELECT rowid,id,revision,thread_id,session_id,state,requested,effective FROM runs WHERE thread_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                sql = "SELECT rowid,id,revision,thread_id,session_id,state,requested,effective,coalesce((SELECT evidence FROM observations WHERE session_id=runs.session_id AND json_extract(CAST(correlation AS TEXT),'$.run.value')=runs.id AND evidence IS NOT NULL ORDER BY commit_sequence DESC LIMIT 1),'') FROM runs WHERE thread_id=? AND rowid>? ORDER BY rowid LIMIT ?";
                 values[0] = .{ .text = v.thread.value };
                 n = 1;
             },
@@ -1427,7 +1566,7 @@ pub const Host = struct {
             const row: t.Row = switch (q) {
                 .projects => .{ .project = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .display_name = try text(allocator, s, 3) } },
                 .workspaces => .{ .workspace = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .binding = try t.decode(t.WorkspaceBinding, try s.bytes(4), allocator) } },
-                .threads, .thread => .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) } } },
+                .threads, .thread => .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator) } },
                 .blocks => .{ .block = try descriptor(allocator, s) },
                 .messages => blk: {
                     const message_id = a.MessageId{ .value = try text(allocator, s, 1) };
@@ -1448,7 +1587,7 @@ pub const Host = struct {
                     }
                     break :blk .{ .message = .{ .message_id = message_id, .revision = try number(s, 2), .ordinal = try number(s, 3), .role = try enumeration(@FieldType(@FieldType(t.Row, "message"), "role"), s, 4), .incomplete = s.integer(5) != 0, .run_id = .{ .value = try text(allocator, s, 6) }, .blocks = descriptors, .next_block_cursor = next } };
                 },
-                .runs => .{ .run = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .thread = .{ .value = try text(allocator, s, 3) }, .session = .{ .value = try text(allocator, s, 4) }, .state = try enumeration(t.RunState, s, 5), .requested = try t.decode(a.Selection, try s.bytes(6), allocator), .effective = if (s.isNull(7)) null else try t.decode(a.Selection, try s.bytes(7), allocator) } },
+                .runs => .{ .run = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .thread = .{ .value = try text(allocator, s, 3) }, .session = .{ .value = try text(allocator, s, 4) }, .state = try enumeration(t.RunState, s, 5), .requested = try t.decode(a.Selection, try s.bytes(6), allocator), .effective = if (s.isNull(7)) null else try t.decode(a.Selection, try s.bytes(7), allocator), .diagnostic = try text(allocator, s, 8) } },
                 .effects => .{ .effect = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .run = .{ .value = try text(allocator, s, 3) }, .kind = try enumeration(t.EffectKind, s, 4), .state = try enumeration(t.EffectState, s, 5), .outcome = try text(allocator, s, 6) } },
                 .tools => .{ .tool = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .run = .{ .value = try text(allocator, s, 3) }, .name = try text(allocator, s, 4), .action_digest = try text(allocator, s, 5), .outcome = try enumeration(t.ToolOutcome, s, 6), .result_block = if (s.isNull(7)) null else .{ .value = try text(allocator, s, 7) } } },
                 .task_list, .task_wait => .{ .task = .{
@@ -1554,4 +1693,81 @@ test {
     _ = types;
     _ = @import("domain/domain_test.zig");
     _ = @import("domain/factory_test.zig");
+}
+
+test "session-only open rejection closes starting claim and preserves indexed run diagnostics on reopen" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    const path = path_buffer[0..path_len];
+    var database = try store.Store.open(std.testing.io, path);
+    var database_live = true;
+    defer if (database_live) database.close() catch {};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: Owner = .{ .database = &database, .io = std.testing.io, .epoch = "rejection-fixture", .utc_ms = 1 };
+    const project = (try owner.command(allocator, .{ .command_id = .{ .value = "project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "RPC rejection fixture" } } })).entity_ids.project.?;
+    const workspace = (try owner.command(allocator, .{ .command_id = .{ .value = "workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = try workspace_binding.capture(allocator, std.testing.io, path) } } })).entity_ids.workspace.?;
+    const thread = (try owner.command(allocator, .{ .command_id = .{ .value = "thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+    owner.factory = @import("domain/fake_factory.zig").factory(&owner);
+    const sent = try owner.command(allocator, .{ .command_id = .{ .value = "send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "no external inference", .selection = a.fakeSelection(workspace) } } });
+    try std.testing.expectEqual(.accepted, sent.outcome);
+    const open = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, open.id, .{ .outcome = .acknowledged });
+    try std.testing.expectEqual(@as(i64, 1), try database.scalar("SELECT count(*) FROM runs WHERE state='starting'"));
+    var failure: a.Observation = .{ .correlation = .{ .session = sent.entity_ids.session.?, .effect = open.id }, .upstream_event = "rejected-open", .body = .{ .failure = .{ .code = "rpc_error", .detail = "dynamic tool name rejected" } } };
+    try owner.observe(allocator, failure);
+    try std.testing.expectEqual(@as(i64, 1), try database.scalar("SELECT count(*) FROM runs WHERE state='failed'"));
+    try std.testing.expectEqual(@as(i64, 1), try database.scalar("SELECT count(*) FROM effects WHERE kind='create_session' AND state='failed'"));
+    try std.testing.expectEqual(@as(i64, 1), try database.scalar("SELECT count(*) FROM effects WHERE kind='start' AND state='withdrawn'"));
+    try std.testing.expect((try owner.claimNext(allocator)) == null);
+    // Explicit mismatched run/session authority cannot overwrite diagnostics.
+    failure.upstream_event = "stale-run";
+    failure.correlation.run = .{ .value = "another-run" };
+    try std.testing.expectError(error.Conflict, owner.observe(allocator, failure));
+    try std.testing.expectEqual(@as(i64, 1), try database.scalar("SELECT count(*) FROM observations WHERE evidence IS NOT NULL"));
+    const second = try owner.command(allocator, .{ .command_id = .{ .value = "second-send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "second run", .selection = a.fakeSelection(workspace) } } });
+    try std.testing.expectEqual(.accepted, second.outcome);
+    const second_open = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, second_open.id, .{ .outcome = .acknowledged });
+    failure.correlation.run = second.entity_ids.run;
+    try std.testing.expectError(error.Conflict, owner.observe(allocator, failure));
+    try owner.observe(allocator, .{ .correlation = .{ .session = second.entity_ids.session.? }, .upstream_event = "disconnected", .body = .{ .disconnect = .{ .reason = "second connection lost", .continuity = .unknown } } });
+    try owner.observe(allocator, .{ .correlation = .{ .session = second.entity_ids.session.? }, .upstream_event = "ambiguous", .body = .{ .ambiguous = .{ .reason = "second run only" } } });
+    const oversized = [_]u8{'x'} ** 4096;
+    try std.testing.expectError(error.Limit, owner.observe(allocator, .{ .correlation = .{ .session = second.entity_ids.session.? }, .upstream_event = "oversized-diagnostic", .body = .{ .ambiguous = .{ .reason = &oversized } } }));
+    try std.testing.expectEqual(@as(i64, 3), try database.scalar("SELECT count(*) FROM observations WHERE evidence IS NOT NULL"));
+    const plan = try database.prepare("EXPLAIN QUERY PLAN SELECT evidence FROM observations WHERE session_id=? AND json_extract(CAST(correlation AS TEXT),'$.run.value')=? AND evidence IS NOT NULL ORDER BY commit_sequence DESC LIMIT 1", &.{ .{ .text = sent.entity_ids.session.?.value }, .{ .text = sent.entity_ids.run.?.value } });
+    {
+        defer plan.deinit();
+        try std.testing.expect(try plan.step());
+        try std.testing.expect(std.mem.indexOf(u8, try plan.bytes(3), "observation_diagnostics") != null);
+    }
+    try database.close();
+    database_live = false;
+    const host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path });
+    defer host.destroy();
+    const ticket = try host.query(.{ .runs = .{ .thread = thread } });
+    const backing = try allocator.alloc(u8, 262144);
+    for (0..2000) |_| {
+        var output: [1]t.Output = undefined;
+        const drained = host.drain(&output, backing);
+        if (drained.output_count == 0) {
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            continue;
+        }
+        try std.testing.expect(output[0] == .query_page);
+        try std.testing.expectEqual(ticket, output[0].query_page.ticket);
+        try std.testing.expectEqual(@as(usize, 2), output[0].query_page.page.items.len);
+        const row = output[0].query_page.page.items[0].run;
+        try std.testing.expectEqual(t.RunState.failed, row.state);
+        try std.testing.expect(std.mem.indexOf(u8, row.diagnostic, "dynamic tool name rejected") != null);
+        try std.testing.expect(std.mem.indexOf(u8, row.diagnostic, "second run only") == null);
+        const second_row = output[0].query_page.page.items[1].run;
+        try std.testing.expect(std.mem.indexOf(u8, second_row.diagnostic, "second run only") != null);
+        return;
+    }
+    return error.HostQueryTimeout;
 }
