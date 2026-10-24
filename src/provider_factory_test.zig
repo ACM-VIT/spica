@@ -341,10 +341,15 @@ test "saved setup restoration owns fields without touching missing account state
     const absent_workspace = try std.fs.path.join(allocator, &.{ root, "workspace-not-created" });
     var provider = [_]u8{ 'o', 'p', 'e', 'n', 'a', 'i' };
     var setup: c.RuntimeSetup = .{ .runtime_kind = .codex, .executable = try fixtureExecutable(allocator), .account_directory = account, .workspace_root = root, .model_provider = &provider };
-    var configured: native.NativeFactory = .{ .configs = &.{} };
+    var session_home = [_:0]u8{ 'H', 'O', 'M', 'E', '=', '/', 'u' };
+    var configured: native.NativeFactory = .{ .configs = &.{}, .codex_environment = &.{ &session_home, "DBUS_SESSION_BUS_ADDRESS=unix:path=/fixture/bus" } };
     const factory = configured.asFactory();
     try factory.runtimeAction(std.testing.allocator, std.testing.io, .{ .restore = setup });
     provider[0] = 'x';
+    session_home[6] = 'x';
+    try std.testing.expectEqualStrings("HOME=/u", configured.configs[0].environment[0]);
+    try std.testing.expectEqualStrings("DBUS_SESSION_BUS_ADDRESS=unix:path=/fixture/bus", configured.configs[0].environment[1]);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "CODEX_HOME={s}", .{account}), configured.configs[0].environment[2]);
     try std.testing.expectEqualStrings("openai", factory.runtimeStatus().configuration.?.model_provider);
     try std.testing.expectEqualStrings(account, factory.runtimeStatus().configuration.?.account_directory);
     try std.testing.expectEqual(@as(usize, 0), factory.models().len);

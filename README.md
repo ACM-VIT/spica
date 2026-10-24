@@ -26,14 +26,18 @@ zig-out/bin/spica
 ```
 
 On first launch, choose **Codex** or **OpenCode**, confirm your existing project
-folder, then **Connect & discover**. Executable and separate managed account
-paths are filled in automatically; **Advanced** lets you change them. Codex
-supports ChatGPT browser/device sign-in in this panel. Sign-in and Refresh apply
+folder, then **Connect & discover**. Codex reuses your existing login from
+`$CODEX_HOME` (normally `~/.codex`); it does not need a second sign-in when that
+account is already authorized. Existing saved account paths are kept exactly;
+**Use existing Codex** switches an old isolated connection to the launch account
+and discovers its models. **Advanced** lets you choose a different account.
+Codex browser/device sign-in is available when the chosen account needs it.
+OpenCode defaults to a separate managed directory. Sign-in and Refresh apply
 the displayed provider/account/workspace fields before proceeding; you can
 start Codex sign-in directly. Pending actions are visibly disabled and failures
 appear inside the setup panel. OpenCode currently needs
 an already authorized account directory selected in Advanced; its sign-in is
-not implemented in Spica. No existing credentials or histories are imported.
+not implemented in Spica. Spica does not copy credentials or import existing histories.
 Choose an actual model beside the composer after discovery, then its effort.
 The app remembers successful connection settings and exact per-thread choices.
 Later launches restore the configured workspace and discover models without
@@ -94,8 +98,10 @@ rejection, run preservation and restart through actual private-desktop input.
 ### Explicit native providers and mixed-runtime children
 
 Codex targets app-server **0.163.0** and supported ChatGPT sign-in; OpenCode
-targets **2.1.4** ACP. Create a disposable absolute workspace and use separate
-managed account directories. No OMP credentials or old histories are imported.
+targets **2.1.4** ACP. Create a disposable absolute workspace; explicit account directories remain supported.
+Codex uses the selected account through its installed app-server, with app-owned
+stdio/process lifetime. It does not take over another client’s running stdio server.
+No credentials are copied and old histories are not imported.
 For OpenCode alone, with an already authorized isolated OpenCode Go account:
 
 ```bash

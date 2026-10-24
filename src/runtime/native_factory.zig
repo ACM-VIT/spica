@@ -21,6 +21,8 @@ pub const NativeFactory = struct {
         }
     };
     configs: []const Config,
+    /// Immutable launch-session allowlist; configurations retain owned copies.
+    codex_environment: []const [:0]const u8 = &.{},
     owned_configs: [2]Config = undefined,
     config_storage: [2][2][65536]u8 = undefined,
     config_generation: [2]u1 = @splat(0),
@@ -254,18 +256,7 @@ pub const NativeFactory = struct {
                 var fixed = std.heap.FixedBufferAllocator.init(&self.config_storage[index][generation]);
                 const retained = fixed.allocator();
                 const codex = setup.runtime_kind == .codex;
-                const environment = try retained.alloc([:0]const u8, if (codex) 7 else 9);
-                environment[0] = try std.fmt.allocPrintSentinel(retained, "HOME={s}", .{account_root}, 0);
-                environment[1] = try std.fmt.allocPrintSentinel(retained, "XDG_DATA_HOME={s}/data", .{account_root}, 0);
-                environment[2] = try std.fmt.allocPrintSentinel(retained, "XDG_CONFIG_HOME={s}/config", .{account_root}, 0);
-                environment[3] = try std.fmt.allocPrintSentinel(retained, "XDG_CACHE_HOME={s}/cache", .{account_root}, 0);
-                environment[4] = try std.fmt.allocPrintSentinel(retained, "XDG_STATE_HOME={s}/state", .{account_root}, 0);
-                environment[5] = if (codex) try std.fmt.allocPrintSentinel(retained, "CODEX_HOME={s}", .{account_root}, 0) else try std.fmt.allocPrintSentinel(retained, "OPENCODE_CONFIG_DIR={s}/config/opencode", .{account_root}, 0);
-                environment[6] = "PATH=/usr/bin:/bin";
-                if (!codex) {
-                    environment[7] = try std.fmt.allocPrintSentinel(retained, "OPENCODE_TEST_HOME={s}", .{account_root}, 0);
-                    environment[8] = "OPENCODE_DISABLE_CLAUDE_CODE=1";
-                }
+                const environment = try @import("environment.zig").build(retained, setup.runtime_kind, account_root, self.codex_environment);
                 self.owned_configs[index] = .{ .selection = .{ .runtime_kind = kind, .required_runtime_version = if (codex) "0.163.0" else "2.1.4", .model_provider = try retained.dupe(u8, setup.model_provider), .model_id = "", .effort = "", .account_ref = try retained.dupe(u8, account_root), .workspace = .{ .value = try retained.dupe(u8, workspace) } }, .executable = try retained.dupeZ(u8, setup.executable), .environment = environment };
                 self.config_generation[index] = generation;
                 self.configs = self.owned_configs[0..@max(self.configs.len, index + 1)];

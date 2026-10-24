@@ -124,6 +124,9 @@ pub const View = struct {
     setup_provider_bounds: [2]c.SDL_FRect = @splat(zero_rect),
     setup_advanced_bounds: c.SDL_FRect = zero_rect,
     setup_login_bounds: c.SDL_FRect = zero_rect,
+    setup_existing_bounds: c.SDL_FRect = zero_rect,
+    setup_existing_account: [512]u8 = undefined,
+    setup_existing_account_len: usize = 0,
     setup_close_bounds: c.SDL_FRect = zero_rect,
     setup_field_bounds: [4]c.SDL_FRect = @splat(zero_rect),
     setup_button_bounds: [4]c.SDL_FRect = @splat(zero_rect),
@@ -181,8 +184,24 @@ pub const View = struct {
         for (defaults, 0..) |configuration, index| {
             if (!self.setup_drafts[index].copy(configuration)) complete = false;
         }
+        self.setup_existing_account_len = self.setup_drafts[0].lengths[1];
+        @memcpy(self.setup_existing_account[0..self.setup_existing_account_len], self.setup_drafts[0].fields[1][0..self.setup_existing_account_len]);
         self.loadSetupDraft();
         return complete;
+    }
+
+    pub fn existingCodexEnabled(self: *const View) bool {
+        return self.setup_runtime == .codex and self.setup_existing_account_len != 0 and self.setupActionEnabled(0);
+    }
+
+    /// Explicitly choose the launch Codex home; saved/custom drafts never migrate
+    /// implicitly. Configure/discovery uses the ordinary Host command path.
+    pub fn useExistingCodex(self: *View) void {
+        if (!self.existingCodexEnabled()) return;
+        const len = self.setup_existing_account_len;
+        @memcpy(self.setup_fields[1][0..len], self.setup_existing_account[0..len]);
+        self.setup_lengths[1] = len;
+        self.setup_action = .configure;
     }
 
     /// Display the exact saved configuration, retaining the other provider's
@@ -687,6 +706,7 @@ pub const View = struct {
                         for (self.setup_provider_bounds, 0..) |box, index| if (widgets.contains(box, x, y)) {
                             self.selectSetupProvider(if (index == 0) .codex else .opencode);
                         };
+                        if (widgets.contains(self.setup_existing_bounds, x, y)) self.useExistingCodex();
                         if (widgets.contains(self.setup_advanced_bounds, x, y)) self.toggleSetupAdvanced();
                         if (self.setup_runtime == .codex and self.login_url_len != 0 and widgets.contains(self.setup_login_bounds, x, y)) self.setup_action = .open_login;
                         for (self.setup_field_bounds, 0..) |box, index| if (widgets.contains(box, x, y)) {
@@ -1569,6 +1589,11 @@ pub const View = struct {
         // the other provider's actual painted choice, never the gap between.
         self.setup_runtime_bounds = geometry.providers[1 - self.setupIndex()];
         self.setup_advanced_bounds = geometry.advanced;
+        self.setup_existing_bounds = zero_rect;
+        if (self.setup_runtime == .codex and self.setup_existing_account_len != 0) {
+            self.setup_advanced_bounds.w = (geometry.advanced.w - 8) / 2;
+            self.setup_existing_bounds = .{ .x = self.setup_advanced_bounds.x + self.setup_advanced_bounds.w + 8, .y = geometry.advanced.y, .w = self.setup_advanced_bounds.w, .h = geometry.advanced.h };
+        }
         self.setup_field_bounds = geometry.fields;
         self.setup_button_bounds = geometry.buttons;
         self.setup_login_bounds = zero_rect;
@@ -1583,13 +1608,17 @@ pub const View = struct {
             const selected = self.setupIndex() == index;
             try widgets.panel(renderer, box, @min(self.design.layout.radius, 6), if (selected) self.design.colors.selection else self.design.colors.surface);
             try self.labels.draw(text, if (index == 0) "Codex" else "OpenCode", box.x + 12, box.y + 6, 13, foreground);
-            try self.labels.draw(text, if (index == 0) "ChatGPT sign-in  ·  Alt+1" else "Preauthorized account  ·  Alt+2", box.x + 12, box.y + 23, 10, if (selected) foreground else muted);
+            try self.labels.draw(text, if (index == 0) "Existing Codex login  ·  Alt+1" else "Preauthorized account  ·  Alt+2", box.x + 12, box.y + 23, 10, if (selected) foreground else muted);
         }
         try self.labels.draw(text, "Workspace · existing project folder", menu.x + 16, menu.y + 104, 11, muted);
         try self.drawSetupField(renderer, text, 2, foreground, muted);
         try widgets.panel(renderer, self.setup_advanced_bounds, @min(self.design.layout.radius, 4), self.design.colors.surface);
         try icon(renderer, .chevron, self.setup_advanced_bounds.x + 8, self.setup_advanced_bounds.y + 6, muted);
-        try self.labels.draw(text, if (self.setup_advanced_open) "Hide Advanced · Alt+A" else "Advanced · executable, account, model provider · Alt+A", self.setup_advanced_bounds.x + 30, self.setup_advanced_bounds.y + 7, 11, muted);
+        try self.labels.drawFitted(renderer, text, if (self.setup_advanced_open) "Hide Advanced · Alt+A" else "Advanced · Alt+A", self.setup_advanced_bounds.x + 30, self.setup_advanced_bounds.y + 7, self.setup_advanced_bounds.w - 36, 11, muted);
+        if (self.setup_existing_bounds.w != 0) {
+            try widgets.panel(renderer, self.setup_existing_bounds, @min(self.design.layout.radius, 4), self.design.colors.surface);
+            try self.labels.drawFitted(renderer, text, "Use existing Codex", self.setup_existing_bounds.x + 12, self.setup_existing_bounds.y + 7, self.setup_existing_bounds.w - 24, 11, if (self.existingCodexEnabled()) foreground else muted);
+        }
         if (self.setup_advanced_open) {
             const names = [_][]const u8{ "Executable", "Account folder", "Model provider" };
             for ([_]usize{ 0, 1, 3 }, names) |index, name| {
@@ -1615,7 +1644,7 @@ pub const View = struct {
             }
         } else {
             const guidance = if (self.setup_runtime == .codex)
-                "Connect finds models. Sign-in and Refresh also apply the settings shown above."
+                "Connect reuses the selected Codex login. Sign in only if it has expired or is missing."
             else
                 "OpenCode sign-in is not supported here. Select a preauthorized account in Advanced.";
             try self.labels.drawFitted(renderer, text, guidance, menu.x + 16, geometry.guidance_y, menu.w - 32, 11, muted);
@@ -3021,4 +3050,28 @@ test "primary circle and glyph preserve disabled opacity enabled accent and dest
             }
         }
     }
+}
+
+test "existing Codex is an explicit owned choice preserving saved custom paths and workspace" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try std.testing.expect(view.setSetupDefaults(setup_fixture_defaults));
+    var saved = setup_fixture_defaults[0];
+    saved.account_directory = "/separate/saved-account";
+    saved.workspace_root = "/chosen/workspace";
+    try std.testing.expect(view.configureSetup(saved));
+    try std.testing.expectEqualStrings(saved.account_directory, view.setup_fields[1][0..view.setup_lengths[1]]);
+    view.setup_busy = true;
+    view.useExistingCodex();
+    try std.testing.expect(view.setup_action == null);
+    try std.testing.expectEqualStrings(saved.account_directory, view.setup_fields[1][0..view.setup_lengths[1]]);
+    view.setup_busy = false;
+    view.useExistingCodex();
+    try std.testing.expectEqual(.configure, view.setup_action.?);
+    try std.testing.expectEqualStrings(setup_fixture_defaults[0].account_directory, view.setup_fields[1][0..view.setup_lengths[1]]);
+    try std.testing.expectEqualStrings(saved.workspace_root, view.setup_fields[2][0..view.setup_lengths[2]]);
+    view.setup_action = null;
+    view.setup_runtime = .opencode;
+    view.useExistingCodex();
+    try std.testing.expect(view.setup_action == null);
 }

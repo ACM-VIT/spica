@@ -68,6 +68,7 @@ pub const Snapshot = struct {
     setup_provider_targets: [2]Target = @splat(.{ .enabled = false }),
     setup_field_targets: [4]Target = @splat(.{ .enabled = false }),
     setup_advanced_target: Target = .{ .enabled = false },
+    setup_existing_target: Target = .{ .enabled = false },
     setup_login_target: Target = .{ .enabled = false },
     setup_fields: [4][]const u8 = @splat(""),
     setup_targets: [4]Target = @splat(.{ .enabled = false }),

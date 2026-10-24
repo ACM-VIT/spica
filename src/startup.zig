@@ -4,13 +4,22 @@ const c = @import("contract.zig");
 
 /// Strings belong to allocator and must outlive App/Host. Only executable
 /// metadata and the actual cwd are inspected; account directories stay untouched.
-pub fn defaults(allocator: std.mem.Allocator, io: std.Io, state_directory: []const u8, path: ?[]const u8, home: ?[]const u8) ![2]c.RuntimeSetup {
+pub fn defaults(allocator: std.mem.Allocator, io: std.Io, state_directory: []const u8, path: ?[]const u8, home: ?[]const u8, codex_home: ?[]const u8) ![2]c.RuntimeSetup {
     if (!std.fs.path.isAbsolute(state_directory)) return error.AbsoluteStateDirectoryRequired;
     const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
     return .{
-        .{ .runtime_kind = .codex, .executable = try executable(allocator, io, .codex, path, home), .account_directory = try std.fs.path.join(allocator, &.{ state_directory, "accounts", "codex" }), .workspace_root = workspace, .model_provider = "openai" },
+        .{ .runtime_kind = .codex, .executable = try executable(allocator, io, .codex, path, home), .account_directory = try codexAccount(allocator, state_directory, home, codex_home), .workspace_root = workspace, .model_provider = "openai" },
         .{ .runtime_kind = .opencode, .executable = try executable(allocator, io, .opencode, path, home), .account_directory = try std.fs.path.join(allocator, &.{ state_directory, "accounts", "opencode" }), .workspace_root = workspace, .model_provider = "opencode" },
     };
+}
+
+/// Resolve path syntax only; never create/read an account or inspect its auth.
+/// Empty CODEX_HOME follows Codex's normal HOME fallback. Relative overrides
+/// are made absolute against the launch cwd before crossing the Host boundary.
+pub fn codexAccount(a: std.mem.Allocator, state: []const u8, home: ?[]const u8, override: ?[]const u8) ![]const u8 {
+    if (override) |value| if (value.len != 0) return std.fs.path.resolve(a, &.{value});
+    if (home) |value| if (std.fs.path.isAbsolute(value)) return std.fs.path.resolve(a, &.{ value, ".codex" });
+    return std.fs.path.join(a, &.{ state, "accounts", "codex" });
 }
 
 fn installed(io: std.Io, candidate: []const u8) !bool {
@@ -53,7 +62,7 @@ test "startup defaults preserve canonical cwd and separate managed Unicode accou
     const allocator = arena.allocator();
     const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     const state = try std.fs.path.join(allocator, &.{ root, "独立 state" });
-    const setups = try defaults(allocator, std.testing.io, state, "", null);
+    const setups = try defaults(allocator, std.testing.io, state, "", null, null);
     try std.testing.expectEqual(.codex, setups[0].runtime_kind);
     try std.testing.expectEqual(.opencode, setups[1].runtime_kind);
     try std.testing.expectEqualStrings(try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator), setups[0].workspace_root);
@@ -61,7 +70,7 @@ test "startup defaults preserve canonical cwd and separate managed Unicode accou
     try std.testing.expectEqualStrings(try std.fs.path.join(allocator, &.{ state, "accounts", "codex" }), setups[0].account_directory);
     try std.testing.expect(!std.mem.eql(u8, setups[0].account_directory, setups[1].account_directory));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(std.testing.io, state, .{}));
-    try std.testing.expectError(error.AbsoluteStateDirectoryRequired, defaults(allocator, std.testing.io, "relative", null, null));
+    try std.testing.expectError(error.AbsoluteStateDirectoryRequired, defaults(allocator, std.testing.io, "relative", null, null, null));
 }
 
 test "executable discovery prefers usable PATH files and recognizes OpenCode home installation" {
@@ -84,4 +93,17 @@ test "executable discovery prefers usable PATH files and recognizes OpenCode hom
     try std.testing.expectEqualStrings(try temporary.dir.realPathFileAlloc(io, "路径 bin/opencode", allocator), try executable(allocator, io, .opencode, path, root));
     try std.testing.expectEqualStrings(try temporary.dir.realPathFileAlloc(io, ".opencode/bin/opencode", allocator), try executable(allocator, io, .opencode, "/no/such/bin", root));
     try std.testing.expectEqualStrings("/usr/bin/codex", try executable(allocator, io, .codex, "/no/such/bin", "/no/such/home"));
+}
+
+test "Codex auth home precedence resolves Unicode overrides without reading or creating accounts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("/custom/账号", try codexAccount(a, "/state", "/user", "/custom/账号"));
+    try std.testing.expectEqualStrings("/user/.codex", try codexAccount(a, "/state", "/user", ""));
+    try std.testing.expectEqualStrings("/state/accounts/codex", try codexAccount(a, "/state", "relative", null));
+    try std.testing.expectEqualStrings(try std.fs.path.resolve(a, &.{"relative/账号"}), try codexAccount(a, "/state", "/user", "relative/账号"));
+    const setups = try defaults(a, std.testing.io, "/state", "", "/user", "/custom/账号");
+    try std.testing.expectEqualStrings("/custom/账号", setups[0].account_directory);
+    try std.testing.expectEqualStrings("/state/accounts/opencode", setups[1].account_directory);
 }

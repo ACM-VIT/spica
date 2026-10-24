@@ -9,6 +9,7 @@ const contract = @import("contract.zig");
 const common = @import("runtime/adapter.zig");
 const transport = @import("runtime/transport.zig");
 const Codex = @import("runtime/codex.zig");
+const child_environment = @import("runtime/environment.zig");
 const NativeFactory = @import("runtime/native_factory.zig").NativeFactory;
 
 /// Final-address storage outlives the Host worker that exclusively owns IO.
@@ -17,27 +18,28 @@ const NativeProvider = struct {
     workspace_root: ?[]const u8 = null,
     factory: ?NativeFactory = null,
     configs: [2]NativeFactory.Config = undefined,
+    codex_environment: []const [:0]const u8 = &.{},
 
     fn init(self: *NativeProvider, a: std.mem.Allocator, io: std.Io, options: options_module.Options) !void {
         if (options.provider == .fake) {
-            self.factory = .{ .configs = &.{} };
+            self.factory = .{ .configs = &.{}, .codex_environment = self.codex_environment };
             return;
         }
         const workspace_dir = try std.Io.Dir.cwd().openDir(io, options.workspace.?, .{});
         defer workspace_dir.close(io);
         const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, options.workspace.?, a);
         self.workspace_root = workspace;
-        self.configs[0] = try accountConfig(a, io, .{ .runtime_kind = @tagName(options.provider), .required_runtime_version = if (options.provider == .codex) "0.163.0" else "2.1.4", .model_provider = options.model_provider.?, .model_id = options.model orelse "", .effort = options.effort orelse "", .account_ref = options.runtime_account_directory.?, .workspace = .{ .value = workspace } }, options.runtime_executable);
+        self.configs[0] = try accountConfig(a, io, self.codex_environment, .{ .runtime_kind = @tagName(options.provider), .required_runtime_version = if (options.provider == .codex) "0.163.0" else "2.1.4", .model_provider = options.model_provider.?, .model_id = options.model orelse "", .effort = options.effort orelse "", .account_ref = options.runtime_account_directory.?, .workspace = .{ .value = workspace } }, options.runtime_executable);
         self.selection = self.configs[0].selection;
         var count: usize = 1;
         if (options.additional_provider) |kind| {
-            self.configs[1] = try accountConfig(a, io, .{ .runtime_kind = @tagName(kind), .required_runtime_version = if (kind == .codex) "0.163.0" else "2.1.4", .model_provider = options.additional_model_provider.?, .model_id = "", .effort = "", .account_ref = options.additional_runtime_account_directory.?, .workspace = .{ .value = workspace } }, options.additional_runtime_executable);
+            self.configs[1] = try accountConfig(a, io, self.codex_environment, .{ .runtime_kind = @tagName(kind), .required_runtime_version = if (kind == .codex) "0.163.0" else "2.1.4", .model_provider = options.additional_model_provider.?, .model_id = "", .effort = "", .account_ref = options.additional_runtime_account_directory.?, .workspace = .{ .value = workspace } }, options.additional_runtime_executable);
             if (std.mem.eql(u8, self.configs[0].selection.account_ref, self.configs[1].selection.account_ref)) return error.SeparateRuntimeAccountsRequired;
             count = 2;
         }
-        self.factory = .{ .configs = self.configs[0..count], .status = .{ .runtime_kind = @tagName(options.provider), .workspace_root = workspace, .configuration = self.configs[0].setup(), .reason = "Explicit startup configuration; refresh native picker for actual catalog/account readiness." } };
+        self.factory = .{ .configs = self.configs[0..count], .codex_environment = self.codex_environment, .status = .{ .runtime_kind = @tagName(options.provider), .workspace_root = workspace, .configuration = self.configs[0].setup(), .reason = "Explicit startup configuration; refresh native picker for actual catalog/account readiness." } };
     }
-    fn accountConfig(a: std.mem.Allocator, io: std.Io, input: contract.Selection, executable_override: ?[]const u8) !NativeFactory.Config {
+    fn accountConfig(a: std.mem.Allocator, io: std.Io, session: []const [:0]const u8, input: contract.Selection, executable_override: ?[]const u8) !NativeFactory.Config {
         // Only the selected tool's explicit managed state, never another tool's auth.
         try std.Io.Dir.cwd().createDirPath(io, input.account_ref);
         const account = try std.Io.Dir.cwd().realPathFileAlloc(io, input.account_ref, a);
@@ -45,20 +47,7 @@ const NativeProvider = struct {
         var selected = input;
         selected.account_ref = account;
         const codex = std.mem.eql(u8, input.runtime_kind, "codex");
-        const environment = try a.alloc([:0]const u8, if (codex) 7 else 9);
-        environment[0] = try std.fmt.allocPrintSentinel(a, "HOME={s}", .{account}, 0);
-        environment[1] = try std.fmt.allocPrintSentinel(a, "XDG_DATA_HOME={s}/data", .{account}, 0);
-        environment[2] = try std.fmt.allocPrintSentinel(a, "XDG_CONFIG_HOME={s}/config", .{account}, 0);
-        environment[3] = try std.fmt.allocPrintSentinel(a, "XDG_CACHE_HOME={s}/cache", .{account}, 0);
-        environment[4] = try std.fmt.allocPrintSentinel(a, "XDG_STATE_HOME={s}/state", .{account}, 0);
-        environment[5] = if (codex) try std.fmt.allocPrintSentinel(a, "CODEX_HOME={s}", .{account}, 0) else try std.fmt.allocPrintSentinel(a, "OPENCODE_CONFIG_DIR={s}/config/opencode", .{account}, 0);
-        environment[6] = "PATH=/usr/bin:/bin";
-        if (!codex) {
-            // Pinned OpenCode 2.1.4 resolves its global home through this explicit
-            // override, not HOME. Keep discovery inside the authorized account.
-            environment[7] = try std.fmt.allocPrintSentinel(a, "OPENCODE_TEST_HOME={s}", .{account}, 0);
-            environment[8] = "OPENCODE_DISABLE_CLAUDE_CODE=1";
-        }
+        const environment = try child_environment.build(a, if (codex) .codex else .opencode, account, session);
         return .{ .selection = selected, .executable = try a.dupeZ(u8, executable_override orelse if (codex) "/usr/bin/codex" else "/usr/bin/opencode"), .environment = environment };
     }
     fn authenticate(self: *NativeProvider, a: std.mem.Allocator, io: std.Io, mode: @FieldType(options_module.Options, "codex_auth")) !void {
@@ -138,7 +127,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return;
     }
     const provider = try arena.allocator().create(NativeProvider);
-    provider.* = .{};
+    provider.* = .{ .codex_environment = try child_environment.capture(arena.allocator(), init.environ) };
     try provider.init(arena.allocator(), threaded.io(), options);
     if (options.codex_auth != .none) {
         try provider.authenticate(std.heap.page_allocator, threaded.io(), options.codex_auth);
@@ -177,7 +166,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try dir.deleteFile(threaded.io(), ".ui-projection");
         try app.connect(threaded.io(), host.?, spool, &wake, if (provider.selection) |selection| selection.workspace.value else workspace_buffer[0..workspace_length]);
         if (!options.provider_explicit) {
-            const setup_defaults = try @import("startup.zig").defaults(arena.allocator(), threaded.io(), workspace_buffer[0..workspace_length], init.environ.getPosix("PATH"), init.environ.getPosix("HOME"));
+            const setup_defaults = try @import("startup.zig").defaults(arena.allocator(), threaded.io(), workspace_buffer[0..workspace_length], init.environ.getPosix("PATH"), init.environ.getPosix("HOME"), init.environ.getPosix("CODEX_HOME"));
             try app.configureStartup(setup_defaults);
         } else if (provider.selection) |selection| try app.configureRuntime(selection, provider.configs[0].executable);
     }

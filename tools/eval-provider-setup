@@ -44,7 +44,7 @@ def main():
         if not (Path.home() / '.local/bin/virtual_pointer.c').exists() and packaged.exists():
             flags = m.run('pkg-config', '--cflags', '--libs', 'wayland-client').split()
             m.run('gcc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', str(packaged), '-o', str(pointer), *flags)
-        argv = ['env', 'XDG_DATA_HOME=' + str(output / 'data'), 'HOME=' + str(home), str(binary),
+        argv = ['env', 'XDG_DATA_HOME=' + str(output / 'data'), 'HOME=' + str(home), 'CODEX_HOME=' + str(home / '.codex'), str(binary),
                 '--automation-live', str(output / 'live.json'), '--automation-output', str(output / 'final.json'),
                 '--metrics-output', str(output / 'metrics.json')]
         manifest['app_argv'] = argv
@@ -75,7 +75,7 @@ def main():
                 snapshot = observe(lambda s: next(t for t in s['setup_targets'] if t['id'] == name)['enabled'], 'action-ready-' + name.replace('.', '-'))
             targets = [item for group in ('targets', 'setup_targets', 'setup_provider_targets', 'setup_field_targets', 'thread_targets', 'sidebar_targets')
                        for item in snapshot.get(group, [])]
-            targets += [snapshot['setup_advanced_target'], snapshot['setup_login_target']]
+            targets += [snapshot['setup_advanced_target'], snapshot['setup_login_target'], snapshot['setup_existing_target']]
             target = next(item for item in targets if item['id'] == name)
             if not target['enabled'] or not target['pointer_bounds']:
                 raise RuntimeError('Unavailable painted target ' + name)
@@ -169,8 +169,7 @@ def main():
         current = observe(lambda s: s['setup_open'], 'restore-first-account')
         click(current, 'runtime.advanced')
         current = observe(lambda s: s['setup_field_targets'][1]['enabled'], 'first-account-advanced')
-        current = edit(current, 'runtime.account', codex_fields[1])
-        click(current, 'runtime.configure')
+        click(current, 'runtime.existing_codex')
         current = observe(lambda s: not s['setup_open'] and s['model_count'] == 1 and not s['pending_command'], 'first-account-restored')
         click(current, 'runtime.setup')
         current = observe(lambda s: s['setup_open'], 'connection-before-opencode')

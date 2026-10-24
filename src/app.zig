@@ -491,6 +491,7 @@ pub const App = struct {
         for (self.view.setup_provider_bounds, 0..) |bounds, index| self.snapshot.setup_provider_targets[index] = setupTarget(if (index == 0) "runtime.codex" else "runtime.opencode", "button", bounds, self.view.setup_open);
         for (self.view.setup_field_bounds, 0..) |bounds, index| self.snapshot.setup_field_targets[index] = setupTarget(([_][]const u8{ "runtime.executable", "runtime.account", "runtime.workspace", "runtime.model_provider" })[index], "textbox", bounds, self.view.setup_open);
         self.snapshot.setup_advanced_target = setupTarget("runtime.advanced", "button", self.view.setup_advanced_bounds, self.view.setup_open);
+        self.snapshot.setup_existing_target = setupTarget("runtime.existing_codex", "button", self.view.setup_existing_bounds, self.view.setup_open and self.view.existingCodexEnabled());
         self.snapshot.setup_login_target = setupTarget("runtime.open_login", "button", self.view.setup_login_bounds, self.view.setup_open and self.view.login_url_len != 0);
         const setup_ids = [_][]const u8{ "runtime.configure", "runtime.browser", "runtime.device", "runtime.refresh" };
         for (self.view.setup_button_bounds, 0..) |bounds, index| {
