@@ -216,6 +216,7 @@ def main():
     parser.add_argument('--binary-sha256')
     parser.add_argument('--source-sha256')
     parser.add_argument('--optimize', choices=('Debug', 'ReleaseSafe'), default='ReleaseSafe')
+    parser.add_argument('--normal-startup', action='store_true', help='Exercise flag-free setup for smoke/measurement instead of the explicit fake fixture')
     parser.add_argument('--default-state', action='store_true', help='Exercise native default with isolated XDG_DATA_HOME, never user history')
     parser.add_argument('--warmup', type=float, default=10)
     parser.add_argument('--phase-seconds', type=float, default=15)
@@ -228,6 +229,8 @@ def main():
         parser.error('finite positive durations and cycles 1..100 required')
     if args.binary and not (args.binary_sha256 and args.source_sha256):
         parser.error('frozen binary requires both fingerprints')
+    if args.normal_startup and args.mode not in ('smoke', 'measure'):
+        parser.error('normal startup is available only for smoke/measurement; input scenarios require explicit fake')
     if args.lua_module and args.mode in ('custom', 'presentation'):
         parser.error('custom/presentation scenarios supply their own module')
     output = args.output.resolve()
@@ -262,7 +265,7 @@ def main():
         record = json.loads((Path(session) / 'session.json').read_text())
         manifest['private_desktop'] = record
         duration = args.warmup + args.phase_seconds * (1 + 2 * args.cycles)
-        argv = [str(binary), '--quit-after-ms', str(math.ceil((duration + 60) * 1000)),
+        argv = [str(binary), *([] if args.normal_startup else ['--provider', 'fake']), '--quit-after-ms', str(math.ceil((duration + 60) * 1000)),
                 '--automation-output', str(output / 'automation.json')]
         if args.default_state:
             argv = ['env', 'XDG_DATA_HOME=' + str(output / 'xdg-data'), *argv]

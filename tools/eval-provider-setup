@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Actual private-desktop, flag-free provider setup/restart regression (offline)."""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+import shutil
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+loader = importlib.machinery.SourceFileLoader('starter', str(ROOT / 'tools/eval-starter'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--binary', type=Path, default=ROOT / 'zig-out/bin/spica')
+    parser.add_argument('--opencode-account', type=Path, help='Explicit authorized isolated OpenCode Go account for optional installed metadata-only UI gate')
+    args = parser.parse_args()
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    binary = args.binary.resolve()
+    workspace = Path(tempfile.mkdtemp(prefix='spica-setup-project-'))
+    home = output / 'home'
+    home.mkdir()
+    manifest = dict(revision=m.run('git', 'rev-parse', 'HEAD'), source_sha256=m.source_fingerprint(),
+                    binary_sha256=m.sha(binary), binary=str(binary), passed=False, commands=m.COMMANDS,
+                    workspace=str(workspace), limitations=['Offline protocol fixtures; no external authentication, entitlement or inference claim.',
+                    'Only ordinary vd pointer/keyboard input; read-only native snapshots.', 'No physical input-to-photon timing.'])
+    session = None
+    try:
+        session = m.run('vd', 'start', '--width', '1280', '--height', '800')
+        record = json.loads((Path(session) / 'session.json').read_text())
+        manifest['private_desktop'] = record
+        # The installed vd can omit this helper. Use the skill's packaged source.
+        pointer = Path(session) / 'native-pointer'
+        packaged = Path.home() / '.codex/skills/virtual-desktop/scripts/virtual_pointer.c'
+        if not (Path.home() / '.local/bin/virtual_pointer.c').exists() and packaged.exists():
+            flags = m.run('pkg-config', '--cflags', '--libs', 'wayland-client').split()
+            m.run('gcc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', str(packaged), '-o', str(pointer), *flags)
+        argv = ['env', 'XDG_DATA_HOME=' + str(output / 'data'), 'HOME=' + str(home), str(binary),
+                '--automation-live', str(output / 'live.json'), '--automation-output', str(output / 'final.json'),
+                '--metrics-output', str(output / 'metrics.json')]
+        manifest['app_argv'] = argv
+        def launch():
+            (output / 'live.json').unlink(missing_ok=True)
+            m.run('vd', 'run', session, '--bg', '--log', str(output / 'app.log'), '--', *argv)
+            windows = m.wait_windows(session, True)
+            return windows.splitlines()[0].split()[0]
+        window = launch()
+        def ipc(value):
+            result = json.loads(m.run('swaymsg', '--socket', record['environment']['SWAYSOCK'], '--raw', value))
+            if not all(item.get('success') for item in result):
+                raise RuntimeError(result)
+        def observe(predicate, label, seconds=20):
+            end = time.monotonic() + seconds
+            while time.monotonic() < end:
+                snapshot = m.read_export(output / 'live.json', end)
+                if predicate(snapshot):
+                    (output / (label + '.json')).write_text(json.dumps(snapshot, indent=2))
+                    return snapshot
+                time.sleep(.05)
+            raise RuntimeError('Native app did not reach ' + label)
+        def key(value):
+            ipc(f'[con_id={window}] focus')
+            m.run(*m.key_command(session, window, value))
+        def click(snapshot, name):
+            targets = [item for group in ('targets', 'setup_targets', 'setup_provider_targets', 'setup_field_targets')
+                       for item in snapshot.get(group, [])]
+            targets += [snapshot['setup_advanced_target'], snapshot['setup_login_target']]
+            target = next(item for item in targets if item['id'] == name)
+            if not target['enabled'] or not target['pointer_bounds']:
+                raise RuntimeError('Unavailable painted target ' + name)
+            tree = json.loads(m.run('swaymsg', '--socket', record['environment']['SWAYSOCK'], '--raw', '-t', 'get_tree'))
+            def find(node):
+                if str(node.get('id')) == window:
+                    return node
+                return next((found for child in node.get('nodes', []) + node.get('floating_nodes', []) if (found := find(child))), None)
+            rect = find(tree)['rect']
+            x, y, width, height = target['pointer_bounds']
+            m.run('vd', 'click', session, window, str(rect['x'] + x + width // 2), str(rect['y'] + y + height // 2))
+        def edit(snapshot, name, text):
+            click(snapshot, name)
+            key('ctrl+a')
+            m.run('vd', 'text', session, window, text)
+            return observe(lambda s: text in s['setup_fields'], 'edited-' + name.replace('.', '-'))
+        def shot(name):
+            m.run('vd', 'shot', session, str(output / (name + '.png')))
+        ipc(f'[con_id={window}] floating enable')
+        ipc(f'[con_id={window}] resize set width 1100 px height 740 px')
+        current = observe(lambda s: s['setup_open'] and not s['thread_id'], 'fresh')
+        assert not current['send_ready'] and current['model_count'] == 0 and not current['selected_runtime']
+        codex_fields = current['setup_fields']
+        shot('fresh')
+        click(current, 'runtime.opencode')
+        current = observe(lambda s: s['setup_runtime'] == 'opencode', 'opencode-defaults')
+        assert current['setup_fields'][0] != codex_fields[0] and current['setup_fields'][1] != codex_fields[1]
+        current = edit(current, 'runtime.workspace', str(workspace))
+        click(current, 'runtime.codex')
+        current = observe(lambda s: s['setup_runtime'] == 'codex', 'codex-defaults-retained')
+        assert current['setup_fields'] == codex_fields
+        click(current, 'runtime.opencode')
+        current = observe(lambda s: s['setup_runtime'] == 'opencode' and s['setup_fields'][2] == str(workspace), 'opencode-draft-retained')
+        click(current, 'runtime.codex')
+        current = observe(lambda s: s['setup_runtime'] == 'codex', 'configure-codex')
+        current = edit(current, 'runtime.workspace', str(workspace))
+        click(current, 'runtime.advanced')
+        current = observe(lambda s: s['setup_field_targets'][0]['enabled'], 'advanced')
+        ipc(f'[con_id={window}] resize set width 720 px height 480 px')
+        current = observe(lambda s: s['logical_width'] == 720 and s['logical_height'] == 480, 'advanced720')
+        shot('advanced720')
+        current = edit(current, 'runtime.executable', '/missing/spica-provider')
+        click(current, 'runtime.configure')
+        current = observe(lambda s: not s['pending_command'] and 'unavailable' in s['runtime_info'], 'disconnected')
+        assert not current['send_ready'] and current['setup_open']
+        shot('disconnected')
+        click(current, 'runtime.advanced')
+        current = observe(lambda s: s['setup_field_targets'][0]['enabled'], 'repair-advanced')
+        current = edit(current, 'runtime.executable', str(ROOT / 'build/provider_setup_fixture.py'))
+        click(current, 'runtime.configure')
+        current = observe(lambda s: s['model_count'] == 1 and 'requires ChatGPT sign-in' in s['runtime_info'], 'signin-required')
+        click(current, 'runtime.device')
+        current = observe(lambda s: s['login_pending'] and s['login_code'] == 'TEST-1234', 'device-code')
+        assert current['login_url'] == 'https://example.invalid/spica-fixture'
+        shot('device-code')
+        current = observe(lambda s: not s['login_pending'] and not s['setup_open'] and s['model_count'] == 1, 'signed-in-discovered')
+        click(current, 'models.picker')
+        current = observe(lambda s: s['picker_open'], 'picker')
+        key('Return')
+        current = observe(lambda s: s['selected_model'] == 'setup-codex' and s['send_ready'], 'selected-codex')
+        m.run('vd', 'text', session, window, 'Verify café 世界 setup')
+        current = observe(lambda s: s['draft'] == 'Verify café 世界 setup', 'typed')
+        key('Return')
+        current = observe(lambda s: s['run_status'] == 'completed' and any('Offline setup worked' in t for t in s['transcript']), 'completed')
+        shot('completed')
+        thread = current['thread_id']
+        key('ctrl+q')
+        m.wait_windows(session, False)
+        shutil.copyfile(output / 'metrics.json', output / 'first-metrics.json')
+        window = launch()
+        current = observe(lambda s: s['send_ready'] and s['thread_id'] == thread, 'reopened-codex')
+        assert current['workspace_root'] == str(workspace) and current['selected_model'] == 'setup-codex'
+        assert not current['notice'], 'Successful reopen must not retain stale startup recovery feedback'
+        assert current['selected_effort'] == 'low' and current['selected_runtime'] == 'codex'
+        shot('reopened-codex')
+        click(current, 'runtime.setup')
+        current = observe(lambda s: s['setup_open'], 'connection-reopened')
+        click(current, 'runtime.opencode')
+        current = observe(lambda s: s['setup_runtime'] == 'opencode', 'switch-opencode')
+        # The new process seeds only defaults for inactive runtime drafts.
+        current = edit(current, 'runtime.workspace', str(workspace))
+        click(current, 'runtime.advanced')
+        current = observe(lambda s: s['setup_field_targets'][0]['enabled'], 'opencode-advanced')
+        current = edit(current, 'runtime.executable', str(ROOT / 'build/provider_setup_fixture.py'))
+        click(current, 'runtime.configure')
+        current = observe(lambda s: not s['setup_open'] and s['model_count'] >= 1 and not s['pending_command'], 'opencode-discovered')
+        click(current, 'models.picker')
+        current = observe(lambda s: s['picker_open'], 'opencode-picker')
+        # Active-first catalog order is a runtime contract; choose its first row.
+        key('Return')
+        current = observe(lambda s: s['selected_runtime'] == 'opencode' and s['send_ready'], 'selected-opencode')
+        thread = current['thread_id']
+        shot('selected-opencode')
+        key('ctrl+q')
+        m.wait_windows(session, False)
+        window = launch()
+        current = observe(lambda s: s['send_ready'] and s['thread_id'] == thread and s['selected_runtime'] == 'opencode', 'reopened-opencode')
+        assert current['selected_model'] == 'setup-opencode' and current['selected_effort'] == 'default'
+        assert current['workspace_root'] == str(workspace)
+        shot('reopened-opencode')
+        click(current, 'runtime.setup')
+        current = observe(lambda s: s['setup_open'], 'both-settings-reopened')
+        click(current, 'runtime.codex')
+        current = observe(lambda s: s['setup_runtime'] == 'codex', 'inactive-codex-restored')
+        assert current['setup_fields'][0] == str(ROOT / 'build/provider_setup_fixture.py')
+        assert current['setup_fields'][1] == codex_fields[1]
+        assert current['setup_fields'][2] == str(workspace)
+        if args.opencode_account:
+            # Explicit caller-supplied account only. The evaluator does not
+            # inspect credentials, copy/import them, or send a live prompt.
+            click(current, 'runtime.opencode')
+            current = observe(lambda s: s['setup_runtime'] == 'opencode', 'installed-opencode')
+            click(current, 'runtime.advanced')
+            current = observe(lambda s: s['setup_field_targets'][0]['enabled'], 'installed-advanced')
+            installed = shutil.which('opencode') or str(Path.home() / '.opencode/bin/opencode')
+            current = edit(current, 'runtime.executable', installed)
+            current = edit(current, 'runtime.account', str(args.opencode_account.resolve()))
+            current = edit(current, 'runtime.model_provider', 'opencode-go')
+            click(current, 'runtime.configure')
+            current = observe(lambda s: not s['setup_open'] and s['model_count'] > 2 and not s['pending_command'], 'installed-catalog', seconds=60)
+            assert current['workspace_root'] == str(workspace)
+            click(current, 'models.picker')
+            current = observe(lambda s: s['picker_open'], 'installed-picker')
+            shot('installed-picker')
+            manifest['installed_opencode'] = dict(executable=installed, model_count=current['model_count'],
+                account_directory=str(args.opencode_account.resolve()), inference=False, credentials_read_by_evaluator=False)
+            key('Escape')
+        key('ctrl+q')
+        m.wait_windows(session, False)
+        if m.source_fingerprint() != manifest['source_sha256'] or m.sha(binary) != manifest['binary_sha256']:
+            raise RuntimeError('Candidate changed during native check')
+        manifest['passed'] = True
+    except Exception as error:
+        manifest['error'] = repr(error)
+        raise
+    finally:
+        if session:
+            m.run('vd', 'clean', session)
+        (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    print(output / 'manifest.json')
+
+
+if __name__ == '__main__':
+    main()

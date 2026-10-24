@@ -104,3 +104,28 @@ Tree RSS sums double-count shared mappings/pages. PSS sums proportional residenc
 ## Later acceptance
 
 Fake adapter tests are not durable workspace acceptance. Persisted prompt/stream/tool approval/cancel/reopen, actual composer/focus/scroll, configuration failure and a small custom root wait for domain/UI tasks. Later workloads reuse identity, phase and raw telemetry evidence. Physical display pacing, IME/accessibility and cross-platform validation remain explicit gates, not headless claims.
+
+
+## Flag-free provider setup
+
+`./tools/eval-provider-setup --output .artifacts/provider-setup/native-NEW`
+launches the actual app with an isolated XDG data/home directory, no provider or
+workspace flags, and read-only painted automation. It physically chooses
+providers, edits paths, verifies independent drafts and 720px Advanced geometry,
+recovers from a disconnected executable, completes the offline Codex device-code
+fixture, chooses an exact model, sends Unicode text and reopens both providers.
+It also checks the inactive provider's custom fields survived restart and that
+successful reopen has no stale recovery notice. No internal UI state is mutated.
+`build/provider_setup_fixture.py` provides disposable Codex/OpenCode protocol
+responses, not external authentication, entitlement or inference evidence.
+
+The optional `--opencode-account /absolute/authorized/isolated/account` adds an
+installed OpenCode Go metadata-only gate using that explicitly supplied account.
+The evaluator neither reads credential files nor imports/copies them, and sends
+no prompt to the installed provider. Do not use a private account implicitly.
+
+Other input scenarios explicitly select `--provider fake`. Smoke/measurement
+can instead use `--normal-startup --default-state` to exercise the real first-run
+setup with isolated application data. Compare measurement cohorts only when the
+scene and workload match; a first-run modal is a different scene from a settled
+conversation. Existing cache/performance budgets remain unchanged.
