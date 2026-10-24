@@ -48,7 +48,7 @@ pub const Layout = struct {
 
     pub fn sidebarWidthWith(design: @import("design.zig").Config, width: f32) f32 {
         const preferred = design.layout.sidebar_width;
-        return @min(@max(0, width * 0.4), if (width <= 700) @min(preferred, 148) else if (width <= 1000) @min(preferred, 184) else preferred);
+        return @min(@max(0, width * 0.4), if (width <= 700) @min(preferred, 148) else preferred);
     }
 
     pub fn coding(self: *Layout, width: f32) Coding {
@@ -166,7 +166,7 @@ test "configured native geometry keeps responsive sidebar and bounded centered c
         try std.testing.expect(boxes.transcript.y + boxes.transcript.height + 19.9 <= boxes.composer.y);
         try std.testing.expectApproxEqAbs(@as(f32, 688), boxes.composer.y + boxes.composer.height, 0.1);
         if (width == 700) try std.testing.expectEqual(@as(f32, 148), layout.sidebarWidthFor(width));
-        if (width == 1000) try std.testing.expectEqual(@as(f32, 184), layout.sidebarWidthFor(width));
+        if (width == 1000) try std.testing.expectEqual(@as(f32, 360), layout.sidebarWidthFor(width));
         if (width == 1280) try std.testing.expectEqual(@as(f32, 360), layout.sidebarWidthFor(width));
     }
 }

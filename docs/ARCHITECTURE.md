@@ -16,7 +16,7 @@ The system has five ownership layers:
 
 Layout/theme reload is atomic with the visual result: reject invalid values and preserve the complete previous root, renderer and settings. F9 switches the installed custom presentation off and restores default settings; it does not restart providers or accepted runs. Settings are bounded values, with no per-frame configuration parsing, arbitrary native pointers or additional idle polling.
 
-Current expansion scope is the main conversation shell, shared colors/layout, custom-node sizing/spacing/paint, and a runnable native-theme module. Full component slots, command/keymap registration, project search, editable durable titles and change-inspection panels require subsequent contracts and acceptance scenarios. Full terminal emulation and an embedded browser remain deferred. Unsupported backend capabilities must not appear as functional controls.
+Current expansion scope is the main conversation shell, shared colors/layout, custom-node sizing/spacing/paint, and a runnable native-theme module. Full component slots, command/keymap registration, full-history search, editable durable titles and change-inspection panels require subsequent contracts and acceptance scenarios. Full terminal emulation and an embedded browser remain deferred. Unsupported backend capabilities must not appear as functional controls.
 
 Rendered changes require source-based comparison, actual private-desktop input/screenshots, Debug/ReleaseSafe integration checks and serialized frame/CPU/process-tree RSS/PSS measurements. Existing budgets are preserved. Measurements establish the tested machine/workload only, not physical input latency or low-end hardware acceptance.
 

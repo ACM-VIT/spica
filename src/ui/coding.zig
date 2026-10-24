@@ -78,6 +78,10 @@ pub const View = struct {
     model_count: usize = 0,
     selected: ?Identity = null,
     picker_open: bool = false,
+    effort_open: bool = false,
+    effort_menu: c.SDL_FRect = zero_rect,
+    effort_rows: [8]c.SDL_FRect = @splat(zero_rect),
+    effort_hover: usize = 0,
     picker_scroll: f32 = 0,
     picker_menu: c.SDL_FRect = zero_rect,
     picker_rows: c.SDL_FRect = zero_rect,
@@ -85,6 +89,20 @@ pub const View = struct {
     sidebar_bounds: c.SDL_FRect = zero_rect,
     sidebar_rows: c.SDL_FRect = zero_rect,
     sidebar_scroll: f32 = 0,
+    search_bounds: c.SDL_FRect = zero_rect,
+    search_clear_bounds: c.SDL_FRect = zero_rect,
+    search_query: [160]u8 = undefined,
+    search_len: usize = 0,
+    search_focused: bool = false,
+    search_select_all: bool = false,
+    search_hover: usize = 0,
+    scope_bounds: c.SDL_FRect = zero_rect,
+    scope_all_bounds: c.SDL_FRect = zero_rect,
+    scope_menu: c.SDL_FRect = zero_rect,
+    scope_project: transcript.Id = .{},
+    scope_open: bool = false,
+    scope_scroll: f32 = 0,
+    sidebar_hover: ?usize = null,
     new_project_bounds: c.SDL_FRect = zero_rect,
     new_thread_bounds: c.SDL_FRect = zero_rect,
     project_bounds: [16]c.SDL_FRect = @splat(zero_rect),
@@ -121,6 +139,7 @@ pub const View = struct {
     retained_clock: u64 = 0,
     const zero_rect: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     pub const picker_row_height: f32 = 48;
+    pub const sidebar_card_stride: f32 = 83;
 
     pub const Identity = struct {
         runtime_kind: transcript.Id = .{},
@@ -165,7 +184,17 @@ pub const View = struct {
         synthetic: bool = false,
     };
     pub const Navigation = union(enum) { new_project, new_thread, project: usize, thread: usize };
-    pub const Entry = struct { id: transcript.Id = .{}, label: [160]u8 = undefined, len: usize = 0 };
+    pub const RunStatus = enum { idle, running, approval, failed, interrupted };
+    pub const Entry = struct {
+        id: transcript.Id = .{},
+        label: [160]u8 = undefined,
+        len: usize = 0,
+        project_id: transcript.Id = .{},
+        project_name: transcript.Id = .{},
+        workspace_name: transcript.Id = .{},
+        branch: transcript.Id = .{},
+        run_status: RunStatus = .idle,
+    };
     const Retained = struct {
         id: transcript.Id = .{},
         editor: ?Composer = null,
@@ -437,6 +466,12 @@ pub const View = struct {
         return a.runtime_kind.eql(b.runtime_kind.slice()) and a.required_runtime_version.eql(b.required_runtime_version.slice()) and a.model_provider.eql(b.model_provider.slice()) and a.model_id.eql(b.model_id.slice()) and a.account_ref.eql(b.account_ref.slice()) and a.workspace.eql(b.workspace.slice()) and a.capability_revision == b.capability_revision;
     }
 
+    fn selectedModel(self: *const View) ?*const Model {
+        const selected = self.selected orelse return null;
+        for (self.models[0..self.model_count]) |*model| if (sameModel(model.identity, selected)) return model;
+        return null;
+    }
+
     fn pickerMaxScroll(self: *const View) f32 {
         return @max(0, @as(f32, @floatFromInt(self.model_count)) * picker_row_height - self.picker_rows.h);
     }
@@ -456,12 +491,66 @@ pub const View = struct {
         return .{ .x = self.picker_rows.x, .y = y, .w = self.picker_rows.w, .h = @max(0, bottom - y) };
     }
 
+    /// Original source index, even when search/scope remove preceding cards.
     pub fn threadRowBounds(self: *const View, index: usize) c.SDL_FRect {
-        if (index >= self.thread_count) return zero_rect;
-        const row = self.thread_bounds[index];
-        const top = @max(row.y, self.sidebar_rows.y);
-        const bottom = @min(row.y + row.h, self.sidebar_rows.y + self.sidebar_rows.h);
-        return .{ .x = row.x, .y = top, .w = row.w, .h = @max(0, bottom - top) };
+        if (self.scope_open or index >= self.thread_count or !self.threadMatches(&self.threads[index])) return zero_rect;
+        return clippedRect(self.thread_bounds[index], self.sidebar_rows);
+    }
+
+    fn clippedRect(row: c.SDL_FRect, viewport: c.SDL_FRect) c.SDL_FRect {
+        const x = @max(row.x, viewport.x);
+        const y = @max(row.y, viewport.y);
+        const right = @min(row.x + row.w, viewport.x + viewport.w);
+        const bottom = @min(row.y + row.h, viewport.y + viewport.h);
+        if (right <= x or bottom <= y) return zero_rect;
+        return .{ .x = x, .y = y, .w = right - x, .h = bottom - y };
+    }
+
+    fn threadMatches(self: *const View, entry: *const Entry) bool {
+        if (self.scope_project.len != 0 and !entry.project_id.eql(self.scope_project.slice())) return false;
+        const query = std.mem.trim(u8, self.search_query[0..self.search_len], " \t\r\n");
+        if (query.len == 0) return true;
+        // Literal Unicode with ASCII case-insensitivity; no history decode,
+        // provider requests, allocation or unbounded indexing on the UI thread.
+        for ([_][]const u8{ entry.label[0..entry.len], entry.project_name.slice(), entry.workspace_name.slice(), entry.branch.slice() }) |value| {
+            if (std.ascii.indexOfIgnoreCase(value, query) != null) return true;
+        }
+        return false;
+    }
+
+    fn visibleThreadCount(self: *const View) usize {
+        var count: usize = 0;
+        for (self.threads[0..self.thread_count]) |*entry| if (self.threadMatches(entry)) {
+            count += 1;
+        };
+        return count;
+    }
+
+    fn sidebarChanged(self: *View) void {
+        self.sidebar_scroll = 0;
+        self.search_hover = 0;
+        self.sidebar_hover = null;
+        self.thread_bounds = @splat(zero_rect);
+    }
+
+    fn searchInsert(self: *View, bytes: []const u8) !void {
+        if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
+        const start = if (self.search_select_all) 0 else self.search_len;
+        if (start + bytes.len > self.search_query.len) return error.TextTooLarge;
+        @memcpy(self.search_query[start..][0..bytes.len], bytes);
+        self.search_len = start + bytes.len;
+        self.search_select_all = false;
+        self.sidebarChanged();
+    }
+
+    fn searchResult(self: *const View, ordinal: usize) ?usize {
+        var count: usize = 0;
+        for (self.threads[0..self.thread_count], 0..) |*entry, index| {
+            if (!self.threadMatches(entry)) continue;
+            if (count == ordinal) return index;
+            count += 1;
+        }
+        return null;
     }
 
     fn revealPickerRow(self: *View) void {
@@ -515,10 +604,48 @@ pub const View = struct {
                         };
                         return true;
                     }
+                    if (self.effort_open) {
+                        if (self.selectedModel()) |model| {
+                            for (self.effort_rows[0..model.effort_count], 0..) |box, index| if (widgets.contains(box, x, y)) {
+                                self.selected.?.effort = model.efforts[index];
+                            };
+                        }
+                        self.effort_open = false;
+                        return true;
+                    }
                     // An open menu owns pointer input, including outside dismissal.
                     if (self.picker_open) {
                         if (self.pickerIndexAt(x, y)) |index| self.selected = self.models[index].identity;
                         self.picker_open = false;
+                        return true;
+                    }
+                    if (self.scope_open) {
+                        if (widgets.contains(self.scope_all_bounds, x, y)) {
+                            self.scope_project = .{};
+                            self.sidebarChanged();
+                        }
+                        for (self.project_bounds[0..self.project_count], 0..) |box, index| if (widgets.contains(box, x, y)) {
+                            self.scope_project = self.projects[index].id;
+                            self.sidebarChanged();
+                        };
+                        self.scope_open = false;
+                        return true;
+                    }
+                    if (widgets.contains(self.search_bounds, x, y)) {
+                        self.search_focused = true;
+                        self.search_select_all = false;
+                        if (widgets.contains(self.search_clear_bounds, x, y)) {
+                            self.search_len = 0;
+                            self.sidebarChanged();
+                        }
+                        try self.focus(window, true);
+                        const area = c.SDL_Rect{ .x = @intFromFloat(self.search_bounds.x), .y = @intFromFloat(self.search_bounds.y), .w = @intFromFloat(self.search_bounds.w), .h = @intFromFloat(self.search_bounds.h) };
+                        if (!c.SDL_SetTextInputArea(window, &area, 0)) return error.TextInputArea;
+                        return true;
+                    }
+                    self.search_focused = false;
+                    if (widgets.contains(self.scope_bounds, x, y)) {
+                        self.scope_open = true;
                         return true;
                     }
                     if (widgets.contains(self.picker_bounds, x, y)) {
@@ -531,13 +658,13 @@ pub const View = struct {
                         return true;
                     }
                     if (widgets.contains(self.effort_bounds, x, y)) {
-                        if (self.selected) |*selected| for (self.models[0..self.model_count]) |model| {
-                            if (!sameModel(model.identity, selected.*)) continue;
-                            for (model.efforts[0..model.effort_count], 0..) |effort, index| if (effort.eql(selected.effort.slice())) {
-                                selected.effort = model.efforts[(index + 1) % model.effort_count];
-                                break;
+                        if (self.selectedModel()) |model| {
+                            self.effort_open = model.effort_count > 0;
+                            self.effort_hover = 0;
+                            if (self.selected) |selected| for (model.efforts[0..model.effort_count], 0..) |effort, index| {
+                                if (effort.eql(selected.effort.slice())) self.effort_hover = index;
                             };
-                        };
+                        }
                         return true;
                     }
                     if (widgets.contains(self.setup_bounds, x, y)) {
@@ -555,10 +682,7 @@ pub const View = struct {
                         if (widgets.contains(self.new_project_bounds, x, y)) self.navigation = .new_project;
                         if (widgets.contains(self.new_thread_bounds, x, y)) self.navigation = .new_thread;
                         if (widgets.contains(self.sidebar_rows, x, y)) {
-                            for (self.project_bounds[0..self.project_count], 0..) |box, index| if (widgets.contains(box, x, y)) {
-                                self.navigation = .{ .project = index };
-                            };
-                            for (self.thread_bounds[0..self.thread_count], 0..) |box, index| if (widgets.contains(box, x, y)) {
+                            for (0..self.thread_count) |index| if (widgets.contains(self.threadRowBounds(index), x, y)) {
                                 self.navigation = .{ .thread = index };
                             };
                         }
@@ -614,9 +738,24 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_MOUSE_MOTION => {
+                if (self.custom_root == null and self.effort_open) {
+                    for (self.effort_rows, 0..) |row, index| if (widgets.contains(row, event.motion.x, event.motion.y)) {
+                        self.effort_hover = index;
+                    };
+                    return true;
+                }
                 if (self.custom_root == null and self.picker_open) {
                     if (self.pickerIndexAt(event.motion.x, event.motion.y)) |index| self.picker_hover = index;
                     return true;
+                }
+
+                if (self.custom_root == null) {
+                    const previous = self.sidebar_hover;
+                    self.sidebar_hover = null;
+                    for (0..self.thread_count) |index| if (widgets.contains(self.threadRowBounds(index), event.motion.x, event.motion.y)) {
+                        self.sidebar_hover = index;
+                    };
+                    if (!self.dragging and self.transcript_drag == null and previous != self.sidebar_hover) return true;
                 }
 
                 if (self.transcript_drag) |index| {
@@ -632,14 +771,19 @@ pub const View = struct {
             },
             c.SDL_EVENT_MOUSE_WHEEL => {
                 const wheel_direction: f32 = if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) -1 else 1;
-                if (self.custom_root == null and self.setup_open) return true;
+                if (self.custom_root == null and (self.setup_open or self.effort_open)) return true;
                 if (self.custom_root == null and self.picker_open) {
                     if (widgets.contains(self.picker_menu, event.wheel.mouse_x, event.wheel.mouse_y)) self.picker_scroll = std.math.clamp(self.picker_scroll - event.wheel.y * wheel_direction * picker_row_height, 0, self.pickerMaxScroll());
                     return true;
                 }
                 if (self.custom_root == null and widgets.contains(self.sidebar_bounds, event.wheel.mouse_x, event.wheel.mouse_y)) {
-                    const height = @as(f32, @floatFromInt(self.project_count)) * 30 + @as(f32, @floatFromInt(self.thread_count)) * 36 + 32;
-                    self.sidebar_scroll = std.math.clamp(self.sidebar_scroll - event.wheel.y * wheel_direction * 36, 0, @max(0, height - self.sidebar_rows.h));
+                    if (self.scope_open) {
+                        const height = @as(f32, @floatFromInt(self.project_count + 1)) * 28;
+                        self.scope_scroll = std.math.clamp(self.scope_scroll - event.wheel.y * wheel_direction * 28, 0, @max(0, height - self.scope_menu.h + 8));
+                    } else {
+                        const height = @as(f32, @floatFromInt(self.visibleThreadCount())) * sidebar_card_stride;
+                        self.sidebar_scroll = std.math.clamp(self.sidebar_scroll - event.wheel.y * wheel_direction * 36, 0, @max(0, height - self.sidebar_rows.h));
+                    }
                     return true;
                 }
                 if (widgets.contains(self.transcript_bounds, event.wheel.mouse_x, event.wheel.mouse_y)) {
@@ -657,7 +801,7 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_TEXT_EDITING => {
-                if (self.custom_root == null and (self.setup_open or self.picker_open)) return true;
+                if (self.custom_root == null and (self.setup_open or self.picker_open or self.effort_open or self.search_focused)) return true;
                 if (!self.hasComposer() or !self.focused or !self.window_active) return false;
                 const bytes = std.mem.span(event.edit.text);
                 self.preedit_changed = true;
@@ -671,9 +815,14 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_TEXT_INPUT => {
-                if (self.custom_root == null and self.picker_open) return true;
+                if (self.custom_root == null and (self.picker_open or self.effort_open)) return true;
                 if (self.setup_open and self.custom_root == null) {
                     try self.setupInsert(std.mem.span(event.text.text));
+                    return true;
+                }
+                if (self.custom_root == null and self.search_focused) {
+                    if (!self.window_active) return false;
+                    try self.searchInsert(std.mem.span(event.text.text));
                     return true;
                 }
                 if (!self.hasComposer() or !self.focused or !self.window_active) return false;
@@ -713,6 +862,18 @@ pub const View = struct {
                     }
                     return true;
                 }
+                if (self.effort_open and self.custom_root == null) {
+                    if (self.selectedModel()) |model| {
+                        if (key == c.SDLK_UP) self.effort_hover -|= 1;
+                        if (key == c.SDLK_DOWN) self.effort_hover = @min(model.effort_count -| 1, self.effort_hover + 1);
+                        if (key == c.SDLK_RETURN and self.effort_hover < model.effort_count) {
+                            self.selected.?.effort = model.efforts[self.effort_hover];
+                            self.effort_open = false;
+                        }
+                    }
+                    if (key == c.SDLK_ESCAPE) self.effort_open = false;
+                    return true;
+                }
                 if (self.picker_open and self.custom_root == null) {
                     switch (key) {
                         c.SDLK_ESCAPE => self.picker_open = false,
@@ -725,6 +886,52 @@ pub const View = struct {
                         else => {},
                     }
                     self.revealPickerRow();
+                    return true;
+                }
+                if (self.scope_open and self.custom_root == null) {
+                    if (key == c.SDLK_ESCAPE) self.scope_open = false;
+                    return true;
+                }
+                if (self.search_focused and self.custom_root == null) {
+                    if (!self.window_active) return false;
+                    if (ctrl and key == c.SDLK_A) self.search_select_all = true;
+                    if (ctrl and key == c.SDLK_V) {
+                        const value = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+                        defer c.SDL_free(value);
+                        try self.searchInsert(std.mem.span(value));
+                    }
+                    if (key == c.SDLK_ESCAPE) {
+                        self.search_len = 0;
+                        self.search_select_all = false;
+                        self.search_focused = false;
+                        self.sidebarChanged();
+                    }
+                    if (key == c.SDLK_BACKSPACE or key == c.SDLK_DELETE) {
+                        if (self.search_select_all) {
+                            self.search_len = 0;
+                        } else if (key == c.SDLK_BACKSPACE and self.search_len > 0) {
+                            self.search_len -= 1;
+                            while (self.search_len > 0 and self.search_query[self.search_len] & 0xc0 == 0x80) self.search_len -= 1;
+                        }
+                        self.search_select_all = false;
+                        self.sidebarChanged();
+                    }
+                    if (key == c.SDLK_UP) self.search_hover -|= 1;
+                    if (key == c.SDLK_DOWN) self.search_hover = @min(self.visibleThreadCount() -| 1, self.search_hover + 1);
+                    if (key == c.SDLK_UP or key == c.SDLK_DOWN) {
+                        const top = @as(f32, @floatFromInt(self.search_hover)) * sidebar_card_stride;
+                        if (top < self.sidebar_scroll) self.sidebar_scroll = top;
+                        if (top + sidebar_card_stride > self.sidebar_scroll + self.sidebar_rows.h) self.sidebar_scroll = @max(0, top + sidebar_card_stride - self.sidebar_rows.h);
+                    }
+                    if ((key == c.SDLK_RETURN or key == c.SDLK_KP_ENTER) and self.navigation_enabled) {
+                        if (self.searchResult(self.search_hover)) |index| {
+                            self.navigation = .{ .thread = index };
+                            self.search_focused = false;
+                            self.search_len = 0;
+                            self.search_select_all = false;
+                            self.sidebarChanged();
+                        }
+                    }
                     return true;
                 }
                 if (!ctrl and mods & c.SDL_KMOD_ALT != 0 and self.window_active) {
@@ -958,16 +1165,23 @@ pub const View = struct {
 
     // Fixed native strokes: no decorative Unicode, face discovery or retained
     // icon textures. Coordinates use a 16-unit local grid.
-    const Icon = enum { plus, folder, pen, chevron, send, stop, settings };
+    const Icon = enum { plus, folder, pen, chevron, send, stop, settings, search, filter, branch, close };
     fn icon(renderer: *c.SDL_Renderer, kind: Icon, x: f32, y: f32, color: Color) !void {
+        // ComposerPrimaryActions.tsx uses an 8px filled rounded square inside
+        // its 12px Stop glyph, centered in the 32px action.
+        if (kind == .stop) return widgets.panel(renderer, .{ .x = x + 4, .y = y + 4, .w = 8, .h = 8 }, 1.5, color);
         if (!c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, 255)) return error.IconDraw;
         const paths: []const [4]f32 = switch (kind) {
+            .search => &.{ .{ 3, 2, 9, 2 }, .{ 9, 2, 12, 5 }, .{ 12, 5, 12, 9 }, .{ 12, 9, 9, 12 }, .{ 9, 12, 3, 12 }, .{ 3, 12, 1, 9 }, .{ 1, 9, 1, 5 }, .{ 1, 5, 3, 2 }, .{ 11, 11, 15, 15 } },
+            .filter => &.{ .{ 1, 3, 15, 3 }, .{ 4, 8, 12, 8 }, .{ 6, 13, 10, 13 } },
+            .branch => &.{ .{ 4, 2, 4, 13 }, .{ 4, 9, 11, 9 }, .{ 11, 9, 12, 7 }, .{ 12, 7, 12, 3 }, .{ 2, 1, 6, 1 }, .{ 10, 2, 14, 2 }, .{ 2, 14, 6, 14 } },
+            .close => &.{ .{ 4, 4, 12, 12 }, .{ 12, 4, 4, 12 } },
             .plus => &.{ .{ 8, 2, 8, 14 }, .{ 2, 8, 14, 8 } },
             .folder => &.{ .{ 1, 4, 6, 4 }, .{ 6, 4, 8, 6 }, .{ 8, 6, 15, 6 }, .{ 15, 6, 15, 14 }, .{ 15, 14, 1, 14 }, .{ 1, 14, 1, 4 } },
             .pen => &.{ .{ 9, 3, 2, 3 }, .{ 2, 3, 2, 14 }, .{ 2, 14, 13, 14 }, .{ 13, 14, 13, 9 }, .{ 7, 10, 8, 6 }, .{ 8, 6, 13, 1 }, .{ 13, 1, 16, 4 }, .{ 16, 4, 10, 10 }, .{ 10, 10, 7, 10 } },
             .chevron => &.{ .{ 4, 6, 8, 10 }, .{ 8, 10, 12, 6 } },
             .send => &.{ .{ 8, 14, 8, 2 }, .{ 8, 2, 3, 7 }, .{ 8, 2, 13, 7 } },
-            .stop => &.{ .{ 4, 4, 12, 4 }, .{ 12, 4, 12, 12 }, .{ 12, 12, 4, 12 }, .{ 4, 12, 4, 4 } },
+            .stop => &.{ .{ 2, 2, 14, 2 }, .{ 14, 2, 14, 14 }, .{ 14, 14, 2, 14 }, .{ 2, 14, 2, 2 } },
             .settings => &.{ .{ 2, 4, 14, 4 }, .{ 2, 12, 14, 12 }, .{ 5, 1, 5, 7 }, .{ 11, 9, 11, 15 } },
         };
         for (paths) |line| if (!c.SDL_RenderLine(renderer, x + line[0], y + line[1], x + line[2], y + line[3])) return error.IconDraw;
@@ -982,59 +1196,71 @@ pub const View = struct {
         const radius = @min(metrics.radius, 8);
         self.sidebar_bounds = .{ .x = 0, .y = 0, .w = sidebar, .h = height };
         try widgets.panel(renderer, self.sidebar_bounds, 0, palette.sidebar);
-        try widgets.panel(renderer, .{ .x = sidebar - 1, .y = 0, .w = 1, .h = height }, 0, palette.border);
-        try icon(renderer, .pen, inset, (bounds.header.height - 16) / 2, foreground);
-        try self.labels.draw(text, "Spica", inset + 26, (bounds.header.height - 18) / 2, 17, foreground);
-        const row_top = bounds.header.height + metrics.gap;
-        self.new_thread_bounds = .{ .x = inset - 6, .y = row_top, .w = sidebar - inset * 2 + 12, .h = 34 };
-        self.new_project_bounds = .{ .x = inset - 6, .y = row_top + 40, .w = sidebar - inset * 2 + 12, .h = 30 };
-        try icon(renderer, .pen, inset, row_top + 9, muted);
-        try self.labels.draw(text, "New chat", inset + 26, row_top + 10, 13, foreground);
-        try icon(renderer, .folder, inset, row_top + 47, muted);
-        try self.labels.draw(text, "New project", inset + 26, row_top + 48, 12, muted);
-        self.sidebar_rows = .{ .x = 8, .y = row_top + 86, .w = sidebar - 16, .h = @max(0, height - row_top - 146) };
-        const project_stride: f32 = 34;
-        const thread_stride: f32 = 38;
-        const rows_height = @as(f32, @floatFromInt(self.project_count)) * project_stride + @as(f32, @floatFromInt(self.thread_count)) * thread_stride + metrics.gap;
-        self.sidebar_scroll = std.math.clamp(self.sidebar_scroll, 0, @max(0, rows_height - self.sidebar_rows.h));
-        var clip = widgets.Clip.push(renderer, self.sidebar_rows);
-        defer clip.restore(renderer);
-        var y = self.sidebar_rows.y - self.sidebar_scroll;
-        self.project_bounds = @splat(zero_rect);
-        self.thread_bounds = @splat(zero_rect);
-        var project_name: []const u8 = "Workspace";
-        var thread_name: []const u8 = "New chat";
-        for (self.threads[0..self.thread_count]) |*entry| if (entry.id.eql(self.active_thread.slice())) {
-            thread_name = entry.label[0..entry.len];
-        };
-        // The parent supplies the active project's bounded chat list. Place it
-        // immediately under that project, preserving entry indices for actions.
-        var drew_threads = false;
-        for (self.projects[0..self.project_count], 0..) |*entry, index| {
-            const active = entry.id.eql(self.active_project.slice());
-            if (active) project_name = entry.label[0..entry.len];
-            self.project_bounds[index] = .{ .x = inset - 6, .y = y, .w = sidebar - inset * 2 + 12, .h = 30 };
-            if (y + 30 > self.sidebar_rows.y and y < self.sidebar_rows.y + self.sidebar_rows.h) {
-                try icon(renderer, .folder, inset, y + 7, muted);
-                try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], inset + 26, y + 8, sidebar - inset * 2 - 30, 12, if (active) foreground else muted);
-            }
-            y += project_stride;
-            if (active) {
-                try self.drawThreads(renderer, text, &y, sidebar, inset, radius, thread_stride, foreground, muted);
-                drew_threads = true;
-                y += metrics.gap;
+        try widgets.panel(renderer, .{ .x = sidebar - 1, .y = 0, .w = 1, .h = height }, 0, palette.sidebar_border);
+        try self.labels.draw(text, "Spica", inset, (bounds.header.height - 16) / 2, 14, foreground);
+        // Current eb1510d source puts Search and all three icon actions on
+        // one 32px row. The older marketing image uses a separate scope row.
+        const row_top = bounds.header.height + 4;
+        const action_y = row_top + 2;
+        self.new_thread_bounds = .{ .x = sidebar - 36, .y = action_y, .w = 28, .h = 28 };
+        self.new_project_bounds = .{ .x = sidebar - 65, .y = action_y, .w = 28, .h = 28 };
+        self.scope_bounds = .{ .x = sidebar - 94, .y = action_y, .w = 28, .h = 28 };
+        self.search_bounds = .{ .x = 8, .y = row_top, .w = @max(0, self.scope_bounds.x - 9), .h = 32 };
+        self.search_clear_bounds = if (self.search_len == 0) zero_rect else .{ .x = self.search_bounds.x + self.search_bounds.w - 22, .y = action_y, .w = 22, .h = 28 };
+        const sidebar_muted = palette.sidebar_muted;
+        if (self.search_focused) try widgets.panel(renderer, self.search_bounds, 6, palette.raised);
+        try icon(renderer, .search, 16, row_top + 8, sidebar_muted);
+        const search_label = if (self.search_len == 0) "Search" else self.search_query[0..self.search_len];
+        try self.labels.drawFitted(renderer, text, search_label, 40, row_top + 8, self.search_bounds.w - 32 - (if (self.search_len == 0) @as(f32, 0) else 22), 14, if (self.search_len == 0) sidebar_muted else foreground);
+        if (self.search_focused and self.search_bounds.w > 40) {
+            var search_clip = widgets.Clip.push(renderer, .{ .x = 40, .y = row_top + 6, .w = @max(0, self.search_bounds.w - 54), .h = 20 });
+            defer search_clip.restore(renderer);
+            const text_width = try self.labels.width(text, @import("../text/utf8.zig").prefix(self.search_query[0..self.search_len], 128), 14);
+            if (self.search_select_all and self.search_len > 0) {
+                try widgets.panel(renderer, .{ .x = 40, .y = row_top + 6, .w = text_width, .h = 20 }, 2, palette.selection);
+                try self.labels.drawFitted(renderer, text, self.search_query[0..self.search_len], 40, row_top + 8, self.search_bounds.w - 54, 14, foreground);
+            } else {
+                try widgets.panel(renderer, .{ .x = 40 + @min(text_width, @max(0, self.search_bounds.w - 56)), .y = row_top + 8, .w = 1, .h = 16 }, 0, foreground);
             }
         }
-        if (!drew_threads) try self.drawThreads(renderer, text, &y, sidebar, inset, radius, thread_stride, foreground, muted);
+        if (self.search_len != 0) try icon(renderer, .close, self.search_clear_bounds.x + 3, row_top + 8, sidebar_muted);
+        if (self.scope_project.len != 0) try widgets.panel(renderer, self.scope_bounds, 6, palette.sidebar_active);
+        try icon(renderer, .filter, self.scope_bounds.x + 6, action_y + 6, sidebar_muted);
+        try icon(renderer, .folder, self.new_project_bounds.x + 6, action_y + 5, sidebar_muted);
+        try icon(renderer, .plus, self.new_project_bounds.x + 8, action_y + 7, sidebar_muted);
+        try icon(renderer, .pen, self.new_thread_bounds.x + 6, action_y + 6, sidebar_muted);
+        self.sidebar_rows = .{ .x = 8, .y = row_top + 40, .w = sidebar - 16, .h = @max(0, height - row_top - 84) };
+        const rows_height = @as(f32, @floatFromInt(self.visibleThreadCount())) * sidebar_card_stride;
+        self.sidebar_scroll = std.math.clamp(self.sidebar_scroll, 0, @max(0, rows_height - self.sidebar_rows.h));
+        self.project_bounds = @splat(zero_rect);
+        self.thread_bounds = @splat(zero_rect);
+        var clip = widgets.Clip.push(renderer, self.sidebar_rows);
+        defer clip.restore(renderer);
+        try self.drawThreads(renderer, text, foreground, sidebar_muted);
+        if (self.visibleThreadCount() == 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
         clip.restore(renderer);
-        try self.labels.drawFitted(renderer, text, self.status, inset, height - 35, sidebar - inset * 2, 11, muted);
+        // Connection is the implemented utility. Do not imitate unavailable
+        // Usage, Pull Requests or Settings destinations from the reference.
+        self.setup_bounds = .{ .x = 8, .y = height - 36, .w = 32, .h = 32 };
+        try icon(renderer, .settings, 16, height - 28, sidebar_muted);
+        try self.labels.drawFitted(renderer, text, self.status, 48, height - 25, sidebar - 60, 11, sidebar_muted);
+        if (self.scope_open) try self.drawScope(renderer, text, foreground, sidebar_muted);
         const header_x = sidebar + metrics.gutter;
-        self.setup_bounds = .{ .x = bounds.header.width - metrics.gutter - 112, .y = (bounds.header.height - 30) / 2, .w = 112, .h = 30 };
-        try icon(renderer, .settings, self.setup_bounds.x + 7, self.setup_bounds.y + 7, muted);
-        try self.labels.draw(text, "Connection", self.setup_bounds.x + 30, self.setup_bounds.y + 9, 12, muted);
-        var title: [512]u8 = undefined;
-        const label = try std.fmt.bufPrint(&title, "{s}   /   {s}", .{ project_name, thread_name });
-        try self.labels.drawFitted(renderer, text, label, header_x, (bounds.header.height - 16) / 2, self.setup_bounds.x - header_x - metrics.gap, 14, foreground);
+        var project_name: []const u8 = "Workspace";
+        var thread_name: []const u8 = "New chat";
+        for (self.projects[0..self.project_count]) |*entry| if (entry.id.eql(self.active_project.slice())) {
+            project_name = entry.label[0..entry.len];
+        };
+        for (self.threads[0..self.thread_count]) |*entry| if (entry.id.eql(self.active_thread.slice())) {
+            thread_name = entry.label[0..entry.len];
+            if (entry.project_name.len != 0) project_name = entry.project_name.slice();
+        };
+        const project_width = @min(@max(0, bounds.header.width - header_x - metrics.gutter) * 0.3, try self.labels.width(text, @import("../text/utf8.zig").prefix(project_name, 128), 14));
+        try icon(renderer, .folder, header_x, (bounds.header.height - 16) / 2, muted);
+        try self.labels.drawFitted(renderer, text, project_name, header_x + 24, (bounds.header.height - 16) / 2, project_width, 14, muted);
+        try self.labels.draw(text, "/", header_x + 34 + project_width, (bounds.header.height - 16) / 2, 14, muted);
+        const title_x = header_x + 52 + project_width;
+        try self.labels.drawFitted(renderer, text, thread_name, title_x, (bounds.header.height - 16) / 2, bounds.header.width - title_x - metrics.gutter, 14, foreground);
         self.follow_bounds = if (self.follow_latest) zero_rect else .{ .x = bounds.transcript.x + bounds.transcript.width - 128, .y = bounds.transcript.y + bounds.transcript.height - 32, .w = 128, .h = 28 };
         for (self.tasks[0..self.task_count], 0..) |*task, index| {
             const task_y = bounds.transcript.y + @as(f32, @floatFromInt(index)) * 24;
@@ -1047,17 +1273,80 @@ pub const View = struct {
         }
     }
 
-    fn drawThreads(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, y: *f32, sidebar: f32, inset: f32, radius: f32, stride: f32, foreground: Color, muted: Color) !void {
-        for (self.threads[0..self.thread_count], 0..) |*entry, index| {
-            const active = entry.id.eql(self.active_thread.slice());
-            const row = c.SDL_FRect{ .x = inset - 6, .y = y.*, .w = sidebar - inset * 2 + 12, .h = stride - 2 };
-            self.thread_bounds[index] = row;
-            if (row.y + row.h > self.sidebar_rows.y and row.y < self.sidebar_rows.y + self.sidebar_rows.h) {
-                if (active) try widgets.panel(renderer, row, radius, self.design.colors.raised);
-                try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], inset + 14, y.* + 11, sidebar - inset * 2 - 20, 13, if (active) foreground else muted);
-            }
-            y.* += stride;
+    fn drawScope(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, foreground: Color, muted: Color) !void {
+        const height = @min(@as(f32, @floatFromInt(self.project_count + 1)) * 28 + 8, self.sidebar_rows.h);
+        self.scope_menu = .{ .x = 8, .y = self.sidebar_rows.y, .w = self.sidebar_rows.w, .h = height };
+        self.scope_scroll = std.math.clamp(self.scope_scroll, 0, @max(0, @as(f32, @floatFromInt(self.project_count + 1)) * 28 - height + 8));
+        try widgets.panel(renderer, self.scope_menu, 6, self.design.colors.border);
+        var clip = widgets.Clip.push(renderer, self.scope_menu);
+        defer clip.restore(renderer);
+        var y = self.scope_menu.y + 4 - self.scope_scroll;
+        self.scope_all_bounds = clippedRect(.{ .x = 12, .y = y, .w = self.scope_menu.w - 8, .h = 28 }, self.scope_menu);
+        if (self.scope_project.len == 0) try widgets.panel(renderer, self.scope_all_bounds, 4, self.design.colors.sidebar_active);
+        try self.labels.drawFitted(renderer, text, "All projects", 20, y + 7, self.scope_menu.w - 24, 12, foreground);
+        y += 28;
+        for (self.projects[0..self.project_count], 0..) |*entry, index| {
+            self.project_bounds[index] = clippedRect(.{ .x = 12, .y = y, .w = self.scope_menu.w - 8, .h = 28 }, self.scope_menu);
+            if (self.scope_project.eql(entry.id.slice())) try widgets.panel(renderer, self.project_bounds[index], 4, self.design.colors.sidebar_active);
+            try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], 20, y + 7, self.scope_menu.w - 24, 12, muted);
+            y += 28;
         }
+    }
+
+    fn drawThreads(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, foreground: Color, muted: Color) !void {
+        var y = self.sidebar_rows.y - self.sidebar_scroll;
+        var ordinal: usize = 0;
+        for (self.threads[0..self.thread_count], 0..) |*entry, index| {
+            if (!self.threadMatches(entry)) continue;
+            const row = c.SDL_FRect{ .x = self.sidebar_rows.x, .y = y + 2, .w = self.sidebar_rows.w, .h = 78 };
+            self.thread_bounds[index] = clippedRect(row, self.sidebar_rows);
+            if (self.thread_bounds[index].h > 0) {
+                const active = entry.id.eql(self.active_thread.slice());
+                if (active) {
+                    try widgets.panel(renderer, row, @min(self.design.layout.radius, 6), self.design.colors.sidebar_active);
+                } else if (self.sidebar_hover == index or (self.search_focused and self.search_len != 0 and self.search_hover == ordinal)) {
+                    try widgets.panel(renderer, row, @min(self.design.layout.radius, 6), self.design.colors.sidebar_hover);
+                }
+                const x = row.x + 10;
+                const width = row.w - 20;
+                if (entry.project_name.len != 0) {
+                    try icon(renderer, .folder, x, row.y + 9, muted);
+                    try self.labels.drawFitted(renderer, text, entry.project_name.slice(), x + 22, row.y + 10, width - 22 - (if (entry.run_status == .idle) @as(f32, 0) else 72), 12, muted);
+                }
+                if (entry.run_status != .idle) {
+                    const status_label: []const u8 = switch (entry.run_status) {
+                        .running => "Working",
+                        .approval => "Approval",
+                        .failed => "Failed",
+                        .interrupted => "Interrupted",
+                        .idle => unreachable,
+                    };
+                    try self.labels.drawFitted(renderer, text, status_label, row.x + row.w - 76, row.y + 10, 66, 11, muted);
+                }
+                try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], x, row.y + 32, width, 14, foreground);
+                const metadata = if (entry.branch.len != 0) entry.branch.slice() else entry.workspace_name.slice();
+                if (metadata.len != 0) {
+                    try icon(renderer, if (entry.branch.len != 0) .branch else .folder, x, row.y + 54, muted);
+                    try self.labels.drawFitted(renderer, text, metadata, x + 20, row.y + 56, width - 40, 12, muted);
+                }
+            }
+            ordinal += 1;
+            y += sidebar_card_stride;
+        }
+    }
+
+    fn disabledPrimaryColor(color: Color, surface: Color) Color {
+        // T3 eb1510d ComposerPrimaryActions.tsx:313-317 keeps message-action
+        // fill/foreground and applies opacity-64 to the complete disabled
+        // button. Composite both opaque native paints against its real surface
+        // without allocating an intermediate texture or blending the glyph
+        // a second time over the already faded circle.
+        var result: Color = undefined;
+        inline for (std.meta.fields(Color)) |field| {
+            const channel = @as(u32, @field(color, field.name)) * 64 + @as(u32, @field(surface, field.name)) * 36;
+            @field(result, field.name) = @intCast((channel + 50) / 100);
+        }
+        return result;
     }
 
     fn drawComposerControls(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, panel: c.SDL_FRect, foreground: Color, muted: Color) !void {
@@ -1065,29 +1354,35 @@ pub const View = struct {
         const gap = self.design.layout.gap;
         const y = panel.y + panel.h - 54 - @min(gap, 16);
         const primary: usize = if (self.can_cancel) 1 else 0;
-        self.controls[primary] = .{ .x = panel.x + panel.w - 90, .y = y, .w = 80, .h = 30 };
+        self.controls[primary] = .{ .x = panel.x + panel.w - 44, .y = y - 2, .w = 32, .h = 32 };
         const model_x = panel.x + 10;
         const available = @max(0, self.controls[primary].x - model_x - gap * 2);
-        const effort_width = @min(104, available * 0.32);
-        const model_width = @min(270, @max(0, available - effort_width));
-        self.picker_bounds = .{ .x = model_x, .y = y, .w = model_width, .h = 30 };
-        self.effort_bounds = .{ .x = model_x + model_width + gap, .y = y, .w = effort_width, .h = 30 };
+        const label = if (self.selected) |*selected| (if (selected.runtime_kind.eql("fake")) "Demo · synthetic" else selected.model_id.slice()) else "Choose model";
+        const effort = if (self.selected) |*selected| selected.effort.slice() else "Effort";
+        const prefix = @import("../text/utf8.zig").prefix;
+        const desired_effort = try self.labels.width(text, prefix(effort, 128), 14) + 34;
+        const effort_width = @min(desired_effort, available * 0.38);
+        const desired_model = try self.labels.width(text, prefix(label, 128), 14) + 40;
+        const model_width = @min(desired_model, @max(0, available - effort_width));
+        self.picker_bounds = .{ .x = model_x, .y = y, .w = model_width, .h = 28 };
+        self.effort_bounds = .{ .x = model_x + model_width + gap, .y = y, .w = effort_width, .h = 28 };
         // Keep menu geometry current while closed, so first-open keyboard
         // reveal uses the same viewport as the next paint.
         const menu_height = @min(344, @max(96, y - 80));
         self.picker_menu = .{ .x = panel.x, .y = y - menu_height - 6, .w = @min(600, panel.w), .h = menu_height };
         self.picker_rows = .{ .x = self.picker_menu.x + 8, .y = self.picker_menu.y + 38, .w = self.picker_menu.w - 16, .h = menu_height - 64 };
 
-        const label = if (self.selected) |*selected| (if (selected.runtime_kind.eql("fake")) "Demo · synthetic" else selected.model_id.slice()) else "Choose model";
-        try self.labels.drawFitted(renderer, text, label, self.picker_bounds.x + 8, y + 8, model_width - 32, 12, foreground);
-        try icon(renderer, .chevron, self.picker_bounds.x + model_width - 24, y + 7, muted);
-        const effort = if (self.selected) |*selected| selected.effort.slice() else "Effort";
-        try self.labels.drawFitted(renderer, text, effort, self.effort_bounds.x + 4, y + 8, self.effort_bounds.w - 25, 12, muted);
-        try icon(renderer, .chevron, self.effort_bounds.x + self.effort_bounds.w - 20, y + 7, muted);
+        try self.labels.drawFitted(renderer, text, label, self.picker_bounds.x + 8, y + 6, model_width - 32, 14, foreground);
+        try icon(renderer, .chevron, self.picker_bounds.x + model_width - 24, y + 6, muted);
+        try self.labels.drawFitted(renderer, text, effort, self.effort_bounds.x + 8, y + 6, self.effort_bounds.w - 30, 14, muted);
+        try icon(renderer, .chevron, self.effort_bounds.x + self.effort_bounds.w - 22, y + 6, muted);
         const enabled = if (primary == 1) self.can_cancel else self.can_send and self.editor.len != 0;
-        try widgets.panel(renderer, self.controls[primary], @min(self.design.layout.radius, 15), if (enabled) self.design.colors.accent else self.design.colors.raised);
-        try self.labels.draw(text, if (primary == 1) "Stop" else "Send", self.controls[primary].x + 12, y + 8, 12, if (enabled) self.design.colors.accent_text else muted);
-        try icon(renderer, if (primary == 1) .stop else .send, self.controls[primary].x + 53, y + 7, if (enabled) self.design.colors.accent_text else muted);
+        const primary_color = if (primary == 1) self.design.colors.danger else self.design.colors.accent;
+        const composer_surface = styleColor(self.nodeStyle(4), false, self.design.colors.surface);
+        const primary_fill = if (enabled) primary_color else disabledPrimaryColor(primary_color, composer_surface);
+        const primary_foreground = if (enabled) self.design.colors.accent_text else disabledPrimaryColor(self.design.colors.accent_text, composer_surface);
+        try widgets.panel(renderer, self.controls[primary], 16, primary_fill);
+        try icon(renderer, if (primary == 1) .stop else .send, self.controls[primary].x + 8, self.controls[primary].y + 8, primary_foreground);
         if (self.can_approve) {
             try self.labels.drawFitted(renderer, text, "Approval needed", panel.x + 12, y - 28, panel.w - 206, 12, foreground);
             for (2..4) |index| {
@@ -1098,6 +1393,20 @@ pub const View = struct {
         }
         const guidance = self.send_disabled_reason orelse if (self.can_cancel) "Working · Stop cancels the current run" else if (self.selected == null) "Choose a model, or open Connection to refresh models" else if (!self.can_send) self.status else if (self.editor.len == 0) "Write a message · Enter sends · Shift+Enter adds a line" else "Enter to send · Shift+Enter for a new line";
         try self.labels.drawFitted(renderer, text, guidance, panel.x + 2, panel.y + panel.h - 16, panel.w - 4, 11, muted);
+    }
+
+    fn drawEffort(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, foreground: Color, muted: Color) !void {
+        const model = self.selectedModel() orelse return;
+        const height = @as(f32, @floatFromInt(model.effort_count)) * 28 + 8;
+        self.effort_menu = .{ .x = self.effort_bounds.x, .y = @max(0, self.effort_bounds.y - height - 6), .w = @max(100, self.effort_bounds.w), .h = height };
+        try widgets.panel(renderer, self.effort_menu, @min(self.design.layout.radius, 6), self.design.colors.raised);
+        self.effort_rows = @splat(zero_rect);
+        for (model.efforts[0..model.effort_count], 0..) |effort, index| {
+            const row = c.SDL_FRect{ .x = self.effort_menu.x + 4, .y = self.effort_menu.y + 4 + @as(f32, @floatFromInt(index)) * 28, .w = self.effort_menu.w - 8, .h = 28 };
+            self.effort_rows[index] = row;
+            if (index == self.effort_hover) try widgets.panel(renderer, row, 4, self.design.colors.selection);
+            try self.labels.drawFitted(renderer, text, effort.slice(), row.x + 6, row.y + 6, row.w - 12, 12, if (index == self.effort_hover) foreground else muted);
+        }
     }
 
     fn drawPicker(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
@@ -1310,7 +1619,7 @@ pub const View = struct {
                 const available = @max(0, editor_bounds.h - 20);
                 self.editor_view.scroll = std.math.clamp(self.editor_view.scroll, 0, @max(0, content_height - available));
                 if (self.editor_view.caret(&self.editor)) |caret_rect| {
-                    if (self.focused and self.reveal_caret) {
+                    if (self.focused and (self.custom_root != null or !self.search_focused) and self.reveal_caret) {
                         if (caret_rect.y < self.editor_view.scroll) self.editor_view.scroll = caret_rect.y;
                         if (caret_rect.y + caret_rect.h > self.editor_view.scroll + available) self.editor_view.scroll = caret_rect.y + caret_rect.h - available;
                     }
@@ -1329,7 +1638,7 @@ pub const View = struct {
                     }
                     if (count > rects.len) self.notice = "Selection display budget exceeded";
                     if (!c.spica_text_layout_draw(text, layout, x, y, widgets.rgba(composer_foreground))) return error.EditorDraw;
-                    if (self.focused and self.window_active) {
+                    if (self.focused and (self.custom_root != null or !self.search_focused) and self.window_active) {
                         const caret = c.SDL_FRect{ .x = x + caret_rect.x, .y = y + caret_rect.y, .w = 1.5, .h = caret_rect.h };
                         if (!c.SDL_SetRenderDrawColor(renderer, composer_foreground.r, composer_foreground.g, composer_foreground.b, 255) or !c.SDL_RenderFillRect(renderer, &caret)) return error.CaretDraw;
                         const input_rect = c.SDL_Rect{ .x = @intFromFloat(caret.x), .y = @intFromFloat(caret.y), .w = 1, .h = @intFromFloat(caret.h) };
@@ -1381,6 +1690,7 @@ pub const View = struct {
         }
         if (self.notice) |notice| try self.labels.drawFitted(renderer, text, notice, bounds.transcript.x, bounds.transcript.y, bounds.transcript.width, 12, muted);
         if (self.custom_root == null and self.picker_open) try self.drawPicker(renderer, text, bounds, foreground, muted);
+        if (self.custom_root == null and self.effort_open) try self.drawEffort(renderer, text, foreground, muted);
         if (self.custom_root == null and self.setup_open) try self.drawSetup(renderer, text, bounds, foreground, muted);
     }
 };
@@ -1627,7 +1937,7 @@ test "model picker clips pointer selection and scrolls to every bounded catalog 
     try std.testing.expect(!view.picker_open);
 }
 
-test "effort cycling respects complete runtime account and workspace identity" {
+test "effort menu respects complete runtime account and workspace identity" {
     var view = try View.init(std.testing.allocator);
     defer view.deinit();
     const selected = try View.Identity.from(.{ .runtime_kind = "codex", .model_provider = "openai", .model_id = "same-name", .effort = "medium", .account_ref = "selected-account", .workspace = .{ .value = "selected-checkout" } });
@@ -1647,6 +1957,14 @@ test "effort cycling respects complete runtime account and workspace identity" {
     event.button.x = 310;
     event.button.y = 410;
     try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expect(view.effort_open);
+    try std.testing.expectEqualStrings("medium", view.selected.?.effort.slice());
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_DOWN;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    event.key.key = c.SDLK_RETURN;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expect(!view.effort_open);
     try std.testing.expectEqualStrings("high", view.selected.?.effort.slice());
     try std.testing.expectEqualStrings("selected-checkout", view.selected.?.workspace.slice());
     try std.testing.expectEqualStrings("selected-account", view.selected.?.account_ref.slice());
@@ -1718,6 +2036,21 @@ test "painted connection and composer controls fit minimum and regular windows" 
             const primary = view.controls[if (view.can_cancel) @as(usize, 1) else 0];
             try std.testing.expect(view.picker_bounds.x + view.picker_bounds.w + 10 <= view.effort_bounds.x);
             try std.testing.expect(view.effort_bounds.x + view.effort_bounds.w + 10 <= primary.x);
+        }
+        // Both real short labels and bounded long catalog IDs must reserve
+        // only their measured width and remain disjoint from primary actions.
+        for ([_][]const u8{ "m", "catalog-" ++ "x" ** 200 }) |model_label| {
+            view.selected = try View.Identity.from(.{ .runtime_kind = "codex", .model_provider = "fixture", .model_id = model_label, .effort = "low", .account_ref = "isolated", .workspace = .{ .value = "checkout" } });
+            view.can_cancel = false;
+            view.can_approve = false;
+            try view.drawComposerControls(renderer, text, panel, foreground, muted);
+            try std.testing.expect(view.picker_bounds.x + view.picker_bounds.w + 10 <= view.effort_bounds.x);
+            try std.testing.expect(view.effort_bounds.x + view.effort_bounds.w + 10 <= view.controls[0].x);
+            try std.testing.expectEqual(@as(f32, 32), view.controls[0].w);
+            try std.testing.expectEqual(@as(f32, 32), view.controls[0].h);
+            try std.testing.expectEqual(@as(f32, 28), view.picker_bounds.h);
+            if (model_label.len == 1) try std.testing.expect(view.picker_bounds.w < 64);
+            try std.testing.expect(view.effort_bounds.w < 80);
         }
         var stats: c.SpicaTextStats = undefined;
         try std.testing.expect(c.spica_text_get_stats(text, &stats));
@@ -1907,4 +2240,244 @@ test "user bubbles align after chronological admission and retain exact text hit
     try view.draw(renderer, text, undefined, boxes);
     try std.testing.expectEqual(retained_layout, first.layout);
     try std.testing.expectEqualStrings("Message in a chat.", first.selectedBytes());
+}
+
+test "bounded sidebar search owns Unicode and preserves source indices and drafts" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.insert("draft must stay intact", .typing);
+    view.thread_count = 3;
+    const titles = [_][]const u8{ "Repair parser", "Review UTF8 café", "Build shader" };
+    for (view.threads[0..3], 0..) |*entry, index| {
+        entry.id = try transcript.Id.init(titles[index]);
+        @memcpy(entry.label[0..titles[index].len], titles[index]);
+        entry.len = titles[index].len;
+        entry.project_id = try transcript.Id.init(if (index == 1) "project-b" else "project-a");
+        entry.project_name = try transcript.Id.init(if (index == 1) "Engine" else "Spica");
+        entry.workspace_name = try transcript.Id.init("checkout");
+        entry.branch = try transcript.Id.init(if (index == 2) "feature/shader" else "main");
+    }
+    view.search_focused = true;
+    view.navigation_enabled = true;
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_TEXT_INPUT;
+    event.text.text = "CAFé";
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqual(@as(usize, 1), view.visibleThreadCount());
+    try std.testing.expectEqual(@as(?usize, 1), view.searchResult(0));
+    try std.testing.expect(view.threadRowBounds(0).w == 0);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_RETURN;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqual(@as(usize, 1), view.navigation.?.thread);
+    view.search_focused = true;
+    try view.searchInsert("CAFé");
+    event.key.key = c.SDLK_BACKSPACE;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqualStrings("CAF", view.search_query[0..view.search_len]);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(view.search_query[0..view.search_len]));
+    view.search_select_all = true;
+    try view.searchInsert("shader");
+    try std.testing.expectEqual(@as(?usize, 2), view.searchResult(0));
+    view.scope_project = try transcript.Id.init("project-b");
+    try std.testing.expectEqual(@as(usize, 0), view.visibleThreadCount());
+    view.search_len = 0;
+    try std.testing.expectEqual(@as(?usize, 1), view.searchResult(0));
+    view.scope_project = .{};
+    try std.testing.expectEqual(@as(usize, 3), view.visibleThreadCount());
+    view.search_len = 6;
+    var saved: [6]u8 = undefined;
+    @memcpy(&saved, view.search_query[0..6]);
+    view.search_select_all = true;
+    try std.testing.expectError(error.TextTooLarge, view.searchInsert("x" ** 161));
+    try std.testing.expectEqualSlices(u8, &saved, view.search_query[0..6]);
+    try std.testing.expectEqual(@as(usize, 6), view.search_len);
+    try std.testing.expect(view.search_select_all);
+    try std.testing.expectError(error.InvalidUtf8, view.searchInsert("\xff"));
+    const draft = try view.editor.materialize(view.scratch);
+    try std.testing.expectEqualStrings("draft must stay intact", draft);
+}
+
+test "flat rendered sidebar cards clip hits filter real project IDs and use bundled chrome" {
+    for ([_][2]f32{ .{ 720, 480 }, .{ 900, 650 }, .{ 1100, 740 }, .{ 1280, 800 } }) |size| {
+        const surface = c.SDL_CreateSurface(@intFromFloat(size[0]), @intFromFloat(size[1]), c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+        defer c.SDL_DestroySurface(surface);
+        const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+        defer c.SDL_DestroyRenderer(renderer);
+        const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+        defer c.spica_text_destroy(text);
+        var layout = try Layout.init(std.testing.allocator, size[0], size[1]);
+        defer layout.deinit();
+        var view = try View.init(std.testing.allocator);
+        defer view.deinit();
+        view.navigation_enabled = true;
+        view.thread_count = 12;
+        view.project_count = 2;
+        view.projects[0].id = try transcript.Id.init("actual/project-a");
+        view.projects[1].id = try transcript.Id.init("actual/project-b");
+        for (view.projects[0..2]) |*entry| {
+            @memcpy(entry.label[0..5], "Spica");
+            entry.len = 5;
+        }
+        for (view.threads[0..view.thread_count], 0..) |*entry, index| {
+            var id_buffer: [32]u8 = undefined;
+            entry.id = try transcript.Id.init(try std.fmt.bufPrint(&id_buffer, "real-thread-{d}", .{index}));
+            const title = try std.fmt.bufPrint(&entry.label, "Repair actual parser {d}", .{index});
+            entry.len = title.len;
+            entry.project_id = view.projects[index % 2].id;
+            entry.project_name = try transcript.Id.init("Spica");
+            entry.workspace_name = try transcript.Id.init("native-workspace");
+            entry.branch = try transcript.Id.init(if (index == 1) "feature/needle" else "main");
+        }
+        view.active_thread = view.threads[0].id;
+        view.active_project = view.projects[0].id;
+        const bounds = layout.coding(size[0]);
+        const fg = view.design.colors.foreground;
+        const muted = view.design.colors.muted;
+        try view.drawChrome(renderer, text, bounds, fg, muted);
+        const first = view.threadRowBounds(0);
+        const second = view.threadRowBounds(1);
+        try std.testing.expectEqual(@as(f32, 78), first.h);
+        try std.testing.expectEqual(@as(f32, 83), second.y - first.y);
+        try std.testing.expectEqual(view.sidebar_rows.x, first.x);
+        try std.testing.expectEqual(view.sidebar_rows.w, first.w);
+        try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(11));
+        try std.testing.expect(view.search_bounds.x + view.search_bounds.w <= view.scope_bounds.x);
+        try std.testing.expect(view.scope_bounds.x + 28 <= view.new_project_bounds.x);
+        try std.testing.expect(view.new_project_bounds.x + 28 <= view.new_thread_bounds.x);
+        try std.testing.expectEqual(view.scope_bounds.y, view.new_thread_bounds.y);
+        try std.testing.expectEqual(@as(f32, 28), view.new_thread_bounds.w);
+        try std.testing.expectEqual(@as(f32, 32), view.search_bounds.h);
+        try std.testing.expect(view.setup_bounds.y >= view.sidebar_rows.y + view.sidebar_rows.h);
+        try std.testing.expect(c.SDL_RenderPresent(renderer));
+        var r: u8 = 0;
+        var g: u8 = 0;
+        var b: u8 = 0;
+        var alpha: u8 = 0;
+        // Flat selected surface fills the card, rather than an indented title.
+        try std.testing.expect(c.SDL_ReadSurfacePixel(surface, @intFromFloat(first.x + 3), @intFromFloat(first.y + 40), &r, &g, &b, &alpha));
+        try std.testing.expectEqual(@as(u8, 0x1a), r);
+        try std.testing.expectEqual(@as(u8, 0x1b), g);
+        try std.testing.expectEqual(@as(u8, 0x1b), b);
+        view.sidebar_scroll = 40;
+        try view.drawChrome(renderer, text, bounds, fg, muted);
+        const clipped = view.threadRowBounds(0);
+        try std.testing.expectEqual(view.sidebar_rows.y, clipped.y);
+        try std.testing.expect(clipped.h > 0 and clipped.h < 78);
+        var event = std.mem.zeroes(c.SDL_Event);
+        event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+        event.button.button = c.SDL_BUTTON_LEFT;
+        event.button.x = clipped.x + 3;
+        event.button.y = clipped.y - 1;
+        view.navigation = null;
+        // Above cards lies the row/header gutter, never a clipped thread hit.
+        try std.testing.expect(try view.handle(event, undefined, undefined));
+        try std.testing.expect(view.navigation == null);
+        event.button.y = clipped.y + 2;
+        try std.testing.expect(try view.handle(event, undefined, undefined));
+        try std.testing.expectEqual(@as(usize, 0), view.navigation.?.thread);
+        try view.searchInsert("NEEDLE");
+        try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(0));
+        try view.drawChrome(renderer, text, bounds, fg, muted);
+        const filtered = view.threadRowBounds(1);
+        try std.testing.expect(filtered.h == 78);
+        event.button.x = filtered.x + 4;
+        event.button.y = filtered.y + 40;
+        try std.testing.expect(try view.handle(event, undefined, undefined));
+        try std.testing.expectEqual(@as(usize, 1), view.navigation.?.thread);
+        event.button.x = view.scope_bounds.x + 4;
+        event.button.y = view.scope_bounds.y + 4;
+        try std.testing.expect(try view.handle(event, undefined, undefined));
+        try std.testing.expect(view.scope_open);
+        try view.drawChrome(renderer, text, bounds, fg, muted);
+        try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(1));
+        event.button.x = view.project_bounds[0].x + 4;
+        event.button.y = view.project_bounds[0].y + 4;
+        try std.testing.expect(try view.handle(event, undefined, undefined));
+        try std.testing.expect(view.scope_project.eql("actual/project-a"));
+        try std.testing.expectEqual(@as(usize, 0), view.visibleThreadCount());
+        view.search_len = 0;
+        try view.drawChrome(renderer, text, bounds, fg, muted);
+        try std.testing.expectEqual(@as(usize, 6), view.visibleThreadCount());
+        try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(1));
+        const a = view.threadRowBounds(0);
+        const c_row = view.threadRowBounds(2);
+        try std.testing.expectEqual(@as(f32, 83), c_row.y - a.y);
+        var stats: c.SpicaTextStats = undefined;
+        try std.testing.expect(c.spica_text_get_stats(text, &stats));
+        try std.testing.expectEqual(@as(c_uint, 1), stats.face_count);
+    }
+}
+
+test "primary circle and glyph preserve disabled opacity enabled accent and destructive colors on the real surface" {
+    const Pixel = struct {
+        fn expect(surface: *c.SDL_Surface, x: f32, y: f32, expected: Color) !void {
+            var actual: Color = undefined;
+            var alpha: u8 = 0;
+            try std.testing.expect(c.SDL_ReadSurfacePixel(surface, @intFromFloat(x), @intFromFloat(y), &actual.r, &actual.g, &actual.b, &alpha));
+            try std.testing.expectEqual(expected, actual);
+            try std.testing.expectEqual(@as(u8, 255), alpha);
+        }
+    };
+    for ([_][2]f32{ .{ 720, 480 }, .{ 900, 650 }, .{ 1100, 740 }, .{ 1280, 800 } }) |size| {
+        const surface = c.SDL_CreateSurface(@intFromFloat(size[0]), @intFromFloat(size[1]), c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+        defer c.SDL_DestroySurface(surface);
+        const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+        defer c.SDL_DestroyRenderer(renderer);
+        const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+        defer c.spica_text_destroy(text);
+        var layout = try Layout.init(std.testing.allocator, size[0], size[1]);
+        defer layout.deinit();
+        const bounds = layout.coding(size[0]);
+        for (0..2) |theme| {
+            var view = try View.init(std.testing.allocator);
+            defer view.deinit();
+            view.focused = false;
+            view.window_active = false;
+            if (theme == 1) {
+                // User configuration may change every contributing role. In
+                // particular the real composer surface differs from raised.
+                view.design.colors.surface = .{ .r = 40, .g = 60, .b = 80 };
+                view.design.colors.raised = .{ .r = 100, .g = 110, .b = 120 };
+                view.design.colors.accent = .{ .r = 200, .g = 150, .b = 100 };
+                view.design.colors.accent_text = .{ .r = 240, .g = 230, .b = 220 };
+                view.design.colors.danger = .{ .r = 180, .g = 30, .b = 90 };
+            }
+            for (0..4) |state| {
+                // Empty draft and unavailable provider both retain the visible
+                // disabled circle; only admitted Send/Stop use opaque paints.
+                if (state == 1) try view.insert("real draft", .typing);
+                view.can_send = state < 2;
+                view.can_cancel = state == 2;
+                try view.draw(renderer, text, undefined, bounds);
+                try std.testing.expect(c.SDL_RenderPresent(renderer));
+                const primary = view.controls[if (state == 2) @as(usize, 1) else 0];
+                try std.testing.expectEqual(@as(f32, 32), primary.w);
+                try std.testing.expectEqual(@as(f32, 32), primary.h);
+                try std.testing.expect(view.picker_bounds.x + view.picker_bounds.w + 10 <= view.effort_bounds.x);
+                try std.testing.expect(view.effort_bounds.x + view.effort_bounds.w + 10 <= primary.x);
+                const disabled = state == 0 or state == 3;
+                // Independent expected sRGB samples from 64% button opacity,
+                // rounded once to bytes. Do not derive expectations with the
+                // production compositing helper.
+                const fill = if (disabled)
+                    (if (theme == 0) Color{ .r = 39, .g = 75, .b = 160 } else Color{ .r = 142, .g = 118, .b = 93 })
+                else if (state == 2)
+                    view.design.colors.danger
+                else
+                    view.design.colors.accent;
+                const glyph = if (disabled)
+                    (if (theme == 0) Color{ .r = 169, .g = 169, .b = 169 } else Color{ .r = 168, .g = 169, .b = 170 })
+                else
+                    view.design.colors.accent_text;
+                try Pixel.expect(surface, primary.x + 16, primary.y + 26, fill);
+                try Pixel.expect(surface, primary.x + 16, primary.y + 18, glyph);
+                if (state == 2) try Pixel.expect(surface, primary.x + 10, primary.y + 18, fill);
+                // Rounded corner stays on the actual composer surface, proving
+                // this remains a circle rather than an opaque 32px rectangle.
+                try Pixel.expect(surface, primary.x, primary.y, view.design.colors.surface);
+                if (disabled) try std.testing.expect(!std.meta.eql(fill, view.design.colors.surface));
+            }
+        }
+    }
 }

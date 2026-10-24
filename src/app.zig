@@ -360,7 +360,7 @@ pub const App = struct {
         }
         self.snapshot.caret = self.view.editor.caret;
         self.snapshot.anchor = self.view.editor.anchor;
-        self.snapshot.editor_focused = self.view.focused;
+        self.snapshot.editor_focused = self.view.focused and !self.view.search_focused and !self.view.setup_open;
         self.snapshot.preedit_bytes = self.view.preedit_len;
         self.snapshot.draft_revision = self.view.revision;
         const editor_bounds = self.view.editor_view.bounds;
@@ -385,6 +385,26 @@ pub const App = struct {
         for (self.view.threads[0..self.view.thread_count], 0..) |*entry, index| {
             const bounds = self.view.threadRowBounds(index);
             self.snapshot.thread_targets[index] = .{ .id = entry.id.slice(), .role = "thread", .enabled = self.view.custom_root == null and self.view.navigation_enabled and bounds.w > 0 and bounds.h > 0, .pointer_bounds = .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } };
+        }
+        self.snapshot.sidebar_search = self.view.search_query[0..self.view.search_len];
+        self.snapshot.sidebar_search_focused = self.view.search_focused;
+        self.snapshot.sidebar_scope_open = self.view.scope_open;
+        self.snapshot.sidebar_scope_project = self.view.scope_project.slice();
+        self.snapshot.effort_open = self.view.effort_open;
+        const sidebar_bounds = [_]c.SDL_FRect{ self.view.search_bounds, self.view.scope_bounds };
+        for (sidebar_bounds, 0..) |bounds, index| {
+            self.snapshot.sidebar_targets[index] = .{ .id = if (index == 0) "sidebar.search" else "sidebar.scope", .role = if (index == 0) "textbox" else "button", .key = "", .enabled = self.view.custom_root == null and bounds.w > 0 and bounds.h > 0, .pointer_bounds = .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } };
+        }
+        self.snapshot.scope_targets = @splat(.{ .enabled = false });
+        for (0..self.view.project_count + 1) |index| {
+            const bounds = if (index == 0) self.view.scope_all_bounds else self.view.project_bounds[index - 1];
+            const enabled = self.view.custom_root == null and self.view.scope_open and bounds.w > 0 and bounds.h > 0;
+            self.snapshot.scope_targets[index] = .{ .id = if (index == 0) "scope.all" else self.view.projects[index - 1].id.slice(), .role = "menuitem", .key = "", .enabled = enabled, .pointer_bounds = if (enabled) .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } else null };
+        }
+        self.snapshot.effort_targets = @splat(.{ .enabled = false });
+        for (self.view.effort_rows, 0..) |bounds, index| {
+            const enabled = self.view.custom_root == null and self.view.effort_open and bounds.w > 0 and bounds.h > 0;
+            self.snapshot.effort_targets[index] = .{ .id = "effort.option", .role = "menuitem", .key = "", .enabled = enabled, .pointer_bounds = if (enabled) .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } else null };
         }
         const present_begin = if (self.metrics != null) c.SDL_GetTicksNS() else 0;
         const succeeded = c.SDL_RenderPresent(self.renderer);
@@ -418,6 +438,7 @@ pub const App = struct {
         self.snapshot.generation = self.frames;
         if (self.conversation) |conversation| {
             self.snapshot.thread_id = conversation.thread.slice();
+            self.snapshot.project_id = conversation.project.slice();
             self.snapshot.run_id = conversation.run.slice();
             self.snapshot.approval_id = if (conversation.approval_live) conversation.approval.slice() else "";
             self.snapshot.pending_command = conversation.command != null;
@@ -451,7 +472,15 @@ pub const App = struct {
         }
         for (0..4) |index| self.snapshot.setup_fields[index] = self.view.setup_fields[index][0..self.view.setup_lengths[index]];
         self.snapshot.thread_labels = @splat("");
-        for (self.view.threads[0..self.view.thread_count], 0..) |*entry, index| self.snapshot.thread_labels[index] = entry.label[0..entry.len];
+        self.snapshot.thread_projects = @splat("");
+        self.snapshot.thread_branches = @splat("");
+        self.snapshot.thread_run_states = @splat("");
+        for (self.view.threads[0..self.view.thread_count], 0..) |*entry, index| {
+            self.snapshot.thread_labels[index] = entry.label[0..entry.len];
+            self.snapshot.thread_projects[index] = entry.project_id.slice();
+            self.snapshot.thread_branches[index] = entry.branch.slice();
+            self.snapshot.thread_run_states[index] = @tagName(entry.run_status);
+        }
         self.snapshot.selected_runtime = "";
         self.snapshot.selected_model = "";
         self.snapshot.selected_effort = "";
@@ -664,8 +693,11 @@ const Conversation = struct {
     completion: presentation.Completion = undefined,
     project: Id = .{},
     workspace: Id = .{},
+    workspace_branch: Id = .{},
     thread: Id = .{},
     thread_revision: u64 = 0,
+    card_rows_seen: usize = 0,
+    create_thread_after_workspace: bool = false,
     run: Id = .{},
     run_revision: u64 = 0,
     run_state: ?types.RunState = null,
@@ -787,6 +819,9 @@ const Conversation = struct {
         self.run_revision = row.revision;
         self.run_state = row.state;
         view.status = @tagName(row.state);
+        for (view.threads[0..view.thread_count]) |*entry| if (entry.id.eql(row.thread.value)) {
+            entry.run_status = cardRunStatus(row.state);
+        };
         if (view.notice) |message| {
             if (message.ptr == self.diagnostic_storage[0..].ptr) view.notice = null;
         }
@@ -825,8 +860,17 @@ const Conversation = struct {
             if (!available) return error.DraftRetentionFull;
         }
         switch (navigation) {
-            .new_project => try self.submit(.project, .absent, .absent, .{ .project_create = .{ .display_name = "Coding project" } }, 0),
-            .new_thread => try self.createThread(),
+            .new_project => {
+                app.view.scope_project = .{};
+                try self.submit(.project, .absent, .absent, .{ .project_create = .{ .display_name = "Coding project" } }, 0);
+            },
+            .new_thread => {
+                if (app.view.scope_project.len != 0 and !app.view.scope_project.eql(self.project.slice())) {
+                    self.project = app.view.scope_project;
+                    self.create_thread_after_workspace = true;
+                    try self.ask(.workspaces, .{ .workspaces = .{ .project = .{ .value = self.project.slice() }, .page = page } });
+                } else try self.createThread();
+            },
             .project => |index| {
                 if (index >= app.view.project_count) return;
                 self.project = app.view.projects[index].id;
@@ -836,6 +880,7 @@ const Conversation = struct {
             },
             .thread => |index| {
                 if (index >= app.view.thread_count) return;
+                self.project = app.view.threads[index].project_id;
                 try self.selectThread(app, app.view.threads[index].id);
             },
         }
@@ -871,13 +916,73 @@ const Conversation = struct {
     }
 
     fn addEntry(entries: []Coding.Entry, count: *usize, id: []const u8, label: []const u8) !void {
-        for (entries[0..count.*]) |entry| if (entry.id.eql(id)) return;
+        for (entries[0..count.*]) |*entry| if (entry.id.eql(id)) {
+            const bounded = @import("text/utf8.zig").prefix(label, entry.label.len);
+            entry.len = bounded.len;
+            @memcpy(entry.label[0..entry.len], bounded);
+            return;
+        };
         if (count.* == entries.len) return;
         const entry = &entries[count.*];
+        entry.* = .{};
         entry.id = try Id.init(id);
-        entry.len = @min(label.len, entry.label.len);
+        entry.len = @import("text/utf8.zig").prefix(label, entry.label.len).len;
         @memcpy(entry.label[0..entry.len], label[0..entry.len]);
         count.* += 1;
+    }
+
+    fn cardRunStatus(state: types.RunState) Coding.RunStatus {
+        return switch (state) {
+            .queued, .starting, .streaming, .cancel_requested => .running,
+            .awaiting_approval => .approval,
+            .failed => .failed,
+            .interrupted, .unknown => .interrupted,
+            .completed, .cancelled => .idle,
+        };
+    }
+
+    fn displayId(bytes: []const u8) !Id {
+        const bounded = @import("text/utf8.zig").prefix(bytes, @import("ui/transcript.zig").id_bytes);
+        return if (bounded.len == 0) .{} else try Id.init(bounded);
+    }
+
+    fn cardTitle(output: *[160]u8, preview: []const u8) []const u8 {
+        const bounded = @import("text/utf8.zig").prefix(preview, output.len);
+        var len: usize = 0;
+        var space = false;
+        for (bounded) |byte| {
+            if (std.ascii.isWhitespace(byte) or byte < 32 or byte == 127) {
+                space = len != 0;
+                continue;
+            }
+            if (space and len < output.len) {
+                output[len] = ' ';
+                len += 1;
+            }
+            space = false;
+            if (len == output.len) break;
+            output[len] = byte;
+            len += 1;
+        }
+        return if (len == 0) "New thread" else output[0..len];
+    }
+
+    fn updateThreadCard(self: *Conversation, view: *Coding, row: @FieldType(types.Row, "thread")) !void {
+        if (row.project_name.len != 0) try addEntry(&view.projects, &view.project_count, row.project.value, row.project_name);
+        var title: [160]u8 = undefined;
+        try addEntry(&view.threads, &view.thread_count, row.id.value, cardTitle(&title, row.title_preview));
+        for (view.threads[0..view.thread_count]) |*entry| if (entry.id.eql(row.id.value)) {
+            entry.project_id = try Id.init(row.project.value);
+            for (view.projects[0..view.project_count]) |*project| if (project.id.eql(row.project.value)) {
+                entry.project_name = try displayId(project.label[0..project.len]);
+                break;
+            };
+            if (row.project_name.len != 0) entry.project_name = try displayId(row.project_name);
+            entry.workspace_name = try displayId(std.fs.path.basename(if (row.workspace_root.len != 0) row.workspace_root else self.workspace_root));
+            entry.branch = try displayId(row.workspace_branch);
+            entry.run_status = if (row.latest_run_state) |state| cardRunStatus(state) else .idle;
+            return;
+        };
     }
 
     fn prepareHistoryRestore(self: *Conversation, view: *Coding) bool {
@@ -1042,7 +1147,7 @@ const Conversation = struct {
         }
     }
 
-    const QueryKind = enum { projects, workspaces, threads, thread, models, runtime_status, runs, approvals, tasks, messages, blocks, content };
+    const QueryKind = enum { projects, workspaces, threads, cards, thread, models, runtime_status, runs, approvals, tasks, messages, blocks, content };
     const CommandKind = enum { project, workspace, thread, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
@@ -1299,7 +1404,8 @@ const Conversation = struct {
                 self.message_anchor = null;
                 self.message_direction = .older;
             }
-            try self.ask(.thread, .{ .thread = .{ .value = self.thread.slice() } });
+            self.card_rows_seen = 0;
+            try self.ask(.cards, .{ .threads = .{ .page = page } });
         }
         const terminal = if (self.run_state) |state| switch (state) {
             .completed, .cancelled, .failed, .interrupted, .unknown => true,
@@ -1357,7 +1463,8 @@ const Conversation = struct {
             .thread => {
                 try self.selectThread(app, try Id.init(value.entity_ids.thread.?.value));
                 app.view.thread_count = 0;
-                try self.ask(.threads, .{ .threads = .{ .project = .{ .value = self.project.slice() }, .page = page } });
+                self.card_rows_seen = 0;
+                try self.ask(.threads, .{ .threads = .{ .page = page } });
             },
             .send => {
                 app.view.notice = null;
@@ -1393,9 +1500,11 @@ const Conversation = struct {
     }
 
     fn createWorkspace(self: *Conversation) !void {
+        self.create_thread_after_workspace = false;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const binding = try domain.workspace_binding.capture(arena.allocator(), self.io, self.workspace_root);
+        self.workspace_branch = try displayId(binding.expected_branch);
         try self.submit(.workspace, .absent, .absent, .{ .workspace_register = .{ .project = .{ .value = self.project.slice() }, .binding = binding } }, 0);
     }
     fn createThread(self: *Conversation) !void {
@@ -1421,6 +1530,7 @@ const Conversation = struct {
                     }
                     if (self.configuration_pending and status.workspace_root.len != 0 and status.binding != null) {
                         self.configuration_pending = false;
+                        self.workspace_branch = try displayId(status.binding.?.expected_branch);
                         const root = try self.allocator.dupe(u8, status.workspace_root);
                         self.allocator.free(self.workspace_root);
                         self.workspace_root = root;
@@ -1473,33 +1583,43 @@ const Conversation = struct {
                 for (value.items) |row| {
                     if (!std.mem.eql(u8, row.workspace.binding.canonical_root, self.workspace_root)) continue;
                     self.workspace = try Id.init(row.workspace.id.value);
+                    self.workspace_branch = try displayId(row.workspace.binding.expected_branch);
                     selected = true;
                     break;
                 }
                 if (selected) {
-                    try self.ask(.threads, .{ .threads = .{ .project = .{ .value = self.project.slice() }, .page = page } });
+                    if (self.create_thread_after_workspace) {
+                        self.create_thread_after_workspace = false;
+                        try self.createThread();
+                    } else {
+                        self.card_rows_seen = 0;
+                        try self.ask(.threads, .{ .threads = .{ .page = page } });
+                    }
                 } else if (value.next_cursor) |cursor| {
                     try self.ask(.workspaces, .{ .workspaces = .{ .project = .{ .value = self.project.slice() }, .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = cursor } } });
                 } else try self.createWorkspace();
             },
-            .threads => {
-                var selected = false;
+            .threads, .cards => {
                 for (value.items) |row| {
-                    if (!std.mem.eql(u8, row.thread.workspace.value, self.workspace.slice())) continue;
-                    var label: [160]u8 = undefined;
-                    const name = try std.fmt.bufPrint(&label, "Chat {d}{s}{s}", .{ app.view.thread_count + 1, if (row.thread.selection != null) " · " else "", if (row.thread.selection) |selection| @import("text/utf8.zig").prefix(selection.model_id, 100) else "" });
-                    try addEntry(&app.view.threads, &app.view.thread_count, row.thread.id.value, name);
-                    if (self.thread.len == 0) self.thread = try Id.init(row.thread.id.value);
-                    selected = true;
+                    self.card_rows_seen += 1;
+                    if (!std.mem.eql(u8, row.thread.workspace_root, self.workspace_root)) continue;
+                    try self.updateThreadCard(&app.view, row.thread);
+                    if (self.thread.len == 0 and std.mem.eql(u8, row.thread.project.value, self.project.slice())) self.thread = try Id.init(row.thread.id.value);
                 }
-                if (value.next_cursor != null and app.view.thread_count < app.view.threads.len) {
-                    try self.ask(.threads, .{ .threads = .{ .project = .{ .value = self.project.slice() }, .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = value.next_cursor } } });
-                } else if (selected or self.thread.len != 0) {
-                    try self.selectThread(app, self.thread);
-                } else try self.createThread();
+                if (value.next_cursor != null and app.view.thread_count < app.view.threads.len and self.card_rows_seen < 128) {
+                    try self.ask(kind, .{ .threads = .{ .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = value.next_cursor } } });
+                } else {
+                    if (value.next_cursor != null) self.notice(&app.view, "Showing a bounded thread page for this workspace. More threads remain outside this view.");
+                    if (kind == .cards) {
+                        try self.ask(.thread, .{ .thread = .{ .value = self.thread.slice() } });
+                    } else if (self.thread.len != 0) {
+                        try self.selectThread(app, self.thread);
+                    } else try self.createThread();
+                }
             },
             .thread => {
                 if (value.items.len != 1) return error.MissingThread;
+                try self.updateThreadCard(&app.view, value.items[0].thread);
                 self.thread_revision = value.items[0].thread.revision;
                 self.workspace = try Id.init(value.items[0].thread.workspace.value);
                 try self.restoreSelection(&app.view, value.items[0].thread.selection);
@@ -2102,4 +2222,51 @@ test "native theme keeps ordinary composition and restores default settings on s
     try bridge.install(app);
     try std.testing.expect(app.view.custom_root == &bridge.root);
     try std.testing.expect(app.view.custom_render == &bridge.render);
+}
+
+test "thread cards own real titles and workspace metadata across refresh" {
+    const conversation = try std.testing.allocator.create(Conversation);
+    defer std.testing.allocator.destroy(conversation);
+    conversation.workspace_root = @constCast("/tmp/actual-project");
+    conversation.workspace_branch = try Id.init("feature/sidebar");
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    try Conversation.addEntry(&view.projects, &view.project_count, "project", "Coding project");
+    var row: @FieldType(types.Row, "thread") = .{
+        .id = .{ .value = "thread" },
+        .revision = 1,
+        .project = .{ .value = "project" },
+        .workspace = .{ .value = "workspace" },
+        .session = null,
+        .title_preview = " \n Fix\t the café sidebar 🎉\r\n",
+        .latest_run_state = .awaiting_approval,
+        .project_name = "Actual project",
+        .workspace_root = "/tmp/actual-project",
+        .workspace_branch = "feature/sidebar",
+    };
+    try conversation.updateThreadCard(&view, row);
+    try std.testing.expectEqual(@as(usize, 1), view.thread_count);
+    const card = &view.threads[0];
+    try std.testing.expectEqualStrings("Fix the café sidebar 🎉", card.label[0..card.len]);
+    try std.testing.expectEqualStrings("Actual project", card.project_name.slice());
+    try std.testing.expectEqualStrings("Actual project", view.projects[0].label[0..view.projects[0].len]);
+    try std.testing.expectEqualStrings("actual-project", card.workspace_name.slice());
+    try std.testing.expectEqualStrings("feature/sidebar", card.branch.slice());
+    try std.testing.expectEqual(Coding.RunStatus.approval, card.run_status);
+    row.latest_run_state = .completed;
+    try conversation.updateThreadCard(&view, row);
+    try std.testing.expectEqual(@as(usize, 1), view.thread_count);
+    try std.testing.expectEqual(Coding.RunStatus.idle, card.run_status);
+    row.title_preview = "\n\t";
+    try conversation.updateThreadCard(&view, row);
+    try std.testing.expectEqualStrings("New thread", card.label[0..card.len]);
+    var title: [160]u8 = undefined;
+    const long = [_]u8{'x'} ** 159 ++ "🎉 trailing";
+    const bounded = Conversation.cardTitle(&title, long);
+    try std.testing.expectEqual(@as(usize, 159), bounded.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(bounded));
+    // Presentation clipping does not change the registered execution identity.
+    const full_branch = [_]u8{'b'} ** 255 ++ "é";
+    try std.testing.expectEqual(@as(u16, 255), (try Conversation.displayId(full_branch)).len);
+    try std.testing.expectEqual(@as(usize, 257), full_branch.len);
 }

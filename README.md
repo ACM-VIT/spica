@@ -34,6 +34,9 @@ discovered or migrated. `--state-directory` selects isolated state explicitly.
 
 For a short manual test, send a Unicode prompt, exercise approval/cancel, then
 create another chat from the sidebar and check that switching restores your draft.
+The flat sidebar shows first-prompt titles and actual project/branch metadata.
+Search filters loaded thread metadata; the project filter scopes the list without
+switching your conversation. New thread follows that explicit scope.
 Close and reopen with the same state directory to check retained output. The
 default provider is a synthetic fixture; use an explicit real provider below for
 an actual coding task.
@@ -87,7 +90,7 @@ zig-out/bin/spica --provider opencode \
 Create the workspace directory first. Configured real runtimes discover their
 models on launch without sending a prompt. An explicit `--model` / `--effort`
 selection is retained exactly; without those flags, choose a model beside the
-composer. The adjacent effort control cycles through that model's actual options.
+composer. The adjacent effort control opens that model's actual options.
 Sending starts real provider work in the selected workspace. **Connection** lets
 you edit the configured paths, refresh discovery or initiate Codex sign-in; the
 composer explains why sending is unavailable. Choose IDs from your actual
