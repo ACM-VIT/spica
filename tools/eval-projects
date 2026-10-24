@@ -66,7 +66,7 @@ class Proof:
         self.manifest['commands_sha256'] = sha(self.out / 'commands.json')
         (self.out / 'manifest.json').write_text(json.dumps(self.manifest, indent=2, ensure_ascii=False))
 
-    def run(self, *argv, env=None, timeout=30, check=True, input=None, pass_fds=(), strip=True):
+    def run(self, *argv, env=None, timeout=30, check=True, input=None, pass_fds=(), strip=True, raw=False):
         command = dict(argv=list(map(str, argv)), cwd=str(self.args.app_root),
                        begin_unix_ns=time.time_ns(), environment_override=env)
         if input is not None:
@@ -76,9 +76,10 @@ class Proof:
         self.save()
         try:
             result = subprocess.run(command['argv'], cwd=self.args.app_root, env=env,
-                                    capture_output=True, text=True, timeout=timeout,
+                                    capture_output=True, text=not raw, timeout=timeout,
                                     input=input, pass_fds=pass_fds)
-            command.update(exit=result.returncode, stdout=result.stdout, stderr=result.stderr)
+            command.update(exit=result.returncode, stdout=evidence_value(result.stdout, binary=raw),
+                           stderr=evidence_value(result.stderr, binary=raw))
             if check:
                 result.check_returncode()
             return result.stdout.strip() if strip else result.stdout
@@ -96,10 +97,10 @@ class Proof:
             raise RuntimeError('Assertion failed: ' + name + ': ' + repr(detail))
 
     def source_identity(self):
-        diff = self.run('git', 'diff', '--binary', 'HEAD', '--', strip=False)
+        diff = self.run('git', 'diff', '--binary', 'HEAD', '--', strip=False, raw=True)
         status = self.run('git', 'status', '--porcelain', '--untracked-files=no', strip=False)
         return dict(head=self.run('git', 'rev-parse', 'HEAD'), tracked_status=status,
-                    tracked_binary_diff_sha256=hashlib.sha256(diff.encode()).hexdigest())
+                    tracked_binary_diff_sha256=hashlib.sha256(diff).hexdigest())
 
     def prepare(self):
         self.require('candidate_at_start', self.run('git', 'rev-parse', 'HEAD') == self.args.candidate)
