@@ -2504,6 +2504,18 @@ test "connection paints provider choices advanced fields and explicit sign-in pa
                 try Pixel.expect(surface, view.setup_provider_bounds[index], view.design.colors.selection);
                 try Pixel.expect(surface, view.setup_provider_bounds[1 - index], view.design.colors.surface);
                 try Pixel.expect(surface, view.setup_button_bounds[0], view.design.colors.selection);
+                if (runtime == .codex) {
+                    const existing = view.setup_existing_bounds;
+                    try std.testing.expect(existing.w > 0 and existing.h > 0);
+                    try std.testing.expect(existing.x >= view.setup_advanced_bounds.x + view.setup_advanced_bounds.w + 8);
+                    try std.testing.expect(existing.x + existing.w <= view.setup_menu.x + view.setup_menu.w);
+                    try Pixel.expect(surface, existing, view.design.colors.surface);
+                    click.button.x = existing.x + existing.w / 2;
+                    click.button.y = existing.y + existing.h / 2;
+                    try std.testing.expect(try view.handle(click, undefined, undefined));
+                    try std.testing.expectEqual(.configure, view.setup_action.?);
+                    view.setup_action = null;
+                } else try std.testing.expectEqual(@as(f32, 0), view.setup_existing_bounds.w);
                 if (runtime == .opencode) {
                     for ([_]usize{ 1, 2 }) |button| {
                         const box = view.setup_button_bounds[button];
