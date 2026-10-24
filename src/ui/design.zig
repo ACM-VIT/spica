@@ -16,16 +16,21 @@ pub const Palette = struct {
     accent: Color = rgb(0x346bf1),
     accent_text: Color = rgb(0xffffff),
     selection: Color = rgb(0x343a47),
+    sidebar_active: Color = rgb(0x1a1b1b),
+    sidebar_hover: Color = rgb(0x131313),
+    sidebar_muted: Color = rgb(0xa3a3a3),
+    sidebar_border: Color = rgb(0x141414),
+    danger: Color = rgb(0xfb414a),
 };
 
 pub const Metrics = struct {
-    sidebar_width: f32 = 272,
-    content_width: f32 = 880,
-    header_height: f32 = 56,
+    sidebar_width: f32 = 256,
+    content_width: f32 = 736,
+    header_height: f32 = 52,
     composer_height: f32 = 160,
     gutter: f32 = 24,
     gap: f32 = 12,
-    radius: f32 = 16,
+    radius: f32 = 24,
 };
 
 pub const metric_min = [7]f32{ 148, 400, 48, 136, 12, 4, 0 };
@@ -48,7 +53,7 @@ pub const Config = struct {
     /// Transport implementations must provide the same validation as Lua.
     pub fn fromScript(root: *const script.Root) ValidationError!Config {
         const source = &root.design;
-        if (source.colors_present & ~@as(u32, 0x3ff) != 0 or
+        if (source.colors_present & ~@as(u32, 0x7fff) != 0 or
             source.layout_present & ~@as(u32, 0x7f) != 0)
             return error.InvalidDesign;
         inline for (0..7) |i| {

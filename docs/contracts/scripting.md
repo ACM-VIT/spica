@@ -53,23 +53,29 @@ Both groups are optional plain tables. Their permitted fields are:
 | accent | `#346bf1` |
 | accent_text | `#ffffff` |
 | selection | `#343a47` |
+| sidebar_active | `#1a1b1b` |
+| sidebar_hover | `#131313` |
+| sidebar_muted | `#a3a3a3` |
+| sidebar_border | `#141414` |
+| danger | `#fb414a` |
 
 These are direct RGB values from T3 Code's MIT-licensed
 `packages/shared/src/themePalettes.ts`, `T3_CODE_DARK_THEME_COLORS`, pinned at
 `eb1510d2493cbf28600432d5193cc22a1af8f3d8`. The corresponding roles are canvas,
 sidebar, surface, surfaceRaised, border, text, textMuted, messageAction,
-messageActionForeground and terminalSelection. This is a bounded subset of its
+messageActionForeground, terminalSelection, sidebarRowActive, sidebarRowHover,
+sidebarMutedForeground, sidebarBorder and error. This is a bounded subset of its
 roles, not its complete theme engine.
 
 | Metrics field | Default | Inclusive range |
 | --- | --- | --- |
-| sidebar_width | 272 | 148–400 |
-| content_width | 880 | 400–1600 |
-| header_height | 56 | 48–96 |
+| sidebar_width | 256 | 148–400 |
+| content_width | 736 | 400–1600 |
+| header_height | 52 | 48–96 |
 | composer_height | 160 | 136–240 |
 | gutter | 24 | 12–48 |
 | gap | 12 | 4–32 |
-| radius | 16 | 0–24 |
+| radius | 24 | 0–24 |
 
 All color values must be actual Lua strings of exactly seven bytes, `#RRGGBB`;
 hex digits are case insensitive. Short hex, alpha, names and numeric colors are

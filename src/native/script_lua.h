@@ -8,7 +8,7 @@
 #define SPICA_SCRIPT_ID 128
 #define SPICA_SCRIPT_ACTIONS 8
 #define SPICA_SCRIPT_NODES 64
-#define SPICA_SCRIPT_COLORS 10
+#define SPICA_SCRIPT_COLORS 15
 #define SPICA_SCRIPT_METRICS 7
 /* Bit order matches the named fields below. Omitted fields retain defaults. */
 #define SPICA_STYLE_WIDTH (1u << 0)
@@ -25,7 +25,8 @@ typedef struct {
     uint8_t background[3], foreground[3];
 } SpicaScriptStyle;
 /* colors: background,sidebar,surface,raised,border,foreground,muted,accent,
- * accent_text,selection. layout: sidebar_width,content_width,header_height,
+ * accent_text,selection,sidebar_active,sidebar_hover,sidebar_muted,
+ * sidebar_border,danger. layout: sidebar_width,content_width,header_height,
  * composer_height,gutter,gap,radius. Native consumers validate before use. */
 typedef struct {
     uint32_t colors_present, layout_present;

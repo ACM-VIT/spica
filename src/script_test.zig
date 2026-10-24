@@ -272,7 +272,7 @@ test "native design validates defaults, masks, every metric bound and finite con
     root.design.layout_present = 1;
     try std.testing.expectError(error.InvalidDesign, design.Config.fromScript(&root));
     root.design.layout[0] = 272;
-    root.design.colors_present = 1 << 10;
+    root.design.colors_present = 1 << 15;
     try std.testing.expectError(error.InvalidDesign, design.Config.fromScript(&root));
     root.design.colors_present = 0;
     root.design.layout_present = 1 << 7;
@@ -298,7 +298,8 @@ test "Lua design and every node style field decode exactly while legacy modules 
     const source = try moduleForRoot(
         "{kind='column',id='root'," ++
             "design={colors={background='#010203',sidebar='#040506',surface='#070809',raised='#0a0b0c'," ++
-            "border='#0d0e0f',foreground='#F0F1F2',muted='#818181',accent='#346BF1',accent_text='#FFFFFF',selection='#343a47'}," ++
+            "border='#0d0e0f',foreground='#F0F1F2',muted='#818181',accent='#346BF1',accent_text='#FFFFFF',selection='#343a47'," ++
+            "sidebar_active='#102030',sidebar_hover='#203040',sidebar_muted='#304050',sidebar_border='#405060',danger='#ff0102'}," ++
             "layout={sidebar_width=300,content_width=960,header_height=64,composer_height=192,gutter=32,gap=16,radius=8}}," ++
             "style={width=4096,height=1,gap=0,padding=128,font_size=72,radius=64,background='#00aAfF',foreground='#fEfDfC'}," ++
             "children={{kind='text',id='unicode',text='héllo 世界',style={font_size=8}},{kind='composer',id='draft'}}}",
@@ -311,13 +312,18 @@ test "Lua design and every node style field decode exactly while legacy modules 
     try runtime.reload(1, source, &input);
     try wait(&runtime, &result);
     try equal(@as(c_int, 0), result.status);
-    try equal(@as(u32, 0x3ff), result.root.design.colors_present);
+    try equal(@as(u32, 0x7fff), result.root.design.colors_present);
     try equal(@as(u32, 0x7f), result.root.design.layout_present);
     const config = try design.Config.fromScript(&result.root);
     try equal(@as(f32, 300), config.layout.sidebar_width);
     try equal(@as(f32, 192), config.layout.composer_height);
     try std.testing.expectEqualDeep(design.Color{ .r = 1, .g = 2, .b = 3 }, config.colors.background);
     try std.testing.expectEqualDeep(design.Color{ .r = 240, .g = 241, .b = 242 }, config.colors.foreground);
+    try std.testing.expectEqualDeep(design.Color{ .r = 16, .g = 32, .b = 48 }, config.colors.sidebar_active);
+    try std.testing.expectEqualDeep(design.Color{ .r = 32, .g = 48, .b = 64 }, config.colors.sidebar_hover);
+    try std.testing.expectEqualDeep(design.Color{ .r = 48, .g = 64, .b = 80 }, config.colors.sidebar_muted);
+    try std.testing.expectEqualDeep(design.Color{ .r = 64, .g = 80, .b = 96 }, config.colors.sidebar_border);
+    try std.testing.expectEqualDeep(design.Color{ .r = 255, .g = 1, .b = 2 }, config.colors.danger);
     const style = &result.root.nodes[0].style;
     try script.validateStyle(style);
     try equal(@as(u32, 255), style.present);

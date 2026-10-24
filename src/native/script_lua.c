@@ -194,9 +194,10 @@ static void style(lua_State *L, int index, SpicaScriptStyle *out) {
 }
 static void design(lua_State *L, int index, SpicaScriptDesign *out) {
     static const char *const groups[] = {"colors", "layout"};
-    static const char *const colors[] = {"background",  "sidebar",    "surface", "raised",
-                                         "border",      "foreground", "muted",   "accent",
-                                         "accent_text", "selection"};
+    static const char *const colors[] = {
+        "background",     "sidebar",       "surface",       "raised",         "border",
+        "foreground",     "muted",         "accent",        "accent_text",    "selection",
+        "sidebar_active", "sidebar_hover", "sidebar_muted", "sidebar_border", "danger"};
     static const char *const metrics[] = {"sidebar_width",   "content_width", "header_height",
                                           "composer_height", "gutter",        "gap",
                                           "radius"};
@@ -211,7 +212,8 @@ static void design(lua_State *L, int index, SpicaScriptDesign *out) {
         plain_table(L, table);
         lua_pushnil(L);
         while (lua_next(L, table)) {
-            int key = named_key(L, -2, group == 0 ? colors : metrics, group == 0 ? 10 : 7);
+            int key = named_key(L, -2, group == 0 ? colors : metrics,
+                                group == 0 ? SPICA_SCRIPT_COLORS : SPICA_SCRIPT_METRICS);
             if (group == 0) {
                 color(L, -1, out->colors[key]);
                 out->colors_present |= 1u << key;
