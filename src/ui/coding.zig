@@ -201,7 +201,20 @@ pub const View = struct {
         const len = self.setup_existing_account_len;
         @memcpy(self.setup_fields[1][0..len], self.setup_existing_account[0..len]);
         self.setup_lengths[1] = len;
-        self.setup_action = .configure;
+        self.requestSetupAction(0);
+    }
+
+    /// Every submission entry point shares availability and focus transitions.
+    fn requestSetupAction(self: *View, index: usize) void {
+        if (!self.setupActionEnabled(index)) return;
+        self.setup_action = switch (index) {
+            0 => .configure,
+            1 => .browser,
+            2 => .device,
+            else => .refresh,
+        };
+        self.setup_advanced_open = false;
+        self.setup_field = 2;
     }
 
     /// Display the exact saved configuration, retaining the other provider's
@@ -714,15 +727,7 @@ pub const View = struct {
                             self.setup_select_all = true;
                         };
                         for (self.setup_button_bounds, 0..) |box, index| if (widgets.contains(box, x, y)) {
-                            if (!self.setupActionEnabled(index)) break;
-                            self.setup_action = switch (index) {
-                                0 => .configure,
-                                1 => .browser,
-                                2 => .device,
-                                else => .refresh,
-                            };
-                            self.setup_advanced_open = false;
-                            self.setup_field = 2;
+                            self.requestSetupAction(index);
                         };
                         return true;
                     }
@@ -980,9 +985,7 @@ pub const View = struct {
                     }
                     if (ctrl and key == c.SDLK_A) self.setup_select_all = true;
                     if (key == c.SDLK_RETURN and self.setupActionEnabled(0)) {
-                        self.setup_action = .configure;
-                        self.setup_advanced_open = false;
-                        self.setup_field = 2;
+                        self.requestSetupAction(0);
                     }
                     if (key == c.SDLK_BACKSPACE or (key == c.SDLK_DELETE and self.setup_select_all)) {
                         const len = &self.setup_lengths[self.setup_field];
@@ -3078,8 +3081,12 @@ test "existing Codex is an explicit owned choice preserving saved custom paths a
     try std.testing.expect(view.setup_action == null);
     try std.testing.expectEqualStrings(saved.account_directory, view.setup_fields[1][0..view.setup_lengths[1]]);
     view.setup_busy = false;
+    view.setup_advanced_open = true;
+    view.setup_field = 1;
     view.useExistingCodex();
     try std.testing.expectEqual(.configure, view.setup_action.?);
+    try std.testing.expect(!view.setup_advanced_open);
+    try std.testing.expectEqual(@as(usize, 2), view.setup_field);
     try std.testing.expectEqualStrings(setup_fixture_defaults[0].account_directory, view.setup_fields[1][0..view.setup_lengths[1]]);
     try std.testing.expectEqualStrings(saved.workspace_root, view.setup_fields[2][0..view.setup_lengths[2]]);
     view.setup_action = null;
