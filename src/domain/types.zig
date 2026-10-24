@@ -146,7 +146,7 @@ pub const Query = union(enum) {
     models: struct { workspace: adapter.WorkspaceId, page: Page = .{} },
     runtime_status: void,
     workspaces: struct { project: ProjectId, page: Page = .{} },
-    threads: struct { project: ProjectId, anchor: ?ThreadId = null, page: Page = .{} },
+    threads: struct { project: ?ProjectId = null, anchor: ?ThreadId = null, page: Page = .{} },
     thread: ThreadId,
     messages: struct { thread: ThreadId, anchor: ?adapter.MessageId = null, direction: Direction = .newer, page: Page = .{} },
     blocks: struct { message: adapter.MessageId, page: Page = .{} },
@@ -190,6 +190,9 @@ pub const Row = union(enum) {
         /// decoding history. Presentation may collapse whitespace for a title.
         title_preview: []const u8 = "",
         latest_run_state: ?RunState = null,
+        project_name: []const u8 = "",
+        workspace_root: []const u8 = "",
+        workspace_branch: []const u8 = "",
     },
     message: struct {
         message_id: adapter.MessageId,
