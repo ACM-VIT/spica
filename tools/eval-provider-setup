@@ -70,6 +70,8 @@ def main():
             ipc(f'[con_id={window}] focus')
             m.run(*m.key_command(session, window, value))
         def click(snapshot, name):
+            if name in ('runtime.configure', 'runtime.browser', 'runtime.device', 'runtime.refresh'):
+                snapshot = observe(lambda s: next(t for t in s['setup_targets'] if t['id'] == name)['enabled'], 'action-ready-' + name.replace('.', '-'))
             targets = [item for group in ('targets', 'setup_targets', 'setup_provider_targets', 'setup_field_targets')
                        for item in snapshot.get(group, [])]
             targets += [snapshot['setup_advanced_target'], snapshot['setup_login_target']]
@@ -122,8 +124,8 @@ def main():
         click(current, 'runtime.advanced')
         current = observe(lambda s: s['setup_field_targets'][0]['enabled'], 'repair-advanced')
         current = edit(current, 'runtime.executable', str(ROOT / 'build/provider_setup_fixture.py'))
-        click(current, 'runtime.configure')
-        current = observe(lambda s: s['model_count'] == 1 and 'requires ChatGPT sign-in' in s['runtime_info'], 'signin-required')
+        # Sign-in must apply the displayed draft itself, including after the
+        # failed executable above; no separate Connect click is required.
         click(current, 'runtime.device')
         current = observe(lambda s: s['login_pending'] and s['login_code'] == 'TEST-1234', 'device-code')
         assert current['login_url'] == 'https://example.invalid/spica-fixture'
@@ -150,6 +152,26 @@ def main():
         shot('reopened-codex')
         click(current, 'runtime.setup')
         current = observe(lambda s: s['setup_open'], 'connection-reopened')
+        click(current, 'runtime.advanced')
+        current = observe(lambda s: s['setup_field_targets'][1]['enabled'], 'second-account-advanced')
+        second_account = output / 'second-codex-account'
+        current = edit(current, 'runtime.account', str(second_account))
+        click(current, 'runtime.device')
+        current = observe(lambda s: s['login_pending'] and s['login_code'] == 'TEST-1234', 'second-account-device')
+        assert current['setup_fields'][1] == str(second_account)
+        assert all(not t['enabled'] for t in current['setup_targets']), 'Pending login actions must be disabled'
+        current = observe(lambda s: not s['login_pending'] and not s['setup_open'] and s['model_count'] == 1, 'second-account-ready')
+        # Only the disposable fixture marker is inspected, never credentials.
+        assert (second_account / '.spica-fixture-signed-in').is_file(), 'Sign-in used the previously saved account'
+        click(current, 'runtime.setup')
+        current = observe(lambda s: s['setup_open'], 'restore-first-account')
+        click(current, 'runtime.advanced')
+        current = observe(lambda s: s['setup_field_targets'][1]['enabled'], 'first-account-advanced')
+        current = edit(current, 'runtime.account', codex_fields[1])
+        click(current, 'runtime.configure')
+        current = observe(lambda s: not s['setup_open'] and s['model_count'] == 1 and not s['pending_command'], 'first-account-restored')
+        click(current, 'runtime.setup')
+        current = observe(lambda s: s['setup_open'], 'connection-before-opencode')
         click(current, 'runtime.opencode')
         current = observe(lambda s: s['setup_runtime'] == 'opencode', 'switch-opencode')
         # The new process seeds only defaults for inactive runtime drafts.
