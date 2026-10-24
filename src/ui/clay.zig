@@ -38,6 +38,54 @@ pub const Layout = struct {
         composer: c.Clay_BoundingBox,
     };
 
+    /// Setup geometry is shared by painting, hit testing and native automation.
+    /// The advanced form stays usable in the 720x480 minimum window; the
+    /// ordinary form reserves more space for connection/sign-in diagnostics.
+    pub const Setup = struct {
+        menu: c.SDL_FRect,
+        close: c.SDL_FRect,
+        providers: [2]c.SDL_FRect,
+        advanced: c.SDL_FRect,
+        fields: [4]c.SDL_FRect,
+        buttons: [4]c.SDL_FRect,
+        guidance_y: f32,
+        status_y: f32,
+    };
+
+    pub fn setup(width: f32, height: f32, advanced: bool) Setup {
+        const menu_width = @max(0, @min(760, width - 24));
+        const menu_height = @max(0, @min(if (advanced) @as(f32, 580) else 468, height - 24));
+        const menu = c.SDL_FRect{ .x = (width - menu_width) / 2, .y = (height - menu_height) / 2, .w = menu_width, .h = menu_height };
+        const x = menu.x + 16;
+        const inner_width = @max(0, menu.w - 32);
+        const half = @max(0, (inner_width - 8) / 2);
+        var fields: [4]c.SDL_FRect = @splat(.{ .x = 0, .y = 0, .w = 0, .h = 0 });
+        fields[2] = .{ .x = x, .y = menu.y + 120, .w = inner_width, .h = 32 };
+        if (advanced) for ([_]usize{ 0, 1, 3 }, 0..) |index, row| {
+            fields[index] = .{ .x = x + 112, .y = menu.y + 202 + @as(f32, @floatFromInt(row)) * 38, .w = @max(0, inner_width - 112), .h = 28 };
+        };
+        const action_y = menu.y + (if (advanced) @as(f32, 318) else 202);
+        return .{
+            .menu = menu,
+            .close = .{ .x = menu.x + menu.w - 82, .y = menu.y + 10, .w = 66, .h = 30 },
+            .providers = .{
+                .{ .x = x, .y = menu.y + 52, .w = half, .h = 40 },
+                .{ .x = x + half + 8, .y = menu.y + 52, .w = half, .h = 40 },
+            },
+            .advanced = .{ .x = x, .y = menu.y + 162, .w = inner_width, .h = 28 },
+            .fields = fields,
+            // The public legacy order is configure/browser/device/refresh.
+            .buttons = .{
+                .{ .x = x, .y = action_y, .w = half, .h = 32 },
+                .{ .x = x, .y = action_y + 42, .w = half, .h = 32 },
+                .{ .x = x + half + 8, .y = action_y + 42, .w = half, .h = 32 },
+                .{ .x = x + half + 8, .y = action_y, .w = half, .h = 32 },
+            },
+            .guidance_y = action_y + 82,
+            .status_y = action_y + 116,
+        };
+    }
+
     pub fn sidebarWidth(width: f32) f32 {
         return sidebarWidthWith(.{}, width);
     }
@@ -147,6 +195,33 @@ pub const Layout = struct {
         c.Clay__ConfigureOpenElement(declaration);
     }
 };
+
+test "connection geometry preserves workspace hierarchy and disjoint painted actions at supported sizes" {
+    for ([_][2]f32{ .{ 720, 480 }, .{ 900, 650 }, .{ 1100, 740 }, .{ 1280, 800 } }) |size| {
+        for ([_]bool{ false, true }) |advanced| {
+            const geometry = Layout.setup(size[0], size[1], advanced);
+            const menu = geometry.menu;
+            try std.testing.expect(menu.x >= 12 and menu.y >= 12);
+            try std.testing.expect(menu.x + menu.w <= size[0] - 12 and menu.y + menu.h <= size[1] - 12);
+            try std.testing.expect(geometry.providers[0].y + geometry.providers[0].h < geometry.fields[2].y);
+            try std.testing.expect(geometry.fields[2].y + geometry.fields[2].h < geometry.advanced.y);
+            const controls = [_]c.SDL_FRect{ geometry.close, geometry.providers[0], geometry.providers[1], geometry.advanced, geometry.fields[0], geometry.fields[1], geometry.fields[2], geometry.fields[3], geometry.buttons[0], geometry.buttons[1], geometry.buttons[2], geometry.buttons[3] };
+            for (controls, 0..) |box, index| {
+                if (box.w == 0 or box.h == 0) continue;
+                try std.testing.expect(box.x >= menu.x and box.y >= menu.y and box.x + box.w <= menu.x + menu.w and box.y + box.h <= menu.y + menu.h);
+                for (controls[index + 1 ..]) |other| {
+                    if (other.w == 0 or other.h == 0) continue;
+                    try std.testing.expect(box.x + box.w <= other.x or other.x + other.w <= box.x or box.y + box.h <= other.y or other.y + other.h <= box.y);
+                }
+            }
+            for ([_]usize{ 0, 1, 3 }) |index| {
+                try std.testing.expectEqual(advanced, geometry.fields[index].w > 0);
+            }
+            try std.testing.expect(geometry.status_y + 14 <= menu.y + menu.h - 6);
+            if (!advanced) try std.testing.expect(geometry.status_y + 100 <= menu.y + menu.h - 6);
+        }
+    }
+}
 
 test "configured native geometry keeps responsive sidebar and bounded centered content" {
     for ([_]f32{ 300, 700, 720, 1000, 1280, 2200 }) |width| {

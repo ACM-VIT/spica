@@ -108,17 +108,26 @@ pub const View = struct {
     project_bounds: [16]c.SDL_FRect = @splat(zero_rect),
     thread_bounds: [32]c.SDL_FRect = @splat(zero_rect),
     setup_open: bool = false,
-    setup_runtime: enum { codex, opencode } = .codex,
+    setup_runtime: contract.RuntimeKind = .codex,
     setup_fields: [4][512]u8 = undefined,
     setup_lengths: [4]usize = @splat(0),
-    setup_field: usize = 0,
+    setup_drafts: [2]SetupDraft = @splat(.{}),
+    setup_field: usize = 2,
     setup_select_all: bool = false,
+    setup_advanced_open: bool = false,
     setup_menu: c.SDL_FRect = zero_rect,
     setup_runtime_bounds: c.SDL_FRect = zero_rect,
+    setup_provider_bounds: [2]c.SDL_FRect = @splat(zero_rect),
+    setup_advanced_bounds: c.SDL_FRect = zero_rect,
+    setup_login_bounds: c.SDL_FRect = zero_rect,
     setup_close_bounds: c.SDL_FRect = zero_rect,
     setup_field_bounds: [4]c.SDL_FRect = @splat(zero_rect),
     setup_button_bounds: [4]c.SDL_FRect = @splat(zero_rect),
-    setup_action: ?enum { configure, browser, device, status, refresh } = null,
+    setup_action: ?enum { configure, browser, device, status, refresh, open_login } = null,
+    login_url: [2048]u8 = undefined,
+    login_url_len: usize = 0,
+    login_code: [128]u8 = undefined,
+    login_code_len: usize = 0,
     runtime_info: [4096]u8 = undefined,
     runtime_info_len: usize = 0,
     picker_bounds: c.SDL_FRect = .{ .x = 240, .y = 18, .w = 350, .h = 28 },
@@ -140,6 +149,82 @@ pub const View = struct {
     const zero_rect: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     pub const picker_row_height: f32 = 48;
     pub const sidebar_card_stride: f32 = 83;
+
+    const SetupDraft = struct {
+        fields: [4][512]u8 = undefined,
+        lengths: [4]usize = @splat(0),
+
+        fn copy(self: *SetupDraft, configuration: contract.RuntimeSetup) bool {
+            var complete = true;
+            const fields = [_][]const u8{ configuration.executable, configuration.account_directory, configuration.workspace_root, configuration.model_provider };
+            for (fields, 0..) |field, index| {
+                self.lengths[index] = 0;
+                if (field.len > self.fields[index].len or !std.unicode.utf8ValidateSlice(field)) {
+                    complete = false;
+                    continue;
+                }
+                @memcpy(self.fields[index][0..field.len], field);
+                self.lengths[index] = field.len;
+            }
+            return complete;
+        }
+    };
+
+    /// Seed both provider drafts in Codex, OpenCode order. No borrowed strings
+    /// survive this call. An oversized or invalid UTF8 field remains empty.
+    pub fn setSetupDefaults(self: *View, defaults: [2]contract.RuntimeSetup) bool {
+        var complete = true;
+        for (defaults, 0..) |configuration, index| {
+            if (!self.setup_drafts[index].copy(configuration)) complete = false;
+        }
+        self.loadSetupDraft();
+        return complete;
+    }
+
+    /// Display the exact saved configuration, retaining the other provider's
+    /// draft. This owns paths only; Host/provider lifetimes belong to the App.
+    pub fn configureSetup(self: *View, configuration: contract.RuntimeSetup) bool {
+        self.saveSetupDraft();
+        self.setup_runtime = configuration.runtime_kind;
+        const complete = self.setup_drafts[self.setupIndex()].copy(configuration);
+        self.loadSetupDraft();
+        return complete;
+    }
+
+    fn setupIndex(self: *const View) usize {
+        return if (self.setup_runtime == .codex) 0 else 1;
+    }
+
+    fn saveSetupDraft(self: *View) void {
+        const draft = &self.setup_drafts[self.setupIndex()];
+        for (self.setup_lengths, 0..) |len, index| {
+            @memcpy(draft.fields[index][0..len], self.setup_fields[index][0..len]);
+        }
+        draft.lengths = self.setup_lengths;
+    }
+
+    fn loadSetupDraft(self: *View) void {
+        const draft = &self.setup_drafts[self.setupIndex()];
+        for (draft.lengths, 0..) |len, index| {
+            @memcpy(self.setup_fields[index][0..len], draft.fields[index][0..len]);
+        }
+        self.setup_lengths = draft.lengths;
+        self.setup_select_all = false;
+    }
+
+    fn selectSetupProvider(self: *View, runtime: contract.RuntimeKind) void {
+        if (self.setup_runtime == runtime) return;
+        self.saveSetupDraft();
+        self.setup_runtime = runtime;
+        self.loadSetupDraft();
+        self.setup_field = 2;
+    }
+
+    fn toggleSetupAdvanced(self: *View) void {
+        self.setup_advanced_open = !self.setup_advanced_open;
+        if (!self.setup_advanced_open) self.setup_field = 2;
+        self.setup_select_all = false;
+    }
 
     pub const Identity = struct {
         runtime_kind: transcript.Id = .{},
@@ -588,7 +673,11 @@ pub const View = struct {
                     const y = event.button.y;
                     if (self.setup_open) {
                         if (widgets.contains(self.setup_close_bounds, x, y)) self.setup_open = false;
-                        if (widgets.contains(self.setup_runtime_bounds, x, y)) self.setup_runtime = if (self.setup_runtime == .codex) .opencode else .codex;
+                        for (self.setup_provider_bounds, 0..) |box, index| if (widgets.contains(box, x, y)) {
+                            self.selectSetupProvider(if (index == 0) .codex else .opencode);
+                        };
+                        if (widgets.contains(self.setup_advanced_bounds, x, y)) self.toggleSetupAdvanced();
+                        if (self.setup_runtime == .codex and self.login_url_len != 0 and widgets.contains(self.setup_login_bounds, x, y)) self.setup_action = .open_login;
                         for (self.setup_field_bounds, 0..) |box, index| if (widgets.contains(box, x, y)) {
                             self.setup_field = index;
                             self.setup_select_all = true;
@@ -601,6 +690,8 @@ pub const View = struct {
                                 2 => .device,
                                 else => .refresh,
                             };
+                            self.setup_advanced_open = false;
+                            self.setup_field = 2;
                         };
                         return true;
                     }
@@ -838,13 +929,30 @@ pub const View = struct {
                 const ctrl = mods & c.SDL_KMOD_CTRL != 0;
                 const shift = mods & c.SDL_KMOD_SHIFT != 0;
                 if (self.setup_open and self.custom_root == null) {
+                    const alt = mods & c.SDL_KMOD_ALT != 0;
                     if (key == c.SDLK_ESCAPE) self.setup_open = false;
+                    if (alt and key == c.SDLK_1) self.selectSetupProvider(.codex);
+                    if (alt and key == c.SDLK_2) self.selectSetupProvider(.opencode);
+                    if (alt and key == c.SDLK_A) self.toggleSetupAdvanced();
+                    if (ctrl and key == c.SDLK_L and self.setup_runtime == .codex and self.login_url_len != 0) self.setup_action = .open_login;
                     if (key == c.SDLK_TAB) {
-                        self.setup_field = (self.setup_field + (if (shift) @as(usize, 3) else 1)) % 4;
+                        if (self.setup_advanced_open) {
+                            // Visual order: Workspace, executable, account, provider.
+                            const order = [_]usize{ 2, 0, 1, 3 };
+                            var position: usize = 0;
+                            for (order, 0..) |field, index| if (field == self.setup_field) {
+                                position = index;
+                            };
+                            self.setup_field = order[(position + (if (shift) @as(usize, 3) else 1)) % order.len];
+                        } else self.setup_field = 2;
                         self.setup_select_all = true;
                     }
                     if (ctrl and key == c.SDLK_A) self.setup_select_all = true;
-                    if (key == c.SDLK_RETURN) self.setup_action = .configure;
+                    if (key == c.SDLK_RETURN) {
+                        self.setup_action = .configure;
+                        self.setup_advanced_open = false;
+                        self.setup_field = 2;
+                    }
                     if (key == c.SDLK_BACKSPACE or (key == c.SDLK_DELETE and self.setup_select_all)) {
                         const len = &self.setup_lengths[self.setup_field];
                         if (self.setup_select_all) {
@@ -1441,42 +1549,73 @@ pub const View = struct {
     fn drawSetup(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
         const width = bounds.header.width;
         const height = bounds.composer.y + bounds.composer.height + self.design.layout.gutter;
-        const menu_width = @min(800, width - 24);
-        const menu_height = @min(536, height - 24);
-        self.setup_menu = .{ .x = (width - menu_width) / 2, .y = (height - menu_height) / 2, .w = menu_width, .h = menu_height };
-        const menu = self.setup_menu;
+        const geometry = Layout.setup(width, height, self.setup_advanced_open);
+        const menu = geometry.menu;
+        self.setup_menu = menu;
+        self.setup_close_bounds = geometry.close;
+        self.setup_provider_bounds = geometry.providers;
+        // Retain the old toggle rectangle for native consumers; it denotes
+        // the other provider's actual painted choice, never the gap between.
+        self.setup_runtime_bounds = geometry.providers[1 - self.setupIndex()];
+        self.setup_advanced_bounds = geometry.advanced;
+        self.setup_field_bounds = geometry.fields;
+        self.setup_button_bounds = geometry.buttons;
+        self.setup_login_bounds = zero_rect;
         try widgets.panel(renderer, menu, @min(self.design.layout.radius, 8), self.design.colors.raised);
         var clip = widgets.Clip.push(renderer, menu);
         defer clip.restore(renderer);
-        try self.labels.draw(text, "Provider connection", menu.x + 16, menu.y + 15, 16, foreground);
-        self.setup_close_bounds = .{ .x = menu.x + menu.w - 82, .y = menu.y + 10, .w = 66, .h = 30 };
-        try widgets.panel(renderer, self.setup_close_bounds, @min(self.design.layout.radius, 4), self.design.colors.raised);
+        try self.labels.draw(text, "Connection setup", menu.x + 16, menu.y + 15, 16, foreground);
+        try widgets.panel(renderer, self.setup_close_bounds, @min(self.design.layout.radius, 4), self.design.colors.surface);
         try self.labels.draw(text, "Close Esc", self.setup_close_bounds.x + 7, menu.y + 19, 11, foreground);
-        self.setup_runtime_bounds = .{ .x = menu.x + 16, .y = menu.y + 48, .w = menu.w - 32, .h = 30 };
-        try widgets.panel(renderer, self.setup_runtime_bounds, @min(self.design.layout.radius, 4), self.design.colors.surface);
-        try self.labels.draw(text, if (self.setup_runtime == .codex) "Runtime: Codex  ↻ click to switch" else "Runtime: OpenCode  ↻ click to switch", menu.x + 24, menu.y + 57, 13, foreground);
-        const names = [_][]const u8{ "Runtime executable · absolute path", "Isolated account directory · absolute path", "Workspace · absolute path", "Model provider · e.g. openai" };
-        for (names, 0..) |name, index| {
-            const y = menu.y + 88 + @as(f32, @floatFromInt(index)) * 48;
-            try self.labels.draw(text, name, menu.x + 16, y, 11, muted);
-            const box = c.SDL_FRect{ .x = menu.x + 16, .y = y + 15, .w = menu.w - 32, .h = 28 };
-            self.setup_field_bounds[index] = box;
-            try widgets.panel(renderer, box, @min(self.design.layout.radius, 3), if (index == self.setup_field) self.design.colors.selection else self.design.colors.surface);
-            try self.labels.drawFitted(renderer, text, self.setup_fields[index][0..self.setup_lengths[index]], box.x + 6, box.y + 6, box.w - 12, 12, foreground);
+        for (self.setup_provider_bounds, 0..) |box, index| {
+            const selected = self.setupIndex() == index;
+            try widgets.panel(renderer, box, @min(self.design.layout.radius, 6), if (selected) self.design.colors.selection else self.design.colors.surface);
+            try self.labels.draw(text, if (index == 0) "Codex" else "OpenCode", box.x + 12, box.y + 6, 13, foreground);
+            try self.labels.draw(text, if (index == 0) "ChatGPT sign-in  ·  Alt+1" else "Preauthorized account  ·  Alt+2", box.x + 12, box.y + 23, 10, if (selected) foreground else muted);
         }
-        const names_buttons = [_][]const u8{ "Save connection", "Browser sign-in", "Device sign-in", "Refresh models" };
-        const button_width = (menu.w - 40) / 2;
+        try self.labels.draw(text, "Workspace · existing project folder", menu.x + 16, menu.y + 104, 11, muted);
+        try self.drawSetupField(renderer, text, 2, foreground, muted);
+        try widgets.panel(renderer, self.setup_advanced_bounds, @min(self.design.layout.radius, 4), self.design.colors.surface);
+        try icon(renderer, .chevron, self.setup_advanced_bounds.x + 8, self.setup_advanced_bounds.y + 6, muted);
+        try self.labels.draw(text, if (self.setup_advanced_open) "Hide Advanced · Alt+A" else "Advanced · executable, account, model provider · Alt+A", self.setup_advanced_bounds.x + 30, self.setup_advanced_bounds.y + 7, 11, muted);
+        if (self.setup_advanced_open) {
+            const names = [_][]const u8{ "Executable", "Account folder", "Model provider" };
+            for ([_]usize{ 0, 1, 3 }, names) |index, name| {
+                try self.labels.draw(text, name, menu.x + 16, self.setup_field_bounds[index].y + 7, 11, muted);
+                try self.drawSetupField(renderer, text, index, foreground, muted);
+            }
+        }
+        const names_buttons = [_][]const u8{ "Connect & discover", "Sign in with browser", "Use device code", "Refresh models" };
         for (names_buttons, 0..) |name, index| {
-            const box = c.SDL_FRect{ .x = menu.x + 16 + @as(f32, @floatFromInt(index % 2)) * (button_width + 8), .y = menu.y + 286 + @as(f32, @floatFromInt(index / 2)) * 38, .w = button_width, .h = 32 };
-            self.setup_button_bounds[index] = box;
+            const box = self.setup_button_bounds[index];
             const enabled = self.setup_runtime == .codex or (index != 1 and index != 2);
-            try widgets.panel(renderer, box, @min(self.design.layout.radius, 4), if (enabled) self.design.colors.selection else self.design.colors.surface);
+            try widgets.panel(renderer, box, @min(self.design.layout.radius, 4), if (index == 0) self.design.colors.selection else self.design.colors.surface);
             try self.labels.draw(text, name, box.x + 12, box.y + 9, 12, if (enabled) foreground else muted);
         }
-        try self.labels.drawFitted(renderer, text, "Tab changes field · Ctrl+A replaces · Paste supported · No credentials imported", menu.x + 16, menu.y + 368, menu.w - 32, 11, muted);
+        var status_y = geometry.status_y;
+        if (self.setup_runtime == .codex and self.login_url_len != 0) {
+            self.setup_login_bounds = .{ .x = menu.x + 16, .y = geometry.guidance_y, .w = 180, .h = 28 };
+            try widgets.panel(renderer, self.setup_login_bounds, @min(self.design.layout.radius, 4), self.design.colors.selection);
+            try self.labels.draw(text, "Open sign-in page", self.setup_login_bounds.x + 12, self.setup_login_bounds.y + 7, 12, foreground);
+            if (self.login_code_len != 0) {
+                try self.labels.draw(text, "Code:", menu.x + 208, geometry.guidance_y + 8, 11, muted);
+                try self.labels.drawFitted(renderer, text, self.login_code[0..self.login_code_len], menu.x + 244, geometry.guidance_y + 6, menu.w - 260, 14, foreground);
+            }
+            try self.labels.drawFitted(renderer, text, self.login_url[0..self.login_url_len], menu.x + 16, status_y, menu.w - 32, 11, muted);
+            status_y += 18;
+        } else {
+            const guidance = if (self.setup_runtime == .codex)
+                "Connect saves settings and finds models. Connect first, then sign in with ChatGPT."
+            else
+                "OpenCode sign-in is not supported here. Select a preauthorized account in Advanced.";
+            try self.labels.drawFitted(renderer, text, guidance, menu.x + 16, geometry.guidance_y, menu.w - 32, 11, muted);
+            try self.labels.drawFitted(renderer, text, "Choose a model beside the composer after connecting. No model is selected for you.", menu.x + 16, geometry.guidance_y + 17, menu.w - 32, 11, muted);
+        }
+        // Keep bounded raw failure diagnostics visible below structured login
+        // details. Long runtime strings never enter the label cache wholesale.
         var start: usize = 0;
-        var y = menu.y + 390;
-        while (start < self.runtime_info_len and y + 18 < menu.y + menu.h - 8) : (y += 18) {
+        var y = status_y;
+        while (start < self.runtime_info_len and y + 14 <= menu.y + menu.h - 6) : (y += 16) {
             const rest = self.runtime_info[start..self.runtime_info_len];
             const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
             const end = @import("../text/utf8.zig").prefix(rest[0..line_end], 100).len;
@@ -1484,6 +1623,15 @@ pub const View = struct {
             start += end;
             if (start < self.runtime_info_len and self.runtime_info[start] == '\n') start += 1;
         }
+    }
+
+    fn drawSetupField(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, index: usize, foreground: Color, muted: Color) !void {
+        const box = self.setup_field_bounds[index];
+        try widgets.panel(renderer, box, @min(self.design.layout.radius, 4), if (index == self.setup_field) self.design.colors.selection else self.design.colors.surface);
+        const placeholders = [_][]const u8{ "Absolute executable path", "Separate account directory", "Enter an absolute project folder", "Provider ID, e.g. openai" };
+        const len = self.setup_lengths[index];
+        const bytes = if (len == 0) placeholders[index] else self.setup_fields[index][0..len];
+        try self.labels.drawFitted(renderer, text, bytes, box.x + 8, box.y + (box.h - 16) / 2, box.w - 16, 12, if (len == 0) muted else foreground);
     }
 
     pub fn draw(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, window: *c.SDL_Window, outer_bounds: Layout.Coding) !void {
@@ -2008,6 +2156,7 @@ test "painted connection and composer controls fit minimum and regular windows" 
                 .device => 2,
                 .refresh => 3,
                 .status => 4,
+                .open_login => 5,
             });
         }
         try std.testing.expect(view.picker_bounds.x + view.picker_bounds.w <= view.effort_bounds.x);
@@ -2071,9 +2220,228 @@ test "painted connection and composer controls fit minimum and regular windows" 
     }
 }
 
+const setup_fixture_defaults = [2]contract.RuntimeSetup{
+    .{ .runtime_kind = .codex, .executable = "/fixture/bin/codex", .account_directory = "/fixture/accounts/codex", .workspace_root = "/fixture/project", .model_provider = "openai" },
+    .{ .runtime_kind = .opencode, .executable = "/fixture/bin/opencode", .account_directory = "/fixture/accounts/opencode", .workspace_root = "/fixture/project", .model_provider = "opencode" },
+};
+
+test "connection defaults own both provider drafts and never substitute another provider paths" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    var executable = "/fixture/bin/codex".*;
+    var defaults = setup_fixture_defaults;
+    defaults[0].executable = &executable;
+    try std.testing.expect(view.setSetupDefaults(defaults));
+    executable[0] = 'x';
+    try std.testing.expectEqualStrings("/fixture/bin/codex", view.setup_fields[0][0..view.setup_lengths[0]]);
+    try std.testing.expect(!view.setup_advanced_open);
+    try std.testing.expectEqual(@as(usize, 2), view.setup_field);
+    view.setup_select_all = true;
+    try view.setupInsert("/fixture/café/新");
+    view.selectSetupProvider(.opencode);
+    try std.testing.expectEqualStrings("/fixture/bin/opencode", view.setup_fields[0][0..view.setup_lengths[0]]);
+    try std.testing.expectEqualStrings("/fixture/accounts/opencode", view.setup_fields[1][0..view.setup_lengths[1]]);
+    try std.testing.expectEqualStrings("opencode", view.setup_fields[3][0..view.setup_lengths[3]]);
+    view.setup_field = 1;
+    view.setup_select_all = true;
+    try view.setupInsert("/fixture/preauthorized-opencode");
+    view.selectSetupProvider(.codex);
+    try std.testing.expectEqualStrings("/fixture/accounts/codex", view.setup_fields[1][0..view.setup_lengths[1]]);
+    try std.testing.expectEqualStrings("/fixture/café/新", view.setup_fields[2][0..view.setup_lengths[2]]);
+    view.selectSetupProvider(.opencode);
+    try std.testing.expectEqualStrings("/fixture/preauthorized-opencode", view.setup_fields[1][0..view.setup_lengths[1]]);
+    try std.testing.expect(view.configureSetup(defaults[0]));
+    try std.testing.expectEqual(.codex, view.setup_runtime);
+    view.selectSetupProvider(.opencode);
+    try std.testing.expectEqualStrings("/fixture/preauthorized-opencode", view.setup_fields[1][0..view.setup_lengths[1]]);
+    try std.testing.expect(view.selected == null);
+}
+
+test "connection configuration empties oversized fields without truncation and owns exact boundary" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    var defaults = setup_fixture_defaults;
+    defaults[1].account_directory = "x" ** 513;
+    try std.testing.expect(!view.setSetupDefaults(defaults));
+    view.selectSetupProvider(.opencode);
+    try std.testing.expectEqual(@as(usize, 0), view.setup_lengths[1]);
+    try std.testing.expectEqualStrings("/fixture/bin/opencode", view.setup_fields[0][0..view.setup_lengths[0]]);
+    var configuration = setup_fixture_defaults[0];
+    configuration.executable = "e" ** 513;
+    configuration.account_directory = "a" ** 512;
+    configuration.workspace_root = "w" ** 513;
+    configuration.model_provider = "p" ** 513;
+    try std.testing.expect(!view.configureSetup(configuration));
+    try std.testing.expectEqualDeep([4]usize{ 0, 512, 0, 0 }, view.setup_lengths);
+    try std.testing.expectEqualStrings("a" ** 512, view.setup_fields[1][0..view.setup_lengths[1]]);
+    view.selectSetupProvider(.opencode);
+    view.selectSetupProvider(.codex);
+    try std.testing.expectEqualDeep([4]usize{ 0, 512, 0, 0 }, view.setup_lengths);
+    configuration = setup_fixture_defaults[0];
+    configuration.account_directory = "\xff";
+    try std.testing.expect(!view.configureSetup(configuration));
+    try std.testing.expectEqual(@as(usize, 0), view.setup_lengths[1]);
+}
+
+test "connection keyboard navigates visible fields and deletes whole Unicode characters" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.setup_open = true;
+    try std.testing.expect(view.setSetupDefaults(setup_fixture_defaults));
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_TAB;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqual(@as(usize, 2), view.setup_field);
+    try view.setupInsert("/fixture/café/新");
+    event.key.key = c.SDLK_BACKSPACE;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqualStrings("/fixture/café/", view.setup_fields[2][0..view.setup_lengths[2]]);
+    event.key.key = c.SDLK_A;
+    event.key.mod = c.SDL_KMOD_ALT;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expect(view.setup_advanced_open);
+    event.key.mod = 0;
+    event.key.key = c.SDLK_TAB;
+    for ([_]usize{ 0, 1, 3, 2 }) |field| {
+        try std.testing.expect(try view.handle(event, undefined, undefined));
+        try std.testing.expectEqual(field, view.setup_field);
+    }
+    event.key.mod = c.SDL_KMOD_SHIFT;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqual(@as(usize, 3), view.setup_field);
+    event.key.mod = c.SDL_KMOD_ALT;
+    event.key.key = c.SDLK_2;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqual(.opencode, view.setup_runtime);
+    try std.testing.expectEqualStrings("/fixture/accounts/opencode", view.setup_fields[1][0..view.setup_lengths[1]]);
+    event.key.key = c.SDLK_1;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqualStrings("/fixture/café/", view.setup_fields[2][0..view.setup_lengths[2]]);
+    event.key.mod = 0;
+    event.key.key = c.SDLK_RETURN;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqual(.configure, view.setup_action.?);
+    try std.testing.expect(!view.setup_advanced_open);
+}
+
+test "connection paints provider choices advanced fields and explicit sign-in page at every supported size" {
+    const Pixel = struct {
+        fn expect(surface: *c.SDL_Surface, box: c.SDL_FRect, color: Color) !void {
+            var actual: Color = undefined;
+            var alpha: u8 = 0;
+            try std.testing.expect(c.SDL_ReadSurfacePixel(surface, @intFromFloat(box.x + box.w - 8), @intFromFloat(box.y + box.h / 2), &actual.r, &actual.g, &actual.b, &alpha));
+            try std.testing.expectEqualDeep(color, actual);
+        }
+    };
+    for ([_][2]f32{ .{ 720, 480 }, .{ 900, 650 }, .{ 1100, 740 }, .{ 1280, 800 } }) |size| {
+        const surface = c.SDL_CreateSurface(@intFromFloat(size[0]), @intFromFloat(size[1]), c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+        defer c.SDL_DestroySurface(surface);
+        const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+        defer c.SDL_DestroyRenderer(renderer);
+        const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+        defer c.spica_text_destroy(text);
+        var layout = try Layout.init(std.testing.allocator, size[0], size[1]);
+        defer layout.deinit();
+        var view = try View.init(std.testing.allocator);
+        defer view.deinit();
+        try std.testing.expect(view.setSetupDefaults(setup_fixture_defaults));
+        view.setup_open = true;
+        const bounds = layout.coding(size[0]);
+        const fg = view.design.colors.foreground;
+        const muted = view.design.colors.muted;
+        var click = std.mem.zeroes(c.SDL_Event);
+        click.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+        click.button.button = c.SDL_BUTTON_LEFT;
+        for ([_]bool{ false, true }) |advanced| {
+            view.setup_advanced_open = advanced;
+            try view.drawSetup(renderer, text, bounds, fg, muted);
+            for (view.setup_field_bounds, 0..) |box, index| {
+                try std.testing.expectEqual(advanced or index == 2, box.w > 0);
+                if (box.w == 0) continue;
+                click.button.x = box.x + box.w / 2;
+                click.button.y = box.y + box.h / 2;
+                try std.testing.expect(try view.handle(click, undefined, undefined));
+                try std.testing.expectEqual(index, view.setup_field);
+                try std.testing.expect(view.setup_select_all);
+            }
+            for ([_]contract.RuntimeKind{ .codex, .opencode }) |runtime| {
+                const index: usize = if (runtime == .codex) 0 else 1;
+                const choice = view.setup_provider_bounds[index];
+                click.button.x = choice.x + choice.w / 2;
+                click.button.y = choice.y + choice.h / 2;
+                view.setup_action = null;
+                try std.testing.expect(try view.handle(click, undefined, undefined));
+                try std.testing.expectEqual(runtime, view.setup_runtime);
+                try std.testing.expect(view.setup_action == null);
+                try view.drawSetup(renderer, text, bounds, fg, muted);
+                try std.testing.expect(c.SDL_RenderPresent(renderer));
+                try Pixel.expect(surface, view.setup_provider_bounds[index], view.design.colors.selection);
+                try Pixel.expect(surface, view.setup_provider_bounds[1 - index], view.design.colors.surface);
+                try Pixel.expect(surface, view.setup_button_bounds[0], view.design.colors.selection);
+                if (runtime == .opencode) {
+                    for ([_]usize{ 1, 2 }) |button| {
+                        const box = view.setup_button_bounds[button];
+                        click.button.x = box.x + 8;
+                        click.button.y = box.y + 8;
+                        try std.testing.expect(try view.handle(click, undefined, undefined));
+                        try std.testing.expect(view.setup_action == null);
+                    }
+                }
+            }
+            view.selectSetupProvider(.codex);
+        }
+        view.setup_advanced_open = false;
+        const url = "https://example.invalid/explicit-sign-in";
+        @memcpy(view.login_url[0..url.len], url);
+        view.login_url_len = url.len;
+        const code = "ABCD-1234";
+        @memcpy(view.login_code[0..code.len], code);
+        view.login_code_len = code.len;
+        const failure = "Connection failed: fixture diagnostic remains visible";
+        @memcpy(view.runtime_info[0..failure.len], failure);
+        view.runtime_info_len = failure.len;
+        try view.drawSetup(renderer, text, bounds, fg, muted);
+        const login = view.setup_login_bounds;
+        try std.testing.expect(login.w > 0 and login.h > 0);
+        try std.testing.expect(login.y + login.h < view.setup_menu.y + view.setup_menu.h);
+        click.button.x = login.x + login.w / 2;
+        click.button.y = login.y + login.h / 2;
+        view.setup_action = null;
+        try std.testing.expect(try view.handle(click, undefined, undefined));
+        try std.testing.expectEqual(.open_login, view.setup_action.?);
+        try std.testing.expectEqualStrings(failure, view.runtime_info[0..view.runtime_info_len]);
+        try std.testing.expect(c.SDL_RenderPresent(renderer));
+        try Pixel.expect(surface, login, view.design.colors.selection);
+        view.setup_action = null;
+        view.selectSetupProvider(.opencode);
+        try view.drawSetup(renderer, text, bounds, fg, muted);
+        try std.testing.expectEqualDeep(View.zero_rect, view.setup_login_bounds);
+        // A stale Codex URL never opens a page while OpenCode is selected.
+        try std.testing.expect(try view.handle(click, undefined, undefined));
+        try std.testing.expect(view.setup_action == null);
+        click.button.x = view.setup_advanced_bounds.x + 10;
+        click.button.y = view.setup_advanced_bounds.y + 10;
+        try std.testing.expect(try view.handle(click, undefined, undefined));
+        try std.testing.expect(view.setup_advanced_open);
+        try view.drawSetup(renderer, text, bounds, fg, muted);
+        try std.testing.expect(view.setup_field_bounds[1].w > 0);
+        click.button.x = view.setup_advanced_bounds.x + 10;
+        click.button.y = view.setup_advanced_bounds.y + 10;
+        try std.testing.expect(try view.handle(click, undefined, undefined));
+        try std.testing.expect(!view.setup_advanced_open);
+        try std.testing.expectEqual(@as(usize, 2), view.setup_field);
+        // Setup chrome does not cause incidental operating-system font loading.
+        var stats: c.SpicaTextStats = undefined;
+        try std.testing.expect(c.spica_text_get_stats(text, &stats));
+        try std.testing.expectEqual(@as(c_uint, 1), stats.face_count);
+    }
+}
+
 test "setup replacement preserves UTF8 and rejects oversized replacement atomically" {
     var view = try View.init(std.testing.allocator);
     defer view.deinit();
+    view.setup_field = 0;
     try view.setupInsert("/tmp/old-account");
     view.setup_select_all = true;
     try view.setupInsert("/tmp/café/新");
