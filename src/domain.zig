@@ -771,9 +771,17 @@ pub const Owner = struct {
             task_id: ?[]const u8 = null,
             content: ?[]const u8 = null,
             reason: ?[]const u8 = null,
+            candidate: ?[]const u8 = null,
+            evidence: ?[]const u8 = null,
+            summary: ?[]const u8 = null,
+            disposition: ?[]const u8 = null,
         };
         const args = try t.decode(Args, arguments_json, allocator);
         const parent = try self.field(allocator, "SELECT id FROM runs WHERE session_id=?", &.{.{ .text = session.value }}) orelse return error.AuthorityUnavailable;
+        if (std.mem.eql(u8, name, "task.catalog")) {
+            const models = if (self.factory) |factory| factory.models() else &.{};
+            return .{ .success = true, .json = try encoded(allocator, models) };
+        }
         if (std.mem.eql(u8, name, "task.list") or std.mem.eql(u8, name, "task.wait")) {
             if (std.mem.eql(u8, name, "task.wait") and args.task_id == null) return error.InvalidToolArguments;
             return .{ .success = true, .json = try encoded(allocator, try self.taskRows(allocator, parent, args.task_id)) };
@@ -796,12 +804,24 @@ pub const Owner = struct {
                 var target: a.RunId = .{ .value = parent };
                 if (std.mem.eql(u8, name, "task.delegate")) {
                     payload = .{ .task_delegate = args.packet orelse return error.InvalidToolArguments };
-                    if (args.task_id != null or args.content != null or args.reason != null) return error.InvalidToolArguments;
+                    if (args.task_id != null or args.content != null or args.reason != null or args.candidate != null or args.evidence != null or args.summary != null or args.disposition != null) return error.InvalidToolArguments;
                 } else {
                     const task = args.task_id orelse return error.InvalidToolArguments;
                     if (try self.field(allocator, "SELECT run_id FROM tasks WHERE parent_run=? AND run_id=?", &.{ .{ .text = parent }, .{ .text = task } }) == null) return error.AuthorityUnavailable;
                     target = .{ .value = task };
-                    if (std.mem.eql(u8, name, "task.send")) payload = .{ .task_send = .{ .content = args.content orelse return error.InvalidToolArguments } } else if (std.mem.eql(u8, name, "task.cancel")) payload = .{ .task_cancel = .{ .reason = args.reason orelse return error.InvalidToolArguments } } else return error.UnsupportedTool;
+                    if (std.mem.eql(u8, name, "task.send")) {
+                        if (args.content == null or args.reason != null or args.candidate != null or args.evidence != null or args.summary != null or args.disposition != null) return error.InvalidToolArguments;
+                        payload = .{ .task_send = .{ .content = args.content.? } };
+                    } else if (std.mem.eql(u8, name, "task.cancel")) {
+                        if (args.reason == null or args.content != null or args.candidate != null or args.evidence != null or args.summary != null or args.disposition != null) return error.InvalidToolArguments;
+                        payload = .{ .task_cancel = .{ .reason = args.reason.? } };
+                    } else if (std.mem.eql(u8, name, "task.result")) {
+                        if (args.candidate == null or args.evidence == null or args.summary == null or args.content != null or args.reason != null or args.disposition != null) return error.InvalidToolArguments;
+                        payload = .{ .task_result = .{ .candidate = args.candidate.?, .evidence = args.evidence.?, .summary = args.summary.? } };
+                    } else if (std.mem.eql(u8, name, "task.review")) {
+                        if (args.candidate == null or args.evidence == null or args.disposition == null or args.content != null or args.reason != null or args.summary != null) return error.InvalidToolArguments;
+                        payload = .{ .task_review = .{ .candidate = args.candidate.?, .evidence = args.evidence.?, .disposition = std.meta.stringToEnum(t.orchestration.Disposition, args.disposition.?) orelse return error.InvalidToolArguments } };
+                    } else return error.UnsupportedTool;
                     if (args.packet != null) return error.InvalidToolArguments;
                 }
                 const command_id = try std.fmt.allocPrint(allocator, "tool:{s}:{s}", .{ session.value, key });

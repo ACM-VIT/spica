@@ -286,6 +286,8 @@ test "public factory Host authenticates MCP durable retries and pumps three isol
     try std.testing.expect(initialize_json.object.get("result").?.object.get("capabilities").?.object.get("tools").? == .object);
     const tools = try consumer.http(bridge, bridge.token, "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/list\"}");
     try std.testing.expect(std.mem.indexOf(u8, tools.body, "task.delegate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools.body, "task.result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools.body, "task.review") != null);
     var packet: t.orchestration.Packet = .{ .purpose = "child one", .prompt = "first exact work", .selection = sampleSelection(workspace.value), .owned_paths = &.{"src/a"}, .acceptance = "check", .result_location = "first-evidence" };
     packet.selection.model_id = "child-one-model";
     packet.selection.account_ref = "child-one-account";
@@ -343,8 +345,10 @@ test "public factory Host authenticates MCP durable retries and pumps three isol
     try std.testing.expect(parent_instance.tool_responded.load(.acquire));
     try std.testing.expect(std.mem.indexOf(u8, parent_instance.tool_result[0..parent_instance.tool_result_len], second.entity_ids.run.?.value) != null);
     const saved_result: t.orchestration.Result = .{ .candidate = "child-one-candidate", .evidence = "actual-consumer-checks", .summary = "cancelled independently" };
-    const result_receipt = try consumer.command(.{ .command_id = .{ .value = "child-result" }, .target = .{ .run = first.entity_ids.run.? }, .expected_revision = .{ .revision = rows.items[0].task.revision }, .payload = .{ .task_result = saved_result } });
+    const result_receipt = try Consumer.receipt(try consumer.call(bridge, "task.result", .{ .request_key = "child-result", .task_id = first.entity_ids.run.?.value, .candidate = saved_result.candidate, .evidence = saved_result.evidence, .summary = saved_result.summary }), allocator);
     try std.testing.expectEqual(.accepted, result_receipt.outcome);
+    const review_receipt = try Consumer.receipt(try consumer.call(bridge, "task.review", .{ .request_key = "child-review", .task_id = first.entity_ids.run.?.value, .candidate = saved_result.candidate, .evidence = saved_result.evidence, .disposition = "accepted" }), allocator);
+    try std.testing.expectEqual(.accepted, review_receipt.outcome);
     const wait_result = try consumer.call(bridge, "task.wait", .{ .task_id = first.entity_ids.run.?.value });
     try std.testing.expect(!wait_result.object.get("isError").?.bool);
     try std.testing.expect(std.mem.indexOf(u8, wait_result.object.get("content").?.array.items[0].object.get("text").?.string, saved_result.candidate) != null);
