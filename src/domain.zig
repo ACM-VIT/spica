@@ -254,7 +254,9 @@ pub const Owner = struct {
                 const message_id = try self.id(allocator);
                 const request: a.Request = .{ .message = .{
                     .correlation = .{ .effect = .{ .value = effect_id }, .session = .{ .value = session }, .run = e.target.run, .followup = .{ .value = effect_id } },
-                    .message = .{ .value = message_id }, .content = p.content, .attachments = p.attachments,
+                    .message = .{ .value = message_id },
+                    .content = p.content,
+                    .attachments = p.attachments,
                     .followup = .{ .id = .{ .value = effect_id }, .content = p.content },
                 } };
                 if (a.frameBytes(request) > composer.provider_start_frame_limit) return .admission_limit;
@@ -296,7 +298,7 @@ pub const Owner = struct {
                 const request_bytes = try self.field(allocator, "SELECT request FROM effects WHERE id=?", &.{.{ .text = e.target.effect.value }}) orelse return .followup_not_found;
                 const existing_request = try t.decode(a.Request, request_bytes, allocator);
                 if (existing_request != .message or existing_request.message.followup == null) return .followup_invalid;
-                try db.execute("UPDATE effects SET state='withdrawn',outcome=?,revision=revision+1 WHERE id=? AND state='planned'", &.{ .{ .blob = p.reason }, .{ .text = e.target.effect.value }});
+                try db.execute("UPDATE effects SET state='withdrawn',outcome=?,revision=revision+1 WHERE id=? AND state='planned'", &.{ .{ .blob = p.reason }, .{ .text = e.target.effect.value } });
                 r.entity_ids.followup = .{ .value = e.target.effect.value };
                 aggregate = .{ .effect = e.target.effect };
                 revision_value = e.expected_revision.revision + 1;
@@ -318,7 +320,7 @@ pub const Owner = struct {
                     if (request != .message or request.message.followup == null or !std.mem.eql(u8, request.message.followup.?.id.value, followup.value)) return .followup_not_found;
                 }
                 try db.execute("UPDATE effects SET depends_on=NULL WHERE run_id=? AND kind='message' AND state='planned' AND instr(CAST(request AS TEXT),'\"followup\":{\"id\"')>0", &.{.{ .text = run }});
-                for (p.followups, 0..) |followup, i| if (i != 0) try db.execute("UPDATE effects SET depends_on=? WHERE id=? AND state='planned'", &.{ .{ .text = p.followups[i - 1].value }, .{ .text = followup.value }});
+                for (p.followups, 0..) |followup, i| if (i != 0) try db.execute("UPDATE effects SET depends_on=? WHERE id=? AND state='planned'", &.{ .{ .text = p.followups[i - 1].value }, .{ .text = followup.value } });
                 aggregate = .{ .run = e.target.run };
                 revision_value = e.expected_revision.revision + 1;
             },
