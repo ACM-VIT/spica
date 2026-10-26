@@ -14,6 +14,7 @@ const Id = @import("ui/transcript.zig").Id;
 const script = @import("script.zig");
 const design = @import("ui/design.zig");
 const composer = @import("text/composer.zig");
+const inspection = @import("domain/inspection.zig");
 
 /// Only a payload-free wake crosses worker threads. Registered after SDL init;
 /// its storage and SDL outlive both Host and presentation worker joins.
@@ -37,6 +38,46 @@ fn setupTarget(id: []const u8, role: []const u8, bounds: c.SDL_FRect, open: bool
     const enabled = open and bounds.w > 0 and bounds.h > 0;
     return .{ .id = id, .role = role, .key = "", .enabled = enabled, .pointer_bounds = if (enabled) .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } else null };
 }
+
+/// Extend explicit live observations within the native consumer; the retained
+/// base snapshot and final-export contract remain owned by native/automation.
+const NavigationObservation = struct {
+    snapshot: *const automation.Snapshot,
+    view: *const Coding,
+
+    pub fn jsonStringify(self: NavigationObservation, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        inline for (std.meta.fields(automation.Snapshot)) |field| {
+            try writer.objectField(field.name);
+            try writer.write(@field(self.snapshot, field.name));
+        }
+        try writer.objectField("navigation_targets");
+        try writer.beginArray();
+        for (self.view.navigation_targets.slice()) |target| {
+            try writer.write(setupTarget(target.id[0..target.id_len], target.role[0..target.role_len], target.bounds, target.enabled));
+        }
+        try writer.endArray();
+        try writer.objectField("workspace_open");
+        try writer.write(self.view.workspace_open);
+        try writer.objectField("workspace_busy");
+        try writer.write(self.view.workspace_busy);
+        try writer.objectField("workspace_stale");
+        try writer.write(self.view.workspace_stale);
+        try writer.objectField("workspace_file_count");
+        try writer.write(self.view.workspace_file_count);
+        try writer.objectField("workspace_diff_bytes");
+        try writer.write(self.view.workspace_diff_len);
+        try writer.objectField("workspace_diff_staged");
+        try writer.write(self.view.workspace_diff_staged);
+        try writer.objectField("workspace_revision");
+        try writer.write(self.view.workspace_revision);
+        try writer.objectField("thread_more_available");
+        try writer.write(self.view.search_more_available);
+        try writer.objectField("model_more_available");
+        try writer.write(self.view.model_more_available);
+        try writer.endObject();
+    }
+};
 
 /// Native lifetime and input dispatch. Replaceable presentation owns no domain.
 pub const App = struct {
@@ -282,6 +323,8 @@ pub const App = struct {
                 self.view.notice = @errorName(err);
             };
         }
+        if (self.view.takeWorkspaceDiffRequest()) |file| if (self.conversation) |conversation| conversation.requestInspectionDiff(&self.view, file);
+        if (self.view.takeWorkspaceRefreshRequest()) if (self.conversation) |conversation| if (conversation.inspection_binding) |binding| conversation.requestInspectionStatus(&self.view, binding);
         if (self.view.setup_action) |action| {
             self.view.setup_action = null;
             if (self.conversation) |conversation| conversation.setup(self, action) catch |err| {
@@ -379,7 +422,7 @@ pub const App = struct {
         }
         self.snapshot.caret = self.view.editor.caret;
         self.snapshot.anchor = self.view.editor.anchor;
-        self.snapshot.editor_focused = self.view.focused and !self.view.search_focused and !self.view.setup_open;
+        self.snapshot.editor_focused = self.view.focused and !self.view.search_focused and !self.view.setup_open and !self.view.workspace_open and !self.view.model_search_focused;
         self.snapshot.preedit_bytes = self.view.preedit_len;
         self.snapshot.draft_revision = self.view.revision;
         const editor_bounds = self.view.editor_view.bounds;
@@ -533,7 +576,7 @@ pub const App = struct {
             // Explicit automation only. Fixed storage, after measured present,
             // no timers/input endpoints; observers may retry a partial write.
             var writer = std.Io.Writer.fixed(&live.buffer);
-            try std.json.Stringify.value(self.snapshot, .{}, &writer);
+            try std.json.Stringify.value(NavigationObservation{ .snapshot = &self.snapshot, .view = &self.view }, .{}, &writer);
             try live.file.writePositionalAll(live.io, writer.buffered(), 0);
             try live.file.setLength(live.io, writer.buffered().len);
         }
@@ -726,6 +769,14 @@ const Conversation = struct {
     worker: *presentation.Worker,
     wake: *Wake,
     workspace_root: []u8,
+    inspection_worker: ?*inspection.Worker = null,
+    inspection_binding_storage: [6][4096]u8 = undefined,
+    inspection_binding_lengths: [6]usize = @splat(0),
+    inspection_binding: ?inspection.WorkspaceBinding = null,
+    inspection_revision: u64 = 0,
+    inspection_pending: bool = false,
+    inspection_workspace: Id = .{},
+    inspection_request: ?InspectionRequest = null,
     drain_storage: [1024 * 1024]u8 = undefined,
     source: [presentation.source_limit]u8 = undefined,
     source_len: usize = 0,
@@ -736,6 +787,11 @@ const Conversation = struct {
     thread: Id = .{},
     thread_revision: u64 = 0,
     card_rows_seen: usize = 0,
+    /// Cursor retained after the resident thread-card budget is full. Search
+    /// can advance through bounded Host pages without growing the UI arrays.
+    thread_page_snapshot: ?types.SnapshotId = null,
+    thread_page_cursor: ?Id = null,
+    thread_page_anchor: ?Id = null,
     create_thread_after_workspace: bool = false,
     run: Id = .{},
     run_revision: u64 = 0,
@@ -804,10 +860,142 @@ const Conversation = struct {
     diagnostic_len: usize = 0,
     preflight_storage: [192]u8 = undefined,
 
+    const InspectionRequest = struct {
+        revision: u64,
+        file: ?Coding.WorkspaceFile = null,
+        staged: bool = false,
+    };
+
     fn notice(self: *Conversation, view: *Coding, message: []const u8) void {
         const bounded = @import("text/utf8.zig").prefix(message, self.notice_storage.len);
         @memcpy(self.notice_storage[0..bounded.len], bounded);
         view.notice = self.notice_storage[0..bounded.len];
+    }
+
+    fn retainInspectionBinding(self: *Conversation, value: inspection.WorkspaceBinding) !void {
+        if (self.inspection_binding) |previous| if (contract.equal(previous, value)) return;
+        const fields = [_][]const u8{ value.canonical_root, value.filesystem_identity, value.repository_identity, value.checkout_identity, value.expected_branch, value.base_revision };
+        for (fields) |field| if (field.len > self.inspection_binding_storage[0].len) return error.InspectionBindingTooLarge;
+        self.inspection_revision +%= 1;
+        self.inspection_request = null;
+        for (fields, 0..) |field, index| {
+            @memcpy(self.inspection_binding_storage[index][0..field.len], field);
+            self.inspection_binding_lengths[index] = field.len;
+        }
+        self.inspection_binding = .{
+            .canonical_root = self.inspection_binding_storage[0][0..self.inspection_binding_lengths[0]],
+            .filesystem_identity = self.inspection_binding_storage[1][0..self.inspection_binding_lengths[1]],
+            .repository_identity = self.inspection_binding_storage[2][0..self.inspection_binding_lengths[2]],
+            .checkout_identity = self.inspection_binding_storage[3][0..self.inspection_binding_lengths[3]],
+            .expected_branch = self.inspection_binding_storage[4][0..self.inspection_binding_lengths[4]],
+            .base_revision = self.inspection_binding_storage[5][0..self.inspection_binding_lengths[5]],
+            .non_git = value.non_git,
+        };
+    }
+
+    fn inspectionFailure(self: *Conversation, view: *Coding, message: []const u8) void {
+        view.workspace_busy = false;
+        view.workspace_stale = true;
+        view.workspace_diff_len = 0;
+        const bounded = @import("text/utf8.zig").prefix(message, view.workspace_feedback.len);
+        @memcpy(view.workspace_feedback[0..bounded.len], bounded);
+        view.workspace_feedback_len = bounded.len;
+        self.notice(view, message);
+    }
+
+    fn requestInspectionStatus(self: *Conversation, view: *Coding, binding: inspection.WorkspaceBinding) void {
+        if (self.inspection_binding == null or !contract.equal(self.inspection_binding.?, binding) or !self.inspection_workspace.eql(self.workspace.slice())) {
+            self.inspectionFailure(view, "Checkout binding is unavailable. Reconnect to the intended workspace.");
+            return;
+        }
+        self.inspection_revision +%= 1;
+        self.inspection_request = .{ .revision = self.inspection_revision };
+        view.workspace_busy = true;
+        view.workspace_feedback_len = 0;
+    }
+
+    fn requestInspectionDiff(self: *Conversation, view: *Coding, file: Coding.WorkspaceFile) void {
+        if (self.inspection_binding == null or !self.inspection_workspace.eql(self.workspace.slice())) {
+            self.inspectionFailure(view, "Checkout binding is unavailable. Reconnect before inspecting changes.");
+            return;
+        }
+        if (file.path_len == 0 or file.path_len > file.path.len) return;
+        self.inspection_revision +%= 1;
+        self.inspection_request = .{ .revision = self.inspection_revision, .file = file, .staged = view.workspace_diff_staged };
+        view.workspace_busy = true;
+        view.workspace_diff_len = 0;
+        view.workspace_feedback_len = 0;
+    }
+
+    fn pumpInspection(self: *Conversation, app: *App) void {
+        const worker = self.inspection_worker orelse return;
+        var completion: inspection.Completion = undefined;
+        const ready = worker.drain(&completion) catch blk: {
+            Wake.notify(self.wake);
+            break :blk false;
+        };
+        if (ready) {
+            defer completion.deinit(self.allocator);
+            self.inspection_pending = false;
+            if (completion.revision == self.inspection_revision) {
+                app.view.workspace_busy = false;
+                if (completion.result) |result| {
+                    if (completion.query == .status) {
+                        var files: [64]Coding.WorkspaceFile = @splat(.{});
+                        var count: usize = 0;
+                        var omitted: usize = 0;
+                        for (result.entries) |entry| {
+                            if (count == files.len or entry.path.len > files[count].path.len or !std.unicode.utf8ValidateSlice(entry.path)) {
+                                omitted += 1;
+                                continue;
+                            }
+                            files[count].path_len = entry.path.len;
+                            @memcpy(files[count].path[0..entry.path.len], entry.path);
+                            files[count].index = entry.index;
+                            files[count].worktree = entry.worktree;
+                            if (entry.original_path) |original| if (original.len <= files[count].original.len and std.unicode.utf8ValidateSlice(original)) {
+                                files[count].original_len = original.len;
+                                @memcpy(files[count].original[0..original.len], original);
+                            };
+                            count += 1;
+                        }
+                        if (app.view.admitWorkspaceInspection(completion.revision, self.workspace_root, files[0..count], "")) {
+                            if (omitted != 0) {
+                                var message: [160]u8 = undefined;
+                                self.inspectionFailure(&app.view, std.fmt.bufPrint(&message, "{d} changed paths exceed the native list or path budget; only {d} are shown.", .{ omitted, count }) catch "Changed paths exceed the native display budget.");
+                            }
+                        } else self.inspectionFailure(&app.view, "Workspace result does not match the captured checkout.");
+                    } else if (result.bytes.len > app.view.workspace_diff.len or !std.unicode.utf8ValidateSlice(result.bytes)) {
+                        self.inspectionFailure(&app.view, "Diff exceeds 64 KiB or contains non-UTF8 bytes; native preview is unavailable.");
+                    } else if (!app.view.admitWorkspaceInspection(completion.revision, self.workspace_root, app.view.workspace_files[0..app.view.workspace_file_count], result.bytes)) {
+                        self.inspectionFailure(&app.view, "Diff result does not match the captured checkout.");
+                    }
+                } else |err| self.inspectionFailure(&app.view, if (err == error.WorkspaceIdentityChanged or err == error.WrongCheckout)
+                    "Captured checkout changed. Reconnect to the intended checkout before inspecting."
+                else
+                    @errorName(err));
+                app.dirty = true;
+            }
+        }
+        if (!self.inspection_pending) if (self.inspection_request) |request| {
+            const binding = self.inspection_binding orelse {
+                self.inspection_request = null;
+                self.inspectionFailure(&app.view, "No captured checkout binding is available.");
+                return;
+            };
+            const query: inspection.Query = if (request.file) |file| .{ .diff = .{ .path = file.path[0..file.path_len], .staged = request.staged } } else .status;
+            worker.request(.{ .revision = request.revision, .binding = binding, .root = self.workspace_root, .query = query }) catch |err| {
+                if (err == error.Busy) {
+                    Wake.notify(self.wake);
+                    return;
+                }
+                self.inspection_request = null;
+                self.inspectionFailure(&app.view, @errorName(err));
+                return;
+            };
+            self.inspection_pending = true;
+            self.inspection_request = null;
+        };
     }
 
     fn sendPreflight(self: *Conversation, view: *const Coding) ?[]const u8 {
@@ -1071,6 +1259,23 @@ const Conversation = struct {
                 if (index >= app.view.thread_count) return;
                 self.project = app.view.threads[index].project_id;
                 try self.selectThread(app, app.view.threads[index].id);
+            },
+            .search_more => {
+                if (self.thread_page_anchor == null) {
+                    app.view.search_more_available = false;
+                    self.notice(&app.view, "No additional thread page is available for this search.");
+                    return;
+                }
+                self.thread_page_cursor = null;
+                const anchor = self.thread_page_anchor orelse {
+                    app.view.search_more_available = false;
+                    self.notice(&app.view, "Thread search cursor expired; refresh the thread list and try again.");
+                    return;
+                };
+                app.view.thread_count = 0;
+                app.view.search_more_available = false;
+                self.card_rows_seen = 0;
+                try self.ask(.cards, .{ .threads = .{ .anchor = .{ .value = anchor.slice() }, .page = .{ .limit = page.limit, .max_bytes = page.max_bytes } } });
             },
         }
     }
@@ -1336,7 +1541,7 @@ const Conversation = struct {
         }
     }
 
-    const QueryKind = enum { projects, workspaces, threads, cards, thread, models, runtime_status, startup_status, runs, approvals, tasks, messages, blocks, content };
+    const QueryKind = enum { projects, workspaces, inspection_workspace, threads, cards, thread, models, runtime_status, startup_status, runs, approvals, tasks, messages, blocks, content };
     const CommandKind = enum { project, workspace, thread, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
@@ -1348,11 +1553,14 @@ const Conversation = struct {
         // Bootstrap admission precedes worker/file ownership transfer.
         const ticket = try host.query(.{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
         const worker = try presentation.Worker.create(allocator, io, file, .{ .context = wake, .notify = Wake.presentationNotify });
-        self.* = .{ .allocator = allocator, .io = io, .host = host, .worker = worker, .wake = wake, .workspace_root = root, .query = .{ .ticket = ticket, .kind = .projects } };
+        errdefer worker.destroy();
+        const inspection_worker = try inspection.Worker.create(allocator, io, .{ .context = wake, .notify = Wake.presentationNotify }, .{});
+        self.* = .{ .allocator = allocator, .io = io, .host = host, .worker = worker, .inspection_worker = inspection_worker, .wake = wake, .workspace_root = root, .query = .{ .ticket = ticket, .kind = .projects } };
         return self;
     }
 
     fn destroy(self: *Conversation) void {
+        if (self.inspection_worker) |worker| worker.destroy();
         self.worker.destroy();
         // Main owns Host and joins it separately before SDL destruction.
         self.allocator.free(self.workspace_root);
@@ -1493,6 +1701,7 @@ const Conversation = struct {
             }
         }
         if (drained.more_pending) Wake.notify(self.wake);
+        self.pumpInspection(app);
         const ready = self.worker.drain(&self.completion) catch |err| switch (err) {
             error.Busy => blk: {
                 Wake.notify(self.wake);
@@ -1623,6 +1832,10 @@ const Conversation = struct {
                 self.message_direction = .older;
             }
             self.card_rows_seen = 0;
+            self.thread_page_snapshot = null;
+            self.thread_page_cursor = null;
+            self.thread_page_anchor = null;
+            app.view.search_more_available = false;
             try self.ask(.cards, .{ .threads = .{ .page = page } });
         }
         const terminal = if (self.run_state) |state| switch (state) {
@@ -1701,6 +1914,7 @@ const Conversation = struct {
             },
             .workspace => {
                 self.workspace = try Id.init(value.entity_ids.workspace.?.value);
+                self.inspection_workspace = self.workspace;
                 try self.createThread();
             },
             .thread => {
@@ -1755,6 +1969,7 @@ const Conversation = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const binding = try domain.workspace_binding.capture(arena.allocator(), self.io, self.workspace_root);
+        try self.retainInspectionBinding(binding);
         self.workspace_branch = try displayId(binding.expected_branch);
         try self.submit(.workspace, .absent, .absent, .{ .workspace_register = .{ .project = .{ .value = self.project.slice() }, .binding = binding } }, 0);
     }
@@ -1831,6 +2046,11 @@ const Conversation = struct {
                         self.allocator.free(self.workspace_root);
                         self.workspace_root = root;
                         self.runtime_configured = true;
+                        try self.retainInspectionBinding(status.binding.?);
+                        self.inspection_workspace = .{};
+                        app.view.workspace_checkout_len = 0;
+                        app.view.workspace_file_count = 0;
+                        app.view.workspace_diff_len = 0;
                         app.view.selected = null;
                         app.view.thread_count = 0;
                         app.view.scope_project = .{};
@@ -1909,6 +2129,8 @@ const Conversation = struct {
                 var selected = false;
                 for (value.items) |row| {
                     if (!std.mem.eql(u8, row.workspace.binding.canonical_root, self.workspace_root)) continue;
+                    try self.retainInspectionBinding(row.workspace.binding);
+                    self.inspection_workspace = try Id.init(row.workspace.id.value);
                     self.workspace = try Id.init(row.workspace.id.value);
                     self.workspace_branch = try displayId(row.workspace.binding.expected_branch);
                     selected = true;
@@ -1940,9 +2162,15 @@ const Conversation = struct {
                     }
                 }
                 if (value.next_cursor != null and app.view.thread_count < app.view.threads.len and self.card_rows_seen < 128) {
+                    self.thread_page_snapshot = value.snapshot_id;
+                    self.thread_page_cursor = try Id.init(value.next_cursor.?);
+                    app.view.search_more_available = false;
                     try self.ask(kind, .{ .threads = .{ .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = value.next_cursor } } });
                 } else {
-                    if (value.next_cursor != null) self.notice(&app.view, "Showing a bounded thread page for this workspace. More threads remain outside this view.");
+                    self.thread_page_snapshot = value.snapshot_id;
+                    self.thread_page_cursor = if (value.next_cursor) |cursor| try Id.init(cursor) else null;
+                    self.thread_page_anchor = if (value.items.len != 0) try Id.init(value.items[value.items.len - 1].thread.id.value) else self.thread_page_anchor;
+                    app.view.search_more_available = self.thread_page_cursor != null;
                     self.startup_runtime = null;
                     if (kind == .cards) {
                         try self.ask(.thread, .{ .thread = .{ .value = self.thread.slice() } });
@@ -1951,8 +2179,26 @@ const Conversation = struct {
                     } else try self.createThread();
                 }
             },
+            .inspection_workspace => {
+                for (value.items) |row| {
+                    if (!self.workspace.eql(row.workspace.id.value)) continue;
+                    if (!std.mem.eql(u8, row.workspace.binding.canonical_root, self.workspace_root)) return error.WrongCheckout;
+                    try self.retainInspectionBinding(row.workspace.binding);
+                    self.inspection_workspace = self.workspace;
+                    try self.ask(.models, .{ .models = .{ .workspace = .{ .value = self.workspace.slice() }, .page = .{ .limit = 32, .max_bytes = 64 * 1024 } } });
+                    return;
+                }
+                if (value.next_cursor) |cursor| {
+                    try self.ask(.inspection_workspace, .{ .workspaces = .{ .project = .{ .value = self.project.slice() }, .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = cursor } } });
+                } else {
+                    self.inspectionFailure(&app.view, "The selected thread's registered checkout is unavailable.");
+                    try self.ask(.models, .{ .models = .{ .workspace = .{ .value = self.workspace.slice() }, .page = .{ .limit = 32, .max_bytes = 64 * 1024 } } });
+                }
+            },
             .thread => {
                 if (value.items.len != 1) return error.MissingThread;
+                if (!std.mem.eql(u8, value.items[0].thread.workspace_root, self.workspace_root)) return error.WrongCheckout;
+                self.project = try Id.init(value.items[0].thread.project.value);
                 try self.updateThreadCard(&app.view, value.items[0].thread);
                 self.thread_revision = value.items[0].thread.revision;
                 self.workspace = try Id.init(value.items[0].thread.workspace.value);
@@ -1969,7 +2215,17 @@ const Conversation = struct {
                 self.runs_snapshot = null;
                 app.view.model_count = 0;
                 self.catalog_truncated = false;
-                try self.ask(.models, .{ .models = .{ .workspace = .{ .value = self.workspace.slice() }, .page = .{ .limit = 32, .max_bytes = 64 * 1024 } } });
+                if (!self.inspection_workspace.eql(self.workspace.slice())) {
+                    self.inspection_revision +%= 1;
+                    self.inspection_request = null;
+                    self.inspection_binding = null;
+                    app.view.workspace_checkout_len = 0;
+                    app.view.workspace_file_count = 0;
+                    app.view.workspace_diff_len = 0;
+                    app.view.workspace_selected_file = null;
+                    app.view.workspace_busy = false;
+                    try self.ask(.inspection_workspace, .{ .workspaces = .{ .project = .{ .value = self.project.slice() }, .page = page } });
+                } else try self.ask(.models, .{ .models = .{ .workspace = .{ .value = self.workspace.slice() }, .page = .{ .limit = 32, .max_bytes = 64 * 1024 } } });
             },
             .runs => {
                 for (value.items) |row| try self.recordRun(&app.view, row.run);
