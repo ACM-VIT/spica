@@ -59,6 +59,7 @@ test "ACP subsequent turns keep upstream session and bounded retained state" {
     try std.testing.expect((try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"stopReason\":\"end_turn\"}}")).?.body == .completed);
     const retained = runtime.retained.end_index;
     var turn_bytes: usize = 0;
+    var previous_message: []const u8 = "";
     for (0..128) |index| {
         const run = try std.fmt.allocPrint(a, "run-{d:0>3}", .{index});
         var next = correlation;
@@ -72,6 +73,8 @@ test "ACP subsequent turns keep upstream session and bounded retained state" {
         const chunk = (try textFrame(&runtime, a, "next response")).?;
         try std.testing.expectEqualStrings(run, chunk.correlation.run.?.value);
         try std.testing.expectEqual(@as(u64, 0), chunk.body.chunk.offset);
+        try std.testing.expect(!std.mem.eql(u8, previous_message, chunk.body.chunk.message.value));
+        previous_message = chunk.body.chunk.message.value;
         const response = try std.json.Stringify.valueAlloc(a, .{ .jsonrpc = "2.0", .id = runtime.pending_id, .result = .{ .stopReason = "end_turn" } }, .{});
         try std.testing.expect((try consume(&runtime, a, response)).?.body == .completed);
         try std.testing.expectEqual(retained, runtime.retained.end_index);

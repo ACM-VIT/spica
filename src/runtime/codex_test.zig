@@ -69,12 +69,15 @@ test "Codex subsequent turns preserve exact session with bounded metadata and no
 }
 
 test "Codex fresh runtime resumes exact upstream through either public request without replay" {
+    var previous_event: [512]u8 = undefined;
+    var previous_len: usize = 0;
     for ([_]bool{ false, true }) |attach| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
         var wire: Mock = .{ .allocator = a };
-        var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "new-instance" });
+        const instance = if (attach) "second-instance" else "first-instance";
+        var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = instance });
         defer runtime.deinit();
         try initializeFixture(&runtime, &wire, a);
         const session: c.Session = .{ .id = .{ .value = "durable-session" }, .instance = .{ .value = "previous-process" }, .upstream = .{ .value = "exact-upstream" } };
@@ -85,10 +88,14 @@ test "Codex fresh runtime resumes exact upstream through either public request w
         try std.testing.expectEqualStrings("exact-upstream", sent.value.object.get("params").?.object.get("threadId").?.string);
         try wire.input.append(a, "{\"id\":3,\"result\":{\"thread\":{\"id\":\"exact-upstream\",\"turns\":[{\"items\":[{\"text\":\"old history\"}]}]},\"model\":\"gpt-6.1-sol\",\"modelProvider\":\"openai\",\"cwd\":\"/tmp/project\",\"reasoningEffort\":\"medium\"}}");
         try runtime.pump();
-        const observed = (try runtime.poll(a)).?.body.session;
+        const event = (try runtime.poll(a)).?;
+        const observed = event.body.session;
         try std.testing.expectEqualStrings("durable-session", observed.id.value);
         try std.testing.expectEqualStrings("exact-upstream", observed.upstream.value);
-        try std.testing.expectEqualStrings("new-instance", observed.instance.value);
+        try std.testing.expectEqualStrings(instance, observed.instance.value);
+        if (attach) try std.testing.expect(!std.mem.eql(u8, previous_event[0..previous_len], event.upstream_event));
+        previous_len = event.upstream_event.len;
+        @memcpy(previous_event[0..previous_len], event.upstream_event);
         try std.testing.expect((try runtime.poll(a)).?.body == .selection);
         try std.testing.expect((try runtime.poll(a)) == null);
         _ = try runtime.asAdapter().dispatch(a, .{ .start = .{ .correlation = .{ .session = session.id, .run = .{ .value = "next-run" }, .effect = .{ .value = "start" } }, .prompt = "continue" } });

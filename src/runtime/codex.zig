@@ -209,8 +209,8 @@ pub fn RuntimeFor(comptime T: type) type {
             const index = (self.head + self.count) % self.queue.len;
             var fixed = std.heap.FixedBufferAllocator.init(&self.storage[index]);
             self.sequence += 1;
-            var id: [64]u8 = undefined;
-            const event = try std.fmt.bufPrint(&id, "codex-{d}", .{self.sequence});
+            var id: [512]u8 = undefined;
+            const event = try std.fmt.bufPrint(&id, "codex:{s}:{d}", .{ self.config.instance, self.sequence });
             self.queue[index] = try adapter.clone(fixed.allocator(), c.Observation{ .correlation = self.correlation, .upstream_event = event, .sequence = self.sequence, .runtime_version = "0.163.0", .body = body });
             self.count += 1;
         }
@@ -375,7 +375,7 @@ pub fn RuntimeFor(comptime T: type) type {
             }
             const thread_id = text(field(params, "threadId"));
             if (self.session == null or !eq(thread_id, self.session.?.upstream.value)) return;
-            // Resume history and late notifications are never new run output.
+            // Outside an active turn, history/late notifications are not output.
             if (self.turn_terminal or self.correlation.run == null) return;
             const turn_id = text(field(params, "turnId"));
             if (eq(method, "error") or eq(method, "turn/completed")) {

@@ -347,8 +347,12 @@ pub fn RuntimeFor(comptime Transport: type) type {
                 return null;
             }
             const is_tool = self.pending_kind == .tool;
+            // ACP has no message ID here. Scope the synthetic message to the
+            // admitted run so a later turn cannot alias its predecessor's block.
+            var message_bytes: [512]u8 = undefined;
+            const message = try std.fmt.bufPrint(&message_bytes, "opencode-message:{s}", .{self.correlation.run.?.value});
             var result = try self.observation(allocator, if (is_tool) "tool/result/chunk" else "agent_message_chunk", .{ .chunk = .{
-                .message = .{ .value = "opencode-message" },
+                .message = .{ .value = message },
                 .block = .{ .value = if (is_tool) self.pending_tool[0..self.pending_tool_len] else "opencode-text" },
                 .offset = if (is_tool) self.pending_cursor else self.offset,
                 .text = remaining[0..count],
