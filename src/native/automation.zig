@@ -46,6 +46,19 @@ pub const Snapshot = struct {
     selected_effort: []const u8 = "",
     send_ready: bool = false,
     send_disabled_reason: ?[]const u8 = null,
+    // Bounded Send correlation for GUI drivers. Prompt/transcript content stays
+    // redacted by default; these fields identify the admission and provider
+    // stage without granting a second command path.
+    send_stage: []const u8 = "idle",
+    send_receipt: []const u8 = "none",
+    send_prompt_bytes: usize = 0,
+    send_frame_bytes: usize = 0,
+    send_command_id: []const u8 = "",
+    send_effect_id: []const u8 = "",
+    send_run_id: []const u8 = "",
+    send_session_id: []const u8 = "",
+    send_rejection: []const u8 = "",
+    send_provider_diagnostic: []const u8 = "",
     picker_open: bool = false,
     effort_open: bool = false,
     sidebar_search: []const u8 = "",
