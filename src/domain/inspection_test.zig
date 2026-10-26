@@ -251,3 +251,137 @@ test "malformed HEAD and missing branch objects are not unborn or non Git" {
     try temporary.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "malformed\n" });
     try std.testing.expectError(error.NotRepository, inspection.capture(a, io, root, .{}));
 }
+
+const TestWake = struct {
+    event: std.Io.Event = .unset,
+    fn notify(context: *anyopaque) void {
+        const self: *TestWake = @ptrCast(@alignCast(context));
+        self.event.set(io);
+    }
+};
+
+fn requestWorker(worker: *inspection.Worker, request: inspection.Request) !void {
+    for (0..1000) |_| {
+        worker.request(request) catch |err| switch (err) {
+            error.Busy => {
+                try std.Thread.yield();
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+    return error.WorkerContended;
+}
+
+fn drainWorker(worker: *inspection.Worker) !inspection.Completion {
+    var result: inspection.Completion = undefined;
+    for (0..1000) |_| {
+        const ready = worker.drain(&result) catch {
+            try std.Thread.yield();
+            continue;
+        };
+        try std.testing.expect(ready);
+        return result;
+    }
+    return error.WorkerContended;
+}
+
+test "worker owns request authority and preserves correlated bounded results across drains" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.write("file space λ\n.txt", "worker modified\n");
+    var wake: TestWake = .{};
+    const worker = try inspection.Worker.create(a, io, .{ .context = &wake, .notify = TestWake.notify }, .{});
+    defer worker.destroy();
+    var empty: inspection.Completion = undefined;
+    try std.testing.expect(!(try worker.drain(&empty)));
+
+    var captured = try inspection.capture(a, io, fixture.root, .{});
+    const binding = captured.binding.?;
+    var root: [4096]u8 = undefined;
+    @memcpy(root[0..fixture.root.len], fixture.root);
+    var path = "file space λ\n.txt".*;
+    try requestWorker(worker, .{ .revision = 41, .binding = binding, .root = root[0..fixture.root.len], .query = .{ .diff = .{ .path = &path } } });
+    // Source pages and mutable UI fields may disappear immediately on admission.
+    captured.deinit(a);
+    @memset(root[0..fixture.root.len], 'x');
+    @memset(&path, 'x');
+    try wake.event.wait(io);
+    // Undrained output applies backpressure even when the operation has ended.
+    try std.testing.expectError(error.Busy, worker.request(.{ .revision = 99, .binding = undefined, .root = "", .query = .status }));
+    var first = try drainWorker(worker);
+    defer first.deinit(a);
+    try std.testing.expectEqual(@as(u64, 41), first.revision);
+    try std.testing.expect(first.query == .diff);
+    try expectContains((try first.result).bytes, "+worker modified");
+
+    captured = try inspection.capture(a, io, fixture.root, .{});
+    defer captured.deinit(a);
+    wake.event.reset();
+    try requestWorker(worker, .{ .revision = 42, .binding = captured.binding.?, .root = fixture.root, .query = .status });
+    try wake.event.wait(io);
+    var second = try drainWorker(worker);
+    defer second.deinit(a);
+    try std.testing.expectEqual(@as(u64, 42), second.revision);
+    try std.testing.expect(second.query == .status);
+    try std.testing.expectEqual(@as(u8, 'M'), (try entry(try second.result, "file space λ\n.txt")).worktree);
+    // Drained storage belongs to the caller and survives a later worker result.
+    try expectContains((try first.result).bytes, "+worker modified");
+}
+
+test "worker reports wrong checkout and stale identity without recapturing and frees abandoned output" {
+    var left = try Fixture.init();
+    defer left.deinit();
+    var right = try Fixture.init();
+    defer right.deinit();
+    var captured = try inspection.capture(a, io, left.root, .{});
+    defer captured.deinit(a);
+    var wake: TestWake = .{};
+    const worker = try inspection.Worker.create(a, io, .{ .context = &wake, .notify = TestWake.notify }, .{});
+    defer worker.destroy();
+    try requestWorker(worker, .{ .revision = 7, .binding = captured.binding.?, .root = right.root, .query = .status });
+    try wake.event.wait(io);
+    var wrong = try drainWorker(worker);
+    defer wrong.deinit(a);
+    try std.testing.expectEqual(@as(u64, 7), wrong.revision);
+    try std.testing.expectError(error.WrongCheckout, wrong.result);
+    try git(left.root, &.{ "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "advance" });
+    wake.event.reset();
+    try requestWorker(worker, .{ .revision = 8, .binding = captured.binding.?, .root = left.root, .query = .status });
+    try wake.event.wait(io);
+    var stale = try drainWorker(worker);
+    defer stale.deinit(a);
+    try std.testing.expectEqual(@as(u64, 8), stale.revision);
+    try std.testing.expectError(error.WorkspaceIdentityChanged, stale.result);
+    // Intentionally leave the next successful result undrained: destroy owns it.
+    var fresh = try inspection.capture(a, io, left.root, .{});
+    defer fresh.deinit(a);
+    wake.event.reset();
+    try requestWorker(worker, .{ .revision = 9, .binding = fresh.binding.?, .root = left.root, .query = .status });
+    try wake.event.wait(io);
+}
+
+fn workerAllocationProbe(allocator: std.mem.Allocator) !void {
+    var wake: TestWake = .{};
+    const worker = try inspection.Worker.create(allocator, io, .{ .context = &wake, .notify = TestWake.notify }, .{});
+    worker.destroy();
+}
+
+test "worker allocation failures and request budget leave ownership reusable" {
+    try std.testing.checkAllAllocationFailures(a, workerAllocationProbe, .{});
+    var wake: TestWake = .{};
+    const worker = try inspection.Worker.create(a, io, .{ .context = &wake, .notify = TestWake.notify }, .{});
+    defer worker.destroy();
+    const binding: inspection.WorkspaceBinding = .{ .canonical_root = "", .filesystem_identity = "", .repository_identity = "", .checkout_identity = "", .expected_branch = "", .base_revision = "" };
+    const huge = try a.alloc(u8, 64 * 1024 + 1);
+    defer a.free(huge);
+    @memset(huge, 'x');
+    try std.testing.expectError(error.RequestBudget, worker.request(.{ .revision = 1, .binding = binding, .root = huge, .query = .status }));
+    try requestWorker(worker, .{ .revision = 2, .binding = binding, .root = "", .query = .status });
+    try wake.event.wait(io);
+    var result = try drainWorker(worker);
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(u64, 2), result.revision);
+    try std.testing.expectError(error.InvalidRoot, result.result);
+}
