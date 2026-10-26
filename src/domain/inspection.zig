@@ -65,8 +65,8 @@ fn execute(allocator: std.mem.Allocator, io: std.Io, binding: ?WorkspaceBinding,
     }
     const memory = try allocator.alloc(u8, limits.memory_bytes);
     errdefer allocator.free(memory);
-    var storage: [2]Completion = undefined;
-    var select = std.Io.Select(Completion).init(io, &storage);
+    var storage: [2]ExecuteCompletion = undefined;
+    var select = std.Io.Select(ExecuteCompletion).init(io, &storage);
     defer select.cancelDiscard();
     try select.concurrent(.deadline, deadline, .{ io, limits.milliseconds });
     try select.concurrent(.work, work, .{ io, memory, binding, root, operation, limits });
@@ -75,10 +75,122 @@ fn execute(allocator: std.mem.Allocator, io: std.Io, binding: ?WorkspaceBinding,
         .deadline => return error.InspectionTimeout,
     };
 }
-const Completion = union(enum) { work: anyerror!Result, deadline: void };
+const ExecuteCompletion = union(enum) { work: anyerror!Result, deadline: void };
 fn deadline(io: std.Io, milliseconds: u32) void {
     std.Io.sleep(io, .fromMilliseconds(milliseconds), .awake) catch {};
 }
+
+pub const Wake = struct { context: *anyopaque, notify: *const fn (*anyopaque) void };
+pub const Request = struct {
+    /// UI-owned generation, changed whenever checkout or selected file changes.
+    /// Consumers must discard completions from an earlier generation.
+    revision: u64,
+    binding: WorkspaceBinding,
+    root: []const u8,
+    query: Query,
+};
+pub const Completion = struct {
+    revision: u64,
+    query: enum { status, diff },
+    result: anyerror!Result,
+
+    pub fn deinit(self: *Completion, allocator: std.mem.Allocator) void {
+        if (self.result) |value| {
+            var owned = value;
+            owned.deinit(allocator);
+        } else |_| {}
+        self.* = undefined;
+    }
+};
+
+/// One request or undrained completion at a time. request copies all authority
+/// and path bytes; callers may immediately release the source query page.
+/// The worker never captures ambient authority, reads a store or touches SDL.
+/// Successful drain transfers Result ownership, to be released by the caller.
+pub const Worker = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    wake: Wake,
+    limits: Limits,
+    thread: ?std.Thread = null,
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
+    stopping: bool = false,
+    active: bool = false,
+    pending: ?Request = null,
+    output: ?Completion = null,
+    request_bytes: [64 * 1024]u8 = undefined,
+
+    pub fn create(allocator: std.mem.Allocator, io: std.Io, wake: Wake, limits: Limits) !*Worker {
+        try limits.validate();
+        const self = try allocator.create(Worker);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator, .io = io, .wake = wake, .limits = limits };
+        self.thread = try std.Thread.spawn(.{ .allocator = allocator, .stack_size = 1024 * 1024 }, run, .{self});
+        return self;
+    }
+
+    /// Joins any running bounded operation. Callback context must outlive join.
+    /// A result that was never drained is disposed here.
+    pub fn destroy(self: *Worker) void {
+        self.mutex.lockUncancelable(self.io);
+        self.stopping = true;
+        self.condition.signal(self.io);
+        self.mutex.unlock(self.io);
+        self.thread.?.join();
+        if (self.output) |*value| value.deinit(self.allocator);
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+
+    pub fn request(self: *Worker, value: Request) error{ Busy, Closed, RequestBudget }!void {
+        if (!self.mutex.tryLock()) return error.Busy;
+        defer self.mutex.unlock(self.io);
+        if (self.stopping) return error.Closed;
+        if (self.active or self.pending != null or self.output != null) return error.Busy;
+        var fixed = std.heap.FixedBufferAllocator.init(&self.request_bytes);
+        const a = fixed.allocator();
+        var owned = value;
+        inline for (std.meta.fields(WorkspaceBinding)) |field| {
+            if (field.type == []const u8) @field(owned.binding, field.name) = a.dupe(u8, @field(value.binding, field.name)) catch return error.RequestBudget;
+        }
+        owned.root = a.dupe(u8, value.root) catch return error.RequestBudget;
+        if (value.query == .diff) owned.query.diff.path = a.dupe(u8, value.query.diff.path) catch return error.RequestBudget;
+        self.pending = owned;
+        self.condition.signal(self.io);
+    }
+
+    /// Busy/empty never consumes a completion. Inspect revision before painting;
+    /// deinit stale successful completions just like displayed completions.
+    pub fn drain(self: *Worker, out: *Completion) error{Busy}!bool {
+        if (!self.mutex.tryLock()) return error.Busy;
+        defer self.mutex.unlock(self.io);
+        out.* = self.output orelse return false;
+        self.output = null;
+        return true;
+    }
+
+    fn run(self: *Worker) void {
+        while (true) {
+            self.mutex.lockUncancelable(self.io);
+            while (!self.stopping and self.pending == null) self.condition.waitUncancelable(self.io, &self.mutex);
+            if (self.stopping) {
+                self.mutex.unlock(self.io);
+                return;
+            }
+            const job = self.pending.?;
+            self.pending = null;
+            self.active = true;
+            self.mutex.unlock(self.io);
+            const result = inspect(self.allocator, self.io, job.binding, job.root, job.query, self.limits);
+            self.mutex.lockUncancelable(self.io);
+            self.output = .{ .revision = job.revision, .query = if (job.query == .status) .status else .diff, .result = result };
+            self.active = false;
+            self.mutex.unlock(self.io);
+            self.wake.notify(self.wake.context);
+        }
+    }
+};
 
 fn work(io: std.Io, memory: []u8, binding: ?WorkspaceBinding, root: []const u8, operation: Operation, limits: Limits) anyerror!Result {
     var fixed = std.heap.FixedBufferAllocator.init(memory);

@@ -4,6 +4,7 @@ const Composer = @import("../text/composer.zig").Composer;
 const EditorView = @import("editor_view.zig").EditorView;
 const LabelCache = @import("label_cache.zig").LabelCache;
 const widgets = @import("widgets.zig");
+const hit_targets = @import("hit_targets.zig");
 const clipboard = @import("clipboard.zig");
 const Layout = @import("clay.zig").Layout;
 const Color = @import("color.zig").Color;
@@ -76,6 +77,16 @@ pub const SendDiagnostic = struct {
         bounded(&self.provider, &self.provider_len, diagnostic);
         self.stage = if (terminal) .terminal else .provider_failed;
     }
+};
+
+/// Bounded, read-only changed-file metadata copied from the inspection worker.
+pub const WorkspaceFileData = struct {
+    path: [256]u8 = undefined,
+    path_len: usize = 0,
+    original: [256]u8 = undefined,
+    original_len: usize = 0,
+    index: u8 = ' ',
+    worktree: u8 = ' ',
 };
 
 /// Presentation state only. No adapter, store, execution lifetime or accepted work.
@@ -213,6 +224,41 @@ pub const View = struct {
     navigation_enabled: bool = false,
     retained: [16]Retained = @splat(.{}),
     retained_clock: u64 = 0,
+    workspace_files: [64]WorkspaceFile = @splat(.{}),
+    workspace_file_count: usize = 0,
+    workspace_selected_file: ?usize = null,
+    workspace_diff: [64 * 1024]u8 = undefined,
+    workspace_diff_len: usize = 0,
+    workspace_checkout: [256]u8 = undefined,
+    workspace_checkout_len: usize = 0,
+    workspace_revision: u64 = 0,
+    workspace_open: bool = false,
+    workspace_scroll: f32 = 0,
+    workspace_diff_scroll: f32 = 0,
+    workspace_bounds: c.SDL_FRect = zero_rect,
+    workspace_close_bounds: c.SDL_FRect = zero_rect,
+    workspace_file_bounds: [64]c.SDL_FRect = @splat(zero_rect),
+    workspace_diff_bounds: c.SDL_FRect = zero_rect,
+    workspace_toggle_bounds: c.SDL_FRect = zero_rect,
+    workspace_stale: bool = false,
+    workspace_diff_request: ?usize = null,
+    workspace_diff_staged: bool = false,
+    workspace_refresh_request: bool = false,
+    workspace_refresh_bounds: c.SDL_FRect = zero_rect,
+    workspace_busy: bool = false,
+    workspace_feedback: [256]u8 = undefined,
+    workspace_feedback_len: usize = 0,
+    navigation_targets: hit_targets.SemanticTargets(128, 96, 16) = .{},
+    thread_search_revision: u64 = 0,
+    thread_search_busy: bool = false,
+    model_search_query: [160]u8 = undefined,
+    model_search_len: usize = 0,
+    model_search_revision: u64 = 0,
+    model_search_busy: bool = false,
+    model_more_available: bool = false,
+    model_action: ?enum { restart, next } = null,
+    selected_model_cache: ?Model = null,
+    search_more_available: bool = false,
     const zero_rect: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     pub const picker_row_height: f32 = 48;
     pub const sidebar_card_stride: f32 = 83;
@@ -371,7 +417,10 @@ pub const View = struct {
         reason_len: usize = 0,
         synthetic: bool = false,
     };
-    pub const Navigation = union(enum) { new_project, new_thread, project: usize, thread: usize };
+    /// Sidebar navigation stays presentation-only. `search_more` asks the
+    /// App/Host consumer for the next bounded page while retaining the draft,
+    /// current thread and scroll state in this view.
+    pub const Navigation = union(enum) { new_project, new_thread, project: usize, thread: usize, search_more, search_reset };
     pub const RunStatus = enum { idle, running, approval, failed, interrupted };
     pub const Entry = struct {
         id: transcript.Id = .{},
@@ -383,6 +432,7 @@ pub const View = struct {
         branch: transcript.Id = .{},
         run_status: RunStatus = .idle,
     };
+
     const Retained = struct {
         id: transcript.Id = .{},
         editor: ?Composer = null,
@@ -393,6 +443,7 @@ pub const View = struct {
         used: u64 = 0,
         selection: ?Identity = null,
     };
+    pub const WorkspaceFile = WorkspaceFileData;
 
     pub fn selectThread(self: *View, id: transcript.Id) !void {
         if (self.active_thread.eql(id.slice())) return;
@@ -654,9 +705,10 @@ pub const View = struct {
         return a.runtime_kind.eql(b.runtime_kind.slice()) and a.required_runtime_version.eql(b.required_runtime_version.slice()) and a.model_provider.eql(b.model_provider.slice()) and a.model_id.eql(b.model_id.slice()) and a.account_ref.eql(b.account_ref.slice()) and a.workspace.eql(b.workspace.slice()) and a.capability_revision == b.capability_revision;
     }
 
-    fn selectedModel(self: *const View) ?*const Model {
+    pub fn selectedModel(self: *const View) ?*const Model {
         const selected = self.selected orelse return null;
         for (self.models[0..self.model_count]) |*model| if (sameModel(model.identity, selected)) return model;
+        if (self.selected_model_cache) |*model| if (sameModel(model.identity, selected)) return model;
         return null;
     }
 
@@ -715,10 +767,78 @@ pub const View = struct {
     }
 
     fn sidebarChanged(self: *View) void {
+        self.thread_search_revision +%= 1;
+        self.thread_search_busy = false;
         self.sidebar_scroll = 0;
         self.search_hover = 0;
         self.sidebar_hover = null;
         self.thread_bounds = @splat(zero_rect);
+    }
+
+    /// Admit a completed read-only inspection only for the currently selected
+    /// checkout. Callers pass an explicit revision so a late worker result can
+    /// be rejected without disturbing drafts, selection or scroll positions.
+    pub fn admitWorkspaceInspection(self: *View, revision: u64, checkout: []const u8, files: []const WorkspaceFile, diff: []const u8) bool {
+        if (revision < self.workspace_revision) {
+            self.workspace_stale = true;
+            return false;
+        }
+        if (checkout.len > self.workspace_checkout.len or !std.unicode.utf8ValidateSlice(checkout)) {
+            self.workspace_stale = true;
+            return false;
+        }
+        if (self.workspace_checkout_len != 0 and !std.mem.eql(u8, self.workspace_checkout[0..self.workspace_checkout_len], checkout)) {
+            self.workspace_stale = true;
+            return false;
+        }
+        if (files.len > self.workspace_files.len or diff.len > self.workspace_diff.len or !std.unicode.utf8ValidateSlice(diff)) {
+            self.workspace_stale = true;
+            return false;
+        }
+        var selected_path: [256]u8 = undefined;
+        var selected_path_len: usize = 0;
+        if (self.workspace_selected_file) |index| if (index < self.workspace_file_count) {
+            selected_path_len = self.workspace_files[index].path_len;
+            @memcpy(selected_path[0..selected_path_len], self.workspace_files[index].path[0..selected_path_len]);
+        };
+        self.workspace_checkout_len = checkout.len;
+        @memcpy(self.workspace_checkout[0..checkout.len], checkout);
+        self.workspace_file_count = files.len;
+        @memcpy(self.workspace_files[0..files.len], files);
+        self.workspace_diff_len = diff.len;
+        @memcpy(self.workspace_diff[0..diff.len], diff);
+        self.workspace_revision = revision;
+        self.workspace_stale = false;
+        self.workspace_selected_file = null;
+        if (selected_path_len != 0) for (files, 0..) |file, index| {
+            if (file.path_len == selected_path_len and std.mem.eql(u8, file.path[0..file.path_len], selected_path[0..selected_path_len])) {
+                self.workspace_selected_file = index;
+                break;
+            }
+        };
+        if (self.workspace_selected_file == null and files.len != 0) self.workspace_selected_file = 0;
+        return true;
+    }
+
+    pub fn workspaceFileAt(self: *const View, x: f32, y: f32) ?usize {
+        if (!self.workspace_open) return null;
+        for (self.workspace_file_bounds[0..self.workspace_file_count], 0..) |bounds, index| {
+            if (widgets.contains(bounds, x, y)) return index;
+        }
+        return null;
+    }
+
+    pub fn takeWorkspaceDiffRequest(self: *View) ?WorkspaceFile {
+        const index = self.workspace_diff_request orelse return null;
+        self.workspace_diff_request = null;
+        if (index >= self.workspace_file_count) return null;
+        return self.workspace_files[index];
+    }
+
+    pub fn takeWorkspaceRefreshRequest(self: *View) bool {
+        const requested = self.workspace_refresh_request;
+        self.workspace_refresh_request = false;
+        return requested;
     }
 
     fn searchInsert(self: *View, bytes: []const u8) !void {
@@ -774,6 +894,24 @@ pub const View = struct {
                 if (self.custom_root == null) {
                     const x = event.button.x;
                     const y = event.button.y;
+                    if (self.workspace_open) {
+                        if (widgets.contains(self.workspace_close_bounds, x, y)) {
+                            self.workspace_open = false;
+                            return true;
+                        }
+                        if (widgets.contains(self.workspace_refresh_bounds, x, y)) {
+                            self.workspace_refresh_request = true;
+                            return true;
+                        }
+                        if (self.workspaceFileAt(x, y)) |index| {
+                            const same = self.workspace_selected_file == index;
+                            self.workspace_selected_file = index;
+                            self.workspace_diff_scroll = 0;
+                            self.workspace_diff_staged = if (same and self.workspace_files[index].index != ' ' and self.workspace_files[index].worktree != ' ') !self.workspace_diff_staged else self.workspace_files[index].index != ' ' and self.workspace_files[index].worktree == ' ';
+                            self.workspace_diff_request = index;
+                        }
+                        return true;
+                    }
                     if (self.setup_open) {
                         if (widgets.contains(self.setup_close_bounds, x, y)) self.setup_open = false;
                         for (self.setup_provider_bounds, 0..) |box, index| if (widgets.contains(box, x, y)) {
@@ -802,7 +940,10 @@ pub const View = struct {
                     }
                     // An open menu owns pointer input, including outside dismissal.
                     if (self.picker_open) {
-                        if (self.pickerIndexAt(x, y)) |index| self.selected = self.models[index].identity;
+                        if (self.pickerIndexAt(x, y)) |index| {
+                            self.selected = self.models[index].identity;
+                            self.selected_model_cache = self.models[index];
+                        }
                         self.picker_open = false;
                         return true;
                     }
@@ -863,6 +1004,12 @@ pub const View = struct {
                     }
                     if (widgets.contains(self.follow_bounds, x, y)) {
                         self.history_move = .latest;
+                        return true;
+                    }
+                    if (widgets.contains(self.workspace_toggle_bounds, x, y)) {
+                        self.workspace_open = true;
+                        self.workspace_refresh_request = true;
+                        self.workspace_selected_file = if (self.workspace_file_count == 0) null else self.workspace_selected_file orelse 0;
                         return true;
                     }
                     if (self.navigation_enabled and widgets.contains(self.sidebar_bounds, x, y)) {
@@ -959,6 +1106,14 @@ pub const View = struct {
             c.SDL_EVENT_MOUSE_WHEEL => {
                 const wheel_direction: f32 = if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) -1 else 1;
                 if (self.custom_root == null and (self.setup_open or self.effort_open)) return true;
+                if (self.custom_root == null and self.workspace_open) {
+                    if (widgets.contains(self.workspace_bounds, event.wheel.mouse_x, event.wheel.mouse_y)) {
+                        const direction: f32 = if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) -1 else 1;
+                        self.workspace_scroll = @max(0, self.workspace_scroll - event.wheel.y * direction * 32);
+                        self.workspace_diff_scroll = @max(0, self.workspace_diff_scroll - event.wheel.y * direction * 32);
+                    }
+                    return true;
+                }
                 if (self.custom_root == null and self.picker_open) {
                     if (widgets.contains(self.picker_menu, event.wheel.mouse_x, event.wheel.mouse_y)) self.picker_scroll = std.math.clamp(self.picker_scroll - event.wheel.y * wheel_direction * picker_row_height, 0, self.pickerMaxScroll());
                     return true;
@@ -1007,6 +1162,7 @@ pub const View = struct {
                     try self.setupInsert(std.mem.span(event.text.text));
                     return true;
                 }
+                if (self.workspace_open and self.custom_root == null) return true;
                 if (self.custom_root == null and self.search_focused) {
                     if (!self.window_active) return false;
                     try self.searchInsert(std.mem.span(event.text.text));
@@ -1082,7 +1238,10 @@ pub const View = struct {
                         c.SDLK_UP => self.picker_hover -|= 1,
                         c.SDLK_DOWN => self.picker_hover = @min(self.model_count -| 1, self.picker_hover + 1),
                         c.SDLK_RETURN => {
-                            if (self.picker_hover < self.model_count) self.selected = self.models[self.picker_hover].identity;
+                            if (self.picker_hover < self.model_count) {
+                                self.selected = self.models[self.picker_hover].identity;
+                                self.selected_model_cache = self.models[self.picker_hover];
+                            }
                             self.picker_open = false;
                         },
                         else => {},
@@ -1092,6 +1251,10 @@ pub const View = struct {
                 }
                 if (self.scope_open and self.custom_root == null) {
                     if (key == c.SDLK_ESCAPE) self.scope_open = false;
+                    return true;
+                }
+                if (self.workspace_open and self.custom_root == null) {
+                    if (key == c.SDLK_ESCAPE) self.workspace_open = false;
                     return true;
                 }
                 if (self.search_focused and self.custom_root == null) {
@@ -1132,6 +1295,8 @@ pub const View = struct {
                             self.search_len = 0;
                             self.search_select_all = false;
                             self.sidebarChanged();
+                        } else if (self.search_len != 0 and self.search_more_available) {
+                            self.navigation = .search_more;
                         }
                     }
                     return true;
@@ -1439,7 +1604,7 @@ pub const View = struct {
         var clip = widgets.Clip.push(renderer, self.sidebar_rows);
         defer clip.restore(renderer);
         try self.drawThreads(renderer, text, foreground, sidebar_muted);
-        if (self.visibleThreadCount() == 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
+        if (self.visibleThreadCount() == 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0 and self.search_more_available) "No match here · Enter searches older threads" else if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
         clip.restore(renderer);
         // Connection is the implemented utility. Do not imitate unavailable
         // Usage, Pull Requests or Settings destinations from the reference.
@@ -1463,6 +1628,15 @@ pub const View = struct {
         try self.labels.draw(text, "/", header_x + 34 + project_width, (bounds.header.height - 16) / 2, 14, muted);
         const title_x = header_x + 52 + project_width;
         try self.labels.drawFitted(renderer, text, thread_name, title_x, (bounds.header.height - 16) / 2, bounds.header.width - title_x - metrics.gutter, 14, foreground);
+        self.workspace_toggle_bounds = if (bounds.header.width - title_x >= 132)
+            .{ .x = bounds.header.width - metrics.gutter - 104, .y = 10, .w = 104, .h = 28 }
+        else
+            .{ .x = 8, .y = height - 72, .w = 104, .h = 28 };
+        if (self.workspace_toggle_bounds.w != 0) {
+            try widgets.panel(renderer, self.workspace_toggle_bounds, @min(metrics.radius, 5), if (self.workspace_open) palette.sidebar_active else palette.surface);
+            try icon(renderer, .branch, self.workspace_toggle_bounds.x + 7, self.workspace_toggle_bounds.y + 6, muted);
+            try self.labels.drawFitted(renderer, text, "Changes", self.workspace_toggle_bounds.x + 28, self.workspace_toggle_bounds.y + 7, self.workspace_toggle_bounds.w - 34, 12, muted);
+        }
         self.follow_bounds = if (self.follow_latest) zero_rect else .{ .x = bounds.transcript.x + bounds.transcript.width - 128, .y = bounds.transcript.y + bounds.transcript.height - 32, .w = 128, .h = 28 };
         for (self.tasks[0..self.task_count], 0..) |*task, index| {
             const task_y = bounds.transcript.y + @as(f32, @floatFromInt(index)) * 24;
@@ -1535,6 +1709,78 @@ pub const View = struct {
             ordinal += 1;
             y += sidebar_card_stride;
         }
+    }
+
+    fn drawWorkspace(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
+        const width = @min(760, @max(420, bounds.transcript.width * 0.82));
+        const height = @min(bounds.transcript.height - 20, @max(260, bounds.transcript.height * 0.86));
+        const panel = c.SDL_FRect{ .x = bounds.transcript.x + (bounds.transcript.width - width) / 2, .y = bounds.transcript.y + 10, .w = width, .h = height };
+        self.workspace_bounds = panel;
+        self.workspace_close_bounds = .{ .x = panel.x + panel.w - 76, .y = panel.y + 10, .w = 60, .h = 26 };
+        self.workspace_refresh_bounds = .{ .x = panel.x + panel.w - 148, .y = panel.y + 10, .w = 64, .h = 26 };
+        _ = self.navigation_targets.add("workspace.close", "button", self.workspace_close_bounds, true) catch {};
+        _ = self.navigation_targets.add("workspace.refresh", "button", self.workspace_refresh_bounds, !self.workspace_busy) catch {};
+        try widgets.panel(renderer, panel, @min(self.design.layout.radius, 8), self.design.colors.raised);
+        try self.labels.draw(text, "Workspace changes", panel.x + 16, panel.y + 14, 16, foreground);
+        try self.labels.draw(text, if (self.workspace_stale) "Snapshot is stale · refresh the selected checkout" else "Read-only snapshot · captured checkout", panel.x + 16, panel.y + 36, 11, if (self.workspace_stale) self.design.colors.danger else muted);
+        if (self.workspace_feedback_len != 0) try self.labels.drawFitted(renderer, text, self.workspace_feedback[0..self.workspace_feedback_len], panel.x + 16, panel.y + 52, panel.w - 180, 10, self.design.colors.danger);
+        try widgets.panel(renderer, self.workspace_close_bounds, 4, self.design.colors.surface);
+        try self.labels.draw(text, "Close", self.workspace_close_bounds.x + 12, self.workspace_close_bounds.y + 7, 11, foreground);
+        try widgets.panel(renderer, self.workspace_refresh_bounds, 4, self.design.colors.surface);
+        try self.labels.draw(text, "Refresh", self.workspace_refresh_bounds.x + 8, self.workspace_refresh_bounds.y + 7, 11, foreground);
+        const list = c.SDL_FRect{ .x = panel.x + 14, .y = panel.y + 72, .w = @min(300, panel.w * 0.42), .h = panel.h - 86 };
+        const diff = c.SDL_FRect{ .x = list.x + list.w + 12, .y = list.y, .w = panel.x + panel.w - list.x - list.w - 26, .h = list.h };
+        self.workspace_diff_bounds = diff;
+        if (self.workspace_selected_file) |selected| if (selected < self.workspace_file_count and self.workspace_files[selected].index != ' ' and self.workspace_files[selected].worktree != ' ') {
+            _ = self.navigation_targets.add("workspace.staged", "button", .{ .x = diff.x, .y = diff.y - 22, .w = diff.w / 2, .h = 20 }, true) catch {};
+            _ = self.navigation_targets.add("workspace.unstaged", "button", .{ .x = diff.x + diff.w / 2, .y = diff.y - 22, .w = diff.w / 2, .h = 20 }, true) catch {};
+        };
+        if (self.workspace_selected_file) |selected| if (selected < self.workspace_file_count and self.workspace_files[selected].index != ' ' and self.workspace_files[selected].worktree != ' ') {
+            try self.labels.drawFitted(renderer, text, if (self.workspace_diff_staged) "Staged diff · click again for unstaged" else "Unstaged diff · click again for staged", diff.x + 8, diff.y - 18, diff.w - 16, 10, muted);
+        };
+        self.workspace_file_bounds = @splat(zero_rect);
+        var list_clip = widgets.Clip.push(renderer, list);
+        defer list_clip.restore(renderer);
+        var y = list.y - self.workspace_scroll;
+        for (self.workspace_files[0..self.workspace_file_count], 0..) |*file, index| {
+            const row = c.SDL_FRect{ .x = list.x, .y = y, .w = list.w, .h = 28 };
+            self.workspace_file_bounds[index] = clippedRect(row, list);
+            var target_id: [32]u8 = undefined;
+            const target_name = std.fmt.bufPrint(&target_id, "workspace.file.{d}", .{index}) catch "workspace.file";
+            _ = self.navigation_targets.add(target_name, "listitem", self.workspace_file_bounds[index], true) catch {};
+            if (self.workspace_selected_file == index) try widgets.panel(renderer, self.workspace_file_bounds[index], 4, self.design.colors.selection);
+            var label: [300]u8 = undefined;
+            const path = file.path[0..file.path_len];
+            const prefix = std.fmt.bufPrint(&label, "{c}{c}  {s}", .{ file.index, file.worktree, path }) catch path;
+            try self.labels.drawFitted(renderer, text, prefix, row.x + 8, row.y + 7, row.w - 16, 11, if (self.workspace_selected_file == index) foreground else muted);
+            y += 30;
+        }
+        list_clip.restore(renderer);
+        var diff_clip = widgets.Clip.push(renderer, diff);
+        defer diff_clip.restore(renderer);
+        if (self.workspace_selected_file == null) {
+            try self.labels.drawFitted(renderer, text, if (self.workspace_file_count == 0) "No changed files" else "Select a file to inspect its diff", diff.x + 8, diff.y + 8, diff.w - 16, 12, muted);
+        } else if (self.workspace_diff_len == 0) {
+            try self.labels.drawFitted(renderer, text, "No diff for this file", diff.x + 8, diff.y + 8, diff.w - 16, 12, muted);
+        } else {
+            var line_y = diff.y + 8 - self.workspace_diff_scroll;
+            var start: usize = 0;
+            var lines: usize = 0;
+            const first_line = @as(usize, @intFromFloat(@max(0, self.workspace_diff_scroll) / 16));
+            while (start < self.workspace_diff_len and lines < first_line) : (lines += 1) {
+                const rest = self.workspace_diff[start..self.workspace_diff_len];
+                const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+                start += end + @intFromBool(end < rest.len);
+            }
+            line_y = diff.y + 8;
+            while (start < self.workspace_diff_len and line_y < diff.y + diff.h) : (line_y += 16) {
+                const rest = self.workspace_diff[start..self.workspace_diff_len];
+                const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+                try self.labels.drawFitted(renderer, text, rest[0..end], diff.x + 8, line_y, diff.w - 16, 10, muted);
+                start += end + @intFromBool(end < rest.len);
+            }
+        }
+        diff_clip.restore(renderer);
     }
 
     fn disabledPrimaryColor(color: Color, surface: Color) Color {
@@ -1770,8 +2016,10 @@ pub const View = struct {
         };
         const foreground = self.design.colors.foreground;
         const muted = self.design.colors.muted;
+        self.navigation_targets.clear();
         if (!c.SDL_SetRenderDrawColor(renderer, self.design.colors.background.r, self.design.colors.background.g, self.design.colors.background.b, 255) or !c.SDL_RenderClear(renderer)) return error.CanvasDraw;
         if (self.custom_root == null) try self.drawChrome(renderer, text, bounds, foreground, muted);
+        if (self.custom_root == null) _ = self.navigation_targets.add("workspace.changes", "button", self.workspace_toggle_bounds, self.workspace_toggle_bounds.w > 0) catch {};
         // Preorder backgrounds precede content; a styled parent must never
         // paint over the transcript, editor or a child's label later in frame.
         if (self.custom_root) |root| for (root.nodes[0..root.count], 0..) |node, index| {
@@ -1966,6 +2214,7 @@ pub const View = struct {
         if (self.custom_root == null and self.picker_open) try self.drawPicker(renderer, text, bounds, foreground, muted);
         if (self.custom_root == null and self.effort_open) try self.drawEffort(renderer, text, foreground, muted);
         if (self.custom_root == null and self.setup_open) try self.drawSetup(renderer, text, bounds, foreground, muted);
+        if (self.custom_root == null and self.workspace_open and !self.setup_open) try self.drawWorkspace(renderer, text, bounds, foreground, muted);
     }
 };
 
@@ -1988,6 +2237,24 @@ test "root emits only enabled explicit intents and preserves draft until receipt
     view.can_cancel = true;
     view.request(.cancel);
     try std.testing.expectEqual(Intent.cancel, view.takeIntent().?);
+}
+
+test "workspace inspection keeps selection and rejects stale checkout results" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    var file: View.WorkspaceFile = .{};
+    @memcpy(file.path[0..8], "src/main");
+    file.path_len = 8;
+    file.index = 'M';
+    try std.testing.expect(view.admitWorkspaceInspection(4, "/tmp/checkout", &.{file}, "diff\n"));
+    view.workspace_open = true;
+    view.workspace_selected_file = 0;
+    view.workspace_scroll = 19;
+    try std.testing.expect(view.admitWorkspaceInspection(5, "/tmp/checkout", &.{file}, "next\n"));
+    try std.testing.expectEqual(@as(?usize, 0), view.workspace_selected_file);
+    try std.testing.expectEqual(@as(f32, 19), view.workspace_scroll);
+    try std.testing.expect(!view.admitWorkspaceInspection(4, "/tmp/other", &.{file}, "wrong\n"));
+    try std.testing.expect(view.workspace_stale);
 }
 
 test "presentation edits retain exact Unicode and rejected insertion state" {
