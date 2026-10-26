@@ -105,6 +105,7 @@ pub const Reason = enum {
     approval_invalid,
     approval_expired,
     unresolved_effects,
+    session_unavailable,
     admission_limit,
 };
 pub const EntityIds = struct {

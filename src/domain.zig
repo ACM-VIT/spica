@@ -253,7 +253,23 @@ pub const Owner = struct {
                 if (self.factory != null and (self.liveRuntimeCount() >= 3 or try db.scalar("SELECT count(*) FROM runs WHERE state IN('queued','starting','streaming','awaiting_approval','cancel_requested')") >= 3)) return .admission_limit;
                 if (try self.field(allocator, "SELECT id FROM runs WHERE thread_id=? AND (state IN('queued','starting','streaming','awaiting_approval','cancel_requested','unknown','interrupted') OR EXISTS(SELECT 1 FROM effects WHERE run_id=runs.id AND state IN('unknown','in_flight')))", &.{.{ .text = thread }}) != null) return .unresolved_effects;
                 const run = try self.id(allocator);
-                const session = try self.id(allocator);
+                var session = try self.id(allocator);
+                var resumed: ?a.Session = null;
+                const previous = try db.prepare("SELECT s.id,s.instance_id,s.upstream_session,s.selection FROM threads t JOIN sessions s ON s.id=t.session_id WHERE t.id=?", &.{.{ .text = thread }});
+                defer previous.deinit();
+                if (try previous.step()) {
+                    const previous_selection = try t.decode(a.Selection, try previous.bytes(3), allocator);
+                    if (!a.equal(previous_selection, p.selection)) return .selection_mismatch;
+                    if (previous.isNull(1) or previous.isNull(2)) return .session_unavailable;
+                    const instance = try previous.bytes(1);
+                    const upstream = try previous.bytes(2);
+                    if (instance.len == 0 or upstream.len == 0) return .session_unavailable;
+                    session = try allocator.dupe(u8, try previous.bytes(0));
+                    resumed = .{ .id = .{ .value = session }, .instance = .{ .value = try allocator.dupe(u8, instance) }, .upstream = .{ .value = try allocator.dupe(u8, upstream) } };
+                    if (self.factory) |runtime| {
+                        if (runtime.discover(p.selection).capabilities[@intFromEnum(a.Capability.attach)].status != .supported) return .capability_unavailable;
+                    }
+                }
                 const user = try self.id(allocator);
                 const assistant = try self.id(allocator);
                 const user_block = try self.id(allocator);
@@ -264,7 +280,7 @@ pub const Owner = struct {
                 if (a.frameBytes(request) > composer.provider_start_frame_limit) return .admission_limit;
                 const selection = try encoded(allocator, p.selection);
                 try db.execute("INSERT INTO thread_selections VALUES(?,?) ON CONFLICT(thread_id) DO UPDATE SET selection=excluded.selection", &.{ .{ .text = thread }, .{ .blob = selection } });
-                try db.execute("INSERT INTO sessions(id,revision,workspace_id,selection) VALUES(?,1,?,?)", &.{ .{ .text = session }, .{ .text = workspace }, .{ .blob = selection } });
+                if (resumed == null) try db.execute("INSERT INTO sessions(id,revision,workspace_id,selection) VALUES(?,1,?,?)", &.{ .{ .text = session }, .{ .text = workspace }, .{ .blob = selection } });
                 try db.execute("INSERT INTO runs(id,revision,thread_id,session_id,state,requested) VALUES(?,1,?,?,'queued',?)", &.{ .{ .text = run }, .{ .text = thread }, .{ .text = session }, .{ .blob = selection } });
                 const ordinal = try db.prepare("SELECT next_ordinal FROM threads WHERE id=?", &.{.{ .text = thread }});
                 defer ordinal.deinit();
@@ -280,8 +296,13 @@ pub const Owner = struct {
                     offset = end;
                 }
                 try db.execute("UPDATE threads SET revision=revision+1,session_id=?,next_ordinal=next_ordinal+2 WHERE id=?", &.{ .{ .text = session }, .{ .text = thread } });
-                try self.plan(allocator, open, run, session, .create_session, .{ .open = .{ .create = .{ .effect = .{ .value = open }, .session = .{ .value = session }, .selection = p.selection } } }, null, null, e.command_id);
-                try self.plan(allocator, start, run, session, .start, request, open, null, e.command_id);
+                if (resumed) |existing| {
+                    try self.plan(allocator, open, run, session, .attach, .{ .open = .{ .existing = .{ .session = existing } } }, null, null, e.command_id);
+                    try self.plan(allocator, start, run, session, .start, request, open, null, e.command_id);
+                } else {
+                    try self.plan(allocator, open, run, session, .create_session, .{ .open = .{ .create = .{ .effect = .{ .value = open }, .session = .{ .value = session }, .selection = p.selection } } }, null, null, e.command_id);
+                    try self.plan(allocator, start, run, session, .start, request, open, null, e.command_id);
+                }
                 r.entity_ids = .{ .thread = e.target.thread, .run = .{ .value = run }, .session = .{ .value = session }, .user_message = .{ .value = user }, .assistant_message = .{ .value = assistant }, .assistant_block = .{ .value = assistant_block } };
                 const effects = try allocator.alloc(a.EffectId, 2);
                 effects[0] = .{ .value = open };
@@ -509,7 +530,7 @@ pub const Owner = struct {
             try db.execute("UPDATE sessions SET instance_id=?,upstream_session=?,continuity=?,revision=revision+1 WHERE id=?", &.{ .{ .text = live.instance.value }, .{ .text = live.upstream.value }, .{ .text = @tagName(receipt.continuity) }, .{ .text = session } });
             try self.event(allocator, sequence, 1, .{ .session = .{ .value = session } }, @intCast(revision_statement.integer(0) + 1), "SessionEvidence", null, effect, "");
         }
-        const next_state: []const u8 = if (pending_session) "starting" else if (missing_session or receipt.outcome == .unknown) "unknown" else if (receipt.outcome == .rejected) "failed" else if (std.mem.eql(u8, kind, "create_session")) "starting" else if (std.mem.eql(u8, kind, "cancel")) "cancel_requested" else "streaming";
+        const next_state: []const u8 = if (pending_session) "starting" else if (missing_session or receipt.outcome == .unknown) "unknown" else if (receipt.outcome == .rejected) "failed" else if (std.mem.eql(u8, kind, "create_session") or std.mem.eql(u8, kind, "attach")) "starting" else if (std.mem.eql(u8, kind, "cancel")) "cancel_requested" else "streaming";
         const revision_statement = try db.prepare("SELECT revision,state FROM runs WHERE id=?", &.{.{ .text = run }});
         defer revision_statement.deinit();
         if (!try revision_statement.step()) return error.Corrupt;
@@ -531,16 +552,20 @@ pub const Owner = struct {
         if (a.frameBytes(input) > 4096 or input.upstream_event.len == 0) return error.Limit;
         var observation = input;
         const run = observation.correlation.run orelse if (self.factory != null) a.RunId{
-            .value = try self.field(allocator, "SELECT id FROM runs WHERE session_id=?", &.{.{ .text = observation.correlation.session.value }}) orelse return error.Conflict,
+            .value = try self.field(allocator, "SELECT id FROM runs WHERE session_id=? ORDER BY rowid DESC LIMIT 1", &.{.{ .text = observation.correlation.session.value }}) orelse return error.Conflict,
         } else return error.Conflict;
         const session = observation.correlation.session;
         const db = self.database;
+        // Provider event labels may be reused for each turn of a durable
+        // session. Scope the journal identity to the durable run while still
+        // retaining the original upstream label in the correlation payload.
+        const observation_key = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ run.value, observation.upstream_event });
         const canonical = try encoded(allocator, input);
         const digest = t.digest(canonical);
         try db.begin();
         errdefer db.rollback() catch {};
         {
-            const duplicate = try db.prepare("SELECT digest FROM observations WHERE session_id=? AND upstream_event=?", &.{ .{ .text = session.value }, .{ .text = observation.upstream_event } });
+            const duplicate = try db.prepare("SELECT digest FROM observations WHERE session_id=? AND upstream_event=?", &.{ .{ .text = session.value }, .{ .text = observation_key } });
             defer duplicate.deinit();
             if (try duplicate.step()) {
                 if (!std.mem.eql(u8, try duplicate.bytes(0), &digest)) return error.Conflict;
@@ -550,6 +575,10 @@ pub const Owner = struct {
         }
         if (self.factory != null) {
             observation.correlation.run = run;
+            if (observation.correlation.upstream_tool) |upstream| {
+                observation.correlation.upstream_tool = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ run.value, upstream });
+                if (observation.correlation.tool) |tool| observation.correlation.tool = .{ .value = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ run.value, tool.value }) };
+            }
             if (observation.correlation.effect) |effect_id| {
                 if (try self.field(allocator, "SELECT id FROM effects WHERE id=? AND session_id=? AND run_id=?", &.{ .{ .text = effect_id.value }, .{ .text = session.value }, .{ .text = run.value } }) == null) return error.Conflict;
             }
@@ -560,7 +589,9 @@ pub const Owner = struct {
             if (observation.body == .chunk) {
                 const chunk = &observation.body.chunk;
                 const message = try self.field(allocator, "SELECT id FROM messages WHERE run_id=? AND role='assistant'", &.{.{ .text = run.value }}) orelse return error.Corrupt;
-                const mapped = try self.field(allocator, "SELECT block_id FROM runtime_blocks WHERE session_id=? AND upstream_message=? AND upstream_block=?", &.{ .{ .text = session.value }, .{ .text = chunk.message.value }, .{ .text = chunk.block.value } });
+                const upstream_message = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ run.value, chunk.message.value });
+                const upstream_block = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ run.value, chunk.block.value });
+                const mapped = try self.field(allocator, "SELECT block_id FROM runtime_blocks WHERE session_id=? AND upstream_message=? AND upstream_block=?", &.{ .{ .text = session.value }, .{ .text = upstream_message }, .{ .text = upstream_block } });
                 const block = mapped orelse blk: {
                     var key: ?[]const u8 = null;
                     if (observation.correlation.tool) |tool| {
@@ -569,7 +600,7 @@ pub const Owner = struct {
                         key = try self.field(allocator, "SELECT id FROM blocks WHERE message_id=? AND ordinal=0 AND kind='text' AND NOT EXISTS(SELECT 1 FROM runtime_blocks WHERE block_id=blocks.id)", &.{.{ .text = message }});
                         if (key == null) key = try self.newBlock(allocator, message, null);
                     }
-                    try db.execute("INSERT INTO runtime_blocks VALUES(?,?,?,?)", &.{ .{ .text = session.value }, .{ .text = chunk.message.value }, .{ .text = chunk.block.value }, .{ .text = key.? } });
+                    try db.execute("INSERT INTO runtime_blocks VALUES(?,?,?,?)", &.{ .{ .text = session.value }, .{ .text = upstream_message }, .{ .text = upstream_block }, .{ .text = key.? } });
                     break :blk key.?;
                 };
                 chunk.message = .{ .value = message };
@@ -686,8 +717,8 @@ pub const Owner = struct {
             },
             .session => |live| {
                 if (self.factory == null or terminal or !std.mem.eql(u8, live.id.value, session.value)) return error.Conflict;
-                const effect_id = observation.correlation.effect orelse return error.Conflict;
-                const pending = try db.prepare("SELECT revision FROM effects WHERE id=? AND session_id=? AND kind='create_session' AND state='in_flight'", &.{ .{ .text = effect_id.value }, .{ .text = session.value } });
+                const effect_id: a.EffectId = if (observation.correlation.effect) |effect| effect else a.EffectId{ .value = try self.field(allocator, "SELECT id FROM effects WHERE session_id=? AND kind='attach' AND state='confirmed' ORDER BY rowid DESC LIMIT 1", &.{.{ .text = session.value }}) orelse return error.Conflict };
+                const pending = try db.prepare("SELECT revision FROM effects WHERE id=? AND session_id=? AND kind IN('create_session','attach') AND state IN('in_flight','confirmed')", &.{ .{ .text = effect_id.value }, .{ .text = session.value } });
                 defer pending.deinit();
                 if (!try pending.step()) return error.Conflict;
                 try db.execute("UPDATE sessions SET instance_id=?,upstream_session=?,revision=revision+1 WHERE id=? AND (upstream_session IS NULL OR upstream_session=?)", &.{ .{ .text = live.instance.value }, .{ .text = live.upstream.value }, .{ .text = session.value }, .{ .text = live.upstream.value } });
@@ -697,7 +728,7 @@ pub const Owner = struct {
                 if (!std.mem.eql(u8, current_state, "cancel_requested")) next_state = "starting";
             },
         }
-        try db.execute("INSERT INTO observations(session_id,upstream_event,runtime_version,correlation,digest,evidence,cursor,commit_sequence) VALUES(?,?,?,?,?,?,?,?)", &.{ .{ .text = session.value }, .{ .text = observation.upstream_event }, .{ .text = observation.runtime_version }, .{ .blob = try encoded(allocator, observation.correlation) }, .{ .blob = &digest }, switch (observation.body) {
+        try db.execute("INSERT INTO observations(session_id,upstream_event,runtime_version,correlation,digest,evidence,cursor,commit_sequence) VALUES(?,?,?,?,?,?,?,?)", &.{ .{ .text = session.value }, .{ .text = observation_key }, .{ .text = observation.runtime_version }, .{ .blob = try encoded(allocator, observation.correlation) }, .{ .blob = &digest }, switch (observation.body) {
             .failure, .disconnect, .ambiguous => .{ .blob = try encoded(allocator, observation.body) },
             else => .null,
         }, if (observation.cursor) |v| .{ .blob = v.value } else .null, .{ .integer = @intCast(sequence) } });
@@ -1145,6 +1176,37 @@ pub const Host = struct {
             .body = .{ .ambiguous = .{ .reason = reason } },
         });
     }
+    /// Recreate a provider process only for a durable upstream session. This
+    /// path never emits an open.create request and cannot replace a missing
+    /// conversation with a contextless session.
+    fn restoreExisting(self: *Host, selection: a.Selection, binding: t.WorkspaceBinding, effect: a.EffectId, request: a.Request, now_ms: u64) !void {
+        if (request != .open or request.open != .existing) return error.InvalidOpenRequest;
+        const registry = &self.registry.?;
+        const session = request.open.existing.session.id;
+        if (registry.find(session) != null) return;
+        for (&registry.entries) |*slot| if (slot.* == null) {
+            var entry_arena = std.heap.ArenaAllocator.init(self.allocator);
+            errdefer entry_arena.deinit();
+            const retained = entry_arena.allocator();
+            const retained_session = try common.clone(retained, session);
+            const retained_selection = try common.clone(retained, selection);
+            const retained_request = try common.clone(retained, request);
+            var random: [16]u8 = undefined;
+            try self.io.randomSecure(&random);
+            const token = try retained.alloc(u8, 32);
+            const hex = "0123456789abcdef";
+            for (random, 0..) |byte, index| {
+                token[index * 2] = hex[byte >> 4];
+                token[index * 2 + 1] = hex[byte & 15];
+            }
+            const bridge = try self.mcp.?.bindSession(retained, retained_session.value, token);
+            errdefer self.mcp.?.unbindSession(retained_session.value);
+            const adapter = try registry.factory.create(self.allocator, retained_selection, binding.canonical_root, retained_session, bridge);
+            slot.* = .{ .arena = entry_arena, .session = retained_session, .selection = retained_selection, .adapter = adapter, .pending_open = .{ .effect = try common.clone(retained, effect), .request = retained_request }, .created_ms = now_ms };
+            return;
+        };
+        return error.RuntimeCapacity;
+    }
     fn pumpRuntimes(self: *Host, owner: *Owner, arena: *std.heap.ArenaAllocator) !void {
         const registry = if (self.registry) |*value| value else return;
         for (&registry.entries, 0..) |*optional, entry_index| {
@@ -1173,8 +1235,10 @@ pub const Host = struct {
                     try runtimeFault(owner, allocator, entry.session, "Runtime emitted another app session identity");
                     break;
                 }
-                owner.observe(allocator, observation) catch |err|
+                owner.observe(allocator, observation) catch |err| {
+                    std.debug.print("observation fault {s} event {s}\\n", .{ @errorName(err), observation.upstream_event });
                     try runtimeFault(owner, allocator, entry.session, @errorName(err));
+                };
             }
             _ = arena.reset(.retain_capacity);
             allocator = arena.allocator();
@@ -1188,12 +1252,19 @@ pub const Host = struct {
             }
             // Process ownership ends at a terminal/ambiguous boundary, while
             // durable unknown claims remain for explicit reconciliation.
-            const done = try self.database.prepare("SELECT 1 FROM runs r WHERE r.session_id=? AND (r.state IN('unknown','interrupted','failed') OR (r.state IN('completed','cancelled') AND NOT EXISTS(SELECT 1 FROM effects e WHERE e.run_id=r.id AND e.state IN('planned','in_flight'))))", &.{.{ .text = entry.session.value }});
+            const done = try self.database.prepare("SELECT 1 FROM sessions s WHERE s.id=? AND NOT EXISTS(SELECT 1 FROM runs active WHERE active.session_id=s.id AND active.state IN('queued','starting','streaming','awaiting_approval','cancel_requested')) AND NOT EXISTS(SELECT 1 FROM effects pending WHERE pending.session_id=s.id AND pending.state IN('planned','in_flight')) AND EXISTS(SELECT 1 FROM runs terminal WHERE terminal.session_id=s.id AND (terminal.state IN('unknown','interrupted','failed') OR terminal.state IN('completed','cancelled')))", &.{.{ .text = entry.session.value }});
             const release = blk: {
                 defer done.deinit();
                 break :blk try done.step();
             };
-            if (release) registry.release(&self.mcp.?, entry_index);
+            if (release) {
+                const states = try self.database.prepare("SELECT group_concat(state, ',') FROM runs WHERE session_id=?", &.{.{ .text = entry.session.value }});
+                defer states.deinit();
+                _ = try states.step();
+                std.debug.print(" session states {s}\\n", .{try states.bytes(0)});
+                std.debug.print("releasing runtime {s}\\n", .{entry.session.value});
+                registry.release(&self.mcp.?, entry_index);
+            }
         }
         _ = arena.reset(.retain_capacity);
         const allocator = arena.allocator();
@@ -1334,6 +1405,15 @@ pub const Host = struct {
                 _ = registry.create(self.io, &self.mcp.?, selection, binding.canonical_root, effect.id, effect.request, self.now()) catch |err| {
                     try owner.delivered(allocator, effect.id, .{ .outcome = .unknown, .detail = @errorName(err) });
                 };
+            } else if (effect.request == .open and effect.request.open == .existing) {
+                if (registry.find(session)) |entry| {
+                    _ = entry;
+                    try owner.delivered(allocator, effect.id, .{ .outcome = .acknowledged, .session = effect.request.open.existing.session, .continuity = .proven });
+                } else {
+                    self.restoreExisting(selection, binding, effect.id, effect.request, self.now()) catch |err| {
+                        try owner.delivered(allocator, effect.id, .{ .outcome = .unknown, .detail = @errorName(err) });
+                    };
+                }
             } else if (registry.find(session)) |entry| {
                 if (effect.request == .cancel) if (entry.pending_open) |pending| {
                     entry.pending_open = null;
@@ -1350,6 +1430,7 @@ pub const Host = struct {
                 };
                 try owner.delivered(allocator, effect.id, try entry.adapter.dispatch(allocator, effect.request));
             } else {
+                std.debug.print("missing live runtime for {s} request {s}\\n", .{ session.value, @tagName(effect.request) });
                 try owner.delivered(allocator, effect.id, .{ .outcome = .unknown, .detail = "No live instance for durable session; explicit reconciliation required" });
             }
             return;
