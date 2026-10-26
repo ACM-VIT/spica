@@ -1,5 +1,16 @@
 # Current work
 
+## Native rewrite audit and completion plan — 2026-10-26
+
+Planning scope, not runtime repair: [task 013](013-native-rewrite-plan.md) and
+[ordered checklist](../NATIVE_REWRITE_PLAN.md). Source audit at `5bbdd5f` found
+fresh provider sessions on each ordinary Send, mismatched composer/start-frame
+limits, missing daily-use surfaces and drift in implementation/acceptance prose.
+User identifies Codex as the failed provider; exact failure remains unreproduced.
+The plan specifies private-desktop CLI testing and separates input, receipt,
+provider execution and artifact outcomes. No new live execution or GUI acceptance
+is claimed. Older sections below are historical receipts, not active worker state.
+
 ## Reuse existing Codex authentication — 2026-10-24
 
 Status: implemented and verified for existing-account connection and restart; inference/entitlement and keyring-only authentication remain unverified. User explicitly authorizes existing Codex account reuse and expects no redundant sign-in; prior separate-account default is no longer desired. Base `89e3902`, clean tree/index. Parent owns source/build/Git/native checks and contracts. Two Luna medium/priority source-only audits own ignored existing-auth-startup/protocol findings, no descendants. Check installed0.163.0 app-server behavior and official documentation; no credential-file contents, prior conversations, login/logout, daemon installation/management or live inference. Reuse the configured Codex home through supported app-server account/read, not by copying secrets. Retain explicit account directories and app-owned conversations. Need correct defaults, existing saved legacy path UX, metadata-only real-account/private-vd verification and safety-mode checks; public transport/process lifetimes stay explicit. No push/install/scheduler.

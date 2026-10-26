@@ -223,6 +223,12 @@ durable state for inspection; a model listing alone never establishes access.
 
 ## What to build next
 
+Start with the [native rewrite completion plan and checklist](docs/NATIVE_REWRITE_PLAN.md).
+The 2026-10-26 source audit prioritizes diagnosable Codex Send, provider session
+continuity, a reusable GUI-driving CLI and missing daily coding workflows.
+It distinguishes existing implementation from end-to-end acceptance; it does
+not claim the reported failed prompt has been reproduced or repaired.
+
 [ROADMAP.md](docs/ROADMAP.md) is the ordered backlog. The durable conversation, protected custom-root bridge, native provider factories and bounded orchestration are implemented in the current shipping loop. Task records distinguish compiled/protocol/consumer evidence from live authenticated provider and human acceptance; absent Codex sign-in or model entitlement is not a successful mixed inference run.
 
 The selected protected Lua 5.4.9 runtime exposes bounded root/renderer descriptors and explicit action proposals; native code owns actual public command admission. Users can replace the composition without owning durable work. Built-in boards and alternate workspace presets are not deliverables. See [the scripting contract](docs/contracts/scripting.md), [ARCHITECTURE.md](docs/ARCHITECTURE.md) and [provider/orchestration design](docs/PROVIDERS_AND_ORCHESTRATION.md).

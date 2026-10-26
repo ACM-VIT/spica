@@ -61,8 +61,10 @@ Codex (including supported ChatGPT sign-in), OpenCode, and a bounded app-owned c
 Plain launch probes the Host's saved runtime configuration before creating a
 workspace or thread. An unconfigured app opens Connection with provider-specific
 editable defaults: executable metadata from PATH/user install locations, canonical
-current directory, and separate app-managed account directories. Preparing the
-form creates no account state and starts no runtime. Connect is the explicit
+current directory, the existing Codex home (`CODEX_HOME` or `~/.codex`) and a
+separate managed OpenCode account directory. Explicit saved account paths are
+retained. Preparing the form creates no account state and starts no runtime.
+Connect is the explicit
 configuration action; only successful configuration becomes the durable active
 provider. Per-thread model and effort selections remain separate durable values.
 
@@ -80,4 +82,5 @@ browser/device action starts supported sign-in. The UI observes status at a
 and opens its web page only on user action. Refresh cannot stop pending sign-in;
 completion schedules catalog discovery. OpenCode account login is currently
 unsupported in this panel; a previously authorized account directory can be
-selected in Advanced. No credentials or legacy histories are discovered/imported.
+selected in Advanced. Spica does not copy credentials or read/import legacy
+histories; the selected runtime accesses its own account through supported APIs.

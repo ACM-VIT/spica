@@ -1,6 +1,6 @@
 # Native agent workspace: prioritized backlog
 
-Implementation backlog. Bootstrap is separate; feature items below remain pending. Priority reflects dependencies and a useful daily coding workflow, not a commitment to full T3 feature parity. Linux first. One default coding interface; the public primitives let users build other interfaces in their own configuration.
+Original dependency map; several foundations below are implemented, while their acceptance coverage varies. For the current workflow audit, concrete gaps and ordered completion checklist, use [Native rewrite completion plan](NATIVE_REWRITE_PLAN.md). Task records retain revision-specific evidence; neither this order nor a checkpoint marks a feature accepted. Priority reflects a useful daily coding workflow, not a commitment to full T3 feature parity. Linux first. One default coding interface; the public primitives let users build other interfaces in their own configuration.
 
 ## Build order
 
@@ -26,7 +26,7 @@ Implementation backlog. Bootstrap is separate; feature items below remain pendin
 
 Items 4–6 form one shared fake-provider milestone; they are not three unrelated releases. Runtime and UI can proceed against agreed interfaces while the fake adapter/harness enables integration. One task can include several related files; do not delegate one model call per file or trivial edit.
 
-Correctness, memory ownership and performance measurement start at P0. Item 16 is deeper optimization, not the first time performance is checked. API fundamentals start at item 6; item 14 adds breadth and stability after real use. At the API proof, select one scripting runtime using a small representative extension; Lua is the current illustrative candidate, while Astra's earlier QuickJS-NG suggestion remains unmeasured. Keep public contracts independent of that choice; do not build both bindings now.
+Correctness, memory ownership and performance measurement start at P0. Item 16 is deeper optimization, not the first time performance is checked. API fundamentals start at item 6; item 14 adds breadth and stability after real use. The API proof selected protected Lua 5.4.9. Keep public contracts independent of that choice; do not add a second binding for parity work. OpenCode implementation and historical live evidence advanced while Codex live acceptance remained incomplete; this is an execution-order exception, not a passed Codex prerequisite.
 
 ## First executable milestone
 
