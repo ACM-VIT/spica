@@ -15,6 +15,9 @@ pub const WorkspaceId = Id("workspace");
 pub const ApprovalId = Id("approval");
 pub const MessageId = Id("message");
 pub const ToolCallId = Id("tool_call");
+pub const FollowupId = Id("followup");
+pub const QuestionId = Id("question");
+pub const AttachmentId = Id("attachment");
 pub const UpstreamSession = struct { value: []const u8 };
 pub const UpstreamTurn = struct { value: []const u8 };
 pub const UpstreamCursor = struct { value: []const u8 };
@@ -35,6 +38,9 @@ pub const Capability = enum {
     workspace,
     usage,
     coordinator_bridge,
+    followup_queue,
+    question,
+    attachment,
 };
 pub const CapabilityInfo = struct {
     status: Status,
@@ -46,6 +52,13 @@ pub const Limits = struct {
     queue_bytes: usize = 16384,
     queue_frames: usize = 16,
     call_frames: usize = 32,
+    followup_count: usize = 8,
+    followup_bytes: usize = 64 * 1024,
+    question_choices: usize = 16,
+    question_answer_bytes: usize = 4096,
+    attachment_count: usize = 8,
+    attachment_bytes: usize = 256 * 1024,
+    attachment_metadata_bytes: usize = 4096,
     // Synchronous dispatch: no hidden outstanding requests or transport buffers.
     pending_requests: usize = 1,
 };
@@ -130,9 +143,44 @@ pub const Correlation = struct {
     run: ?RunId = null,
     tool: ?ToolCallId = null,
     approval: ?ApprovalId = null,
+    question: ?QuestionId = null,
+    followup: ?FollowupId = null,
     upstream_turn: ?UpstreamTurn = null,
     upstream_request: ?[]const u8 = null,
     upstream_tool: ?[]const u8 = null,
+};
+pub const AttachmentKind = enum { file, image };
+pub const AttachmentMetadata = struct {
+    id: AttachmentId,
+    name: []const u8,
+    media_type: []const u8,
+    byte_length: u64,
+    digest: []const u8,
+    kind: AttachmentKind = .file,
+};
+/// Content is copied by an adapter boundary and is never retained through a
+/// caller-owned buffer. Empty content is valid for metadata-only handoff.
+pub const Attachment = struct {
+    metadata: AttachmentMetadata,
+    content: []const u8 = &.{},
+};
+pub const Followup = struct {
+    id: FollowupId,
+    content: []const u8,
+};
+pub const QuestionChoice = struct { id: []const u8, label: []const u8 };
+pub const Question = struct {
+    id: QuestionId,
+    correlation: Correlation,
+    prompt: []const u8,
+    choices: []const QuestionChoice = &.{},
+    allow_multiple: bool = false,
+    allow_freeform: bool = false,
+    expires_at: ?u64 = null,
+};
+pub const QuestionAnswer = struct {
+    choice_ids: []const []const u8 = &.{},
+    text: []const u8 = "",
 };
 pub const Open = union(enum) {
     create: struct { effect: EffectId, session: RuntimeSessionId, selection: Selection },
@@ -141,10 +189,17 @@ pub const Open = union(enum) {
 };
 pub const Request = union(enum) {
     open: Open,
-    start: struct { correlation: Correlation, prompt: []const u8 },
+    start: struct { correlation: Correlation, prompt: []const u8, attachments: []const Attachment = &.{} },
     respond_approval: struct { correlation: Correlation, decision: enum { allow, deny }, action_digest: []const u8 },
     cancel: struct { correlation: Correlation, reason: []const u8 },
-    message: struct { correlation: Correlation, message: MessageId, content: []const u8 },
+    message: struct {
+        correlation: Correlation,
+        message: MessageId,
+        content: []const u8,
+        followup: ?Followup = null,
+        attachments: []const Attachment = &.{},
+    },
+    answer_question: struct { correlation: Correlation, question: QuestionId, answer: QuestionAnswer },
     inspect: struct { session: Session, run: ?RunId = null, effect: ?EffectId = null, turn: ?UpstreamTurn = null },
     attach: struct { session: Session, after: ?UpstreamCursor = null },
 };
@@ -181,6 +236,7 @@ pub const Observation = struct {
         tool_started: struct { name: []const u8, action_digest: []const u8 },
         tool_completed: struct { outcome: enum { succeeded, failed, unknown }, result: []const u8 },
         approval: ApprovalEvidence,
+        question: Question,
         /// Cumulative run usage; cached input is a subset of input, not added
         /// again. Subscription billing cannot be inferred from these counters.
         usage: struct { input_tokens: u64, output_tokens: u64, cached_tokens: u64 },
@@ -191,7 +247,7 @@ pub const Observation = struct {
         ambiguous: struct { reason: []const u8 },
     },
 };
-pub const Counters = struct { O: u64 = 0, S: u64 = 0, A: u64 = 0, C: u64 = 0, I: u64 = 0, T: u64 = 0, D: u64 = 0, X: u64 = 0 };
+pub const Counters = struct { O: u64 = 0, S: u64 = 0, A: u64 = 0, C: u64 = 0, I: u64 = 0, T: u64 = 0, D: u64 = 0, F: u64 = 0, Q: u64 = 0, H: u64 = 0, X: u64 = 0 };
 pub const Error = error{
     InvalidLimits,
     CapabilityUnavailable,
@@ -206,6 +262,11 @@ pub const Error = error{
     ScriptFinished,
     ClockReversed,
     BarrierMismatch,
+    InvalidFollowup,
+    InvalidQuestion,
+    QuestionExpired,
+    InvalidAttachment,
+    AttachmentLimit,
 };
 
 /// Structural byte equality, including borrowed string contents (not addresses).
@@ -227,7 +288,11 @@ pub fn equal(a: anytype, b: @TypeOf(a)) bool {
             unreachable;
         },
         .optional => if (a) |value| if (b) |other| equal(value, other) else false else b == null,
-        .pointer => std.mem.eql(u8, a, b),
+        .pointer => |pointer| if (pointer.child == u8) std.mem.eql(u8, a, b) else blk: {
+            if (a.len != b.len) break :blk false;
+            for (a, b) |left, right| if (!equal(left, right)) break :blk false;
+            break :blk true;
+        },
         else => a == b,
     };
 }
@@ -235,12 +300,65 @@ pub fn equal(a: anytype, b: @TypeOf(a)) bool {
 /// Wire admission size: all variable byte fields, plus the typed fixed header.
 /// Checked without allocation; repeated string fields count separately.
 pub fn frameBytes(value: anytype) usize {
-    return @sizeOf(@TypeOf(value)) +| variableBytes(value);
+    const T = @TypeOf(value);
+    // Keep the v1 start-frame accounting stable as optional queue/question
+    // fields are added to the structural union. Their variable payload bytes
+    // are still counted below, so bounded admission remains conservative.
+    const fixed = if (T == Request) 208 else @sizeOf(T);
+    return fixed +| variableBytes(value);
 }
+
+pub fn validateAttachments(attachments: []const Attachment, limits: Limits) Error!void {
+    if (attachments.len > limits.attachment_count) return error.InvalidAttachment;
+    var content_bytes: usize = 0;
+    var metadata_bytes: usize = 0;
+    for (attachments) |attachment| {
+        if (attachment.metadata.id.value.len == 0 or attachment.metadata.name.len == 0 or
+            attachment.metadata.media_type.len == 0 or attachment.metadata.digest.len == 0 or
+            attachment.metadata.byte_length > @as(u64, @intCast(std.math.maxInt(usize)))) return error.InvalidAttachment;
+        if (attachment.content.len != 0 and attachment.content.len != attachment.metadata.byte_length) return error.InvalidAttachment;
+        content_bytes +|= @intCast(attachment.metadata.byte_length);
+        metadata_bytes +|= attachment.metadata.name.len +| attachment.metadata.media_type.len +| attachment.metadata.digest.len +| attachment.metadata.id.value.len;
+    }
+    if (content_bytes > limits.attachment_bytes or metadata_bytes > limits.attachment_metadata_bytes) return error.InvalidAttachment;
+}
+
+pub fn validateFollowup(followup: Followup, limits: Limits) Error!void {
+    if (followup.id.value.len == 0 or followup.content.len == 0 or followup.content.len > limits.followup_bytes) return error.InvalidFollowup;
+    if (frameBytes(followup) > limits.frame_bytes) return error.FrameTooLarge;
+}
+
+pub fn validateQuestion(question: Question, limits: Limits) Error!void {
+    if (question.id.value.len == 0 or question.prompt.len == 0 or question.choices.len > limits.question_choices or
+        (question.choices.len == 0 and !question.allow_freeform)) return error.InvalidQuestion;
+    var seen: [16][]const u8 = undefined;
+    var seen_count: usize = 0;
+    for (question.choices) |choice| {
+        if (choice.id.len == 0 or choice.label.len == 0 or seen_count == seen.len) return error.InvalidQuestion;
+        for (seen[0..seen_count]) |previous| if (std.mem.eql(u8, previous, choice.id)) return error.InvalidQuestion;
+        seen[seen_count] = choice.id;
+        seen_count += 1;
+    }
+    if (frameBytes(question) > limits.frame_bytes) return error.FrameTooLarge;
+}
+
+pub fn validateQuestionAnswer(answer: QuestionAnswer, limits: Limits) Error!void {
+    if (answer.text.len > limits.question_answer_bytes or answer.choice_ids.len > limits.question_choices) return error.InvalidQuestion;
+    for (answer.choice_ids, 0..) |choice, index| {
+        if (choice.len == 0) return error.InvalidQuestion;
+        for (answer.choice_ids[0..index]) |previous| if (std.mem.eql(u8, previous, choice)) return error.InvalidQuestion;
+    }
+    if (frameBytes(answer) > limits.frame_bytes) return error.FrameTooLarge;
+}
+
 fn variableBytes(value: anytype) usize {
     const T = @TypeOf(value);
     return switch (@typeInfo(T)) {
-        .pointer => value.len,
+        .pointer => |pointer| if (pointer.child == u8) value.len else blk: {
+            var n: usize = 0;
+            for (value) |item| n +|= variableBytes(item);
+            break :blk n;
+        },
         .optional => if (value) |v| variableBytes(v) else 0,
         .@"struct" => blk: {
             var n: usize = 0;

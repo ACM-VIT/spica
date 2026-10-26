@@ -17,6 +17,16 @@ fn cfg(comptime q: usize, comptime calls: usize) f.Config {
     return result;
 }
 
+fn workflowConfig() f.Config {
+    var result = config;
+    result.discovery.capabilities[@intFromEnum(c.Capability.followup_queue)].status = .supported;
+    result.discovery.capabilities[@intFromEnum(c.Capability.question)].status = .supported;
+    result.discovery.capabilities[@intFromEnum(c.Capability.attachment)].status = .supported;
+    result.discovery.limits.queue_frames = 8;
+    result.discovery.limits.call_frames = 8;
+    return result;
+}
+
 test "Unicode lifecycle keeps duplicates, reordering, approval, unknown and exact counters" {
     const response: c.Request = .{ .respond_approval = .{ .correlation = corr, .decision = .allow, .action_digest = approval.action_digest } };
     const cancel: c.Request = .{ .cancel = .{ .correlation = corr, .reason = "stop" } };
@@ -187,4 +197,76 @@ test "historical completion preserves correlation without start and validates ca
     configuration = cfg(1, 1);
     configuration.discovery.capabilities[@intFromEnum(c.Capability.usage)].status = .supported;
     try t.expectError(error.CapabilityUnavailable, f.Runtime(1, 1).init(configuration, &.{}));
+}
+
+test "queued followup and bounded attachments retain typed identity and capability gates" {
+    const followup: c.Followup = .{ .id = .{ .value = "followup-1" }, .content = "continue after the current turn" };
+    const attachment: c.Attachment = .{ .metadata = .{
+        .id = .{ .value = "attachment-1" },
+        .name = "notes.txt",
+        .media_type = "text/plain",
+        .byte_length = 5,
+        .digest = "digest-1",
+    }, .content = "hello" };
+    const queued: c.Request = .{ .message = .{
+        .correlation = corr,
+        .message = .{ .value = "followup-message" },
+        .content = followup.content,
+        .followup = followup,
+        .attachments = &.{attachment},
+    } };
+    const script = [_]f.Step{.{ .expect = .{ .request = queued, .receipt = ack } }};
+    var runtime = try f.Runtime(8, 8).init(workflowConfig(), &script);
+    _ = try runtime.message(queued.message);
+    try t.expectEqual(@as(u64, 1), runtime.counters.F);
+    try t.expectEqual(@as(u64, 1), runtime.counters.H);
+    try t.expect(c.equal(queued, runtime.takeCall().?.request));
+
+    const unsupported = cfg(1, 1);
+    const blocked = try f.Runtime(1, 1).init(unsupported, &.{});
+    try t.expectError(error.CapabilityUnavailable, blocked.message(queued.message));
+    var too_large = workflowConfig();
+    too_large.discovery.limits.attachment_bytes = 4;
+    var bounded = try f.Runtime(1, 1).init(too_large, &.{});
+    try t.expectError(error.InvalidAttachment, bounded.message(queued.message));
+}
+
+test "structured provider question answers are distinct from permission replies" {
+    const question: c.Question = .{
+        .id = .{ .value = "question-1" },
+        .correlation = .{ .effect = corr.effect, .session = session.id, .run = corr.run, .question = .{ .value = "question-1" } },
+        .prompt = "Which change should I apply?",
+        .choices = &.{ .{ .id = "safe", .label = "Safe change" }, .{ .id = "full", .label = "Full change" } },
+        .allow_multiple = false,
+        .allow_freeform = false,
+        .expires_at = 100,
+    };
+    const answer: c.Request = .{ .answer_question = .{
+        .correlation = .{ .effect = .{ .value = "answer-effect" }, .session = session.id, .run = corr.run, .question = question.id },
+        .question = question.id,
+        .answer = .{ .choice_ids = &.{"safe"} },
+    } };
+    const script = [_]f.Step{
+        .{ .emit = .{ .correlation = question.correlation, .upstream_event = "question-1", .body = .{ .question = question } } },
+        .{ .barrier = "answer-question" },
+        .{ .expect = .{ .request = answer, .receipt = ack } },
+    };
+    var runtime = try f.Runtime(4, 4).init(workflowConfig(), &script);
+    try runtime.pump();
+    const observed = runtime.poll().?;
+    try t.expectEqual(.question, std.meta.activeTag(observed.body));
+    try t.expect(c.equal(question, observed.body.question));
+    try runtime.release("answer-question");
+    _ = try runtime.answerQuestion(answer.answer_question);
+    try t.expectEqual(@as(u64, 1), runtime.counters.Q);
+    const permission: c.Request = .{ .respond_approval = .{ .correlation = corr, .decision = .allow, .action_digest = "digest" } };
+    try t.expectError(error.UnexpectedRequest, runtime.dispatch(permission));
+
+    const expired = workflowConfig();
+    var expired_runtime = try f.Runtime(4, 4).init(expired, &script);
+    try expired_runtime.pump();
+    _ = expired_runtime.poll();
+    try expired_runtime.advance(100);
+    try expired_runtime.release("answer-question");
+    try t.expectError(error.QuestionExpired, expired_runtime.answerQuestion(answer.answer_question));
 }

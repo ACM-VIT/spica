@@ -13,6 +13,9 @@ pub const ProjectId = Id("project");
 pub const ThreadId = Id("thread");
 pub const CommandId = Id("command");
 pub const EventId = Id("event");
+pub const FollowupId = adapter.FollowupId;
+pub const QuestionId = adapter.QuestionId;
+pub const AttachmentId = adapter.AttachmentId;
 pub const SnapshotId = struct { slot: u8, generation: u64 };
 pub const SubscriptionId = struct { slot: u8, generation: u64 };
 pub const Ticket = struct { value: u64 };
@@ -33,6 +36,10 @@ pub const Target = union(enum) {
     thread: ThreadId,
     run: adapter.RunId,
     approval: adapter.ApprovalId,
+    effect: adapter.EffectId,
+    followup: FollowupId,
+    question: QuestionId,
+    attachment: AttachmentId,
 };
 
 /// Mutations target command aggregates; events/receipts also identify content,
@@ -48,6 +55,9 @@ pub const AggregateRef = union(enum) {
     session: adapter.RuntimeSessionId,
     effect: adapter.EffectId,
     tool: adapter.ToolCallId,
+    followup: FollowupId,
+    question: QuestionId,
+    attachment: AttachmentId,
 };
 pub const WorkspaceBinding = struct {
     canonical_root: []const u8,
@@ -66,6 +76,18 @@ pub const Payload = union(enum) {
     thread_create: struct { project: ProjectId, workspace: adapter.WorkspaceId },
     thread_send: struct { text: []const u8, selection: adapter.Selection },
     thread_select: struct { selection: adapter.Selection },
+    /// A queued follow-up is represented by a planned provider message effect.
+    /// The effect remains nondispatchable until its dependency chain permits it.
+    followup_enqueue: struct { content: []const u8, attachments: []const adapter.Attachment = &.{} },
+    followup_edit: struct { content: []const u8, attachments: []const adapter.Attachment = &.{} },
+    followup_cancel: struct { reason: []const u8 },
+    followup_order: struct { followups: []const FollowupId },
+    /// Provider questions are separate from permission approvals. Durable
+    /// pending-question storage is a later schema handoff; this command shape
+    /// is still shared by domain and provider fixtures.
+    question_answer: struct { question: QuestionId, answer: adapter.QuestionAnswer },
+    attachment_add: adapter.Attachment,
+    attachment_remove: AttachmentId,
     runtime_configure: adapter.RuntimeSetup,
     runtime_refresh: void,
     runtime_login: adapter.RuntimeLogin,
@@ -107,6 +129,13 @@ pub const Reason = enum {
     unresolved_effects,
     session_unavailable,
     admission_limit,
+    followup_limit,
+    followup_not_found,
+    followup_invalid,
+    question_invalid,
+    question_expired,
+    attachment_limit,
+    attachment_unsupported,
 };
 pub const EntityIds = struct {
     project: ?ProjectId = null,
@@ -117,6 +146,9 @@ pub const EntityIds = struct {
     assistant_message: ?adapter.MessageId = null,
     assistant_block: ?adapter.BlockId = null,
     session: ?adapter.RuntimeSessionId = null,
+    followup: ?FollowupId = null,
+    question: ?QuestionId = null,
+    attachment: ?AttachmentId = null,
 };
 pub const CommittedRevision = struct { target: AggregateRef, revision: Revision };
 pub const Receipt = struct {
@@ -241,6 +273,33 @@ pub const Event = struct {
     effect_id: ?adapter.EffectId = null,
     // Bounded normalized record; content events reference blocks/ranges, not copied history.
     payload: []const u8,
+};
+pub const EventKind = enum {
+    FollowupQueued,
+    FollowupEdited,
+    FollowupCancelled,
+    FollowupReordered,
+    QuestionRequested,
+    QuestionAnswered,
+    QuestionInvalidated,
+    AttachmentAccepted,
+    AttachmentRejected,
+};
+pub const TypedEvent = struct {
+    contract_version: u32 = 1,
+    event_id: EventId,
+    position: EventPosition,
+    aggregate: AggregateRef,
+    aggregate_revision: Revision,
+    kind: EventKind,
+    causation_command_id: ?CommandId = null,
+    effect_id: ?adapter.EffectId = null,
+    payload: union(enum) {
+        followup: struct { id: FollowupId, order: u32 = 0 },
+        question: adapter.Question,
+        answer: struct { id: QuestionId, answer: adapter.QuestionAnswer },
+        attachment: adapter.AttachmentMetadata,
+    },
 };
 pub const Scope = union(enum) { all, thread: ThreadId, run: adapter.RunId };
 pub const Subscribe = struct { scope: Scope, after_position: EventPosition, max_batch_bytes: u32 = 64 * 1024 };
