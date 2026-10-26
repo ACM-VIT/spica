@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import json
 import os
 from pathlib import Path
@@ -589,6 +590,8 @@ def scenario(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
     if args.provider != "fake":
         raise DriverError("scenarios only support the explicit offline fake provider", EX_PROVIDER)
+    if args.name == "rejected-send" and not 4097 <= args.rejected_bytes <= 64 * 1024:
+        raise DriverError("--rejected-bytes must be between 4097 and 65536", EX_USAGE)
     if args.dry_run:
         print(json.dumps({"command": "scenario", "scenario": args.name, "provider": "fake",
                           "output": str(output), "steps": scenario_steps(args.name)}, indent=2))
@@ -846,7 +849,8 @@ def main(argv: list[str] | None = None) -> int:
     cli = parser()
     try:
         args = cli.parse_args(argv)
-        if args.dry_run is False and getattr(args, "timeout", 15) <= 0:
+        timeout = getattr(args, "timeout", 15)
+        if not math.isfinite(timeout) or timeout <= 0:
             raise DriverError("timeout must be positive", EX_USAGE)
         if args.command == "launch":
             return launch(args)

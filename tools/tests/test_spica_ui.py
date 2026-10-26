@@ -67,6 +67,13 @@ class SpicaUiOfflineTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, (command, result.stderr))
             self.assertFalse((Path(directory) / "session.json").exists())
 
+    def test_rejected_scenario_bounds_fixture_size(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_cli("scenario", "rejected-send", "--output", directory,
+                                  "--rejected-bytes", "4096", "--dry-run")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("between 4097 and 65536", result.stderr)
+
     def test_redaction_does_not_leak_account_material(self):
         module = load_cli()
         value = module.redact({"account_directory": "/tmp/private", "nested": {"token": "secret"},
