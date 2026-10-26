@@ -909,20 +909,17 @@ pub const Owner = struct {
     /// A stable caller request key retains the exact public envelope before
     /// dispatch, including its original optimistic revision across retries.
     pub fn toolCall(self: *Owner, allocator: std.mem.Allocator, session: a.RuntimeSessionId, name: []const u8, arguments_json: []const u8) !ToolReply {
-        if (arguments_json.len > 16384) return error.Limit;
-        const Args = struct {
-            request_key: ?[]const u8 = null,
-            packet: ?t.orchestration.Packet = null,
-            task_id: ?[]const u8 = null,
-            content: ?[]const u8 = null,
-            reason: ?[]const u8 = null,
-            candidate: ?[]const u8 = null,
-            evidence: ?[]const u8 = null,
-            summary: ?[]const u8 = null,
-            disposition: ?[]const u8 = null,
-        };
-        const args = try t.decode(Args, arguments_json, allocator);
-        const parent = try self.field(allocator, "SELECT id FROM runs WHERE session_id=?", &.{.{ .text = session.value }}) orelse return error.AuthorityUnavailable;
+        const args = try coordinator_tools.parseArguments(allocator, name, arguments_json);
+        // A resumed session can contain completed coordinator turns. The newest
+        // run owns new calls; durable request keys still replay their saved
+        // envelope/receipt, even when that envelope belongs to an earlier turn.
+        const coordinator = try self.field(allocator, "SELECT id FROM runs WHERE session_id=? ORDER BY rowid DESC LIMIT 1", &.{.{ .text = session.value }}) orelse return error.AuthorityUnavailable;
+        // Explicit task references retain their original parent across turns.
+        // A sibling session cannot acquire that authority by knowing the ID.
+        const parent = if (args.task_id) |task|
+            try self.field(allocator, "SELECT t.parent_run FROM tasks t JOIN runs p ON p.id=t.parent_run WHERE t.run_id=? AND p.session_id=?", &.{ .{ .text = task }, .{ .text = session.value } }) orelse return error.AuthorityUnavailable
+        else
+            coordinator;
         if (std.mem.eql(u8, name, "task.catalog")) {
             const models = if (self.factory) |factory| factory.models() else &.{};
             return .{ .success = true, .json = try encoded(allocator, models) };
@@ -943,7 +940,7 @@ pub const Owner = struct {
                 if (!std.mem.eql(u8, try previous.bytes(0), name) or !std.mem.eql(u8, try previous.bytes(1), &digest)) return error.ToolRequestConflict;
                 envelope = try t.decode(t.CommandEnvelope, try previous.bytes(2), allocator);
             } else {
-                const state = try self.field(allocator, "SELECT state FROM runs WHERE id=?", &.{.{ .text = parent }}) orelse return error.AuthorityUnavailable;
+                const state = try self.field(allocator, "SELECT state FROM runs WHERE id=?", &.{.{ .text = coordinator }}) orelse return error.AuthorityUnavailable;
                 if (!(std.mem.eql(u8, state, "streaming") or std.mem.eql(u8, state, "awaiting_approval"))) return error.AuthorityUnavailable;
                 var payload: t.Payload = undefined;
                 var target: a.RunId = .{ .value = parent };

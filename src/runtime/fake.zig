@@ -200,10 +200,10 @@ pub fn Runtime(comptime queue_capacity: usize, comptime call_capacity: usize) ty
                 .start => self.counters.S += 1,
                 .respond_approval => self.counters.A += 1,
                 .cancel => self.counters.C += 1,
-                .message => |message| {
+                .message => |sent_message| {
                     self.counters.D += 1;
-                    if (message.followup != null) self.counters.F += 1;
-                    if (message.attachments.len != 0) self.counters.H += 1;
+                    if (sent_message.followup != null) self.counters.F += 1;
+                    if (sent_message.attachments.len != 0) self.counters.H += 1;
                 },
                 .answer_question => self.counters.Q += 1,
                 .inspect => self.counters.I += 1,

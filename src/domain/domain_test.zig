@@ -732,6 +732,93 @@ test "durable app task delegation deduplicates bounds and correlates out of orde
     try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM tasks"));
 }
 
+fn acknowledgeOpenAndStart(owner: *domain.Owner, allocator: std.mem.Allocator) !void {
+    const open = (try owner.claimNext(allocator)).?;
+    try std.testing.expect(open.request == .open);
+    const session = open.request.open.create.session;
+    try owner.delivered(allocator, open.id, .{ .outcome = .acknowledged, .session = .{ .id = session, .instance = .{ .value = "orchestration-fixture" }, .upstream = .{ .value = session.value } } });
+    const start = (try owner.claimNext(allocator)).?;
+    try std.testing.expect(start.request == .start);
+    try owner.delivered(allocator, start.id, .{ .outcome = .acknowledged });
+}
+
+test "bridge retries survive disk reopen without replaying ambiguous child effects" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "before", .utc_ms = 1000 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const parent = try owner.command(allocator, conversation.send("parent", "coordinate", 1));
+    try acknowledgeOpenAndStart(&owner, allocator);
+    const packet: t.orchestration.Packet = .{ .purpose = "restart fixture", .prompt = "one child", .selection = conversation.send("", "", 1).payload.thread_send.selection, .owned_paths = &.{"restart.zig"}, .acceptance = "no replay", .result_location = "temporary evidence" };
+    const args = try std.json.Stringify.valueAlloc(allocator, .{ .request_key = "delegate", .packet = packet }, .{});
+    const first = try owner.toolCall(allocator, parent.entity_ids.session.?, "task.delegate", args);
+    const delegated = try t.decode(t.Receipt, first.json, allocator);
+    try std.testing.expect(first.success);
+    const open = (try owner.claimNext(allocator)).?;
+    try std.testing.expect(open.request == .open);
+    // Crash after claiming the open, before any delivery receipt. The test does
+    // not dispatch external work or invent a successful provider completion.
+    var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try f.path(&directory);
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, path);
+    owner.epoch = "after";
+    try owner.recover();
+    const sequence = (try f.store.position()).commit_sequence;
+    const retry = try owner.toolCall(allocator, parent.entity_ids.session.?, "task.delegate", args);
+    try std.testing.expectEqualStrings(first.json, retry.json);
+    try std.testing.expectEqual(sequence, (try f.store.position()).commit_sequence);
+    try std.testing.expect((try owner.claimNext(allocator)) == null);
+    const wait_args = try std.json.Stringify.valueAlloc(allocator, .{ .task_id = delegated.entity_ids.run.?.value }, .{});
+    const waited = try owner.toolCall(allocator, parent.entity_ids.session.?, "task.wait", wait_args);
+    const rows = try t.decode([]t.Row, waited.json, allocator);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(.unknown, rows[0].task.state);
+    try std.testing.expectEqualStrings(delegated.entity_ids.run.?.value, rows[0].task.task.id.value);
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM tasks"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE state='unknown'"));
+    try std.testing.expectError(error.ToolRequestConflict, owner.toolCall(allocator, parent.entity_ids.session.?, "task.cancel", try std.json.Stringify.valueAlloc(allocator, .{ .request_key = "delegate", .task_id = delegated.entity_ids.run.?.value, .reason = "conflicting retry" }, .{})));
+    try std.testing.expectError(error.AuthorityUnavailable, owner.toolCall(allocator, parent.entity_ids.session.?, "task.delegate", try std.json.Stringify.valueAlloc(allocator, .{ .request_key = "new-after-crash", .packet = packet }, .{})));
+    // Unknown work cannot be presented as an explicit successful result.
+    const result: t.CommandEnvelope = .{ .command_id = .{ .value = "unknown-result" }, .target = .{ .run = delegated.entity_ids.run.? }, .expected_revision = .{ .revision = rows[0].task.revision }, .payload = .{ .task_result = .{ .candidate = "sha", .evidence = "log", .summary = "must not be accepted" } } };
+    try std.testing.expectEqual(t.Reason.invalid_command, (try owner.command(allocator, result)).reason.?);
+}
+
+test "bridge validates exact arguments before reserving keys and selects newest coordinator turn" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "turns", .utc_ms = 1000 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const parent = try owner.command(allocator, conversation.send("parent", "coordinate", 1));
+    try acknowledgeOpenAndStart(&owner, allocator);
+    const session = parent.entity_ids.session.?;
+    try std.testing.expectError(error.InvalidToolArguments, owner.toolCall(allocator, session, "task.catalog", "{\"task_id\":\"ignored\"}"));
+    try std.testing.expectError(error.InvalidToolArguments, owner.toolCall(allocator, session, "task.list", "{\"task_id\":\"ignored\"}"));
+    try std.testing.expectError(error.InvalidToolArguments, owner.toolCall(allocator, session, "task.send", "{\"request_key\":\"invalid\",\"task_id\":\"child\",\"content\":\"message\",\"packet\":null}"));
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM bridge_calls"));
+    // Stopped-app fixture: model an already persisted second coordinator turn
+    // sharing its exact session. This is a bridge authority test, not provider
+    // continuation or GUI evidence.
+    try f.store.execute("UPDATE runs SET state='completed' WHERE id=?", &.{.{ .text = parent.entity_ids.run.?.value }});
+    try f.store.execute("INSERT INTO runs(id,revision,thread_id,session_id,state,requested) SELECT 'newest-parent',1,thread_id,session_id,'streaming',requested FROM runs WHERE id=?", &.{.{ .text = parent.entity_ids.run.?.value }});
+    const packet: t.orchestration.Packet = .{ .purpose = "latest parent", .prompt = "one child", .selection = conversation.send("", "", 1).payload.thread_send.selection, .owned_paths = &.{"latest.zig"}, .acceptance = "exact parent", .result_location = "temporary evidence" };
+    const response = try owner.toolCall(allocator, session, "task.delegate", try std.json.Stringify.valueAlloc(allocator, .{ .request_key = "new-turn-delegate", .packet = packet }, .{}));
+    try std.testing.expect(response.success);
+    const listed = try owner.toolCall(allocator, session, "task.list", "{}");
+    const rows = try t.decode([]t.Row, listed.json, allocator);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("newest-parent", rows[0].task.task.parent.value);
+    try std.testing.expectEqualStrings("latest.zig", rows[0].task.task.packet.owned_paths[0]);
+    const catalog = try owner.toolCall(allocator, session, "task.catalog", "{}");
+    try std.testing.expectEqualStrings("[]", catalog.json);
+}
+
 test "indexed distant history pages retain boundaries cursors and exact source ranges" {
     const Host = @import("../domain.zig").Host;
     var temporary = std.testing.tmpDir(.{});

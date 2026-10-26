@@ -203,7 +203,7 @@ class Session:
 
 def target_groups(snapshot: dict[str, Any]) -> Iterable[dict[str, Any]]:
     for name in ("targets", "thread_targets", "sidebar_targets", "scope_targets",
-                 "effort_targets", "setup_targets", "setup_provider_targets",
+                 "effort_targets", "navigation_targets", "task_targets", "setup_targets", "setup_provider_targets",
                  "setup_field_targets"):
         for target in snapshot.get(name, []) or []:
             if isinstance(target, dict):
@@ -314,8 +314,8 @@ def launch(args: argparse.Namespace) -> int:
         binary = Path(args.binary).resolve() if args.binary else ROOT / "zig-out/bin/spica"
         plan = {"command": "launch", "private": args.private, "provider": args.provider,
                 "output": str(output), "binary": str(binary), "build": bool(args.build),
-                "state_directory": str(output / "state"),
-                "argv": [str(binary), "--provider", "fake", "--state-directory", str(output / "state"),
+                "state_directory": str(output / "state"), "workspace": str(output / "workspace"),
+                "argv": [str(binary), "--provider", "fake", "--state-directory", str(output / "state"), "--workspace", str(output / "workspace"),
                          "--automation-live", str(output / "live.json"), "--automation-output", str(output / "final.json")]}
         print(json.dumps(plan, indent=2))
         return 0
@@ -337,11 +337,15 @@ def launch(args: argparse.Namespace) -> int:
     output.mkdir(parents=True, exist_ok=False)
     state = output / "state"
     state.mkdir()
+    workspace = output / "workspace"
+    workspace.mkdir()
+    if args.scenario == "workspace-diff":
+        prepare_workspace_fixture(workspace)
     private_path = run_command(["vd", "start", "--width", str(args.width), "--height", str(args.height)]).stdout.strip()
     private_dir = Path(private_path)
     try:
         private_record = json.loads((private_dir / "session.json").read_text(encoding="utf-8"))
-        argv = [str(binary), "--provider", "fake", "--state-directory", str(state),
+        argv = [str(binary), "--provider", "fake", "--state-directory", str(state), "--workspace", str(workspace),
                 "--automation-live", str(output / "live.json"), "--automation-output", str(output / "final.json"),
                 "--quit-after-ms", str(args.quit_after_ms)]
         launch_result = run_command(["vd", "run", private_path, "--bg", "--log", str(output / "app.log"), "--", *argv])
@@ -359,7 +363,7 @@ def launch(args: argparse.Namespace) -> int:
         manifest = record_manifest(output, scenario=args.scenario, binary=binary,
                                    build_command=build_command, private={"session": private_path, **private_record})
         manifest.update({"session_nonce": secrets.token_hex(16), "window": window,
-                         "observations": str(output / "live.json"), "launch": launch_info,
+                         "observations": str(output / "live.json"), "launch": launch_info, "workspace": str(workspace),
                          "actions": []})
         session = Session(output, manifest)
         session.save()
@@ -449,31 +453,37 @@ def input_action(args: argparse.Namespace, operation: str) -> int:
         print(json.dumps(details, indent=2))
         return 0
     session = get_session(args)
-    before = session.snapshot(args.timeout)
-    target = find_target(before, args.target)
+    file = getattr(args, "file", None)
+    content = Path(file).read_text(encoding="utf-8") if file else getattr(args, "value", "")
+    source = str(Path(file).resolve()) if file else "inline"
+    after = perform_input(session, operation, args.target, args.timeout, content, source)
+    print(json.dumps({"operation": operation, "target": args.target, "frame_id": after.get("frame_id")}, indent=2))
+    return 0
+
+
+def perform_input(session: Session, operation: str, identifier: str, timeout: float,
+                  content: str = "", source: str = "inline") -> dict[str, Any]:
+    before = session.snapshot(timeout)
+    target = find_target(before, identifier)
     begin = now_ns()
+    focus(session)
+    x, y = pointer(session, target)
     if operation == "click":
-        x, y = pointer(session, target)
         run_command(["vd", "click", str(session.vd_session), session.window, str(x), str(y)])
-        detail = {"target": args.target, "pointer": [x, y], "input_origin": "ordinary vd pointer"}
+        detail = {"target": identifier, "pointer": [x, y], "input_origin": "ordinary vd pointer"}
     elif operation == "text":
-        focus(session)
-        if args.file:
-            content = Path(args.file).read_text(encoding="utf-8")
-            source = str(Path(args.file).resolve())
-        else:
-            content = args.value
-            source = "inline"
+        # Text input goes to the freshly resolved semantic target, even when a
+        # previous action left keyboard focus in a menu or the sidebar.
+        run_command(["vd", "click", str(session.vd_session), session.window, str(x), str(y)])
         digest = hashlib.sha256(content.encode()).hexdigest()
         run_command(["vd", "text", str(session.vd_session), session.window, content])
-        detail = {"target": args.target, "input_origin": "ordinary vd text", "source": source,
+        detail = {"target": identifier, "input_origin": "ordinary vd text", "source": source,
                   "bytes": len(content.encode()), "sha256": digest}
     else:
         raise DriverError(f"unknown input operation: {operation}", EX_USAGE)
-    after = session.snapshot(args.timeout)
+    after = session.snapshot(timeout)
     session.journal(operation, before, after, begin_unix_ns=begin, **detail)
-    print(json.dumps(redact({"operation": operation, "target": args.target, "frame_id": after.get("frame_id")}), indent=2))
-    return 0
+    return after
 
 
 def key(args: argparse.Namespace) -> int:
@@ -482,18 +492,39 @@ def key(args: argparse.Namespace) -> int:
                           "key": args.value, "input_origin": "ordinary vd keyboard"}, indent=2))
         return 0
     session = get_session(args)
-    before = session.snapshot(args.timeout)
-    begin = now_ns()
-    focus(session)
-    run_command(key_argv(session, args.value))
-    after = session.snapshot(args.timeout)
-    session.journal("key", before, after, begin_unix_ns=begin, key=args.value,
-                    input_origin="ordinary vd keyboard")
+    after = perform_key(session, args.value, args.timeout)
     print(json.dumps({"operation": "key", "key": args.value, "frame_id": after.get("frame_id")}, indent=2))
     return 0
 
 
+def perform_key(session: Session, value: str, timeout: float) -> dict[str, Any]:
+    before = session.snapshot(timeout)
+    begin = now_ns()
+    focus(session)
+    run_command(key_argv(session, value))
+    after = session.snapshot(timeout)
+    session.journal("key", before, after, begin_unix_ns=begin, key=value,
+                    input_origin="ordinary vd keyboard")
+    return after
+
+
+def matches_wait(value: dict[str, Any], *, command_id: str | None = None,
+                 run: str | None = None, receipt: str | None = None,
+                 state: str | None = None) -> bool:
+    if command_id and value.get("send_command_id") != command_id:
+        return False
+    if run and (value.get("run_id") != run or (command_id and value.get("send_run_id") != run)):
+        return False
+    if receipt and value.get("send_receipt") != receipt:
+        return False
+    return not state or value.get("run_status") == state
+
+
 def wait_command(args: argparse.Namespace) -> int:
+    if not args.command_id and not args.run:
+        raise DriverError("wait requires an exact --command or --run", EX_USAGE)
+    if args.receipt and not args.command_id:
+        raise DriverError("--receipt requires an exact --command", EX_USAGE)
     if args.dry_run:
         print(json.dumps({"command": "wait", "output": str(Path(args.output).resolve()),
                           "command_id": args.command_id, "run_id": args.run,
@@ -501,42 +532,21 @@ def wait_command(args: argparse.Namespace) -> int:
                           "timeout": args.timeout}, indent=2))
         return 0
     session = get_session(args)
-    if not args.command_id and not args.run and not args.receipt and not args.state:
-        raise DriverError("wait requires --command/--run/--receipt/--state", EX_USAGE)
     deadline = time.monotonic() + args.timeout
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
         last = session.snapshot(min(1, max(.1, deadline - time.monotonic())))
-        if args.command_id:
-            observed_ids = {last.get("command_id"), last.get("last_command_id")}
-            receipt = last.get("receipt")
-            if isinstance(receipt, dict):
-                observed_ids.add(receipt.get("command_id"))
-            if args.command_id not in observed_ids:
-                # A run ID alone is not sufficient evidence for a command: an
-                # older completed run must never satisfy a new wait.
-                time.sleep(.05)
-                continue
-        if args.run and last.get("run_id") != args.run:
+        if (args.state == "completed" and last.get("run_status") in {"failed", "unknown", "interrupted"}
+                and matches_wait(last, command_id=args.command_id, run=args.run)):
+            raise DriverError("correlated run did not complete", EX_PROVIDER)
+        if not matches_wait(last, command_id=args.command_id, run=args.run,
+                            receipt=args.receipt, state=args.state):
             time.sleep(.05)
             continue
-        if args.state and last.get("run_status") != args.state:
-            time.sleep(.05)
-            continue
-        if args.receipt:
-            if args.receipt == "accepted":
-                ready = bool(last.get("run_id")) and not last.get("pending_command")
-            elif args.receipt == "rejected":
-                ready = bool(last.get("admission_errors")) or bool(last.get("last_admission_error"))
-            else:
-                raise DriverError("receipt must be accepted or rejected", EX_USAGE)
-            if not ready:
-                time.sleep(.05)
-                continue
-            if args.receipt == "rejected":
-                session.journal("wait", None, last, outcome="rejected")
-                print(json.dumps(redact(last), indent=2))
-                return EX_REJECTED
+        if args.receipt == "rejected":
+            session.journal("wait", None, last, outcome="rejected")
+            print(json.dumps(redact(last), indent=2))
+            return EX_REJECTED
         print(json.dumps(redact(last), indent=2))
         return 0
     raise DriverError(f"wait timed out after {args.timeout:g}s", EX_TIMEOUT)
@@ -561,176 +571,265 @@ def stop(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(json.dumps({"command": "stop", "output": str(Path(args.output).resolve())}, indent=2))
         return 0
-    session = get_session(args)
+    close_app(get_session(args), args.timeout)
+    print(json.dumps({"stopped": True}, indent=2))
+    return 0
+
+
+def close_app(session: Session, timeout: float, *, clean_desktop: bool = True) -> None:
     if session.data.get("launch", {}).get("attached"):
         raise DriverError("attached sessions require the owning launcher to stop them", EX_USAGE)
     try:
         session.require_live()
-        before = read_json(session.observations, time.monotonic() + args.timeout)
         focus(session)
         run_command(key_argv(session, "ctrl+q"))
-        deadline = time.monotonic() + args.timeout
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             windows = run_command(["vd", "windows", session.vd_session], check=False).stdout
             if session.window not in windows.split():
                 session.data["stopped_unix_ns"] = now_ns()
                 session.data["stop_observation"] = redact(read_json(session.observations, time.monotonic() + 2))
                 session.save()
-                run_command(["vd", "clean", str(session.vd_session)], check=False)
-                print(json.dumps({"stopped": True}, indent=2))
-                return 0
+                return
             time.sleep(.1)
         raise DriverError("native window did not close", EX_TIMEOUT)
-    except DriverError:
-        run_command(["vd", "clean", str(session.vd_session)], check=False)
-        raise
+    finally:
+        if clean_desktop:
+            run_command(["vd", "clean", str(session.vd_session)], check=False)
+
+
+def prepare_workspace_fixture(workspace: Path) -> None:
+    """Create disposable Git input before launch; never mutate the app database."""
+    run_command(["git", "-C", workspace, "init", "--quiet"])
+    fixture = workspace / "fixture.txt"
+    fixture.write_text("original fixture line\n", encoding="utf-8")
+    run_command(["git", "-C", workspace, "add", "--", "fixture.txt"])
+    run_command(["git", "-C", workspace, "-c", "core.hooksPath=/dev/null",
+                 "-c", "commit.gpgSign=false", "-c", "user.name=Spica Fixture",
+                 "-c", "user.email=fixture@invalid", "commit", "--quiet", "-m", "Disposable GUI fixture"])
+    fixture.write_text("original fixture line\n+ workspace diff fixture 世界\n", encoding="utf-8")
+
+
+def composer_ready(session: Session, timeout: float) -> dict[str, Any]:
+    return wait_snapshot(session, lambda value: value.get("connected") and value.get("thread_id")
+                         and any(item.get("id") == "composer.input" and item.get("enabled")
+                                 for item in target_groups(value)), timeout, "fake composer input")
+
+
+def send_turn(session: Session, prompt: str, timeout: float) -> dict[str, Any]:
+    before = composer_ready(session, timeout)
+    old_command, old_run = before.get("send_command_id"), before.get("run_id")
+    perform_input(session, "text", "composer.input", timeout, prompt)
+    wait_snapshot(session, lambda value: value.get("draft") == prompt and value.get("send_ready"),
+                  timeout, "exact editable prompt")
+    perform_input(session, "click", "command.send", timeout)
+    current = wait_snapshot(session, lambda value: value.get("send_command_id")
+                            and value.get("send_command_id") != old_command
+                            and value.get("send_receipt") in {"accepted", "rejected"},
+                            timeout, "new Send receipt")
+    if current.get("send_receipt") == "rejected":
+        raise DriverError("new Send was rejected: " + str(current.get("send_rejection", "unknown")), EX_REJECTED)
+    command = current["send_command_id"]
+    current = wait_snapshot(session, lambda value: value.get("send_command_id") == command
+                            and value.get("send_run_id") and value.get("run_id") == value.get("send_run_id")
+                            and value.get("run_id") != old_run, timeout, "new correlated run")
+    run, thread = current["run_id"], before["thread_id"]
+    approval_sent = False
+
+    def completed(value: dict[str, Any]) -> bool:
+        nonlocal approval_sent
+        if value.get("thread_id") != thread or value.get("run_id") != run:
+            raise DriverError("Send changed the captured thread/run", EX_STALE)
+        if value.get("run_status") in {"failed", "unknown", "interrupted", "cancelled"}:
+            raise DriverError("correlated fake run failed: " + value["run_status"], EX_PROVIDER)
+        if value.get("run_status") == "awaiting_approval" and not approval_sent:
+            perform_input(session, "click", "approval.allow", timeout)
+            approval_sent = True
+        return value.get("run_status") == "completed"
+
+    current = wait_snapshot(session, completed, timeout, "correlated completed fake run")
+    turn = {key: current.get(key) for key in ("thread_id", "run_id", "send_command_id",
+            "send_run_id", "send_session_id", "send_receipt", "selected_runtime", "selected_model", "selected_effort")}
+    session.data.setdefault("turns", []).append(turn)
+    session.journal("scenario.turn", before, current, correlation=turn)
+    return current
+
+
+def capture(session: Session, name: str) -> None:
+    path = session.output / name
+    run_command(["vd", "shot", str(session.vd_session), str(path)])
+    session.data["last_screenshot"] = str(path)
+    session.save()
+
+
+def restart_app(session: Session, args: argparse.Namespace) -> dict[str, Any]:
+    before = session.snapshot(args.timeout)
+    previous_launch = session.data["launch"]
+    # Preserve the private compositor until the new process has been inspected.
+    close_app(session, args.timeout, clean_desktop=False)
+    restarted_output = session.output / "restart-process"
+    restarted_output.mkdir(exist_ok=False)
+    live = restarted_output / "live.json"
+    argv = [session.data["binary"], "--provider", "fake", "--workspace", session.data["workspace"],
+            "--state-directory", str(session.output / "state"), "--automation-live", str(live),
+            "--automation-output", str(restarted_output / "final.json"),
+            "--quit-after-ms", str(args.quit_after_ms)]
+    restarted = json.loads(run_command(["vd", "run", str(session.vd_session), "--bg", "--log",
+                           str(restarted_output / "app.log"), "--", *argv]).stdout)
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
+        windows = run_command(["vd", "windows", str(session.vd_session)], check=False).stdout
+        if windows.strip():
+            session.data.update({"restart_process": restarted, "previous_launch": previous_launch,
+                                 "observations": str(live), "launch": restarted,
+                                 "window": windows.splitlines()[0].split()[0]})
+            session.data.pop("stopped_unix_ns", None)
+            session.save()
+            current = wait_snapshot(session, lambda value: value.get("connected")
+                                    and value.get("thread_id") == before.get("thread_id")
+                                    and value.get("run_id") == before.get("run_id")
+                                    and value.get("run_status") == "completed", args.timeout, "durable reopened run")
+            session.journal("scenario.restart", before, current, previous_launch=previous_launch,
+                            launch=restarted, input_origin="ordinary Ctrl+Q and fresh process")
+            return current
+        time.sleep(.1)
+    raise DriverError("restarted native window did not appear", EX_PROCESS)
+
+
+def assert_oversized_refusal(before: dict[str, Any], current: dict[str, Any], size: int) -> None:
+    target = next((item for item in target_groups(current) if item.get("id") == "command.send"), None)
+    if (current.get("draft") != "x" * size or not target or target.get("enabled")
+            or current.get("send_frame_bytes", 0) <= 4096 or not current.get("send_disabled_reason")
+            or current.get("pending_command") or current.get("run_id") != before.get("run_id")
+            or current.get("send_command_id") != before.get("send_command_id")):
+        raise DriverError("oversized refusal did not preserve the draft and command/run identity", EX_ASSERTION)
+
+
+def capability_refusal(session: Session, timeout: float, identifiers: tuple[str, ...]) -> None:
+    before = composer_ready(session, timeout)
+    for identifier in identifiers:
+        try:
+            find_target(before, identifier)
+        except DriverError as error:
+            if error.code != EX_TARGET:
+                raise
+            # A missing UI capability is an explicit driver refusal, not evidence
+            # that a provider rejected a typed request. Never substitute Send.
+            session.journal("scenario.capability-refusal", before, before, target=identifier,
+                            outcome="driver_refused_unavailable_target", reason=str(error), input_delivered=False)
+        else:
+            raise DriverError("refusal scenario requires an unavailable target: " + identifier, EX_ASSERTION)
+    after = session.snapshot(timeout)
+    for key in ("thread_id", "run_id", "send_command_id", "draft_revision", "pending_command"):
+        if before.get(key) != after.get(key):
+            raise DriverError("capability refusal changed " + key, EX_ASSERTION)
+    session.data["limitations"].append("Capability refusal covers unavailable GUI actions only; typed provider refusal is a separate fixture gate.")
+
+
+def failure_packet(session: Session, error: Exception) -> None:
+    atomic_json(session.output / "failure.json", {"error": str(error), "exit_code": getattr(error, "code", EX_ASSERTION),
+                "revision": session.data.get("revision"), "binary_sha256": session.data.get("binary_sha256")})
+    try:
+        atomic_json(session.output / "last-snapshot.json", redact(session.snapshot(1)))
+        capture(session, "failure.png")
+    except (DriverError, OSError, ValueError):
+        pass
 
 
 def scenario(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
     if args.provider != "fake":
         raise DriverError("scenarios only support the explicit offline fake provider", EX_PROVIDER)
-    if args.name == "rejected-send" and not 4097 <= args.rejected_bytes <= 64 * 1024:
+    if args.name in {"rejected-send", "oversized-send"} and not 4097 <= args.rejected_bytes <= 64 * 1024:
         raise DriverError("--rejected-bytes must be between 4097 and 65536", EX_USAGE)
     if args.dry_run:
         print(json.dumps({"command": "scenario", "scenario": args.name, "provider": "fake",
                           "output": str(output), "steps": scenario_steps(args.name)}, indent=2))
         return 0
     launch_args = argparse.Namespace(**vars(args))
-    launch_args.scenario = args.name
-    launch_args.private = True
+    launch_args.scenario, launch_args.private = args.name, True
     launch(launch_args)
     session = Session.load(output)
     try:
         if args.name == "disabled-send":
-            current = wait_snapshot(session,
-                                    lambda value: value.get("connected") and value.get("thread_id")
-                                    and any(item.get("id") == "command.send" for item in target_groups(value)),
-                                    args.timeout, "fake composer")
+            current = composer_ready(session, args.timeout)
             target = next((item for item in target_groups(current) if item.get("id") == "command.send"), None)
             if not target or target.get("enabled") or not current.get("send_disabled_reason"):
                 raise DriverError("empty composer did not expose a disabled Send target", EX_ASSERTION)
             session.data["expected_outcome"] = "send_disabled"
-        elif args.name == "rejected-send":
-            # Host admission is exercised through a GUI paste/type event.  No SQL or
-            # command-server shortcut is used; the oversized text is never put in a receipt.
-            wait_snapshot(session, lambda value: value.get("connected") and value.get("thread_id")
-                          and any(item.get("id") == "composer.input" and item.get("enabled")
-                                  for item in target_groups(value)), args.timeout, "fake composer input")
-            input_action(argparse.Namespace(output=str(output), timeout=args.timeout, target="composer.input",
-                                           file=None, value="x" * args.rejected_bytes), "text")
-            before = session.snapshot(args.timeout)
-            key(argparse.Namespace(output=str(output), timeout=args.timeout, value="Return"))
-            deadline = time.monotonic() + args.timeout
-            while time.monotonic() < deadline:
-                current = session.snapshot(min(1, deadline - time.monotonic()))
-                if current.get("admission_errors") or current.get("last_admission_error"):
-                    session.data["expected_outcome"] = "send_rejected"
-                    session.data["rejection"] = {"admission_errors": current.get("admission_errors"),
-                                                  "last_admission_error": current.get("last_admission_error"),
-                                                  "draft_revision": current.get("draft_revision")}
-                    session.journal("scenario.rejected-send", before, current,
-                                    outcome="rejected", content_recorded=False)
-                    break
-                time.sleep(.05)
-            else:
-                raise DriverError("oversized Send was not visibly rejected", EX_TIMEOUT)
-        elif args.name == "send-restart":
-            wait_snapshot(session, lambda value: value.get("connected") and value.get("thread_id")
-                          and any(item.get("id") == "composer.input" and item.get("enabled")
-                                  for item in target_groups(value)), args.timeout, "fake composer input")
-            input_action(argparse.Namespace(output=str(output), timeout=args.timeout, target="composer.input",
-                                           file=None, value=args.prompt), "text")
-            key(argparse.Namespace(output=str(output), timeout=args.timeout, value="Return"))
-            deadline = time.monotonic() + args.timeout
-            first = None
-            while time.monotonic() < deadline:
-                first = session.snapshot(min(1, deadline - time.monotonic()))
-                if first.get("run_id") and first.get("run_status") in {"awaiting_approval", "completed", "cancelled"}:
-                    break
-                time.sleep(.05)
-            if not first or not first.get("run_id"):
-                raise DriverError("fake Send did not produce a correlated run", EX_TIMEOUT)
-            if first.get("run_status") == "awaiting_approval":
-                allow = find_target(first, "approval.allow")
-                x, y = pointer(session, allow)
-                run_command(["vd", "click", str(session.vd_session), session.window, str(x), str(y)])
-                current = session.snapshot(args.timeout)
-                session.journal("approval.allow", first, current, input_origin="ordinary vd pointer")
-                first = current
-            if first.get("run_status") != "completed":
-                raise DriverError("fake Send did not reach completed state", EX_ASSERTION)
-            thread_id, run_id = first.get("thread_id"), first.get("run_id")
-            session.data["pre_restart"] = {"thread_id": thread_id, "run_id": run_id,
-                                            "run_status": first.get("run_status")}
-            screenshot(argparse.Namespace(output=str(output), timeout=args.timeout, path=str(output / "before-restart.png"), dry_run=False))
-            stop(argparse.Namespace(output=str(output), timeout=args.timeout, dry_run=False))
-            # A fresh app process is required for the restart assertion.  Reuse the
-            # same private desktop/state directory and retain the nonce only as a session lineage marker.
-            relaunch = argparse.Namespace(**vars(args))
-            relaunch.output = str(output / "restarted")
-            relaunch.private = False
-            relaunch.dry_run = False
-            relaunch.build = False
-            relaunch.binary = args.binary
-            relaunch.optimize = args.optimize
-            relaunch.width, relaunch.height = args.width, args.height
-            relaunch.quit_after_ms = args.quit_after_ms
-            relaunch.timeout = args.timeout
-            # launch normally creates a new state directory; point the second app at the
-            # original state and private desktop through a small explicit relaunch path.
-            restarted_output = output / "restart-process"
-            if restarted_output.exists():
-                raise DriverError("restart evidence directory already exists", EX_STALE)
-            restarted_output.mkdir()
-            live = restarted_output / "live.json"
-            final = restarted_output / "final.json"
-            argv = [str(Path(args.binary).resolve() if args.binary else ROOT / "zig-out/bin/spica"),
-                    "--provider", "fake", "--state-directory", str(output / "state"),
-                    "--automation-live", str(live), "--automation-output", str(final),
-                    "--quit-after-ms", str(args.quit_after_ms)]
-            launch_result = run_command(["vd", "run", str(session.vd_session), "--bg", "--log",
-                                         str(restarted_output / "app.log"), "--", *argv])
-            restarted = json.loads(launch_result.stdout)
-            deadline = time.monotonic() + args.timeout
-            new_window = None
-            while time.monotonic() < deadline:
-                windows = run_command(["vd", "windows", str(session.vd_session)], check=False).stdout
-                candidates = [line.split()[0] for line in windows.splitlines() if line.split()]
-                if candidates:
-                    new_window = candidates[-1]
-                    break
-                time.sleep(.1)
-            if new_window is None:
-                raise DriverError("restarted native window did not appear", EX_PROCESS)
-            session.data["restart_process"] = restarted
-            session.data["observations"] = str(live)
-            session.data["launch"] = restarted
-            session.data["window"] = new_window
-            session.save()
+        elif args.name in {"rejected-send", "oversized-send"}:
+            before = composer_ready(session, args.timeout)
+            perform_input(session, "text", "composer.input", args.timeout, "x" * args.rejected_bytes)
+            current = wait_snapshot(session, lambda value: value.get("send_stage") == "preflight_rejected",
+                                    args.timeout, "visible oversized Send refusal")
+            assert_oversized_refusal(before, current, args.rejected_bytes)
+            perform_key(session, "Return", args.timeout)
             current = session.snapshot(args.timeout)
-            if current.get("thread_id") != thread_id or current.get("run_id") != run_id or current.get("run_status") != "completed":
-                raise DriverError("restart did not retain the completed fake run", EX_ASSERTION)
+            assert_oversized_refusal(before, current, args.rejected_bytes)
+            session.data["expected_outcome"] = "oversized_send_refused_draft_retained_no_command"
+            session.journal("scenario.oversized-send", before, current, outcome="preflight_rejected")
+        elif args.name in {"send-restart", "second-turn"}:
+            first = send_turn(session, args.prompt, args.timeout)
+            capture(session, "before-restart.png")
+            reopened = restart_app(session, args)
+            capture(session, "after-restart.png")
             session.data["expected_outcome"] = "send_completed_and_reopened"
-            screenshot(argparse.Namespace(output=str(output), timeout=args.timeout, path=str(output / "after-restart.png"), dry_run=False))
+            if args.name == "second-turn":
+                second = send_turn(session, "second offline turn 世界", args.timeout)
+                if second.get("thread_id") != first.get("thread_id") or second.get("run_id") == reopened.get("run_id"):
+                    raise DriverError("second turn did not retain the thread and create a distinct run", EX_ASSERTION)
+                session.data["expected_outcome"] = "same_thread_second_send_after_restart"
+                session.data["limitations"].append("The deterministic fake proves GUI turn/run correlation, not upstream provider context retention.")
+        elif args.name == "workspace-diff":
+            composer_ready(session, args.timeout)
+            perform_input(session, "click", "workspace.changes", args.timeout)
+            current = wait_snapshot(session, lambda value: value.get("workspace_open")
+                                    and not value.get("workspace_busy") and value.get("workspace_file_count") == 1,
+                                    args.timeout, "captured checkout changed-file list")
+            if current.get("workspace_root") != session.data["workspace"] or current.get("workspace_stale"):
+                raise DriverError("inspection belongs to a stale or different checkout", EX_STALE)
+            revision = current.get("workspace_revision")
+            perform_input(session, "click", "workspace.file.0", args.timeout)
+            current = wait_snapshot(session, lambda value: not value.get("workspace_busy")
+                                    and value.get("workspace_diff_bytes", 0) > 0, args.timeout, "selected-file diff")
+            if current.get("workspace_revision") != revision or current.get("workspace_stale"):
+                raise DriverError("checkout binding changed during diff inspection", EX_STALE)
+            if current.get("run_id") or current.get("send_command_id"):
+                raise DriverError("read-only inspection started provider work", EX_ASSERTION)
+            session.data["expected_outcome"] = "disposable_checkout_diff_visible"
+            session.journal("scenario.workspace-diff", None, current, fixture="fixture.txt", workspace_revision=revision)
+        elif args.name in {"capability-refusal", "followup-refusal", "question-refusal"}:
+            identifiers = {"capability-refusal": ("followup.enqueue", "question.answer"),
+                           "followup-refusal": ("followup.enqueue",), "question-refusal": ("question.answer",)}
+            capability_refusal(session, args.timeout, identifiers[args.name])
+            session.data["expected_outcome"] = "unavailable_gui_capability_refused_without_input"
         else:
             raise DriverError(f"unknown scenario: {args.name}", EX_USAGE)
-        stop(argparse.Namespace(output=str(output), timeout=args.timeout, dry_run=False))
+        capture(session, "result.png")
+        close_app(session, args.timeout)
         session.data["passed"] = True
         session.save()
+        atomic_json(output / "manifest.json", redact(session.data))
         receipt(args, session=session)
         return 0
-    except Exception:
+    except Exception as error:
         try:
-            run_command(["vd", "clean", str(session.vd_session)], check=False)
+            failure_packet(session, error)
         finally:
-            raise
+            run_command(["vd", "clean", str(session.vd_session)], check=False)
+        raise
 
 
 def scenario_steps(name: str) -> list[str]:
     return {"disabled-send": ["launch fake", "snapshot empty composer", "assert command.send disabled"],
-            "rejected-send": ["launch fake", "type oversized prompt through vd", "press Return", "assert visible admission rejection"],
-            "send-restart": ["launch fake", "type prompt and Send", "allow fake approval", "assert completed run", "close and relaunch", "assert same thread/run"],
+            "rejected-send": ["launch fake", "type oversized prompt through vd", "assert disabled Send and retained draft", "press Return", "assert no command or run"],
+            "oversized-send": ["launch fake", "type oversized prompt through vd", "assert disabled Send and retained draft", "press Return", "assert no command or run"],
+            "send-restart": ["launch fake", "type prompt and Send", "correlate command and new run", "allow fake approval", "close app while retaining private desktop", "relaunch and assert same completed thread/run"],
+            "second-turn": ["run send-restart", "send second prompt in reopened thread", "assert distinct command/run and same thread", "record fake-only context limitation"],
+            "workspace-diff": ["create disposable committed Git fixture before launch", "launch fake in fixture checkout", "open workspace.changes", "select workspace.file.0", "assert captured checkout revision and diff bytes", "capture rendered diff"],
+            "capability-refusal": ["launch fake", "refuse unavailable followup.enqueue and question.answer", "assert no input or command/run change"],
+            "followup-refusal": ["launch fake", "refuse unavailable followup.enqueue", "assert no input or command/run change"],
+            "question-refusal": ["launch fake", "refuse unavailable question.answer", "assert no input or command/run change"],
             }.get(name, [])
 
 
@@ -828,7 +927,8 @@ def parser() -> argparse.ArgumentParser:
     add_common(item)
 
     item = commands.add_parser("scenario", help="run a bounded offline fake GUI scenario")
-    item.add_argument("name", choices=("send-restart", "disabled-send", "rejected-send"))
+    item.add_argument("name", choices=("send-restart", "disabled-send", "rejected-send", "oversized-send", "second-turn",
+                                             "workspace-diff", "capability-refusal", "followup-refusal", "question-refusal"))
     item.add_argument("--provider", choices=("fake",), default="fake")
     item.add_argument("--prompt", default="offline GUI send")
     item.add_argument("--rejected-bytes", type=int, default=6000)
