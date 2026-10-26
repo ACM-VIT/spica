@@ -6,6 +6,7 @@ const t = types;
 const a = t.adapter;
 const V = store.Value;
 const common = @import("runtime/adapter.zig");
+const composer = @import("text/composer.zig");
 const Factory = common.Factory;
 const Registry = @import("domain/registry.zig").Registry;
 const Mcp = @import("orchestration_mcp.zig").Server;
@@ -260,7 +261,7 @@ pub const Owner = struct {
                 const open = try self.id(allocator);
                 const start = try self.id(allocator);
                 const request: a.Request = .{ .start = .{ .correlation = .{ .effect = .{ .value = start }, .run = .{ .value = run }, .session = .{ .value = session } }, .prompt = p.text } };
-                if (a.frameBytes(request) > 4096) return .admission_limit;
+                if (a.frameBytes(request) > composer.provider_start_frame_limit) return .admission_limit;
                 const selection = try encoded(allocator, p.selection);
                 try db.execute("INSERT INTO thread_selections VALUES(?,?) ON CONFLICT(thread_id) DO UPDATE SET selection=excluded.selection", &.{ .{ .text = thread }, .{ .blob = selection } });
                 try db.execute("INSERT INTO sessions(id,revision,workspace_id,selection) VALUES(?,1,?,?)", &.{ .{ .text = session }, .{ .text = workspace }, .{ .blob = selection } });

@@ -1,10 +1,38 @@
 const std = @import("std");
 const edit = @import("edit.zig");
+const contract = @import("../contract.zig");
 
 pub const max_bytes = 64 * 1024;
 pub const max_groups = 256;
 pub const source_budget = 192 * 1024;
 pub const max_pieces = 2048;
+/// The provider start request has a smaller accounted wire budget than the
+/// retained editor. Host admission reuses this calculation.
+pub const provider_start_frame_limit = 4096;
+
+pub const StartPreflight = struct {
+    prompt_bytes: usize,
+    frame_bytes: usize,
+    max_prompt_bytes: usize,
+
+    pub fn fits(self: StartPreflight) bool {
+        return self.frame_bytes <= provider_start_frame_limit;
+    }
+};
+
+/// Account the fixed header and generated 32-byte IDs used by Host's
+/// `Request.start`, without reading or retaining prompt contents. Host still
+/// rechecks the concrete request after generating its real IDs.
+pub fn startPreflight(prompt_bytes: usize) StartPreflight {
+    const id = [_]u8{'0'} ** 32;
+    const request: contract.Request = .{ .start = .{ .correlation = .{
+        .effect = .{ .value = &id },
+        .run = .{ .value = &id },
+        .session = .{ .value = &id },
+    }, .prompt = "" } };
+    const overhead = contract.frameBytes(request);
+    return .{ .prompt_bytes = prompt_bytes, .frame_bytes = overhead +| prompt_bytes, .max_prompt_bytes = provider_start_frame_limit -| overhead };
+}
 // Two extra staging slots let an over-limit edit fail transactionally even
 // when undo has temporarily used all of its reserved split-piece capacity.
 const piece_capacity = max_pieces + 2 * max_groups + 2;
@@ -465,6 +493,31 @@ pub const Composer = struct {
 fn expectText(composer: *const Composer, expected: []const u8) !void {
     var buffer: [max_bytes]u8 = undefined;
     try std.testing.expectEqualStrings(expected, try composer.materialize(&buffer));
+}
+
+test "provider start preflight shares Host accounting at exact ASCII and UTF-8 boundaries" {
+    const empty = startPreflight(0);
+    try std.testing.expectEqual(@as(usize, 304), empty.frame_bytes);
+    try std.testing.expectEqual(@as(usize, 3792), empty.max_prompt_bytes);
+    try std.testing.expect(startPreflight(3792).fits());
+    try std.testing.expectEqual(@as(usize, 4096), startPreflight(3792).frame_bytes);
+    try std.testing.expect(!startPreflight(3793).fits());
+    try std.testing.expectEqual(@as(usize, 4097), startPreflight(3793).frame_bytes);
+
+    const euro_at_edge = ("x" ** 3789) ++ "€";
+    const euro_over = ("x" ** 3790) ++ "€";
+    try std.testing.expectEqual(@as(usize, 3792), euro_at_edge.len);
+    try std.testing.expect(startPreflight(euro_at_edge.len).fits());
+    try std.testing.expectEqual(@as(usize, 3793), euro_over.len);
+    try std.testing.expect(!startPreflight(euro_over.len).fits());
+
+    const emoji_at_edge = ("x" ** 3788) ++ "😀";
+    const emoji_over = ("x" ** 3789) ++ "😀";
+    try std.testing.expectEqual(@as(usize, 3792), emoji_at_edge.len);
+    try std.testing.expect(startPreflight(emoji_at_edge.len).fits());
+    try std.testing.expectEqual(@as(usize, 3793), emoji_over.len);
+    try std.testing.expect(!startPreflight(emoji_over.len).fits());
+    try std.testing.expect(max_bytes > startPreflight(0).max_prompt_bytes);
 }
 
 test "multiline grapheme deletion and selection replacement restore exact selections" {
