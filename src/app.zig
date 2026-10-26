@@ -13,6 +13,7 @@ const presentation = @import("content/presentation.zig");
 const Id = @import("ui/transcript.zig").Id;
 const script = @import("script.zig");
 const design = @import("ui/design.zig");
+const composer = @import("text/composer.zig");
 
 /// Only a payload-free wake crosses worker threads. Registered after SDL init;
 /// its storage and SDL outlive both Host and presentation worker joins.
@@ -791,11 +792,24 @@ const Conversation = struct {
     notice_storage: [1024]u8 = undefined,
     diagnostic_storage: [1024]u8 = undefined,
     diagnostic_len: usize = 0,
+    preflight_storage: [192]u8 = undefined,
 
     fn notice(self: *Conversation, view: *Coding, message: []const u8) void {
         const bounded = @import("text/utf8.zig").prefix(message, self.notice_storage.len);
         @memcpy(self.notice_storage[0..bounded.len], bounded);
         view.notice = self.notice_storage[0..bounded.len];
+    }
+
+    fn sendPreflight(self: *Conversation, view: *const Coding) ?[]const u8 {
+        if (view.editor.len == 0) return null;
+        const preflight = composer.startPreflight(view.editor.len);
+        if (preflight.fits()) return null;
+        return std.fmt.bufPrint(&self.preflight_storage, "Send disabled: prompt is {d} bytes; accounted start frame is {d}/{d} bytes (max prompt {d}). Shorten the message.", .{
+            preflight.prompt_bytes,
+            preflight.frame_bytes,
+            composer.provider_start_frame_limit,
+            preflight.max_prompt_bytes,
+        }) catch "Send disabled: prompt exceeds the provider start-frame budget. Shorten the message.";
     }
 
     fn setupConfiguration(view: *const Coding) contract.RuntimeSetup {
@@ -858,6 +872,7 @@ const Conversation = struct {
         else
             "Choose a model and effort before sending.";
         if (!selected.workspace.eql(self.workspace.slice())) return "Selection belongs to another workspace. Choose a model again.";
+        if (view.editor.len != 0 and !composer.startPreflight(view.editor.len).fits()) return "Message exceeds the provider start-frame budget. Shorten it before sending.";
         for (view.models[0..view.model_count]) |*model| {
             var candidate = model.identity;
             candidate.effort = selected.effort;
@@ -971,6 +986,12 @@ const Conversation = struct {
         @memcpy(self.diagnostic_storage[0..diagnostic.len], diagnostic);
         self.diagnostic_len = diagnostic.len;
         if (diagnostic.len != 0) view.notice = self.diagnostic_storage[0..diagnostic.len];
+        switch (row.state) {
+            .failed => view.send_diagnostic.setProviderDiagnostic(diagnostic, false),
+            .completed, .cancelled, .interrupted, .unknown => view.send_diagnostic.setProviderDiagnostic(diagnostic, true),
+            else => {},
+        }
+        view.send_diagnostic.setRun(row.id.value, row.session.value);
     }
 
     fn setup(self: *Conversation, app: *App, action: @typeInfo(@FieldType(Coding, "setup_action")).optional.child) !void {
@@ -1360,11 +1381,20 @@ const Conversation = struct {
         switch (intent) {
             .send => {
                 if (self.selectionDisabledReason(&app.view)) |reason| {
-                    self.notice(&app.view, reason);
+                    if (self.sendPreflight(&app.view)) |preflight| {
+                        app.view.send_diagnostic.prompt_bytes = app.view.editor.len;
+                        app.view.send_diagnostic.frame_bytes = composer.startPreflight(app.view.editor.len).frame_bytes;
+                        app.view.send_diagnostic.stage = .preflight_rejected;
+                        self.notice(&app.view, preflight);
+                    } else self.notice(&app.view, reason);
                     return;
                 }
                 const selected = if (app.view.selected) |*identity| identity.selection() else return error.ChooseModel;
-                try self.submit(.send, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .thread_send = .{ .text = app.view.editor.textBytes(), .selection = selected } }, app.view.revision);
+                const prompt = app.view.editor.textBytes();
+                const command_id = try self.commandId();
+                try self.submitIdentified(.send, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .thread_send = .{ .text = prompt, .selection = selected } }, app.view.revision, command_id);
+                const preflight = composer.startPreflight(prompt.len);
+                app.view.send_diagnostic.begin(&command_id, prompt.len, preflight.frame_bytes);
                 app.view.follow_latest = true;
             },
             .cancel => try self.submit(.cancel, .{ .run = .{ .value = self.run.slice() } }, .{ .revision = self.run_revision }, .{ .run_cancel = .{ .reason = "Native user cancellation" } }, 0),
@@ -1596,7 +1626,9 @@ const Conversation = struct {
             self.attempted_selection = selected;
             app.dirty = true;
         }
-        app.view.send_disabled_reason = if (self.selectionDisabledReason(&app.view)) |reason| reason else if (self.thread.len == 0)
+        const selection_reason = self.selectionDisabledReason(&app.view);
+        const preflight_reason = self.sendPreflight(&app.view);
+        app.view.send_disabled_reason = if (preflight_reason) |reason| reason else if (selection_reason) |reason| reason else if (self.thread.len == 0)
             "Opening conversation…"
         else if (!terminal)
             "Wait for this run to finish, or cancel it."
@@ -1604,6 +1636,16 @@ const Conversation = struct {
             "Updating conversation…"
         else
             null;
+        if (self.command == null) {
+            if (preflight_reason != null) {
+                const preflight = composer.startPreflight(app.view.editor.len);
+                app.view.send_diagnostic.prompt_bytes = preflight.prompt_bytes;
+                app.view.send_diagnostic.frame_bytes = preflight.frame_bytes;
+                app.view.send_diagnostic.stage = .preflight_rejected;
+            } else if (app.view.send_disabled_reason != null and app.view.send_diagnostic.stage == .idle) {
+                app.view.send_diagnostic.stage = .disabled;
+            }
+        }
         app.view.can_send = app.view.send_disabled_reason == null;
         app.view.can_cancel = self.run.len != 0 and !terminal and self.command == null;
         app.view.tasks_enabled = self.command == null and !self.refresh;
@@ -1626,6 +1668,9 @@ const Conversation = struct {
         if (pending.ticket.value != ticket.value or !std.mem.eql(u8, &pending.id, value.command_id.value)) return error.UnexpectedCommandReceipt;
         self.command = null;
         if (value.outcome == .rejected) {
+            if (pending.kind == .send) {
+                app.view.send_diagnostic.setReceipt(.rejected, if (value.reason) |reason| @tagName(reason) else "command_rejected");
+            }
             if (pending.kind == .refresh_models) self.catalog_refresh_inflight = false;
             if (pending.kind == .configure) {
                 self.setup_login_after_configure = null;
@@ -1655,6 +1700,7 @@ const Conversation = struct {
                 try self.ask(.threads, .{ .threads = .{ .page = page } });
             },
             .send => {
+                app.view.send_diagnostic.setReceipt(.accepted, "accepted");
                 app.view.notice = null;
                 if (app.view.revision == pending.draft_revision) {
                     try app.view.editor.setText("");
@@ -1662,6 +1708,8 @@ const Conversation = struct {
                     app.view.editor_view.changed = true;
                 }
                 self.run = try Id.init(value.entity_ids.run.?.value);
+                if (value.entity_ids.session) |session| app.view.send_diagnostic.setRun(value.entity_ids.run.?.value, session.value);
+                if (value.effect_ids.len != 0) app.view.send_diagnostic.setEffect(value.effect_ids[0].value);
                 self.refresh = true;
             },
             .cancel, .approval => {
@@ -2310,6 +2358,23 @@ test "changed history revision restarts canonical block after Markdown append sh
 }
 
 const usability_selection: contract.Selection = .{ .runtime_kind = "opencode", .required_runtime_version = "2.1.4", .model_provider = "fixture-provider", .model_id = "explicit-model", .effort = "high", .account_ref = "/isolated/account", .workspace = .{ .value = "durable-workspace" } };
+
+test "send preflight reports accounted bytes and preserves the editable draft revision" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    var root = [_]u8{'/'};
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = &root };
+    const prompt = ("x" ** 3790) ++ "€";
+    try view.editor.setText(prompt);
+    view.revision = 17;
+    const before = view.editor.textBytes();
+    const reason = conversation.sendPreflight(&view) orelse return error.ExpectedPreflightRejection;
+    try std.testing.expect(std.mem.indexOf(u8, reason, "3793") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "3792") != null);
+    try std.testing.expectEqual(@as(u64, 17), view.revision);
+    try std.testing.expectEqualSlices(u8, before, view.editor.textBytes());
+    try std.testing.expectEqual(@as(usize, 4097), composer.startPreflight(view.editor.len).frame_bytes);
+}
 
 test "send requires complete catalog identity and negotiated effort without claiming entitlement" {
     var view = try Coding.init(std.testing.allocator);

@@ -19,6 +19,65 @@ const script_api = @import("../script.zig");
 
 pub const Intent = enum { send, cancel, allow, deny };
 
+/// Bounded Send evidence owned by the native consumer. It is intentionally
+/// separate from provider contracts: receipts and run rows remain the
+/// authority, while this record lets the UI distinguish local disablement,
+/// preflight refusal, command rejection, accepted provider failure and a
+/// terminal run without retaining prompt contents.
+pub const SendStage = enum { idle, disabled, preflight_rejected, submitted, accepted, rejected, provider_failed, terminal };
+pub const SendReceipt = enum { none, accepted, rejected };
+pub const SendDiagnostic = struct {
+    stage: SendStage = .idle,
+    prompt_bytes: usize = 0,
+    frame_bytes: usize = 0,
+    receipt: SendReceipt = .none,
+    command_id: [32]u8 = @splat(0),
+    command_id_len: usize = 0,
+    effect_id: [32]u8 = @splat(0),
+    effect_id_len: usize = 0,
+    rejection: [96]u8 = @splat(0),
+    rejection_len: usize = 0,
+    run_id: [32]u8 = @splat(0),
+    run_id_len: usize = 0,
+    session_id: [32]u8 = @splat(0),
+    session_id_len: usize = 0,
+    turn_id: [64]u8 = @splat(0),
+    turn_id_len: usize = 0,
+    provider: [1024]u8 = @splat(0),
+    provider_len: usize = 0,
+
+    pub fn bounded(destination: []u8, length: *usize, value: []const u8) void {
+        const clipped = @import("../text/utf8.zig").prefix(value, destination.len);
+        @memcpy(destination[0..clipped.len], clipped);
+        length.* = clipped.len;
+    }
+
+    pub fn begin(self: *SendDiagnostic, command_id: []const u8, prompt_bytes: usize, frame_bytes: usize) void {
+        self.* = .{ .stage = .submitted, .prompt_bytes = prompt_bytes, .frame_bytes = frame_bytes, .receipt = .none };
+        bounded(&self.command_id, &self.command_id_len, command_id);
+    }
+
+    pub fn setReceipt(self: *SendDiagnostic, outcome: SendReceipt, reason: []const u8) void {
+        self.receipt = outcome;
+        self.stage = if (outcome == .rejected) .rejected else .accepted;
+        bounded(&self.rejection, &self.rejection_len, reason);
+    }
+
+    pub fn setRun(self: *SendDiagnostic, run: []const u8, session: []const u8) void {
+        bounded(&self.run_id, &self.run_id_len, run);
+        bounded(&self.session_id, &self.session_id_len, session);
+    }
+
+    pub fn setEffect(self: *SendDiagnostic, effect: []const u8) void {
+        bounded(&self.effect_id, &self.effect_id_len, effect);
+    }
+
+    pub fn setProviderDiagnostic(self: *SendDiagnostic, diagnostic: []const u8, terminal: bool) void {
+        bounded(&self.provider, &self.provider_len, diagnostic);
+        self.stage = if (terminal) .terminal else .provider_failed;
+    }
+};
+
 /// Presentation state only. No adapter, store, execution lifetime or accepted work.
 pub const View = struct {
     allocator: std.mem.Allocator,
@@ -39,6 +98,7 @@ pub const View = struct {
     preedit_width: f32 = 0,
     preedit_font_size: f32 = 0,
     notice: ?[]const u8 = null,
+    send_diagnostic: SendDiagnostic = .{},
     revision: u64 = 0,
     status: []const u8 = "Conversation not connected",
     connected: bool = false,
