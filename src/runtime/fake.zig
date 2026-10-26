@@ -20,6 +20,11 @@ pub fn defaultCapabilities() [@typeInfo(c.Capability).@"enum".fields.len]c.Capab
     // No coordinator registration or normalized usage accounting implemented here.
     result[@intFromEnum(c.Capability.coordinator_bridge)].status = .unsupported;
     result[@intFromEnum(c.Capability.usage)].status = .unsupported;
+    // The built-in fake factory intentionally does not claim these newer
+    // workflows. Scripted fixtures opt in explicitly after implementing them.
+    result[@intFromEnum(c.Capability.followup_queue)].status = .unsupported;
+    result[@intFromEnum(c.Capability.question)].status = .unsupported;
+    result[@intFromEnum(c.Capability.attachment)].status = .unsupported;
     return result;
 }
 pub const Call = struct { request: c.Request, receipt: c.Receipt, at: u64 };
@@ -39,6 +44,8 @@ pub fn Runtime(comptime queue_capacity: usize, comptime call_capacity: usize) ty
         observation_head: usize = 0,
         observation_count: usize = 0,
         observation_bytes: usize = 0,
+        questions: [queue_capacity]?c.Question = [_]?c.Question{null} ** queue_capacity,
+        question_count: usize = 0,
         calls: [call_capacity]Call = undefined,
         call_head: usize = 0,
         call_count: usize = 0,
@@ -49,6 +56,9 @@ pub fn Runtime(comptime queue_capacity: usize, comptime call_capacity: usize) ty
                 l.call_frames == 0 or l.call_frames > call_capacity or
                 l.frame_bytes == 0 or l.chunk_bytes == 0 or l.chunk_bytes > l.frame_bytes or
                 l.queue_bytes == 0 or l.pending_requests != 1) return error.InvalidLimits;
+            if (l.followup_count == 0 or l.question_choices == 0 or l.attachment_count == 0 or
+                l.followup_bytes == 0 or l.question_answer_bytes == 0 or l.attachment_bytes == 0 or
+                l.attachment_metadata_bytes == 0) return error.InvalidLimits;
             if (config.discovery.capabilities[@intFromEnum(c.Capability.usage)].status == .supported or
                 config.discovery.capabilities[@intFromEnum(c.Capability.coordinator_bridge)].status == .supported)
                 return error.CapabilityUnavailable;
@@ -87,6 +97,9 @@ pub fn Runtime(comptime queue_capacity: usize, comptime call_capacity: usize) ty
         pub fn message(self: *Self, request: @FieldType(c.Request, "message")) c.Error!c.Receipt {
             return self.dispatch(.{ .message = request });
         }
+        pub fn answerQuestion(self: *Self, request: @FieldType(c.Request, "answer_question")) c.Error!c.Receipt {
+            return self.dispatch(.{ .answer_question = request });
+        }
         pub fn inspect(self: *Self, request: @FieldType(c.Request, "inspect")) c.Error!c.Receipt {
             return self.dispatch(.{ .inspect = request });
         }
@@ -110,6 +123,10 @@ pub fn Runtime(comptime queue_capacity: usize, comptime call_capacity: usize) ty
                 .start => |r| {
                     try self.require(.start);
                     try validate(r.correlation, false);
+                    if (r.attachments.len != 0) {
+                        try self.require(.attachment);
+                        try c.validateAttachments(r.attachments, self.config.discovery.limits);
+                    }
                 },
                 .respond_approval => |r| {
                     try self.require(.approval);
@@ -122,6 +139,44 @@ pub fn Runtime(comptime queue_capacity: usize, comptime call_capacity: usize) ty
                 .message => |r| {
                     try self.require(.message);
                     try validate(r.correlation, false);
+                    try c.validateAttachments(r.attachments, self.config.discovery.limits);
+                    if (r.followup) |followup| {
+                        try self.require(.followup_queue);
+                        try c.validateFollowup(followup, self.config.discovery.limits);
+                    }
+                    if (r.attachments.len != 0) try self.require(.attachment);
+                },
+                .answer_question => |r| {
+                    try self.require(.question);
+                    try validate(r.correlation, false);
+                    if (r.question.value.len == 0 or r.correlation.question == null or
+                        !c.equal(r.question, r.correlation.question.?)) return error.InvalidQuestion;
+                    try c.validateQuestionAnswer(r.answer, self.config.discovery.limits);
+                    var matched: ?usize = null;
+                    for (self.questions[0..self.question_count], 0..) |question, index| {
+                        if (question) |pending| if (c.equal(pending.id, r.question)) {
+                            if (!c.equal(pending.correlation.session, r.correlation.session) or
+                                !c.equal(pending.correlation.run, r.correlation.run)) return error.InvalidQuestion;
+                            if (pending.expires_at) |expires| if (self.now >= expires) return error.QuestionExpired;
+                            if (r.answer.choice_ids.len == 0 and r.answer.text.len == 0) return error.InvalidQuestion;
+                            if (!pending.allow_multiple and r.answer.choice_ids.len > 1) return error.InvalidQuestion;
+                            if (r.answer.text.len != 0 and !pending.allow_freeform) return error.InvalidQuestion;
+                            for (r.answer.choice_ids) |choice| {
+                                var known = false;
+                                for (pending.choices) |option| {
+                                    if (c.equal(option.id, choice)) known = true;
+                                }
+                                if (!known) return error.InvalidQuestion;
+                            }
+                            matched = index;
+                            break;
+                        };
+                    }
+                    if (matched == null) return error.InvalidQuestion;
+                    var shift = matched.?;
+                    while (shift + 1 < self.question_count) : (shift += 1) self.questions[shift] = self.questions[shift + 1];
+                    self.questions[self.question_count - 1] = null;
+                    self.question_count -= 1;
                 },
                 .inspect => try self.require(.inspect),
                 .attach => |r| {
@@ -145,7 +200,12 @@ pub fn Runtime(comptime queue_capacity: usize, comptime call_capacity: usize) ty
                 .start => self.counters.S += 1,
                 .respond_approval => self.counters.A += 1,
                 .cancel => self.counters.C += 1,
-                .message => self.counters.D += 1,
+                .message => |message| {
+                    self.counters.D += 1;
+                    if (message.followup != null) self.counters.F += 1;
+                    if (message.attachments.len != 0) self.counters.H += 1;
+                },
+                .answer_question => self.counters.Q += 1,
                 .inspect => self.counters.I += 1,
                 .attach => self.counters.T += 1,
             }
@@ -176,6 +236,7 @@ pub fn Runtime(comptime queue_capacity: usize, comptime call_capacity: usize) ty
                             .chunk => .stream,
                             .tool_started, .tool_completed => .tools,
                             .approval => .approval,
+                            .question => .question,
                             .selection => .selection,
                             .cancelled => .cancel,
                             else => null,
@@ -186,6 +247,12 @@ pub fn Runtime(comptime queue_capacity: usize, comptime call_capacity: usize) ty
                         if (bytes > limits.frame_bytes) return error.FrameTooLarge;
                         switch (observation.body) {
                             .chunk => |chunk| if (chunk.text.len > limits.chunk_bytes) return error.ChunkTooLarge,
+                            .question => |question| {
+                                try c.validateQuestion(question, limits);
+                                if (self.question_count == queue_capacity) return error.QueueFull;
+                                self.questions[self.question_count] = question;
+                                self.question_count += 1;
+                            },
                             else => {},
                         }
                         if (self.observation_count == limits.queue_frames or bytes > limits.queue_bytes - self.observation_bytes)

@@ -57,6 +57,12 @@ pub const Owner = struct {
         if (!try statement.step() or statement.isNull(0)) return null;
         return try allocator.dupe(u8, try statement.bytes(0));
     }
+    fn scalar(self: *Owner, sql: [:0]const u8, values: []const V) !i64 {
+        const statement = try self.database.prepare(sql, values);
+        defer statement.deinit();
+        if (!try statement.step()) return error.Corrupt;
+        return statement.integer(0);
+    }
     fn revision(self: *Owner, target: t.Target) !?u64 {
         const sql: [:0]const u8, const key: []const u8 = switch (target) {
             .absent => return null,
@@ -65,6 +71,11 @@ pub const Owner = struct {
             .thread => |v| .{ "SELECT revision FROM threads WHERE id=?", v.value },
             .run => |v| .{ "SELECT revision FROM runs WHERE id=?", v.value },
             .approval => |v| .{ "SELECT revision FROM approvals WHERE id=?", v.value },
+            .effect => |v| .{ "SELECT revision FROM effects WHERE id=?", v.value },
+            // Questions and attachment metadata have no durable tables in the
+            // current schema; their public command shapes remain provider-
+            // neutral until the owning migration lands.
+            .followup, .question, .attachment => return null,
         };
         const statement = try self.database.prepare(sql, &.{.{ .text = key }});
         defer statement.deinit();
@@ -225,6 +236,93 @@ pub const Owner = struct {
                 revision_value = e.expected_revision.revision + 1;
                 r.entity_ids.thread = e.target.thread;
             },
+            .followup_enqueue => |p| {
+                if (e.target != .run or e.expected_revision != .revision or p.content.len == 0) return .followup_invalid;
+                if (a.validateAttachments(p.attachments, .{})) |_| {} else |_| return .attachment_limit;
+                const run = e.target.run.value;
+                const state = try self.field(allocator, "SELECT state FROM runs WHERE id=?", &.{.{ .text = run }}) orelse return .not_found;
+                if (!(std.mem.eql(u8, state, "starting") or std.mem.eql(u8, state, "streaming") or std.mem.eql(u8, state, "awaiting_approval"))) return .busy;
+                if (self.factory) |runtime| {
+                    const requested = try self.field(allocator, "SELECT requested FROM runs WHERE id=?", &.{.{ .text = run }}) orelse return error.Corrupt;
+                    const selection = try t.decode(a.Selection, requested, allocator);
+                    if (runtime.discover(selection).capabilities[@intFromEnum(a.Capability.followup_queue)].status != .supported) return .capability_unavailable;
+                }
+                const count = try self.scalar("SELECT count(*) FROM effects WHERE run_id=? AND kind='message' AND state='planned' AND instr(CAST(request AS TEXT),'\"followup\":{\"id\"')>0", &.{.{ .text = run }});
+                if (count >= 8) return .followup_limit;
+                const session = try self.field(allocator, "SELECT session_id FROM runs WHERE id=?", &.{.{ .text = run }}) orelse return error.Corrupt;
+                const effect_id = try self.id(allocator);
+                const message_id = try self.id(allocator);
+                const request: a.Request = .{ .message = .{
+                    .correlation = .{ .effect = .{ .value = effect_id }, .session = .{ .value = session }, .run = e.target.run, .followup = .{ .value = effect_id } },
+                    .message = .{ .value = message_id }, .content = p.content, .attachments = p.attachments,
+                    .followup = .{ .id = .{ .value = effect_id }, .content = p.content },
+                } };
+                if (a.frameBytes(request) > composer.provider_start_frame_limit) return .admission_limit;
+                const dependency = try self.field(allocator, "SELECT id FROM effects WHERE run_id=? AND kind='message' AND state='planned' AND instr(CAST(request AS TEXT),'\"followup\":{\"id\"')>0 AND NOT EXISTS(SELECT 1 FROM effects child WHERE child.depends_on=effects.id AND child.state='planned') ORDER BY rowid DESC LIMIT 1", &.{.{ .text = run }});
+                try self.plan(allocator, effect_id, run, session, .message, request, dependency, null, e.command_id);
+                r.entity_ids.run = e.target.run;
+                r.entity_ids.followup = .{ .value = effect_id };
+                r.effect_ids = try allocator.dupe(a.EffectId, &.{.{ .value = effect_id }});
+                aggregate = .{ .run = e.target.run };
+                revision_value = e.expected_revision.revision + 1;
+            },
+            .followup_edit => |p| {
+                if (e.target != .effect or e.expected_revision != .revision or p.content.len == 0) return .followup_invalid;
+                if (a.validateAttachments(p.attachments, .{})) |_| {} else |_| return .attachment_limit;
+                const statement = try db.prepare("SELECT run_id,session_id,kind,state,request FROM effects WHERE id=?", &.{.{ .text = e.target.effect.value }});
+                defer statement.deinit();
+                if (!try statement.step()) return .followup_not_found;
+                if (!std.mem.eql(u8, try statement.bytes(2), "message") or !std.mem.eql(u8, try statement.bytes(3), "planned")) return .followup_invalid;
+                var request = try t.decode(a.Request, try statement.bytes(4), allocator);
+                if (request != .message or request.message.followup == null) return .followup_invalid;
+                request.message.content = p.content;
+                request.message.attachments = p.attachments;
+                request.message.followup.?.content = p.content;
+                if (a.frameBytes(request) > composer.provider_start_frame_limit) return .admission_limit;
+                const bytes = try encoded(allocator, request);
+                const digest = t.digest(bytes);
+                try db.execute("UPDATE effects SET request=?,digest=?,revision=revision+1 WHERE id=? AND state='planned'", &.{ .{ .blob = bytes }, .{ .blob = &digest }, .{ .text = e.target.effect.value } });
+                r.entity_ids.followup = .{ .value = e.target.effect.value };
+                aggregate = .{ .effect = e.target.effect };
+                revision_value = e.expected_revision.revision + 1;
+            },
+            .followup_cancel => |p| {
+                if (e.target != .effect or e.expected_revision != .revision or p.reason.len == 0) return .followup_invalid;
+                const statement = try db.prepare("SELECT run_id,kind,state FROM effects WHERE id=?", &.{.{ .text = e.target.effect.value }});
+                defer statement.deinit();
+                if (!try statement.step()) return .followup_not_found;
+                if (!std.mem.eql(u8, try statement.bytes(1), "message")) return .followup_invalid;
+                if (!std.mem.eql(u8, try statement.bytes(2), "planned")) return .followup_invalid;
+                const request_bytes = try self.field(allocator, "SELECT request FROM effects WHERE id=?", &.{.{ .text = e.target.effect.value }}) orelse return .followup_not_found;
+                const existing_request = try t.decode(a.Request, request_bytes, allocator);
+                if (existing_request != .message or existing_request.message.followup == null) return .followup_invalid;
+                try db.execute("UPDATE effects SET state='withdrawn',outcome=?,revision=revision+1 WHERE id=? AND state='planned'", &.{ .{ .blob = p.reason }, .{ .text = e.target.effect.value }});
+                r.entity_ids.followup = .{ .value = e.target.effect.value };
+                aggregate = .{ .effect = e.target.effect };
+                revision_value = e.expected_revision.revision + 1;
+            },
+            .followup_order => |p| {
+                if (e.target != .run or e.expected_revision != .revision or p.followups.len == 0 or p.followups.len > 8) return .followup_invalid;
+                const run = e.target.run.value;
+                const state = try self.field(allocator, "SELECT state FROM runs WHERE id=?", &.{.{ .text = run }}) orelse return .not_found;
+                if (!(std.mem.eql(u8, state, "starting") or std.mem.eql(u8, state, "streaming") or std.mem.eql(u8, state, "awaiting_approval"))) return .busy;
+                const expected = try self.scalar("SELECT count(*) FROM effects WHERE run_id=? AND kind='message' AND state='planned' AND instr(CAST(request AS TEXT),'\"followup\":{\"id\"')>0", &.{.{ .text = run }});
+                if (expected != @as(i64, @intCast(p.followups.len))) return .followup_invalid;
+                for (p.followups, 0..) |followup, i| {
+                    for (p.followups[0..i]) |previous| if (std.mem.eql(u8, previous.value, followup.value)) return .followup_invalid;
+                    const found = try db.prepare("SELECT run_id,kind,state FROM effects WHERE id=?", &.{.{ .text = followup.value }});
+                    defer found.deinit();
+                    if (!try found.step() or !std.mem.eql(u8, try found.bytes(0), run) or !std.mem.eql(u8, try found.bytes(1), "message") or !std.mem.eql(u8, try found.bytes(2), "planned")) return .followup_not_found;
+                    const request_bytes = try self.field(allocator, "SELECT request FROM effects WHERE id=?", &.{.{ .text = followup.value }}) orelse return .followup_not_found;
+                    const request = try t.decode(a.Request, request_bytes, allocator);
+                    if (request != .message or request.message.followup == null or !std.mem.eql(u8, request.message.followup.?.id.value, followup.value)) return .followup_not_found;
+                }
+                try db.execute("UPDATE effects SET depends_on=NULL WHERE run_id=? AND kind='message' AND state='planned' AND instr(CAST(request AS TEXT),'\"followup\":{\"id\"')>0", &.{.{ .text = run }});
+                for (p.followups, 0..) |followup, i| if (i != 0) try db.execute("UPDATE effects SET depends_on=? WHERE id=? AND state='planned'", &.{ .{ .text = p.followups[i - 1].value }, .{ .text = followup.value }});
+                aggregate = .{ .run = e.target.run };
+                revision_value = e.expected_revision.revision + 1;
+            },
+            .question_answer, .attachment_add, .attachment_remove => return .capability_unavailable,
             .thread_send => |p| {
                 if (e.target != .thread or e.expected_revision != .revision or p.text.len == 0) return .invalid_command;
                 const thread = e.target.thread.value;
@@ -370,7 +468,17 @@ pub const Owner = struct {
             },
             .task_delegate, .task_send, .task_cancel, .task_result, .task_review => return self.taskCommand(allocator, e, r),
         }
-        try self.event(allocator, seq, if (e.payload == .thread_send) 1 else 0, aggregate, revision_value, @tagName(e.payload), e.command_id, null, "");
+        const event_kind = switch (e.payload) {
+            .followup_enqueue => "FollowupQueued",
+            .followup_edit => "FollowupEdited",
+            .followup_cancel => "FollowupCancelled",
+            .followup_order => "FollowupReordered",
+            .question_answer => "QuestionAnswered",
+            .attachment_add => "AttachmentAccepted",
+            .attachment_remove => "AttachmentRejected",
+            else => @tagName(e.payload),
+        };
+        try self.event(allocator, seq, if (e.payload == .thread_send) 1 else 0, aggregate, revision_value, event_kind, e.command_id, null, "");
         return null;
     }
     fn taskCommand(self: *Owner, allocator: std.mem.Allocator, e: t.CommandEnvelope, r: *t.Receipt) anyerror!?t.Reason {
@@ -654,6 +762,9 @@ pub const Owner = struct {
                 try self.event(allocator, sequence, index, .{ .approval = approval_id }, 1, "ApprovalPending", null, observation.correlation.effect, "");
                 index += 1;
             },
+            // Pending structured questions need their own durable projection;
+            // approvals are permission-only and cannot be reused for this.
+            .question => return error.CapabilityUnavailable,
             .completed => {
                 const pending = try self.field(allocator, "SELECT id FROM tools WHERE run_id=? AND outcome IN('pending','unknown') LIMIT 1", &.{.{ .text = run.value }});
                 if (!terminal) next_state = if (pending == null) "completed" else "unknown";
@@ -1740,6 +1851,7 @@ pub const Host = struct {
             .tool => |v| .{ "SELECT r.thread_id,r.id FROM tools t JOIN runs r ON r.id=t.run_id WHERE t.id=?", v.value },
             .approval => |v| .{ "SELECT r.thread_id,r.id FROM approvals a JOIN runs r ON r.id=a.run_id WHERE a.id=?", v.value },
             .effect => |v| .{ "SELECT r.thread_id,r.id FROM effects e JOIN runs r ON r.id=e.run_id WHERE e.id=?", v.value },
+            .followup, .question, .attachment => return error.NotFound,
             .session => |v| .{ "SELECT thread_id,id FROM runs WHERE session_id=?", v.value },
             else => return false,
         };
