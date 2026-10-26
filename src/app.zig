@@ -463,7 +463,7 @@ pub const App = struct {
         }
         self.snapshot.caret = self.view.editor.caret;
         self.snapshot.anchor = self.view.editor.anchor;
-        self.snapshot.editor_focused = self.view.focused and !self.view.search_focused and !self.view.setup_open and !self.view.workspace_open and !self.view.model_search_focused;
+        self.snapshot.editor_focused = self.view.focused and !self.view.search_focused and !self.view.setup_open and !self.view.workspace_open and !self.view.picker_open and !self.view.effort_open;
         self.snapshot.preedit_bytes = self.view.preedit_len;
         self.snapshot.draft_revision = self.view.revision;
         const editor_bounds = self.view.editor_view.bounds;
@@ -1340,6 +1340,15 @@ const Conversation = struct {
                 app.view.search_more_available = false;
                 self.card_rows_seen = 0;
                 try self.ask(.cards, .{ .threads = .{ .anchor = .{ .value = anchor.slice() }, .page = .{ .limit = page.limit, .max_bytes = page.max_bytes } } });
+            },
+            .search_reset => {
+                self.thread_page_snapshot = null;
+                self.thread_page_cursor = null;
+                self.thread_page_anchor = null;
+                self.card_rows_seen = 0;
+                app.view.thread_count = 0;
+                app.view.search_more_available = false;
+                try self.ask(.cards, .{ .threads = .{ .page = page } });
             },
         }
     }

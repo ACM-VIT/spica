@@ -223,7 +223,7 @@ test "queued followup and bounded attachments retain typed identity and capabili
     try t.expect(c.equal(queued, runtime.takeCall().?.request));
 
     const unsupported = cfg(1, 1);
-    const blocked = try f.Runtime(1, 1).init(unsupported, &.{});
+    var blocked = try f.Runtime(1, 1).init(unsupported, &.{});
     try t.expectError(error.CapabilityUnavailable, blocked.message(queued.message));
     var too_large = workflowConfig();
     too_large.discovery.limits.attachment_bytes = 4;
