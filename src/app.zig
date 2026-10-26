@@ -13,7 +13,6 @@ const presentation = @import("content/presentation.zig");
 const Id = @import("ui/transcript.zig").Id;
 const script = @import("script.zig");
 const design = @import("ui/design.zig");
-const composer = @import("text/composer.zig");
 const inspection = @import("domain/inspection.zig");
 
 /// Only a payload-free wake crosses worker threads. Registered after SDL init;
@@ -96,6 +95,37 @@ pub const App = struct {
     live: ?*Live = null,
 
     lua: ?*LuaBridge = null,
+
+    /// Bounded, content-free native diagnostic report. Null turn identity means
+    /// the public Host rows do not expose it; it is never inferred from a run ID.
+    pub fn sendDiagnosticReport(self: *const App, buffer: []u8) ![]const u8 {
+        const evidence = &self.view.send_diagnostic;
+        return types.encode(.{
+            .version = @as(u32, 1),
+            .stage = evidence.stage,
+            .command_id = evidence.command_id[0..evidence.command_id_len],
+            .ticket = evidence.ticket,
+            .receipt = evidence.receipt,
+            .rejection = evidence.rejection[0..evidence.rejection_len],
+            .prompt_bytes = evidence.prompt_bytes,
+            .frame_bytes = evidence.frame_bytes,
+            .frame_limit = domain.start_frame_limit,
+            .max_prompt_bytes = domain.startPreflight(0).max_prompt_bytes,
+            .run_id = evidence.run_id[0..evidence.run_id_len],
+            .session_id = evidence.session_id[0..evidence.session_id_len],
+            .effect_id = evidence.effect_id[0..evidence.effect_id_len],
+            .turn_id = @as(?[]const u8, null),
+            .run_state = evidence.run_state[0..evidence.run_state_len],
+            .provider_diagnostic = evidence.provider[0..evidence.provider_len],
+            .current_draft_bytes = self.view.editor.len,
+            .draft_revision = self.view.revision,
+            .editor_focused = self.view.focused,
+            .preedit_bytes = self.view.preedit_len,
+            .send_ready = self.view.can_send,
+            .send_enabled = self.view.can_send and self.view.editor.len != 0,
+            .send_disabled_reason = self.view.send_disabled_reason,
+        }, buffer);
+    }
 
     /// Presentation-only API. Call on the App thread; values are validated and
     /// copied together before the next paint. Host and provider work are untouched.
@@ -291,6 +321,17 @@ pub const App = struct {
             else => {},
         }
         if (event.type == c.SDL_EVENT_KEY_DOWN) {
+            if (event.key.key == c.SDLK_C and event.key.mod & c.SDL_KMOD_CTRL != 0 and event.key.mod & c.SDL_KMOD_SHIFT != 0) {
+                var report: [16 * 1024]u8 = undefined;
+                @import("ui/clipboard.zig").copyBytes(try self.sendDiagnosticReport(&report), self.view.scratch) catch |err| {
+                    self.view.notice = @errorName(err);
+                    self.dirty = true;
+                    return;
+                };
+                if (self.conversation) |conversation| conversation.notice(&self.view, "Send diagnostic copied. Prompt contents are omitted.");
+                self.dirty = true;
+                return;
+            }
             if (self.lua) |bridge| {
                 if (event.key.key == c.SDLK_F5) {
                     bridge.reload(self) catch |err| {
@@ -700,10 +741,7 @@ const LuaBridge = struct {
         const conversation = app.conversation orelse return error.NoConversation;
         const context = &pending.context;
         switch (result.intent.kind) {
-            1 => try conversation.submitIdentified(.send, .{ .thread = .{ .value = context.thread_id.bytes[0..context.thread_id.len] } }, .{ .revision = pending.thread_revision }, .{ .thread_send = .{
-                .text = result.intent.text.bytes[0..result.intent.text.len],
-                .selection = if (pending.selection) |*selection| selection.selection() else return error.ChooseModel,
-            } }, pending.draft_revision, pending.command_id),
+            1 => try conversation.sendIdentified(app, .{ .thread = .{ .value = context.thread_id.bytes[0..context.thread_id.len] } }, .{ .revision = pending.thread_revision }, result.intent.text.bytes[0..result.intent.text.len], if (pending.selection) |*selection| selection.selection() else return error.ChooseModel, pending.draft_revision, pending.command_id),
             2 => try conversation.submitIdentified(.cancel, .{ .run = .{ .value = context.run_id.bytes[0..context.run_id.len] } }, .{ .revision = pending.run_revision }, .{ .run_cancel = .{ .reason = "Custom root cancellation" } }, 0, pending.command_id),
             3, 4 => try conversation.submitIdentified(.approval, .{ .approval = .{ .value = context.approval_id.bytes[0..context.approval_id.len] } }, .{ .revision = pending.approval_revision }, .{ .approval_respond = .{ .decision = if (result.intent.kind == 3) .allow else .deny, .action_digest = context.action_digest.bytes[0..context.action_digest.len] } }, 0, pending.command_id),
             else => return error.InvalidScriptIntent,
@@ -999,14 +1037,17 @@ const Conversation = struct {
     }
 
     fn sendPreflight(self: *Conversation, view: *const Coding) ?[]const u8 {
-        if (view.editor.len == 0) return null;
-        const preflight = composer.startPreflight(view.editor.len);
+        return self.promptDisabledReason(view.editor.len);
+    }
+
+    fn promptDisabledReason(self: *Conversation, prompt_bytes: usize) ?[]const u8 {
+        const preflight = domain.startPreflight(prompt_bytes);
         if (preflight.fits()) return null;
-        return std.fmt.bufPrint(&self.preflight_storage, "Send disabled: prompt is {d} bytes; accounted start frame is {d}/{d} bytes (max prompt {d}). Shorten the message.", .{
+        return std.fmt.bufPrint(&self.preflight_storage, "Shorten this message: {d} UTF-8 bytes exceeds the {d}-byte prompt limit ({d}/{d} accounted frame bytes).", .{
             preflight.prompt_bytes,
-            preflight.frame_bytes,
-            composer.provider_start_frame_limit,
             preflight.max_prompt_bytes,
+            preflight.frame_bytes,
+            domain.start_frame_limit,
         }) catch "Send disabled: prompt exceeds the provider start-frame budget. Shorten the message.";
     }
 
@@ -1070,7 +1111,6 @@ const Conversation = struct {
         else
             "Choose a model and effort before sending.";
         if (!selected.workspace.eql(self.workspace.slice())) return "Selection belongs to another workspace. Choose a model again.";
-        if (view.editor.len != 0 and !composer.startPreflight(view.editor.len).fits()) return "Message exceeds the provider start-frame budget. Shorten it before sending.";
         for (view.models[0..view.model_count]) |*model| {
             var candidate = model.identity;
             candidate.effort = selected.effort;
@@ -1165,6 +1205,7 @@ const Conversation = struct {
             .revision_conflict => "Conversation changed. Wait for refresh, then retry your action.",
             .busy => "Provider or conversation is busy. Wait for the current action to finish.",
             .unresolved_effects => "Previous work has an unresolved outcome. Inspect its status before retrying.",
+            .admission_limit => "Send limit reached. Draft retained. Wait for other runs or shorten this message.",
             else => @tagName(reason),
         };
     }
@@ -1184,12 +1225,35 @@ const Conversation = struct {
         @memcpy(self.diagnostic_storage[0..diagnostic.len], diagnostic);
         self.diagnostic_len = diagnostic.len;
         if (diagnostic.len != 0) view.notice = self.diagnostic_storage[0..diagnostic.len];
+        const evidence = &view.send_diagnostic;
+        // Historical pages may contain older runs before the current Send.
+        // They update cards, but cannot borrow that Send's command/receipt.
+        if (evidence.command_id_len != 0 and (evidence.receipt != .accepted or !std.mem.eql(u8, evidence.run_id[0..evidence.run_id_len], row.id.value))) return;
+        if (!std.mem.eql(u8, evidence.run_id[0..evidence.run_id_len], row.id.value)) {
+            evidence.provider_len = 0;
+        }
         switch (row.state) {
             .failed => view.send_diagnostic.setProviderDiagnostic(diagnostic, false),
             .completed, .cancelled, .interrupted, .unknown => view.send_diagnostic.setProviderDiagnostic(diagnostic, true),
-            else => {},
+            else => {
+                evidence.stage = .accepted;
+                evidence.provider_len = 0;
+            },
         }
         view.send_diagnostic.setRun(row.id.value, row.session.value);
+        view.send_diagnostic.setRunState(@tagName(row.state));
+    }
+
+    fn recordEffect(self: *Conversation, view: *Coding, row: @FieldType(types.Row, "effect")) void {
+        if (!self.run.eql(row.run.value) or self.diagnostic_len != 0 or (row.state != .failed and row.state != .unknown) or row.outcome.len == 0) return;
+        const evidence = &view.send_diagnostic;
+        if (evidence.command_id_len != 0 and (evidence.receipt != .accepted or !std.mem.eql(u8, evidence.run_id[0..evidence.run_id_len], row.run.value))) return;
+        const diagnostic = @import("text/utf8.zig").prefix(row.outcome, self.diagnostic_storage.len);
+        @memcpy(self.diagnostic_storage[0..diagnostic.len], diagnostic);
+        self.diagnostic_len = diagnostic.len;
+        view.notice = self.diagnostic_storage[0..diagnostic.len];
+        evidence.setEffect(row.id.value);
+        evidence.setProviderDiagnostic(diagnostic, self.run_state != .failed);
     }
 
     fn setup(self: *Conversation, app: *App, action: @typeInfo(@FieldType(Coding, "setup_action")).optional.child) !void {
@@ -1286,6 +1350,7 @@ const Conversation = struct {
         self.thread = id;
         self.run = .{};
         self.run_state = null;
+        app.view.send_diagnostic = .{};
         self.durable_selection = null;
         self.attempted_selection = null;
         if (changed_thread) app.view.notice = null;
@@ -1541,7 +1606,7 @@ const Conversation = struct {
         }
     }
 
-    const QueryKind = enum { projects, workspaces, inspection_workspace, threads, cards, thread, models, runtime_status, startup_status, runs, approvals, tasks, messages, blocks, content };
+    const QueryKind = enum { projects, workspaces, inspection_workspace, threads, cards, thread, models, runtime_status, startup_status, runs, effects, approvals, tasks, messages, blocks, content };
     const CommandKind = enum { project, workspace, thread, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
@@ -1595,24 +1660,40 @@ const Conversation = struct {
         self.command = .{ .ticket = ticket, .kind = kind, .draft_revision = draft_revision, .id = id };
     }
 
+    /// Both native and custom actions preflight the actual proposed text. Host
+    /// queue admission and its concrete provider-frame check remain authoritative.
+    fn sendIdentified(self: *Conversation, app: *App, target: types.Target, revision: types.Precondition, prompt: []const u8, selection: contract.Selection, draft_revision: u64, id: [32]u8) !void {
+        if (self.command != null) return error.CommandPending;
+        const preflight = domain.startPreflight(prompt.len);
+        if (self.promptDisabledReason(prompt.len)) |reason| {
+            app.view.send_diagnostic = .{ .stage = .preflight_rejected, .prompt_bytes = prompt.len, .frame_bytes = preflight.frame_bytes };
+            self.notice(&app.view, reason);
+            return;
+        }
+        if (prompt.len == 0) {
+            app.view.send_diagnostic = .{ .stage = .disabled };
+            self.notice(&app.view, "Write a message before sending.");
+            return;
+        }
+        app.view.send_diagnostic.begin(&id, prompt.len, preflight.frame_bytes);
+        self.submitIdentified(.send, target, revision, .{ .thread_send = .{ .text = prompt, .selection = selection } }, draft_revision, id) catch |err| {
+            app.view.send_diagnostic.stage = .admission_failed;
+            @import("ui/coding.zig").SendDiagnostic.bounded(&app.view.send_diagnostic.rejection, &app.view.send_diagnostic.rejection_len, @errorName(err));
+            app.view.notice = std.fmt.bufPrint(&self.notice_storage, "Send was not queued: {s}. Draft retained; retry after the current action finishes.", .{@errorName(err)}) catch @errorName(err);
+            return;
+        };
+        app.view.send_diagnostic.ticket = self.command.?.ticket.value;
+    }
+
     fn act(self: *Conversation, app: *App, intent: @import("ui/coding.zig").Intent) !void {
         switch (intent) {
             .send => {
                 if (self.selectionDisabledReason(&app.view)) |reason| {
-                    if (self.sendPreflight(&app.view)) |preflight| {
-                        app.view.send_diagnostic.prompt_bytes = app.view.editor.len;
-                        app.view.send_diagnostic.frame_bytes = composer.startPreflight(app.view.editor.len).frame_bytes;
-                        app.view.send_diagnostic.stage = .preflight_rejected;
-                        self.notice(&app.view, preflight);
-                    } else self.notice(&app.view, reason);
+                    self.notice(&app.view, reason);
                     return;
                 }
                 const selected = if (app.view.selected) |*identity| identity.selection() else return error.ChooseModel;
-                const prompt = app.view.editor.textBytes();
-                const command_id = try self.commandId();
-                try self.submitIdentified(.send, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .thread_send = .{ .text = prompt, .selection = selected } }, app.view.revision, command_id);
-                const preflight = composer.startPreflight(prompt.len);
-                app.view.send_diagnostic.begin(&command_id, prompt.len, preflight.frame_bytes);
+                try self.sendIdentified(app, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, app.view.editor.textBytes(), selected, app.view.revision, try self.commandId());
                 app.view.follow_latest = true;
             },
             .cancel => try self.submit(.cancel, .{ .run = .{ .value = self.run.slice() } }, .{ .revision = self.run_revision }, .{ .run_cancel = .{ .reason = "Native user cancellation" } }, 0),
@@ -1659,6 +1740,11 @@ const Conversation = struct {
                 .failure => |value| {
                     if (self.query) |pending| if (pending.ticket.value == value.ticket.value) {
                         self.query = null;
+                        if (pending.kind == .effects) {
+                            self.notice(&app.view, "Provider effect diagnostic is unavailable. Inspect the run before retrying Send.");
+                            try self.ask(.approvals, .{ .approvals = .{ .run = .{ .value = self.run.slice() }, .page = page } });
+                            continue;
+                        }
                         if (pending.kind == .models or pending.kind == .runtime_status or pending.kind == .startup_status) {
                             self.catalog_refresh_inflight = false;
                             if (self.configuration_pending) {
@@ -1684,6 +1770,10 @@ const Conversation = struct {
                         }
                     };
                     if (self.command) |pending| if (pending.ticket.value == value.ticket.value) {
+                        if (pending.kind == .send) {
+                            app.view.send_diagnostic.stage = .outcome_unknown;
+                            @import("ui/coding.zig").SendDiagnostic.bounded(&app.view.send_diagnostic.rejection, &app.view.send_diagnostic.rejection_len, @tagName(value.failure.reason));
+                        }
                         if (pending.kind == .refresh_models) self.catalog_refresh_inflight = false;
                         if (pending.kind == .configure) {
                             self.setup_login_after_configure = null;
@@ -1859,14 +1949,16 @@ const Conversation = struct {
             "Updating conversation…"
         else
             null;
-        if (self.command == null) {
+        if (self.command == null and app.view.send_diagnostic.command_id_len == 0 and app.view.send_diagnostic.run_id_len == 0) {
             if (preflight_reason != null) {
-                const preflight = composer.startPreflight(app.view.editor.len);
+                const preflight = domain.startPreflight(app.view.editor.len);
                 app.view.send_diagnostic.prompt_bytes = preflight.prompt_bytes;
                 app.view.send_diagnostic.frame_bytes = preflight.frame_bytes;
                 app.view.send_diagnostic.stage = .preflight_rejected;
             } else if (app.view.send_disabled_reason != null and app.view.send_diagnostic.stage == .idle) {
                 app.view.send_diagnostic.stage = .disabled;
+            } else if (app.view.send_disabled_reason == null and (app.view.send_diagnostic.stage == .disabled or app.view.send_diagnostic.stage == .preflight_rejected)) {
+                app.view.send_diagnostic.stage = .idle;
             }
         }
         app.view.can_send = app.view.send_disabled_reason == null;
@@ -1900,7 +1992,10 @@ const Conversation = struct {
                 self.submitted_setup_key = null;
             }
             const setup_busy = value.reason == .busy and (pending.kind == .configure or pending.kind == .refresh_models or pending.kind == .login);
-            self.notice(&app.view, if (setup_busy)
+            if (pending.kind == .send and !setup_busy) {
+                const reason = if (value.reason) |why| rejectionMessage(why) else "Command rejected. Open Connection to inspect provider status.";
+                app.view.notice = std.fmt.bufPrint(&self.notice_storage, "{s} (Send rejected; command {s})", .{ reason, pending.id[0..] }) catch reason;
+            } else self.notice(&app.view, if (setup_busy)
                 "A run is using a provider. Close Connection, open its chat and Stop it, then retry."
             else if (value.reason) |reason| rejectionMessage(reason) else "Command rejected. Open Connection to inspect provider status.");
             self.refresh = self.thread.len != 0;
@@ -1924,7 +2019,8 @@ const Conversation = struct {
                 try self.ask(.threads, .{ .threads = .{ .page = page } });
             },
             .send => {
-                app.view.send_diagnostic.setReceipt(.accepted, "accepted");
+                app.view.send_diagnostic.setReceipt(.accepted, "");
+                app.view.send_diagnostic.setRunState("queued");
                 app.view.notice = null;
                 if (app.view.revision == pending.draft_revision) {
                     try app.view.editor.setText("");
@@ -1933,7 +2029,7 @@ const Conversation = struct {
                 }
                 self.run = try Id.init(value.entity_ids.run.?.value);
                 if (value.entity_ids.session) |session| app.view.send_diagnostic.setRun(value.entity_ids.run.?.value, session.value);
-                if (value.effect_ids.len != 0) app.view.send_diagnostic.setEffect(value.effect_ids[0].value);
+                if (value.effect_ids.len != 0) app.view.send_diagnostic.setEffect(value.effect_ids[value.effect_ids.len - 1].value);
                 self.refresh = true;
             },
             .cancel, .approval => {
@@ -2236,8 +2332,21 @@ const Conversation = struct {
                     try self.askRuns();
                 } else {
                     self.approval_live = false;
-                    if (self.run.len != 0) try self.ask(.approvals, .{ .approvals = .{ .run = .{ .value = self.run.slice() }, .page = page } }) else try self.askHistory(app);
+                    if (self.run.len != 0) {
+                        if (self.diagnostic_len == 0 and (self.run_state == .failed or self.run_state == .unknown or self.run_state == .interrupted)) {
+                            try self.ask(.effects, .{ .effects = .{ .run = .{ .value = self.run.slice() }, .page = page } });
+                        } else try self.ask(.approvals, .{ .approvals = .{ .run = .{ .value = self.run.slice() }, .page = page } });
+                    } else try self.askHistory(app);
                 }
+            },
+            .effects => {
+                for (value.items) |row| self.recordEffect(&app.view, row.effect);
+                if (self.diagnostic_len == 0 and value.next_cursor != null) {
+                    var bounds = page;
+                    bounds.cursor = value.next_cursor;
+                    bounds.snapshot = value.snapshot_id;
+                    try self.ask(.effects, .{ .effects = .{ .run = .{ .value = self.run.slice() }, .page = bounds } });
+                } else try self.ask(.approvals, .{ .approvals = .{ .run = .{ .value = self.run.slice() }, .page = page } });
             },
             .approvals => {
                 for (value.items) |row| if (row.approval.state == .pending and row.approval.live) {
@@ -2639,7 +2748,72 @@ test "send preflight reports accounted bytes and preserves the editable draft re
     try std.testing.expect(std.mem.indexOf(u8, reason, "3792") != null);
     try std.testing.expectEqual(@as(u64, 17), view.revision);
     try std.testing.expectEqualSlices(u8, before, view.editor.textBytes());
-    try std.testing.expectEqual(@as(usize, 4097), composer.startPreflight(view.editor.len).frame_bytes);
+    try std.testing.expectEqual(@as(usize, 4097), domain.startPreflight(view.editor.len).frame_bytes);
+}
+
+test "native and custom send preflight rejects proposed text before touching Host" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    try app.view.insert("retained Unicode draft €", .paste);
+    const revision = app.view.revision;
+    const prompt = ("x" ** 3790) ++ "€";
+    try conversation.sendIdentified(&app, .absent, .absent, prompt, usability_selection, revision, @splat('a'));
+    try std.testing.expect(conversation.command == null);
+    try std.testing.expectEqual(.preflight_rejected, app.view.send_diagnostic.stage);
+    try std.testing.expectEqual(@as(usize, 3793), app.view.send_diagnostic.prompt_bytes);
+    try std.testing.expectEqualStrings("retained Unicode draft €", app.view.editor.textBytes());
+    try std.testing.expectEqual(revision, app.view.revision);
+    try std.testing.expect(std.mem.indexOf(u8, app.view.notice.?, "Shorten") != null);
+    try std.testing.expect(app.view.editor.undo());
+    try std.testing.expectEqualStrings("", app.view.editor.textBytes());
+}
+
+test "send receipts preserve rejection and newer drafts while exposing accepted provider failure" {
+    for ([_]bool{ false, true }) |newer_draft| {
+        var app: App = undefined;
+        app.view = try Coding.init(std.testing.allocator);
+        defer app.view.deinit();
+        var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+        try app.view.insert("sent €", .paste);
+        const captured_revision = app.view.revision;
+        const id = [_]u8{'a'} ** 32;
+        app.view.send_diagnostic.begin(&id, app.view.editor.len, domain.startPreflight(app.view.editor.len).frame_bytes);
+        conversation.command = .{ .ticket = .{ .value = 1 }, .kind = .send, .draft_revision = captured_revision, .id = id };
+        // An authoritative rejection never clears the captured draft or undo.
+        try conversation.receipt(&app, .{ .value = 1 }, .{ .command_id = .{ .value = &id }, .outcome = .rejected, .reason = .revision_conflict, .commit_sequence = 1 });
+        try std.testing.expectEqualStrings("sent €", app.view.editor.textBytes());
+        try std.testing.expectEqual(captured_revision, app.view.revision);
+        try std.testing.expectEqual(.rejected, app.view.send_diagnostic.stage);
+        try std.testing.expectEqualStrings("revision_conflict", app.view.send_diagnostic.rejection[0..app.view.send_diagnostic.rejection_len]);
+        try conversation.recordRun(&app.view, .{ .id = .{ .value = "older-run" }, .revision = 2, .thread = .{ .value = "thread" }, .session = .{ .value = "older-session" }, .state = .failed, .requested = usability_selection, .effective = null, .diagnostic = "Older provider failure" });
+        try std.testing.expectEqual(.rejected, app.view.send_diagnostic.stage);
+        try std.testing.expectEqual(@as(usize, 0), app.view.send_diagnostic.run_id_len);
+        if (newer_draft) try app.view.insert(" newer 😀", .typing);
+        const current_revision = app.view.revision;
+        app.view.send_diagnostic.begin(&id, "sent €".len, domain.startPreflight("sent €".len).frame_bytes);
+        conversation.command = .{ .ticket = .{ .value = 2 }, .kind = .send, .draft_revision = captured_revision, .id = id };
+        const receipt: types.Receipt = .{ .command_id = .{ .value = &id }, .outcome = .accepted, .commit_sequence = 2, .entity_ids = .{ .run = .{ .value = "run" }, .session = .{ .value = "session" } } };
+        try conversation.receipt(&app, .{ .value = 2 }, receipt);
+        try std.testing.expectEqualStrings(if (newer_draft) "sent € newer 😀" else "", app.view.editor.textBytes());
+        try std.testing.expectEqual(current_revision + @as(u64, @intFromBool(!newer_draft)), app.view.revision);
+        try std.testing.expectEqual(.accepted, app.view.send_diagnostic.receipt);
+        try std.testing.expectEqual(.accepted, app.view.send_diagnostic.stage);
+        try std.testing.expectError(error.UnexpectedCommandReceipt, conversation.receipt(&app, .{ .value = 2 }, receipt));
+        const row: @FieldType(types.Row, "run") = .{ .id = .{ .value = "run" }, .revision = 2, .thread = .{ .value = "thread" }, .session = .{ .value = "session" }, .state = .failed, .requested = usability_selection, .effective = null };
+        try conversation.recordRun(&app.view, row);
+        conversation.recordEffect(&app.view, .{ .id = .{ .value = "open-effect" }, .revision = 2, .run = .{ .value = "run" }, .kind = .create_session, .state = .failed, .outcome = "Offline fixture: login expired" });
+        try std.testing.expectEqual(.provider_failed, app.view.send_diagnostic.stage);
+        try std.testing.expectEqual(.accepted, app.view.send_diagnostic.receipt);
+        try conversation.recordRun(&app.view, row);
+        try std.testing.expectEqualStrings("Offline fixture: login expired", app.view.send_diagnostic.provider[0..app.view.send_diagnostic.provider_len]);
+        var buffer: [8192]u8 = undefined;
+        const report = try app.sendDiagnosticReport(&buffer);
+        try std.testing.expect(std.mem.indexOf(u8, report, "login expired") != null);
+        try std.testing.expect(std.mem.indexOf(u8, report, "sent €") == null);
+        try std.testing.expect(std.mem.indexOf(u8, report, "\"turn_id\":null") != null);
+    }
 }
 
 test "send requires complete catalog identity and negotiated effort without claiming entitlement" {

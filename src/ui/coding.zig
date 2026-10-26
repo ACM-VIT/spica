@@ -25,12 +25,13 @@ pub const Intent = enum { send, cancel, allow, deny };
 /// authority, while this record lets the UI distinguish local disablement,
 /// preflight refusal, command rejection, accepted provider failure and a
 /// terminal run without retaining prompt contents.
-pub const SendStage = enum { idle, disabled, preflight_rejected, submitted, accepted, rejected, provider_failed, terminal };
+pub const SendStage = enum { idle, disabled, preflight_rejected, submitted, admission_failed, outcome_unknown, accepted, rejected, provider_failed, terminal };
 pub const SendReceipt = enum { none, accepted, rejected };
 pub const SendDiagnostic = struct {
     stage: SendStage = .idle,
     prompt_bytes: usize = 0,
     frame_bytes: usize = 0,
+    ticket: u64 = 0,
     receipt: SendReceipt = .none,
     command_id: [32]u8 = @splat(0),
     command_id_len: usize = 0,
@@ -42,8 +43,8 @@ pub const SendDiagnostic = struct {
     run_id_len: usize = 0,
     session_id: [32]u8 = @splat(0),
     session_id_len: usize = 0,
-    turn_id: [64]u8 = @splat(0),
-    turn_id_len: usize = 0,
+    run_state: [24]u8 = @splat(0),
+    run_state_len: usize = 0,
     provider: [1024]u8 = @splat(0),
     provider_len: usize = 0,
 
@@ -73,8 +74,12 @@ pub const SendDiagnostic = struct {
         bounded(&self.effect_id, &self.effect_id_len, effect);
     }
 
+    pub fn setRunState(self: *SendDiagnostic, state: []const u8) void {
+        bounded(&self.run_state, &self.run_state_len, state);
+    }
+
     pub fn setProviderDiagnostic(self: *SendDiagnostic, diagnostic: []const u8, terminal: bool) void {
-        bounded(&self.provider, &self.provider_len, diagnostic);
+        if (self.provider_len == 0) bounded(&self.provider, &self.provider_len, diagnostic);
         self.stage = if (terminal) .terminal else .provider_failed;
     }
 };
@@ -2034,7 +2039,8 @@ pub const View = struct {
             }
         };
         const task_height: f32 = if (self.custom_root == null) @as(f32, @floatFromInt(self.task_count)) * 24 else 0;
-        self.transcript_bounds = .{ .x = bounds.transcript.x, .y = bounds.transcript.y + task_height, .w = bounds.transcript.width, .h = @max(0, bounds.transcript.height - task_height) };
+        const notice_height: f32 = if (self.notice != null) 20 else 0;
+        self.transcript_bounds = .{ .x = bounds.transcript.x, .y = bounds.transcript.y + task_height + notice_height, .w = bounds.transcript.width, .h = @max(0, bounds.transcript.height - task_height - notice_height) };
         var transcript_clip = widgets.Clip.push(renderer, self.transcript_bounds);
         if (self.custom_render) |render| {
             if (self.custom_tile_sequence != self.custom_render_sequence) {
@@ -2056,7 +2062,7 @@ pub const View = struct {
             }
             self.styleTile(&self.custom_tile);
             try self.custom_tile.reflow(text, @max(25, bounds.transcript.width));
-            try self.custom_tile.drawStyled(renderer, text, bounds.transcript.x, bounds.transcript.y, self.transcriptDesign());
+            try self.custom_tile.drawStyled(renderer, text, bounds.transcript.x, self.transcript_bounds.y, self.transcriptDesign());
         } else {
             var anchor_index: ?usize = null;
             var anchor_point: transcript.RichTile.ScrollPoint = .{ .byte = 0, .offset = 0 };
@@ -2210,7 +2216,11 @@ pub const View = struct {
             }
             try self.labels.drawFitted(renderer, text, self.status, self.design.layout.gutter, 0, 600, 11, muted);
         }
-        if (self.notice) |notice| try self.labels.drawFitted(renderer, text, notice, bounds.transcript.x, bounds.transcript.y, bounds.transcript.width, 12, muted);
+        if (self.notice) |notice| {
+            const hint_width: f32 = if (self.send_diagnostic.stage != .idle and bounds.transcript.width >= 600) 222 else 0;
+            try self.labels.drawFitted(renderer, text, notice, bounds.transcript.x, bounds.transcript.y + task_height, bounds.transcript.width - hint_width, 12, muted);
+            if (hint_width != 0) try self.labels.drawFitted(renderer, text, "Ctrl+Shift+C: Send diagnostics", bounds.transcript.x + bounds.transcript.width - hint_width + 12, bounds.transcript.y + task_height, hint_width - 12, 11, muted);
+        }
         if (self.custom_root == null and self.picker_open) try self.drawPicker(renderer, text, bounds, foreground, muted);
         if (self.custom_root == null and self.effort_open) try self.drawEffort(renderer, text, foreground, muted);
         if (self.custom_root == null and self.setup_open) try self.drawSetup(renderer, text, bounds, foreground, muted);
@@ -2255,6 +2265,30 @@ test "workspace inspection keeps selection and rejects stale checkout results" {
     try std.testing.expectEqual(@as(f32, 19), view.workspace_scroll);
     try std.testing.expect(!view.admitWorkspaceInspection(4, "/tmp/other", &.{file}, "wrong\n"));
     try std.testing.expect(view.workspace_stale);
+}
+
+test "send diagnostic keeps bounded command, receipt and provider evidence" {
+    var diagnostic: SendDiagnostic = .{};
+    const command = "a" ** 40;
+    diagnostic.begin(command, 3792, 4096);
+    try std.testing.expectEqual(SendStage.submitted, diagnostic.stage);
+    try std.testing.expectEqual(@as(usize, 32), diagnostic.command_id_len);
+    diagnostic.setReceipt(.rejected, "admission_limit");
+    try std.testing.expectEqual(SendStage.rejected, diagnostic.stage);
+    try std.testing.expectEqual(SendReceipt.rejected, diagnostic.receipt);
+    diagnostic.setRun("run-id", "session-id");
+    diagnostic.setProviderDiagnostic("provider failed", false);
+    try std.testing.expectEqual(SendStage.provider_failed, diagnostic.stage);
+    try std.testing.expectEqualStrings("run-id", diagnostic.run_id[0..diagnostic.run_id_len]);
+    try std.testing.expectEqualStrings("session-id", diagnostic.session_id[0..diagnostic.session_id_len]);
+    diagnostic.setProviderDiagnostic("completed", true);
+    try std.testing.expectEqual(SendStage.terminal, diagnostic.stage);
+    diagnostic.setProviderDiagnostic("", true);
+    try std.testing.expectEqualStrings("provider failed", diagnostic.provider[0..diagnostic.provider_len]);
+    diagnostic.begin(command, 3792, 4096);
+    diagnostic.setProviderDiagnostic("€" ** 400, false);
+    try std.testing.expectEqual(@as(usize, 1023), diagnostic.provider_len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(diagnostic.provider[0..diagnostic.provider_len]));
 }
 
 test "presentation edits retain exact Unicode and rejected insertion state" {

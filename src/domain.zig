@@ -6,12 +6,40 @@ const t = types;
 const a = t.adapter;
 const V = store.Value;
 const common = @import("runtime/adapter.zig");
-const composer = @import("text/composer.zig");
 const Factory = common.Factory;
 const Registry = @import("domain/registry.zig").Registry;
 const Mcp = @import("orchestration_mcp.zig").Server;
 pub const coordinator_tools = @import("orchestration_tools.zig");
 pub const workspace_binding = @import("domain/workspace.zig");
+
+/// The provider start request has a smaller accounted wire budget than the
+/// retained editor. Host admission reuses this calculation.
+pub const start_frame_limit = (a.Limits{}).frame_bytes;
+const generated_id_bytes = 32;
+
+pub const StartPreflight = struct {
+    prompt_bytes: usize,
+    frame_bytes: usize,
+    max_prompt_bytes: usize,
+
+    pub fn fits(self: StartPreflight) bool {
+        return self.frame_bytes <= start_frame_limit;
+    }
+};
+
+/// Account the fixed header and generated 32-byte IDs used by Host's
+/// `Request.start`, without reading or retaining prompt contents. Host still
+/// rechecks the concrete request after generating its real IDs.
+pub fn startPreflight(prompt_bytes: usize) StartPreflight {
+    const id = [_]u8{'0'} ** generated_id_bytes;
+    const request: a.Request = .{ .start = .{ .correlation = .{
+        .effect = .{ .value = &id },
+        .run = .{ .value = &id },
+        .session = .{ .value = &id },
+    }, .prompt = "" } };
+    const overhead = a.frameBytes(request);
+    return .{ .prompt_bytes = prompt_bytes, .frame_bytes = overhead +| prompt_bytes, .max_prompt_bytes = start_frame_limit -| overhead };
+}
 
 // Every nested lookup is a point/range lookup on an existing primary/unique
 // index (plus runs_by_thread). The preview reads only a prefix of one chunk.
@@ -38,9 +66,9 @@ pub const Owner = struct {
     }
 
     fn id(self: *Owner, allocator: std.mem.Allocator) ![]const u8 {
-        var random: [16]u8 = undefined;
+        var random: [generated_id_bytes / 2]u8 = undefined;
         try self.io.randomSecure(&random);
-        const result = try allocator.alloc(u8, 32);
+        const result = try allocator.alloc(u8, generated_id_bytes);
         const hex = "0123456789abcdef";
         for (random, 0..) |byte, i| {
             result[i * 2] = hex[byte >> 4];
@@ -259,7 +287,7 @@ pub const Owner = struct {
                     .attachments = p.attachments,
                     .followup = .{ .id = .{ .value = effect_id }, .content = p.content },
                 } };
-                if (a.frameBytes(request) > composer.provider_start_frame_limit) return .admission_limit;
+                if (a.frameBytes(request) > start_frame_limit) return .admission_limit;
                 const dependency = try self.field(allocator, "SELECT id FROM effects WHERE run_id=? AND kind='message' AND state='planned' AND instr(CAST(request AS TEXT),'\"followup\":{\"id\"')>0 AND NOT EXISTS(SELECT 1 FROM effects child WHERE child.depends_on=effects.id AND child.state='planned') ORDER BY rowid DESC LIMIT 1", &.{.{ .text = run }});
                 try self.plan(allocator, effect_id, run, session, .message, request, dependency, null, e.command_id);
                 r.entity_ids.run = e.target.run;
@@ -280,7 +308,7 @@ pub const Owner = struct {
                 request.message.content = p.content;
                 request.message.attachments = p.attachments;
                 request.message.followup.?.content = p.content;
-                if (a.frameBytes(request) > composer.provider_start_frame_limit) return .admission_limit;
+                if (a.frameBytes(request) > start_frame_limit) return .admission_limit;
                 const bytes = try encoded(allocator, request);
                 const digest = t.digest(bytes);
                 try db.execute("UPDATE effects SET request=?,digest=?,revision=revision+1 WHERE id=? AND state='planned'", &.{ .{ .blob = bytes }, .{ .blob = &digest }, .{ .text = e.target.effect.value } });
@@ -377,7 +405,7 @@ pub const Owner = struct {
                 const open = try self.id(allocator);
                 const start = try self.id(allocator);
                 const request: a.Request = .{ .start = .{ .correlation = .{ .effect = .{ .value = start }, .run = .{ .value = run }, .session = .{ .value = session } }, .prompt = p.text } };
-                if (a.frameBytes(request) > composer.provider_start_frame_limit) return .admission_limit;
+                if (a.frameBytes(request) > start_frame_limit) return .admission_limit;
                 const selection = try encoded(allocator, p.selection);
                 try db.execute("INSERT INTO thread_selections VALUES(?,?) ON CONFLICT(thread_id) DO UPDATE SET selection=excluded.selection", &.{ .{ .text = thread }, .{ .blob = selection } });
                 if (resumed == null) try db.execute("INSERT INTO sessions(id,revision,workspace_id,selection) VALUES(?,1,?,?)", &.{ .{ .text = session }, .{ .text = workspace }, .{ .blob = selection } });
@@ -1948,6 +1976,30 @@ test {
     _ = @import("domain/factory_test.zig");
 }
 
+test "provider start preflight shares Host accounting at exact ASCII and UTF-8 boundaries" {
+    const empty = startPreflight(0);
+    try std.testing.expectEqual(@as(usize, 304), empty.frame_bytes);
+    try std.testing.expectEqual(@as(usize, 3792), empty.max_prompt_bytes);
+    try std.testing.expect(startPreflight(3792).fits());
+    try std.testing.expectEqual(@as(usize, 4096), startPreflight(3792).frame_bytes);
+    try std.testing.expect(!startPreflight(3793).fits());
+    try std.testing.expectEqual(@as(usize, 4097), startPreflight(3793).frame_bytes);
+
+    const euro_at_edge = ("x" ** 3789) ++ "€";
+    const euro_over = ("x" ** 3790) ++ "€";
+    try std.testing.expectEqual(@as(usize, 3792), euro_at_edge.len);
+    try std.testing.expect(startPreflight(euro_at_edge.len).fits());
+    try std.testing.expectEqual(@as(usize, 3793), euro_over.len);
+    try std.testing.expect(!startPreflight(euro_over.len).fits());
+
+    const emoji_at_edge = ("x" ** 3788) ++ "😀";
+    const emoji_over = ("x" ** 3789) ++ "😀";
+    try std.testing.expectEqual(@as(usize, 3792), emoji_at_edge.len);
+    try std.testing.expect(startPreflight(emoji_at_edge.len).fits());
+    try std.testing.expectEqual(@as(usize, 3793), emoji_over.len);
+    try std.testing.expect(!startPreflight(emoji_over.len).fits());
+}
+
 test "session-only open rejection closes starting claim and preserves indexed run diagnostics on reopen" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -2023,6 +2075,46 @@ test "session-only open rejection closes starting claim and preserves indexed ru
         return;
     }
     return error.HostQueryTimeout;
+}
+
+test "fake send admission matches the shared start-frame preflight at UTF-8 boundaries" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    const path = path_buffer[0..path_len];
+    var database = try store.Store.open(std.testing.io, path);
+    defer database.close() catch {};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: Owner = .{ .database = &database, .io = std.testing.io, .epoch = "send-frame-boundary", .utc_ms = 1 };
+    const project = (try owner.command(allocator, .{ .command_id = .{ .value = "project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "Frame boundary fixture" } } })).entity_ids.project.?;
+    const workspace = (try owner.command(allocator, .{ .command_id = .{ .value = "workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = try workspace_binding.capture(allocator, std.testing.io, path) } } })).entity_ids.workspace.?;
+    const prompts = [_][]const u8{ "x" ** 3792, "x" ** 3793, ("x" ** 3789) ++ "€", ("x" ** 3790) ++ "€", ("x" ** 3788) ++ "😀", ("x" ** 3789) ++ "😀" };
+    for (prompts, 0..) |prompt, index| {
+        const thread_command = try std.fmt.allocPrint(allocator, "thread-{d}", .{index});
+        const thread = (try owner.command(allocator, .{ .command_id = .{ .value = thread_command }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+        const before = try database.scalar("SELECT count(*) FROM effects");
+        const command: t.CommandEnvelope = .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "send-{d}", .{index}) }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = prompt, .selection = a.fakeSelection(workspace) } } };
+        const receipt = try owner.command(allocator, command);
+        if (index % 2 == 0) {
+            try std.testing.expectEqual(.accepted, receipt.outcome);
+            const stored = (try owner.field(allocator, "SELECT request FROM effects WHERE run_id=? AND kind='start'", &.{.{ .text = receipt.entity_ids.run.?.value }})).?;
+            const request = try t.decode(a.Request, stored, allocator);
+            try std.testing.expectEqual(@as(usize, 4096), a.frameBytes(request));
+            try std.testing.expectEqual(startPreflight(prompt.len).frame_bytes, a.frameBytes(request));
+            try std.testing.expectEqual(before + 2, try database.scalar("SELECT count(*) FROM effects"));
+        } else {
+            try std.testing.expectEqual(.rejected, receipt.outcome);
+            try std.testing.expectEqual(t.Reason.admission_limit, receipt.reason.?);
+            try std.testing.expectEqual(before, try database.scalar("SELECT count(*) FROM effects"));
+        }
+        // Even rejected oversized Sends retain their original durable receipt.
+        const replay = try owner.command(allocator, command);
+        try std.testing.expectEqual(receipt.commit_sequence, replay.commit_sequence);
+        try std.testing.expectEqual(receipt.outcome, replay.outcome);
+    }
 }
 
 test "thread cards read bounded UTF8 first-prompt previews and latest status after reopen" {
