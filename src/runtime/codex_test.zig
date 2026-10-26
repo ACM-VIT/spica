@@ -18,6 +18,159 @@ const Mock = struct {
     pub fn deinit(_: *@This()) void {}
 };
 const selection: c.Selection = .{ .runtime_kind = "codex", .required_runtime_version = "0.163.0", .model_provider = "openai", .model_id = "gpt-6.1-sol", .effort = "medium", .account_ref = "/tmp/spica-codex", .workspace = .{ .value = "opaque-workspace" } };
+
+fn initializeFixture(runtime: *codex.RuntimeFor(Mock), wire: *Mock, a: std.mem.Allocator) !void {
+    try wire.input.append(a, "{\"id\":1,\"result\":{\"userAgent\":\"codex/0.163.0\"}}");
+    try wire.input.append(a, "{\"id\":2,\"result\":{\"account\":{\"type\":\"chatgpt\"}}}");
+    try runtime.pump();
+}
+
+test "Codex subsequent turns preserve exact session with bounded metadata and no terminal replay" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "continuation" });
+    defer runtime.deinit();
+    try startErrorFixture(a, &wire, &runtime);
+    try wire.input.append(a, "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"upstream\",\"turn\":{\"id\":\"turn\",\"status\":\"completed\"}}}");
+    try runtime.pump();
+    const retained = runtime.state.end_index;
+    var turn_bytes: usize = 0;
+    for (0..128) |index| {
+        const run = try std.fmt.allocPrint(a, "run-{d:0>3}", .{index});
+        const turn = try std.fmt.allocPrint(a, "turn-{d:0>3}", .{index});
+        _ = try runtime.asAdapter().dispatch(a, .{ .start = .{ .correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = run }, .effect = .{ .value = "next-start" } }, .prompt = "follow-up only" } });
+        // The previous queued observation survives reclaiming turn metadata.
+        try std.testing.expect((try runtime.poll(a)).?.body == .completed);
+        const sent = try std.json.parseFromSlice(std.json.Value, a, wire.lines.items[wire.lines.items.len - 1], .{});
+        const params = sent.value.object.get("params").?;
+        try std.testing.expectEqualStrings("turn/start", sent.value.object.get("method").?.string);
+        try std.testing.expectEqualStrings("upstream", params.object.get("threadId").?.string);
+        try std.testing.expectEqualStrings("follow-up only", params.object.get("input").?.array.items[0].object.get("text").?.string);
+        const response = try std.json.Stringify.valueAlloc(a, .{ .id = runtime.pending.?.id, .result = .{ .turn = .{ .id = turn } } }, .{});
+        const completed = try std.json.Stringify.valueAlloc(a, .{ .method = "turn/completed", .params = .{ .threadId = "upstream", .turn = .{ .id = turn, .status = "completed" } } }, .{});
+        // Upstream notifications may precede the corresponding RPC reply.
+        if (index % 2 == 0) try wire.input.append(a, completed);
+        try wire.input.append(a, response);
+        if (index % 2 != 0) try wire.input.append(a, completed);
+        try runtime.pump();
+        try std.testing.expect(runtime.turn_terminal);
+        try std.testing.expectEqualStrings("", runtime.turn);
+        try std.testing.expectEqual(retained, runtime.state.end_index);
+        if (index < 2) turn_bytes = @max(turn_bytes, runtime.turn_state.end_index) else try std.testing.expect(runtime.turn_state.end_index <= turn_bytes);
+    }
+    const last = (try runtime.poll(a)).?;
+    try std.testing.expectEqualStrings("run-127", last.correlation.run.?.value);
+    try std.testing.expectEqualStrings("turn-127", last.correlation.upstream_turn.?.value);
+    try wire.input.append(a, "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"upstream\",\"turnId\":\"turn-127\",\"delta\":\"late replay\"}}");
+    try runtime.pump();
+    try std.testing.expect((try runtime.poll(a)) == null);
+}
+
+test "Codex fresh runtime resumes exact upstream through either public request without replay" {
+    for ([_]bool{ false, true }) |attach| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var wire: Mock = .{ .allocator = a };
+        var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "new-instance" });
+        defer runtime.deinit();
+        try initializeFixture(&runtime, &wire, a);
+        const session: c.Session = .{ .id = .{ .value = "durable-session" }, .instance = .{ .value = "previous-process" }, .upstream = .{ .value = "exact-upstream" } };
+        const request: c.Request = if (attach) .{ .attach = .{ .session = session } } else .{ .open = .{ .existing = .{ .session = session } } };
+        _ = try runtime.asAdapter().dispatch(a, request);
+        const sent = try std.json.parseFromSlice(std.json.Value, a, wire.lines.items[wire.lines.items.len - 1], .{});
+        try std.testing.expectEqualStrings("thread/resume", sent.value.object.get("method").?.string);
+        try std.testing.expectEqualStrings("exact-upstream", sent.value.object.get("params").?.object.get("threadId").?.string);
+        try wire.input.append(a, "{\"id\":3,\"result\":{\"thread\":{\"id\":\"exact-upstream\",\"turns\":[{\"items\":[{\"text\":\"old history\"}]}]},\"model\":\"gpt-6.1-sol\",\"modelProvider\":\"openai\",\"cwd\":\"/tmp/project\",\"reasoningEffort\":\"medium\"}}");
+        try runtime.pump();
+        const observed = (try runtime.poll(a)).?.body.session;
+        try std.testing.expectEqualStrings("durable-session", observed.id.value);
+        try std.testing.expectEqualStrings("exact-upstream", observed.upstream.value);
+        try std.testing.expectEqualStrings("new-instance", observed.instance.value);
+        try std.testing.expect((try runtime.poll(a)).?.body == .selection);
+        try std.testing.expect((try runtime.poll(a)) == null);
+        _ = try runtime.asAdapter().dispatch(a, .{ .start = .{ .correlation = .{ .session = session.id, .run = .{ .value = "next-run" }, .effect = .{ .value = "start" } }, .prompt = "continue" } });
+        const start = try std.json.parseFromSlice(std.json.Value, a, wire.lines.items[wire.lines.items.len - 1], .{});
+        try std.testing.expectEqualStrings("exact-upstream", start.value.object.get("params").?.object.get("threadId").?.string);
+    }
+}
+
+test "Codex missing session and failed resume never create or permit a start" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "resume-failure" });
+    defer runtime.deinit();
+    try initializeFixture(&runtime, &wire, a);
+    var session: c.Session = .{ .id = .{ .value = "session" }, .instance = .{ .value = "old" }, .upstream = .{ .value = "" } };
+    const before = wire.lines.items.len;
+    try std.testing.expectError(error.MissingSession, runtime.dispatch(a, .{ .attach = .{ .session = session } }));
+    session.upstream.value = "missing-upstream";
+    try std.testing.expectError(error.CapabilityUnavailable, runtime.dispatch(a, .{ .open = .{ .existing = .{ .session = session, .after = .{ .value = "cursor" } } } }));
+    try std.testing.expectError(error.CapabilityUnavailable, runtime.dispatch(a, .{ .attach = .{ .session = session, .after = .{ .value = "cursor" } } }));
+    try std.testing.expectEqual(before, wire.lines.items.len);
+    _ = try runtime.dispatch(a, .{ .attach = .{ .session = session } });
+    try wire.input.append(a, "{\"id\":3,\"error\":{\"code\":-32000,\"message\":\"session not found\"}}");
+    try runtime.pump();
+    const failure = (try runtime.poll(a)).?;
+    try std.testing.expectEqualStrings("session_resume_failed", failure.body.failure.code);
+    try std.testing.expect(std.mem.indexOf(u8, failure.body.failure.detail, "session not found") != null);
+    try std.testing.expectEqualStrings("session", failure.correlation.session.value);
+    try std.testing.expectError(error.SessionUnavailable, runtime.dispatch(a, .{ .start = .{ .correlation = .{ .session = session.id, .run = .{ .value = "run" }, .effect = .{ .value = "start" } }, .prompt = "never sent" } }));
+    try std.testing.expectEqual(before + 1, wire.lines.items.len);
+    try std.testing.expect((try runtime.poll(a)) == null);
+}
+
+test "Codex resume identity or selection mismatch publishes no usable session" {
+    for ([_][]const u8{
+        "{\"id\":3,\"result\":{\"thread\":{\"id\":\"wrong-session\"},\"model\":\"gpt-6.1-sol\",\"modelProvider\":\"openai\",\"cwd\":\"/tmp/project\",\"reasoningEffort\":\"medium\"}}",
+        "{\"id\":3,\"result\":{\"thread\":{\"id\":\"upstream\"},\"model\":\"gpt-6.1-sol\",\"modelProvider\":\"openai\",\"cwd\":\"/tmp/wrong-project\",\"reasoningEffort\":\"medium\"}}",
+        "{\"id\":3,\"result\":{\"thread\":{\"id\":\"upstream\"},\"model\":\"gpt-6.1-sol\",\"modelProvider\":\"openai\",\"cwd\":\"/tmp/project\",\"reasoningEffort\":\"low\"}}",
+    }, 0..) |reply, index| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var wire: Mock = .{ .allocator = a };
+        var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "mismatch" });
+        defer runtime.deinit();
+        try initializeFixture(&runtime, &wire, a);
+        _ = try runtime.dispatch(a, .{ .attach = .{ .session = .{ .id = .{ .value = "session" }, .instance = .{ .value = "old" }, .upstream = .{ .value = "upstream" } } } });
+        try wire.input.append(a, reply);
+        try std.testing.expectError(if (index == 0) error.InvalidSession else error.SelectionMismatch, runtime.pump());
+        const observed = (try runtime.poll(a)).?;
+        try std.testing.expect(observed.body == .disconnect);
+        try std.testing.expectEqual(.unknown, observed.body.disconnect.continuity);
+        try std.testing.expect((try runtime.poll(a)) == null);
+        const before = wire.lines.items.len;
+        const receipt = try runtime.dispatch(a, .{ .start = .{ .correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "run" }, .effect = .{ .value = "start" } }, .prompt = "never sent" } });
+        try std.testing.expectEqual(.rejected, receipt.outcome);
+        try std.testing.expectEqual(before, wire.lines.items.len);
+    }
+}
+
+test "Codex uncertain cancellation and process death prohibit subsequent turns" {
+    for ([_]bool{ false, true }) |death| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var wire: Mock = .{ .allocator = a };
+        var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "unknown" });
+        defer runtime.deinit();
+        try startErrorFixture(a, &wire, &runtime);
+        const next: c.Request = .{ .start = .{ .correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "next-run" }, .effect = .{ .value = "next-start" } }, .prompt = "never retried" } };
+        try std.testing.expectError(error.InvalidCorrelation, runtime.dispatch(a, next));
+        if (death) wire.exited = true else try wire.input.append(a, "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"upstream\",\"turn\":{\"id\":\"turn\",\"status\":\"interrupted\"}}}");
+        try runtime.pump();
+        const before = wire.lines.items.len;
+        if (death) {
+            try std.testing.expectEqual(.rejected, (try runtime.dispatch(a, next)).outcome);
+        } else try std.testing.expectError(error.SessionUnavailable, runtime.dispatch(a, next));
+        try std.testing.expectEqual(before, wire.lines.items.len);
+    }
+}
 test "Codex initialize account create stream approval cancel exit" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -291,8 +444,8 @@ test "Codex retry can recover successfully and oversized structured error stays 
     try std.testing.expect(failure.detail.len <= 2048);
     try std.testing.expect(failure.detail.len >= 2045);
     try std.testing.expect(std.unicode.utf8ValidateSlice(failure.detail));
-    // Only the next turn's ID, not the oversized error, enters retained state.
-    try std.testing.expectEqual(retained + "next-turn".len, runtime.state.end_index);
+    // Turn IDs and errors never consume persistent session storage.
+    try std.testing.expectEqual(retained, runtime.state.end_index);
 }
 
 fn loginFixture(a: std.mem.Allocator, wire: *Mock, runtime: *codex.RuntimeFor(Mock)) !void {

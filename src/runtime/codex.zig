@@ -41,6 +41,7 @@ pub fn RuntimeFor(comptime T: type) type {
         const Operation = enum { initialize, account, login, open, restore, start, cancel };
         allocator: std.mem.Allocator,
         state: std.heap.FixedBufferAllocator,
+        turn_state: std.heap.FixedBufferAllocator,
         state_bytes: []u8,
         wire: *T,
         config: Config,
@@ -58,8 +59,11 @@ pub fn RuntimeFor(comptime T: type) type {
         next_id: u64 = 1,
         pending: ?struct { id: u64, kind: Operation, correlation: c.Correlation } = null,
         session: ?c.Session = null,
+        session_ready: bool = false,
         correlation: c.Correlation = .{ .session = .{ .value = "" } },
         turn: []const u8 = "",
+        turn_terminal: bool = true,
+        finished_turn: []const u8 = "",
         offset: u64 = 0,
         sequence: u64 = 0,
         approval: ?struct { id_json: []const u8, evidence: c.ApprovalEvidence } = null,
@@ -74,7 +78,7 @@ pub fn RuntimeFor(comptime T: type) type {
             // Runtime-retained protocol identity/callback state has a hard byte cap.
             const state_bytes = try allocator.alloc(u8, 1048576);
             errdefer allocator.free(state_bytes);
-            var self: Self = .{ .allocator = allocator, .wire = wire, .state = std.heap.FixedBufferAllocator.init(state_bytes), .state_bytes = state_bytes, .config = config };
+            var self: Self = .{ .allocator = allocator, .wire = wire, .state = std.heap.FixedBufferAllocator.init(state_bytes[0..32768]), .turn_state = std.heap.FixedBufferAllocator.init(state_bytes[32768..]), .state_bytes = state_bytes, .config = config };
             self.config.selection = try adapter.clone(self.state.allocator(), config.selection);
             try self.rpc(.initialize, .{ .clientInfo = .{ .name = "spica", .version = "1" }, .capabilities = .{ .experimentalApi = true } }, self.correlation);
             return self;
@@ -95,8 +99,9 @@ pub fn RuntimeFor(comptime T: type) type {
             };
             const bytes = try std.json.Stringify.valueAlloc(self.allocator, .{ .id = self.next_id, .method = method, .params = params }, .{});
             defer self.allocator.free(bytes);
+            const owned = try adapter.clone(if (kind == .start or kind == .cancel) self.turn_state.allocator() else self.state.allocator(), correlation);
             try self.wire.send(bytes);
-            self.pending = .{ .id = self.next_id, .kind = kind, .correlation = try adapter.clone(self.state.allocator(), correlation) };
+            self.pending = .{ .id = self.next_id, .kind = kind, .correlation = owned };
             self.next_id += 1;
         }
         pub fn startLogin(self: *Self, device_code: bool) !void {
@@ -139,12 +144,24 @@ pub fn RuntimeFor(comptime T: type) type {
                         self.correlation = try adapter.clone(self.state.allocator(), c.Correlation{ .session = p.session, .effect = p.effect });
                         try self.rpc(.open, .{ .model = p.selection.model_id, .modelProvider = p.selection.model_provider, .cwd = self.config.cwd, .approvalPolicy = "on-request", .sandbox = "workspace-write", .allowProviderModelFallback = false, .config = .{ .model_reasoning_effort = p.selection.effort }, .dynamicTools = self.config.tools }, self.correlation);
                     },
-                    .existing => |p| try self.restore(p.session),
+                    .existing => |p| {
+                        if (p.after != null) return error.CapabilityUnavailable;
+                        try self.restore(p.session);
+                    },
                 },
-                .attach => |p| try self.restore(p.session),
+                .attach => |p| {
+                    if (p.after != null) return error.CapabilityUnavailable;
+                    try self.restore(p.session);
+                },
                 .start => |p| {
+                    if (!self.session_ready) return error.SessionUnavailable;
                     if (p.correlation.run == null or p.correlation.effect == null or self.session == null or !eq(p.correlation.session.value, self.session.?.id.value) or self.turn.len != 0) return error.InvalidCorrelation;
-                    self.correlation = try adapter.clone(self.state.allocator(), p.correlation);
+                    // Queued observations own their bytes. Reclaim only completed
+                    // turn metadata; the exact session binding stays retained.
+                    self.turn_state.reset();
+                    self.correlation = try adapter.clone(self.turn_state.allocator(), p.correlation);
+                    self.turn_terminal = false;
+                    self.finished_turn = "";
                     self.offset = 0;
                     self.turn_error_len = 0;
                     self.diagnostic = "";
@@ -166,6 +183,7 @@ pub fn RuntimeFor(comptime T: type) type {
         }
         fn restore(self: *Self, session: c.Session) !void {
             if (self.session != null or self.readiness != .ready) return error.SessionUnavailable;
+            if (session.id.value.len == 0 or session.upstream.value.len == 0) return error.MissingSession;
             self.session = try adapter.clone(self.state.allocator(), session);
             self.correlation = .{ .session = self.session.?.id };
             try self.rpc(.restore, .{ .threadId = session.upstream.value, .model = self.config.selection.model_id, .modelProvider = self.config.selection.model_provider, .cwd = self.config.cwd, .config = .{ .model_reasoning_effort = self.config.selection.effort } }, self.correlation);
@@ -265,11 +283,14 @@ pub fn RuntimeFor(comptime T: type) type {
                         self.diagnostic = self.setup_diagnostic.slice();
                         self.login_active = false;
                         self.readiness = .unavailable;
-                    } else self.diagnostic = try std.json.Stringify.valueAlloc(self.state.allocator(), failure, .{});
+                    } else {
+                        self.rememberTurnError(failure);
+                        self.session_ready = false;
+                    }
                     if (self.correlation.session.value.len != 0) {
                         var end = @min(self.diagnostic.len, 2048);
                         while (end < self.diagnostic.len and end > 0 and self.diagnostic[end] & 0xc0 == 0x80) end -= 1;
-                        try self.emit(.{ .failure = .{ .code = "rpc_error", .detail = self.diagnostic[0..end] } });
+                        try self.emit(.{ .failure = .{ .code = if (pending.kind == .restore) "session_resume_failed" else "rpc_error", .detail = self.diagnostic[0..end] } });
                     }
                     return;
                 }
@@ -302,18 +323,23 @@ pub fn RuntimeFor(comptime T: type) type {
                         if (self.session) |session| {
                             if (!eq(session.upstream.value, thread_id)) return error.InvalidSession;
                         }
-                        self.session = try adapter.clone(self.state.allocator(), c.Session{ .id = self.correlation.session, .instance = .{ .value = self.config.instance }, .upstream = .{ .value = thread_id } });
-                        try self.emit(.{ .session = self.session.? });
                         const effort = text(field(result, "reasoningEffort"));
                         if (!eq(effort, self.config.selection.effort)) return error.SelectionMismatch;
+                        self.session = try adapter.clone(self.state.allocator(), c.Session{ .id = self.correlation.session, .instance = .{ .value = self.config.instance }, .upstream = .{ .value = thread_id } });
+                        self.session_ready = true;
+                        try self.emit(.{ .session = self.session.? });
                         try self.emit(.{ .selection = .{ .requested = self.config.selection, .effective = self.config.selection, .readiness = self.readiness } });
                     },
                     .start => {
                         const turn_id = text(field(field(result, "turn"), "id"));
                         if (turn_id.len == 0) return error.InvalidTurn;
-                        if (self.turn.len != 0 and !eq(self.turn, turn_id)) return error.InvalidCorrelation;
-                        self.turn = try self.state.allocator().dupe(u8, turn_id);
-                        self.correlation.upstream_turn = .{ .value = self.turn };
+                        if (self.turn_terminal) {
+                            if (!eq(self.finished_turn, turn_id)) return error.InvalidCorrelation;
+                        } else {
+                            if (self.turn.len != 0 and !eq(self.turn, turn_id)) return error.InvalidCorrelation;
+                            self.turn = try self.turn_state.allocator().dupe(u8, turn_id);
+                            self.correlation.upstream_turn = .{ .value = self.turn };
+                        }
                     },
                     .cancel => {},
                 }
@@ -349,6 +375,8 @@ pub fn RuntimeFor(comptime T: type) type {
             }
             const thread_id = text(field(params, "threadId"));
             if (self.session == null or !eq(thread_id, self.session.?.upstream.value)) return;
+            // Resume history and late notifications are never new run output.
+            if (self.turn_terminal or self.correlation.run == null) return;
             const turn_id = text(field(params, "turnId"));
             if (eq(method, "error") or eq(method, "turn/completed")) {
                 const observed_turn = if (eq(method, "error")) turn_id else text(field(field(params, "turn"), "id"));
@@ -358,7 +386,7 @@ pub fn RuntimeFor(comptime T: type) type {
                     // The error can precede turn/start's response, but it must
                     // still belong to a currently outstanding start request.
                     if (self.pending == null or self.pending.?.kind != .start) return;
-                    self.turn = try self.state.allocator().dupe(u8, observed_turn);
+                    self.turn = try self.turn_state.allocator().dupe(u8, observed_turn);
                     self.correlation.upstream_turn = .{ .value = self.turn };
                 }
                 if (!eq(observed_turn, self.turn)) return;
@@ -372,7 +400,7 @@ pub fn RuntimeFor(comptime T: type) type {
             } else if (eq(method, "turn/started")) {
                 const started = text(field(field(params, "turn"), "id"));
                 if (started.len == 0 or self.correlation.run == null or (self.turn.len != 0 and !eq(self.turn, started))) return error.InvalidCorrelation;
-                if (self.turn.len == 0) self.turn = try self.state.allocator().dupe(u8, started);
+                if (self.turn.len == 0) self.turn = try self.turn_state.allocator().dupe(u8, started);
                 self.correlation.upstream_turn = .{ .value = self.turn };
             } else if (eq(method, "item/agentMessage/delta")) {
                 const delta = text(field(params, "delta"));
@@ -402,12 +430,15 @@ pub fn RuntimeFor(comptime T: type) type {
                 const status = text(field(turn, "status"));
                 if (field(turn, "error") != .null) self.rememberTurnError(field(turn, "error"));
                 if (eq(status, "completed")) try self.emit(.completed) else if (eq(status, "interrupted")) try self.emit(.{ .cancelled = .{ .tools_stopped = false } }) else try self.emit(.{ .failure = .{ .code = status, .detail = if (self.turn_error_len != 0) self.turn_error_bytes[0..self.turn_error_len] else "Codex turn did not complete" } });
+                self.turn_terminal = true;
+                self.finished_turn = self.turn;
+                if (!eq(status, "completed") and !eq(status, "failed")) self.session_ready = false;
                 self.turn = "";
                 self.approval = null;
                 self.tool = null;
             } else if (eq(method, "item/commandExecution/requestApproval") or eq(method, "item/fileChange/requestApproval")) {
                 if (self.approval != null) return error.TooManyApprovals;
-                const a = self.state.allocator();
+                const a = self.turn_state.allocator();
                 const id_json = try std.json.Stringify.valueAlloc(a, field(value, "id"), .{});
                 var correlation = self.correlation;
                 correlation.upstream_request = id_json;
@@ -422,7 +453,7 @@ pub fn RuntimeFor(comptime T: type) type {
             } else if (eq(method, "item/tool/call")) {
                 if (self.tool != null) return error.TooManyToolCalls;
                 if (self.correlation.run == null or self.correlation.session.value.len == 0 or self.turn.len == 0 or !eq(turn_id, self.turn) or text(field(params, "callId")).len == 0 or text(field(params, "tool")).len == 0 or (field(value, "id") != .integer and field(value, "id") != .string)) return error.InvalidCorrelation;
-                const a = self.state.allocator();
+                const a = self.turn_state.allocator();
                 const wire_name = text(field(params, "tool"));
                 var application_name: ?[]const u8 = null;
                 for (self.config.tools) |registered| {

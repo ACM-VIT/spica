@@ -75,7 +75,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
         selection: c.Selection = undefined,
         session: ?c.Session = null,
         correlation: c.Correlation = undefined,
-        phase: enum { cold, initializing, idle, creating, model, effort, ready, prompting, failed, stopped } = .cold,
+        phase: enum { cold, initializing, idle, creating, resuming, model, effort, ready, prompting, failed, stopped } = .cold,
         request_id: i64 = 0,
         pending_id: i64 = 0,
         prompt_id: i64 = 0,
@@ -242,13 +242,16 @@ pub fn RuntimeFor(comptime Transport: type) type {
                         },
                         .existing => |r| {
                             if (!self.resume_supported or r.after != null) return error.CapabilityUnavailable;
+                            if (r.session.id.value.len == 0 or r.session.upstream.value.len == 0) return error.MissingSession;
                             self.session = try clone(self.retained.allocator(), r.session);
+                            self.session.?.instance = self.config.instance;
                             self.correlation = try clone(self.turn.allocator(), c.Correlation{ .session = r.session.id });
                             try self.sessionParams("session/resume", r.session.upstream.value);
                         },
                     }
-                    self.phase = .creating;
+                    self.phase = if (open == .existing) .resuming else .creating;
                 },
+                .attach => |r| return self.dispatch(allocator, .{ .open = .{ .existing = .{ .session = r.session, .after = r.after } } }),
                 .start => |r| {
                     if (self.phase != .ready or self.session == null) return error.NotReady;
                     if (r.correlation.effect == null or r.correlation.run == null or !c.equal(r.correlation.session, self.session.?.id)) return error.InvalidCorrelation;
@@ -393,13 +396,14 @@ pub fn RuntimeFor(comptime Transport: type) type {
                 if (id != .integer or id.integer != self.pending_id) return error.UnexpectedResponse;
                 const failure = field(frame, "error");
                 if (failure != .null) {
+                    const resuming = self.phase == .resuming;
                     self.phase = .failed;
                     const structured = if (field(failure, "data") != .null) try std.json.Stringify.valueAlloc(self.allocator, failure, .{}) else null;
                     defer if (structured) |bytes| self.allocator.free(bytes);
                     const diagnostic = structured orelse text(field(failure, "message"));
                     var end = @min(diagnostic.len, 2048);
                     while (end < diagnostic.len and end > 0 and diagnostic[end] & 0xc0 == 0x80) end -= 1;
-                    return try self.observation(allocator, "rpc/error", .{ .failure = .{ .code = "opencode_rpc_error", .detail = diagnostic[0..end] } });
+                    return try self.observation(allocator, "rpc/error", .{ .failure = .{ .code = if (resuming) "session_resume_failed" else "opencode_rpc_error", .detail = diagnostic[0..end] } });
                 }
                 const result = field(frame, "result");
                 switch (self.phase) {
@@ -417,11 +421,14 @@ pub fn RuntimeFor(comptime Transport: type) type {
                         self.resume_supported = field(field(caps, "sessionCapabilities"), "resume") == .object;
                         self.phase = .idle;
                     },
-                    .creating => {
+                    .creating, .resuming => {
                         if (self.session == null) {
                             const upstream = text(field(result, "sessionId"));
                             if (upstream.len == 0) return error.InvalidProtocol;
                             self.session = try clone(self.retained.allocator(), c.Session{ .id = self.correlation.session, .instance = self.config.instance, .upstream = .{ .value = upstream } });
+                        } else if (field(result, "sessionId") != .null and !eq(text(field(result, "sessionId")), self.session.?.upstream.value)) {
+                            self.phase = .failed;
+                            return error.InvalidCorrelation;
                         }
                         try self.configureModel();
                     },
@@ -447,7 +454,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
                     .prompting => {
                         if (self.utf8_carry_len != 0) return error.IncompleteUtf8;
                         const reason = text(field(result, "stopReason"));
-                        self.phase = .ready;
+                        self.phase = if (eq(reason, "end_turn")) .ready else .failed;
                         self.approval_id = null;
                         if (eq(reason, "cancelled")) return try self.observation(allocator, "session/prompt", .{ .cancelled = .{ .tools_stopped = false } });
                         if (eq(reason, "end_turn")) return try self.observation(allocator, "session/prompt", .{ .completed = {} });
