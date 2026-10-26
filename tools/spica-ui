@@ -1,0 +1,887 @@
+#!/usr/bin/env python3
+"""Drive Spica through ordinary private-desktop input and read-only observations.
+
+The driver deliberately has no database or Host API.  It resolves semantic
+targets from the latest painted snapshot, translates them into compositor
+coordinates, and records enough provenance to reproduce a failed action.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import math
+import json
+import os
+from pathlib import Path
+import secrets
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Iterable
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_OUTPUT = ROOT / ".artifacts" / "spica-ui"
+
+# Exit values are part of the driver contract.  2 is reserved for argparse.
+EX_USAGE = 2
+EX_UNAVAILABLE = 10
+EX_STALE = 11
+EX_TARGET = 12
+EX_TIMEOUT = 13
+EX_REJECTED = 14
+EX_PROVIDER = 15
+EX_ASSERTION = 16
+EX_PROCESS = 17
+EX_BUILD = 18
+
+
+class DriverError(Exception):
+    def __init__(self, message: str, code: int = EX_ASSERTION):
+        super().__init__(message)
+        self.code = code
+
+
+def now_ns() -> int:
+    return time.time_ns()
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def source_fingerprint() -> str:
+    """Hash the source/build/tool inputs used by the native candidate."""
+    result = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=ROOT, capture_output=True, check=True,
+    )
+    names = sorted({item for item in result.stdout.decode().split("\0") if item})
+    digest = hashlib.sha256()
+    for name in names:
+        if not (name.startswith(("src/", "assets/", "build/", "tools/"))
+                or name in {"build.zig", "build.zig.zon", "deps.lock.json"}):
+            continue
+        path = ROOT / name
+        digest.update(name.encode() + b"\0")
+        digest.update(path.read_bytes() if path.is_file() else b"<deleted>")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                     prefix="." + path.name + ".", delete=False) as out:
+        json.dump(value, out, indent=2, ensure_ascii=False, sort_keys=True)
+        out.write("\n")
+        temporary = Path(out.name)
+    os.replace(temporary, path)
+
+
+def redact(value: Any, key: str = "") -> Any:
+    """Redact account/credential material while retaining useful diagnostics."""
+    sensitive = ("token", "secret", "password", "credential", "cookie", "authorization",
+                 "account_directory", "api_key", "access_key")
+    if any(part in key.lower() for part in sensitive):
+        return "<redacted>"
+    # Routine receipts and action journals carry state correlation, not user
+    # content.  An explicit snapshot content opt-in is provided by the CLI.
+    if key.lower() in {"draft", "transcript", "custom_render", "setup_fields"}:
+        return "<omitted>"
+    if isinstance(value, dict):
+        return {k: redact(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v, key) for v in value]
+    return value
+
+
+def run_command(argv: Iterable[os.PathLike[str] | str], *, timeout: float = 30,
+                check: bool = True, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run([str(value) for value in argv], cwd=ROOT, env=env,
+                                text=True, capture_output=True, timeout=timeout)
+    except FileNotFoundError as error:
+        raise DriverError(f"required command unavailable: {error.filename}", EX_UNAVAILABLE) from error
+    except subprocess.TimeoutExpired as error:
+        raise DriverError(f"command timed out: {shlex.join(map(str, argv))}", EX_TIMEOUT) from error
+    if check and result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise DriverError(f"command failed ({result.returncode}): {detail}", EX_PROCESS)
+    return result
+
+
+def read_json(path: Path, deadline: float | None = None) -> dict[str, Any]:
+    while True:
+        try:
+            with path.open(encoding="utf-8") as source:
+                value = json.load(source)
+            if not isinstance(value, dict):
+                raise ValueError("observation is not an object")
+            return value
+        except (FileNotFoundError, json.JSONDecodeError, ValueError) as error:
+            if deadline is None or time.monotonic() >= deadline:
+                raise DriverError(f"observation unavailable or incomplete: {path}", EX_STALE) from error
+            time.sleep(0.05)
+
+
+def session_file(output: Path) -> Path:
+    return output / "session.json"
+
+
+class Session:
+    def __init__(self, output: Path, data: dict[str, Any]):
+        self.output = output
+        self.data = data
+
+    @classmethod
+    def load(cls, output: Path) -> "Session":
+        path = session_file(output)
+        if not path.is_file():
+            raise DriverError(f"no spica-ui session at {output}", EX_STALE)
+        data = read_json(path)
+        if data.get("version") != 1 or not data.get("session_nonce"):
+            raise DriverError("invalid or stale spica-ui session manifest", EX_STALE)
+        return cls(output, data)
+
+    def save(self) -> None:
+        atomic_json(session_file(self.output), redact(self.data))
+        atomic_json(self.output / "actions.json", redact(self.data.get("actions", [])))
+
+    @property
+    def vd_session(self) -> Path:
+        return Path(self.data["private_desktop"]["session"])
+
+    @property
+    def window(self) -> str:
+        return str(self.data["window"])
+
+    @property
+    def observations(self) -> Path:
+        return Path(self.data["observations"])
+
+    @property
+    def sway_socket(self) -> str | None:
+        return self.data.get("private_desktop", {}).get("environment", {}).get("SWAYSOCK")
+
+    def require_live(self) -> None:
+        pid = self.data.get("launch", {}).get("pid")
+        if not pid or not Path(f"/proc/{pid}/exe").exists():
+            raise DriverError("native process is no longer alive", EX_STALE)
+        windows = run_command(["vd", "windows", self.vd_session], check=False).stdout
+        if self.window not in windows.split():
+            raise DriverError("native window is no longer present", EX_STALE)
+
+    def snapshot(self, timeout: float = 5) -> dict[str, Any]:
+        self.require_live()
+        value = read_json(self.observations, time.monotonic() + timeout)
+        if value.get("version", 0) < 1:
+            raise DriverError("unsupported observation schema", EX_STALE)
+        self.data["last_observation"] = {
+            "generation": value.get("generation"),
+            "frame_id": value.get("frame_id"),
+            "event_sequence": value.get("event_sequence"),
+            "observed_unix_ns": now_ns(),
+        }
+        self.save()
+        return value
+
+    def journal(self, action: str, before: dict[str, Any] | None,
+                after: dict[str, Any] | None, **extra: Any) -> None:
+        entry = {"action": action, "begin_unix_ns": extra.pop("begin_unix_ns", now_ns()),
+                 "end_unix_ns": now_ns(), "before": redact(before), "after": redact(after)}
+        entry.update(redact(extra))
+        self.data.setdefault("actions", []).append(entry)
+        atomic_json(self.output / "actions.json", redact(self.data["actions"]))
+        self.save()
+
+
+def target_groups(snapshot: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    for name in ("targets", "thread_targets", "sidebar_targets", "scope_targets",
+                 "effort_targets", "setup_targets", "setup_provider_targets",
+                 "setup_field_targets"):
+        for target in snapshot.get(name, []) or []:
+            if isinstance(target, dict):
+                yield target
+    for name in ("setup_advanced_target", "setup_existing_target", "setup_login_target"):
+        target = snapshot.get(name)
+        if isinstance(target, dict):
+            yield target
+
+
+def find_target(snapshot: dict[str, Any], identifier: str) -> dict[str, Any]:
+    matches = [target for target in target_groups(snapshot) if target.get("id") == identifier]
+    if not matches:
+        raise DriverError(f"semantic target not painted: {identifier}", EX_TARGET)
+    target = matches[0]
+    if not target.get("enabled"):
+        raise DriverError(f"semantic target disabled: {identifier}", EX_TARGET)
+    bounds = target.get("pointer_bounds")
+    if not bounds or len(bounds) != 4 or bounds[2] <= 0 or bounds[3] <= 0:
+        raise DriverError(f"semantic target has no painted bounds: {identifier}", EX_TARGET)
+    return target
+
+
+def wait_snapshot(session: Session, predicate: Any, timeout: float, label: str) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        current = session.snapshot(min(1, max(.1, deadline - time.monotonic())))
+        if predicate(current):
+            return current
+        time.sleep(.05)
+    raise DriverError(f"timed out waiting for {label}", EX_TIMEOUT)
+
+
+def window_rect(session: Session) -> dict[str, Any]:
+    socket = session.sway_socket
+    if not socket:
+        raise DriverError("private desktop has no compositor socket", EX_STALE)
+    result = run_command(["swaymsg", "--socket", socket, "--raw", "-t", "get_tree"])
+    tree = json.loads(result.stdout)
+
+    def walk(node: dict[str, Any]) -> dict[str, Any] | None:
+        if str(node.get("id")) == session.window:
+            return node
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            found = walk(child)
+            if found:
+                return found
+        return None
+    node = walk(tree)
+    if not node or not node.get("rect"):
+        raise DriverError("painted window disappeared from compositor tree", EX_STALE)
+    return node["rect"]
+
+
+def focus(session: Session) -> None:
+    socket = session.sway_socket
+    if not socket:
+        raise DriverError("private desktop has no compositor socket", EX_STALE)
+    run_command(["swaymsg", "--socket", socket, f"[con_id={session.window}]", "focus"])
+
+
+def pointer(session: Session, target: dict[str, Any]) -> tuple[int, int]:
+    rect = window_rect(session)
+    x, y, width, height = target["pointer_bounds"]
+    return int(rect["x"] + x + width // 2), int(rect["y"] + y + height // 2)
+
+
+def key_argv(session: Session, value: str) -> list[str]:
+    parts = value.split("+")
+    if len(parts) == 1:
+        return ["vd", "key", str(session.vd_session), session.window, value]
+    modifiers, key = parts[:-1], parts[-1]
+    keysyms = {"ctrl": "Control_L", "shift": "Shift_L", "alt": "Alt_L", "logo": "Super_L"}
+    if not key or any(modifier not in keysyms for modifier in modifiers):
+        raise DriverError(f"unsupported key chord: {value}", EX_USAGE)
+    command = ["vd", "run", str(session.vd_session), "--", "wtype", "-s", "150"]
+    for modifier in modifiers:
+        command += ["-P", keysyms[modifier]]
+    command += ["-k", key]
+    for modifier in reversed(modifiers):
+        command += ["-p", keysyms[modifier]]
+    return command
+
+
+def record_manifest(output: Path, *, scenario: str, binary: Path | None,
+                    build_command: list[str] | None, private: dict[str, Any] | None = None) -> dict[str, Any]:
+    revision = run_command(["git", "rev-parse", "HEAD"]).stdout.strip()
+    status = run_command(["git", "status", "--porcelain"], check=True).stdout
+    result: dict[str, Any] = {
+        "version": 1, "scenario": scenario, "revision": revision, "status": status,
+        "source_sha256": source_fingerprint(), "binary": str(binary) if binary else None,
+        "binary_sha256": sha256(binary) if binary and binary.is_file() else None,
+        "build_mode": "explicit build" if build_command else "prebuilt; no build requested",
+        "build_command": build_command, "input_method": "ordinary vd compositor input",
+        "provider": "fake", "private_desktop": private, "passed": False,
+        "limitations": ["No physical input-to-photon or provider-inference claim.",
+                        "Snapshots are bounded read-only observations; content is not copied into routine receipts.",
+                        "Process-tree memory/performance are outside this workflow driver."],
+    }
+    return result
+
+
+def launch(args: argparse.Namespace) -> int:
+    output = Path(args.output).resolve()
+    if args.provider != "fake":
+        raise DriverError("only the explicit offline fake provider is allowed", EX_PROVIDER)
+    if args.dry_run:
+        binary = Path(args.binary).resolve() if args.binary else ROOT / "zig-out/bin/spica"
+        plan = {"command": "launch", "private": args.private, "provider": args.provider,
+                "output": str(output), "binary": str(binary), "build": bool(args.build),
+                "state_directory": str(output / "state"),
+                "argv": [str(binary), "--provider", "fake", "--state-directory", str(output / "state"),
+                         "--automation-live", str(output / "live.json"), "--automation-output", str(output / "final.json")]}
+        print(json.dumps(plan, indent=2))
+        return 0
+    if not args.private:
+        raise DriverError("launch requires --private; ordinary user desktops are never used", EX_USAGE)
+    if session_file(output).exists():
+        raise DriverError("output already contains a session; choose a fresh directory", EX_STALE)
+    binary = Path(args.binary).resolve() if args.binary else ROOT / "zig-out/bin/spica"
+    build_command = None
+    if args.build:
+        build_command = ["python3", "build/driver.py", f"-Doptimize={args.optimize}"]
+        try:
+            run_command(build_command, timeout=300)
+        except DriverError as error:
+            error.code = EX_BUILD
+            raise
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise DriverError(f"native binary unavailable: {binary}; pass --build explicitly", EX_UNAVAILABLE)
+    output.mkdir(parents=True, exist_ok=False)
+    state = output / "state"
+    state.mkdir()
+    private_path = run_command(["vd", "start", "--width", str(args.width), "--height", str(args.height)]).stdout.strip()
+    private_dir = Path(private_path)
+    try:
+        private_record = json.loads((private_dir / "session.json").read_text(encoding="utf-8"))
+        argv = [str(binary), "--provider", "fake", "--state-directory", str(state),
+                "--automation-live", str(output / "live.json"), "--automation-output", str(output / "final.json"),
+                "--quit-after-ms", str(args.quit_after_ms)]
+        launch_result = run_command(["vd", "run", private_path, "--bg", "--log", str(output / "app.log"), "--", *argv])
+        launch_info = json.loads(launch_result.stdout)
+        deadline = time.monotonic() + args.timeout
+        window = None
+        while time.monotonic() < deadline:
+            windows = run_command(["vd", "windows", private_path], check=False).stdout
+            if windows.strip():
+                window = windows.splitlines()[0].split()[0]
+                break
+            time.sleep(.1)
+        if window is None:
+            raise DriverError("native window did not appear", EX_PROCESS)
+        manifest = record_manifest(output, scenario=args.scenario, binary=binary,
+                                   build_command=build_command, private={"session": private_path, **private_record})
+        manifest.update({"session_nonce": secrets.token_hex(16), "window": window,
+                         "observations": str(output / "live.json"), "launch": launch_info,
+                         "actions": []})
+        session = Session(output, manifest)
+        session.save()
+        # Require a first painted snapshot so every subsequent action has a fresh baseline.
+        session.snapshot(args.timeout)
+        atomic_json(output / "manifest.json", redact(manifest))
+        print(json.dumps(redact({"output": str(output), "session": private_path, "window": window,
+                                 "session_nonce": manifest["session_nonce"]}), indent=2))
+        return 0
+    except Exception:
+        run_command(["vd", "clean", private_path], check=False)
+        raise
+
+
+def attach(args: argparse.Namespace) -> int:
+    output = Path(args.output).resolve()
+    if args.dry_run:
+        print(json.dumps({"command": "attach", "output": str(output), "session": args.session,
+                          "window": args.window, "observations": args.observations}, indent=2))
+        return 0
+    if session_file(output).exists():
+        raise DriverError("output already contains a session", EX_STALE)
+    private_path = Path(args.session).resolve()
+    record_path = private_path / "session.json"
+    if not record_path.is_file():
+        raise DriverError("private desktop session record unavailable", EX_STALE)
+    private_record = json.loads(record_path.read_text(encoding="utf-8"))
+    windows = run_command(["vd", "windows", str(private_path)], check=False).stdout
+    if str(args.window) not in windows.split():
+        raise DriverError("requested window is not present in private desktop", EX_STALE)
+    observations = Path(args.observations).resolve()
+    if not observations.is_file():
+        raise DriverError("observation export unavailable", EX_STALE)
+    output.mkdir(parents=True, exist_ok=False)
+    manifest = record_manifest(output, scenario="attached", binary=None, build_command=None,
+                               private={"session": str(private_path), **private_record})
+    manifest.update({"session_nonce": secrets.token_hex(16), "window": str(args.window),
+                     "observations": str(observations), "launch": {"attached": True}, "actions": []})
+    session = Session(output, manifest)
+    session.save()
+    session.snapshot(args.timeout)
+    atomic_json(output / "manifest.json", redact(manifest))
+    print(json.dumps({"output": str(output), "window": str(args.window)}, indent=2))
+    return 0
+
+
+def get_session(args: argparse.Namespace) -> Session:
+    return Session.load(Path(args.output).resolve())
+
+
+def snapshot(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        print(json.dumps({"command": "snapshot", "output": str(Path(args.output).resolve())}, indent=2))
+        return 0
+    session = get_session(args)
+    value = session.snapshot(args.timeout)
+    target = Path(args.save).resolve() if args.save else None
+    visible = value if args.include_content else redact(value)
+    if target:
+        atomic_json(target, visible)
+    print(json.dumps(visible, indent=2, ensure_ascii=False))
+    return 0
+
+
+def targets(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        print(json.dumps({"command": "targets", "output": str(Path(args.output).resolve())}, indent=2))
+        return 0
+    session = get_session(args)
+    value = session.snapshot(args.timeout)
+    items = [redact(item) for item in target_groups(value)]
+    if args.target:
+        item = find_target(value, args.target)
+        print(json.dumps(redact(item), indent=2))
+    else:
+        print(json.dumps(items, indent=2))
+    return 0
+
+
+def input_action(args: argparse.Namespace, operation: str) -> int:
+    if args.dry_run:
+        details: dict[str, Any] = {"command": operation, "output": str(Path(args.output).resolve()),
+                                   "target": args.target}
+        if operation == "text":
+            details["source"] = str(Path(args.file).resolve()) if args.file else "inline"
+            details["content_recorded"] = False
+        print(json.dumps(details, indent=2))
+        return 0
+    session = get_session(args)
+    before = session.snapshot(args.timeout)
+    target = find_target(before, args.target)
+    begin = now_ns()
+    if operation == "click":
+        x, y = pointer(session, target)
+        run_command(["vd", "click", str(session.vd_session), session.window, str(x), str(y)])
+        detail = {"target": args.target, "pointer": [x, y], "input_origin": "ordinary vd pointer"}
+    elif operation == "text":
+        focus(session)
+        if args.file:
+            content = Path(args.file).read_text(encoding="utf-8")
+            source = str(Path(args.file).resolve())
+        else:
+            content = args.value
+            source = "inline"
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        run_command(["vd", "text", str(session.vd_session), session.window, content])
+        detail = {"target": args.target, "input_origin": "ordinary vd text", "source": source,
+                  "bytes": len(content.encode()), "sha256": digest}
+    else:
+        raise DriverError(f"unknown input operation: {operation}", EX_USAGE)
+    after = session.snapshot(args.timeout)
+    session.journal(operation, before, after, begin_unix_ns=begin, **detail)
+    print(json.dumps(redact({"operation": operation, "target": args.target, "frame_id": after.get("frame_id")}), indent=2))
+    return 0
+
+
+def key(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        print(json.dumps({"command": "key", "output": str(Path(args.output).resolve()),
+                          "key": args.value, "input_origin": "ordinary vd keyboard"}, indent=2))
+        return 0
+    session = get_session(args)
+    before = session.snapshot(args.timeout)
+    begin = now_ns()
+    focus(session)
+    run_command(key_argv(session, args.value))
+    after = session.snapshot(args.timeout)
+    session.journal("key", before, after, begin_unix_ns=begin, key=args.value,
+                    input_origin="ordinary vd keyboard")
+    print(json.dumps({"operation": "key", "key": args.value, "frame_id": after.get("frame_id")}, indent=2))
+    return 0
+
+
+def wait_command(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        print(json.dumps({"command": "wait", "output": str(Path(args.output).resolve()),
+                          "command_id": args.command_id, "run_id": args.run,
+                          "receipt": args.receipt, "state": args.state,
+                          "timeout": args.timeout}, indent=2))
+        return 0
+    session = get_session(args)
+    if not args.command_id and not args.run and not args.receipt and not args.state:
+        raise DriverError("wait requires --command/--run/--receipt/--state", EX_USAGE)
+    deadline = time.monotonic() + args.timeout
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = session.snapshot(min(1, max(.1, deadline - time.monotonic())))
+        if args.command_id:
+            observed_ids = {last.get("command_id"), last.get("last_command_id")}
+            receipt = last.get("receipt")
+            if isinstance(receipt, dict):
+                observed_ids.add(receipt.get("command_id"))
+            if args.command_id not in observed_ids:
+                # A run ID alone is not sufficient evidence for a command: an
+                # older completed run must never satisfy a new wait.
+                time.sleep(.05)
+                continue
+        if args.run and last.get("run_id") != args.run:
+            time.sleep(.05)
+            continue
+        if args.state and last.get("run_status") != args.state:
+            time.sleep(.05)
+            continue
+        if args.receipt:
+            if args.receipt == "accepted":
+                ready = bool(last.get("run_id")) and not last.get("pending_command")
+            elif args.receipt == "rejected":
+                ready = bool(last.get("admission_errors")) or bool(last.get("last_admission_error"))
+            else:
+                raise DriverError("receipt must be accepted or rejected", EX_USAGE)
+            if not ready:
+                time.sleep(.05)
+                continue
+            if args.receipt == "rejected":
+                session.journal("wait", None, last, outcome="rejected")
+                print(json.dumps(redact(last), indent=2))
+                return EX_REJECTED
+        print(json.dumps(redact(last), indent=2))
+        return 0
+    raise DriverError(f"wait timed out after {args.timeout:g}s", EX_TIMEOUT)
+
+
+def screenshot(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        print(json.dumps({"command": "screenshot", "output": args.path}, indent=2))
+        return 0
+    session = get_session(args)
+    session.require_live()
+    path = Path(args.path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    run_command(["vd", "shot", str(session.vd_session), str(path)])
+    session.data["last_screenshot"] = str(path)
+    session.save()
+    print(json.dumps({"screenshot": str(path)}, indent=2))
+    return 0
+
+
+def stop(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        print(json.dumps({"command": "stop", "output": str(Path(args.output).resolve())}, indent=2))
+        return 0
+    session = get_session(args)
+    if session.data.get("launch", {}).get("attached"):
+        raise DriverError("attached sessions require the owning launcher to stop them", EX_USAGE)
+    try:
+        session.require_live()
+        before = read_json(session.observations, time.monotonic() + args.timeout)
+        focus(session)
+        run_command(key_argv(session, "ctrl+q"))
+        deadline = time.monotonic() + args.timeout
+        while time.monotonic() < deadline:
+            windows = run_command(["vd", "windows", session.vd_session], check=False).stdout
+            if session.window not in windows.split():
+                session.data["stopped_unix_ns"] = now_ns()
+                session.data["stop_observation"] = redact(read_json(session.observations, time.monotonic() + 2))
+                session.save()
+                run_command(["vd", "clean", str(session.vd_session)], check=False)
+                print(json.dumps({"stopped": True}, indent=2))
+                return 0
+            time.sleep(.1)
+        raise DriverError("native window did not close", EX_TIMEOUT)
+    except DriverError:
+        run_command(["vd", "clean", str(session.vd_session)], check=False)
+        raise
+
+
+def scenario(args: argparse.Namespace) -> int:
+    output = Path(args.output).resolve()
+    if args.provider != "fake":
+        raise DriverError("scenarios only support the explicit offline fake provider", EX_PROVIDER)
+    if args.name == "rejected-send" and not 4097 <= args.rejected_bytes <= 64 * 1024:
+        raise DriverError("--rejected-bytes must be between 4097 and 65536", EX_USAGE)
+    if args.dry_run:
+        print(json.dumps({"command": "scenario", "scenario": args.name, "provider": "fake",
+                          "output": str(output), "steps": scenario_steps(args.name)}, indent=2))
+        return 0
+    launch_args = argparse.Namespace(**vars(args))
+    launch_args.scenario = args.name
+    launch_args.private = True
+    launch(launch_args)
+    session = Session.load(output)
+    try:
+        if args.name == "disabled-send":
+            current = wait_snapshot(session,
+                                    lambda value: value.get("connected") and value.get("thread_id")
+                                    and any(item.get("id") == "command.send" for item in target_groups(value)),
+                                    args.timeout, "fake composer")
+            target = next((item for item in target_groups(current) if item.get("id") == "command.send"), None)
+            if not target or target.get("enabled") or not current.get("send_disabled_reason"):
+                raise DriverError("empty composer did not expose a disabled Send target", EX_ASSERTION)
+            session.data["expected_outcome"] = "send_disabled"
+        elif args.name == "rejected-send":
+            # Host admission is exercised through a GUI paste/type event.  No SQL or
+            # command-server shortcut is used; the oversized text is never put in a receipt.
+            wait_snapshot(session, lambda value: value.get("connected") and value.get("thread_id")
+                          and any(item.get("id") == "composer.input" and item.get("enabled")
+                                  for item in target_groups(value)), args.timeout, "fake composer input")
+            input_action(argparse.Namespace(output=str(output), timeout=args.timeout, target="composer.input",
+                                           file=None, value="x" * args.rejected_bytes), "text")
+            before = session.snapshot(args.timeout)
+            key(argparse.Namespace(output=str(output), timeout=args.timeout, value="Return"))
+            deadline = time.monotonic() + args.timeout
+            while time.monotonic() < deadline:
+                current = session.snapshot(min(1, deadline - time.monotonic()))
+                if current.get("admission_errors") or current.get("last_admission_error"):
+                    session.data["expected_outcome"] = "send_rejected"
+                    session.data["rejection"] = {"admission_errors": current.get("admission_errors"),
+                                                  "last_admission_error": current.get("last_admission_error"),
+                                                  "draft_revision": current.get("draft_revision")}
+                    session.journal("scenario.rejected-send", before, current,
+                                    outcome="rejected", content_recorded=False)
+                    break
+                time.sleep(.05)
+            else:
+                raise DriverError("oversized Send was not visibly rejected", EX_TIMEOUT)
+        elif args.name == "send-restart":
+            wait_snapshot(session, lambda value: value.get("connected") and value.get("thread_id")
+                          and any(item.get("id") == "composer.input" and item.get("enabled")
+                                  for item in target_groups(value)), args.timeout, "fake composer input")
+            input_action(argparse.Namespace(output=str(output), timeout=args.timeout, target="composer.input",
+                                           file=None, value=args.prompt), "text")
+            key(argparse.Namespace(output=str(output), timeout=args.timeout, value="Return"))
+            deadline = time.monotonic() + args.timeout
+            first = None
+            while time.monotonic() < deadline:
+                first = session.snapshot(min(1, deadline - time.monotonic()))
+                if first.get("run_id") and first.get("run_status") in {"awaiting_approval", "completed", "cancelled"}:
+                    break
+                time.sleep(.05)
+            if not first or not first.get("run_id"):
+                raise DriverError("fake Send did not produce a correlated run", EX_TIMEOUT)
+            if first.get("run_status") == "awaiting_approval":
+                allow = find_target(first, "approval.allow")
+                x, y = pointer(session, allow)
+                run_command(["vd", "click", str(session.vd_session), session.window, str(x), str(y)])
+                current = session.snapshot(args.timeout)
+                session.journal("approval.allow", first, current, input_origin="ordinary vd pointer")
+                first = current
+            if first.get("run_status") != "completed":
+                raise DriverError("fake Send did not reach completed state", EX_ASSERTION)
+            thread_id, run_id = first.get("thread_id"), first.get("run_id")
+            session.data["pre_restart"] = {"thread_id": thread_id, "run_id": run_id,
+                                            "run_status": first.get("run_status")}
+            screenshot(argparse.Namespace(output=str(output), timeout=args.timeout, path=str(output / "before-restart.png"), dry_run=False))
+            stop(argparse.Namespace(output=str(output), timeout=args.timeout, dry_run=False))
+            # A fresh app process is required for the restart assertion.  Reuse the
+            # same private desktop/state directory and retain the nonce only as a session lineage marker.
+            relaunch = argparse.Namespace(**vars(args))
+            relaunch.output = str(output / "restarted")
+            relaunch.private = False
+            relaunch.dry_run = False
+            relaunch.build = False
+            relaunch.binary = args.binary
+            relaunch.optimize = args.optimize
+            relaunch.width, relaunch.height = args.width, args.height
+            relaunch.quit_after_ms = args.quit_after_ms
+            relaunch.timeout = args.timeout
+            # launch normally creates a new state directory; point the second app at the
+            # original state and private desktop through a small explicit relaunch path.
+            restarted_output = output / "restart-process"
+            if restarted_output.exists():
+                raise DriverError("restart evidence directory already exists", EX_STALE)
+            restarted_output.mkdir()
+            live = restarted_output / "live.json"
+            final = restarted_output / "final.json"
+            argv = [str(Path(args.binary).resolve() if args.binary else ROOT / "zig-out/bin/spica"),
+                    "--provider", "fake", "--state-directory", str(output / "state"),
+                    "--automation-live", str(live), "--automation-output", str(final),
+                    "--quit-after-ms", str(args.quit_after_ms)]
+            launch_result = run_command(["vd", "run", str(session.vd_session), "--bg", "--log",
+                                         str(restarted_output / "app.log"), "--", *argv])
+            restarted = json.loads(launch_result.stdout)
+            deadline = time.monotonic() + args.timeout
+            new_window = None
+            while time.monotonic() < deadline:
+                windows = run_command(["vd", "windows", str(session.vd_session)], check=False).stdout
+                candidates = [line.split()[0] for line in windows.splitlines() if line.split()]
+                if candidates:
+                    new_window = candidates[-1]
+                    break
+                time.sleep(.1)
+            if new_window is None:
+                raise DriverError("restarted native window did not appear", EX_PROCESS)
+            session.data["restart_process"] = restarted
+            session.data["observations"] = str(live)
+            session.data["launch"] = restarted
+            session.data["window"] = new_window
+            session.save()
+            current = session.snapshot(args.timeout)
+            if current.get("thread_id") != thread_id or current.get("run_id") != run_id or current.get("run_status") != "completed":
+                raise DriverError("restart did not retain the completed fake run", EX_ASSERTION)
+            session.data["expected_outcome"] = "send_completed_and_reopened"
+            screenshot(argparse.Namespace(output=str(output), timeout=args.timeout, path=str(output / "after-restart.png"), dry_run=False))
+        else:
+            raise DriverError(f"unknown scenario: {args.name}", EX_USAGE)
+        stop(argparse.Namespace(output=str(output), timeout=args.timeout, dry_run=False))
+        session.data["passed"] = True
+        session.save()
+        receipt(args, session=session)
+        return 0
+    except Exception:
+        try:
+            run_command(["vd", "clean", str(session.vd_session)], check=False)
+        finally:
+            raise
+
+
+def scenario_steps(name: str) -> list[str]:
+    return {"disabled-send": ["launch fake", "snapshot empty composer", "assert command.send disabled"],
+            "rejected-send": ["launch fake", "type oversized prompt through vd", "press Return", "assert visible admission rejection"],
+            "send-restart": ["launch fake", "type prompt and Send", "allow fake approval", "assert completed run", "close and relaunch", "assert same thread/run"],
+            }.get(name, [])
+
+
+def receipt(args: argparse.Namespace, session: Session | None = None) -> int:
+    if session is None and args.dry_run:
+        print(json.dumps({"command": "receipt", "output": str(Path(args.output).resolve()),
+                          "redacted": True}, indent=2))
+        return 0
+    if session is None:
+        session = get_session(args)
+    manifest = redact(session.data)
+    receipt_data = {"version": 1, "status": "passed" if manifest.get("passed") else "incomplete",
+                    "scenario": manifest.get("scenario"), "revision": manifest.get("revision"),
+                    "source_sha256": manifest.get("source_sha256"), "binary_sha256": manifest.get("binary_sha256"),
+                    "input_method": manifest.get("input_method"), "expected_outcome": manifest.get("expected_outcome"),
+                    "actions": len(manifest.get("actions", [])),
+                    "evidence": {"manifest": str(session.output / "session.json"),
+                                 "actions": str(session.output / "actions.json"),
+                                 "screenshots": [str(path) for path in session.output.glob("*.png")]},
+                    "limitations": manifest.get("limitations", [])}
+    atomic_json(session.output / "receipt.json", receipt_data)
+    print(json.dumps(receipt_data, indent=2))
+    return 0
+
+
+def add_common(parser: argparse.ArgumentParser, *, output: bool = True) -> None:
+    if output:
+        parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--timeout", type=float, default=15.0)
+    # Suppress the subparser default so `spica-ui --dry-run launch` keeps the
+    # root flag instead of being overwritten by argparse's child default.
+    parser.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="spica-ui", description=__doc__)
+    root.add_argument("--dry-run", action="store_true", help="print the bounded plan without desktop/build/input")
+    commands = root.add_subparsers(dest="command", required=True)
+
+    item = commands.add_parser("launch", help="launch an explicit fake provider on a private desktop")
+    item.add_argument("--private", action="store_true", help="required acknowledgement of private vd desktop")
+    item.add_argument("--provider", choices=("fake",), default="fake")
+    item.add_argument("--binary", type=Path)
+    item.add_argument("--build", action="store_true", help="explicitly build before launch")
+    item.add_argument("--optimize", choices=("Debug", "ReleaseSafe"), default="ReleaseSafe")
+    item.add_argument("--width", type=int, default=1280)
+    item.add_argument("--height", type=int, default=800)
+    item.add_argument("--quit-after-ms", type=int, default=180000)
+    item.add_argument("--scenario", default="manual")
+    add_common(item)
+
+    item = commands.add_parser("attach", help="attach to an already launched private desktop app")
+    item.add_argument("--session", required=True)
+    item.add_argument("--window", required=True)
+    item.add_argument("--observations", required=True)
+    add_common(item)
+
+    item = commands.add_parser("snapshot", help="print the latest read-only observation")
+    item.add_argument("--save", type=Path)
+    item.add_argument("--include-content", action="store_true",
+                      help="opt in to draft/transcript payloads in this snapshot only")
+    add_common(item)
+
+    item = commands.add_parser("targets", help="list semantic painted targets")
+    item.add_argument("--target")
+    add_common(item)
+
+    item = commands.add_parser("click", help="click an enabled semantic painted target")
+    item.add_argument("target")
+    add_common(item)
+
+    item = commands.add_parser("text", help="type text through vd into an enabled semantic target")
+    item.add_argument("--target", default="composer.input")
+    source = item.add_mutually_exclusive_group(required=True)
+    source.add_argument("--file", type=Path)
+    source.add_argument("--value")
+    add_common(item)
+
+    item = commands.add_parser("key", help="send an ordinary vd keyboard event")
+    item.add_argument("value")
+    add_common(item)
+
+    item = commands.add_parser("wait", help="wait for a bounded receipt/run observation")
+    item.add_argument("--command", dest="command_id")
+    item.add_argument("--run")
+    item.add_argument("--receipt", choices=("accepted", "rejected"))
+    item.add_argument("--state")
+    add_common(item)
+
+    item = commands.add_parser("screenshot", help="capture a private-desktop screenshot")
+    item.add_argument("--path", required=True)
+    add_common(item)
+
+    item = commands.add_parser("stop", help="close the app through ordinary Ctrl+Q and clean its vd session")
+    add_common(item)
+
+    item = commands.add_parser("scenario", help="run a bounded offline fake GUI scenario")
+    item.add_argument("name", choices=("send-restart", "disabled-send", "rejected-send"))
+    item.add_argument("--provider", choices=("fake",), default="fake")
+    item.add_argument("--prompt", default="offline GUI send")
+    item.add_argument("--rejected-bytes", type=int, default=6000)
+    item.add_argument("--binary", type=Path)
+    item.add_argument("--build", action="store_true")
+    item.add_argument("--optimize", choices=("Debug", "ReleaseSafe"), default="ReleaseSafe")
+    item.add_argument("--width", type=int, default=1280)
+    item.add_argument("--height", type=int, default=800)
+    item.add_argument("--quit-after-ms", type=int, default=180000)
+    add_common(item)
+
+    item = commands.add_parser("receipt", help="write a redacted manifest/receipt")
+    add_common(item)
+    return root
+
+
+def main(argv: list[str] | None = None) -> int:
+    cli = parser()
+    try:
+        args = cli.parse_args(argv)
+        timeout = getattr(args, "timeout", 15)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise DriverError("timeout must be positive", EX_USAGE)
+        if args.command == "launch":
+            return launch(args)
+        if args.command == "attach":
+            return attach(args)
+        if args.command == "snapshot":
+            return snapshot(args)
+        if args.command == "targets":
+            return targets(args)
+        if args.command in ("click", "text"):
+            return input_action(args, args.command)
+        if args.command == "key":
+            return key(args)
+        if args.command == "wait":
+            return wait_command(args)
+        if args.command == "screenshot":
+            return screenshot(args)
+        if args.command == "stop":
+            return stop(args)
+        if args.command == "scenario":
+            return scenario(args)
+        if args.command == "receipt":
+            return receipt(args)
+        raise DriverError("unknown command", EX_USAGE)
+    except DriverError as error:
+        print(f"spica-ui: {error}", file=sys.stderr)
+        return error.code
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        print(f"spica-ui: {error}", file=sys.stderr)
+        return EX_ASSERTION
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
