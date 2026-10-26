@@ -48,6 +48,109 @@ fn prompting(runtime: *Runtime, a: std.mem.Allocator) !void {
     try ready(runtime, a);
     _ = try runtime.asAdapter().dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = "hello" } });
 }
+
+test "ACP subsequent turns keep upstream session and bounded retained state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var runtime: Runtime = undefined;
+    try prompting(&runtime, a);
+    defer runtime.shutdown();
+    try std.testing.expect((try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"stopReason\":\"end_turn\"}}")).?.body == .completed);
+    const retained = runtime.retained.end_index;
+    var turn_bytes: usize = 0;
+    var previous_message: []const u8 = "";
+    for (0..128) |index| {
+        const run = try std.fmt.allocPrint(a, "run-{d:0>3}", .{index});
+        var next = correlation;
+        next.run = .{ .value = run };
+        _ = try runtime.asAdapter().dispatch(a, .{ .start = .{ .correlation = next, .prompt = "follow-up only" } });
+        const sent = try std.json.parseFromSlice(std.json.Value, a, runtime.transport.sent[0..runtime.transport.len], .{});
+        const params = sent.value.object.get("params").?;
+        try std.testing.expectEqualStrings("session/prompt", sent.value.object.get("method").?.string);
+        try std.testing.expectEqualStrings("ses_upstream", params.object.get("sessionId").?.string);
+        try std.testing.expectEqualStrings("follow-up only", params.object.get("prompt").?.array.items[0].object.get("text").?.string);
+        const chunk = (try textFrame(&runtime, a, "next response")).?;
+        try std.testing.expectEqualStrings(run, chunk.correlation.run.?.value);
+        try std.testing.expectEqual(@as(u64, 0), chunk.body.chunk.offset);
+        try std.testing.expect(!std.mem.eql(u8, previous_message, chunk.body.chunk.message.value));
+        previous_message = chunk.body.chunk.message.value;
+        const response = try std.json.Stringify.valueAlloc(a, .{ .jsonrpc = "2.0", .id = runtime.pending_id, .result = .{ .stopReason = "end_turn" } }, .{});
+        try std.testing.expect((try consume(&runtime, a, response)).?.body == .completed);
+        try std.testing.expectEqual(retained, runtime.retained.end_index);
+        if (index == 0) turn_bytes = runtime.turn.end_index else try std.testing.expectEqual(turn_bytes, runtime.turn.end_index);
+    }
+    try std.testing.expect((try textFrame(&runtime, a, "late replay")) == null);
+}
+
+test "ACP fresh runtime resumes exact session via either public request without history replay" {
+    for ([_]bool{ false, true }) |attach| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var runtime: Runtime = undefined;
+        try runtime.init(std.testing.allocator, .{}, .{ .selection = selection, .cwd = "/tmp/spica", .instance = .{ .value = "new-instance" }, .account = .{ .reference = "isolated", .readiness = .unknown } });
+        defer runtime.shutdown();
+        _ = try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentInfo\":{\"version\":\"2.1.4\"},\"agentCapabilities\":{\"sessionCapabilities\":{\"resume\":{}}}}}");
+        const session: c.Session = .{ .id = correlation.session, .instance = .{ .value = "old-instance" }, .upstream = .{ .value = "ses_upstream" } };
+        const request: c.Request = if (attach) .{ .attach = .{ .session = session } } else .{ .open = .{ .existing = .{ .session = session } } };
+        _ = try runtime.asAdapter().dispatch(a, request);
+        const sent = try std.json.parseFromSlice(std.json.Value, a, runtime.transport.sent[0..runtime.transport.len], .{});
+        const params = sent.value.object.get("params").?;
+        try std.testing.expectEqualStrings("session/resume", sent.value.object.get("method").?.string);
+        try std.testing.expectEqualStrings("ses_upstream", params.object.get("sessionId").?.string);
+        try std.testing.expectEqualStrings("/tmp/spica", params.object.get("cwd").?.string);
+        try std.testing.expectError(error.NotReady, runtime.dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = "too early" } }));
+        try std.testing.expect((try textFrame(&runtime, a, "old history")) == null);
+        // Resume replies need not echo sessionId; the correlated request binds it.
+        _ = try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}");
+        const observed = (try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"configOptions\":[{\"id\":\"model\",\"currentValue\":\"opencode/big-pickle\"}]}}")).?.body.session;
+        try std.testing.expectEqualStrings("ses_upstream", observed.upstream.value);
+        try std.testing.expectEqualStrings("new-instance", observed.instance.value);
+        try std.testing.expect((try runtime.poll(a)).?.body == .selection);
+        _ = try runtime.asAdapter().dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = "continue" } });
+        const start = try std.json.parseFromSlice(std.json.Value, a, runtime.transport.sent[0..runtime.transport.len], .{});
+        try std.testing.expectEqualStrings("ses_upstream", start.value.object.get("params").?.object.get("sessionId").?.string);
+    }
+}
+
+test "ACP missing unsupported or mismatched resume cannot create or start" {
+    for ([_]bool{ false, true }) |supported| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var runtime: Runtime = undefined;
+        try runtime.init(std.testing.allocator, .{}, .{ .selection = selection, .cwd = "/tmp/spica", .instance = .{ .value = "new-instance" }, .account = .{ .reference = "isolated", .readiness = .unknown } });
+        defer runtime.shutdown();
+        _ = try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentInfo\":{\"version\":\"2.1.4\"},\"agentCapabilities\":{\"sessionCapabilities\":{\"resume\":{}}}}}");
+        runtime.resume_supported = supported;
+        var session: c.Session = .{ .id = correlation.session, .instance = .{ .value = "old" }, .upstream = .{ .value = "" } };
+        try std.testing.expectError(if (supported) error.MissingSession else error.CapabilityUnavailable, runtime.dispatch(a, .{ .attach = .{ .session = session } }));
+        session.upstream.value = "missing-session";
+        try std.testing.expectError(error.CapabilityUnavailable, runtime.dispatch(a, .{ .attach = .{ .session = session, .after = .{ .value = "cursor" } } }));
+        try std.testing.expectEqual(@as(i64, 1), runtime.request_id);
+        if (!supported) continue;
+        _ = try runtime.dispatch(a, .{ .attach = .{ .session = session } });
+        const failure = (try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32002,\"message\":\"session not found\"}}")).?;
+        try std.testing.expectEqualStrings("session_resume_failed", failure.body.failure.code);
+        try std.testing.expectEqualStrings("session not found", failure.body.failure.detail);
+        try std.testing.expectEqualStrings("session", failure.correlation.session.value);
+        try std.testing.expectError(error.NotReady, runtime.dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = "never sent" } }));
+        try std.testing.expectError(error.NotReady, runtime.dispatch(a, .{ .open = .{ .create = .{ .session = correlation.session, .effect = correlation.effect.?, .selection = selection } } }));
+        try std.testing.expectEqual(@as(i64, 2), runtime.request_id);
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var runtime: Runtime = undefined;
+    try runtime.init(std.testing.allocator, .{}, .{ .selection = selection, .cwd = "/tmp/spica", .instance = .{ .value = "new-instance" }, .account = .{ .reference = "isolated", .readiness = .unknown } });
+    defer runtime.shutdown();
+    _ = try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentInfo\":{\"version\":\"2.1.4\"},\"agentCapabilities\":{\"sessionCapabilities\":{\"resume\":{}}}}}");
+    _ = try runtime.dispatch(a, .{ .attach = .{ .session = .{ .id = correlation.session, .instance = .{ .value = "old" }, .upstream = .{ .value = "exact" } } } });
+    try std.testing.expectError(error.InvalidCorrelation, consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"replacement\"}}"));
+    try std.testing.expectError(error.NotReady, runtime.dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = "never sent" } }));
+    try std.testing.expectEqual(@as(i64, 2), runtime.request_id);
+}
 test "ACP common adapter selection is negotiated not inferred and observations own text" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -103,6 +206,9 @@ test "ACP cancellation waits for upstream stop and does not claim tools stopped"
     const stopped = (try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"stopReason\":\"cancelled\"}}")).?;
     try std.testing.expect(stopped.body == .cancelled);
     try std.testing.expect(!stopped.body.cancelled.tools_stopped);
+    const before = runtime.request_id;
+    try std.testing.expectError(error.NotReady, runtime.dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = "never retried" } }));
+    try std.testing.expectEqual(before, runtime.request_id);
 }
 test "ACP exact model and version mismatches are explicit" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
