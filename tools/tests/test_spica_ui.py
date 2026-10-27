@@ -76,6 +76,65 @@ class SpicaUiOfflineTests(unittest.TestCase):
                 self.assertEqual(json.loads(result.stdout)["provider"], "fake")
                 self.assertEqual(list(Path(directory).iterdir()), [])
 
+    def test_crash_scenarios_dry_run_are_offline_and_pin_codex_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ("codex-crash-open", "codex-crash-recovery"):
+                result = self.run_cli("scenario", name, "--output", directory, "--dry-run")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["provider"], "codex-fixture")
+                self.assertIn("SIGKILL", result.stdout)
+                self.assertIn("replay", result.stdout)
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_recovery_assertion_requires_identity_unresolved_state_and_disabled_send(self):
+        module = load_cli()
+        before = {"thread_id": "thread", "run_id": "run"}
+        for state in ("unknown", "interrupted"):
+            recovered = {**before, "run_status": state, "send_ready": False, "pending_command": False,
+                         "send_disabled_reason": "This chat has unresolved work. Start a new chat."}
+            module.assert_recovered_run(before, recovered, state)
+            for changed in ({"thread_id": "other"}, {"run_id": "other"}, {"run_status": "completed"},
+                            {"send_ready": True}, {"pending_command": True}, {"send_disabled_reason": "ready"}):
+                with self.assertRaises(module.DriverError):
+                    module.assert_recovered_run(before, {**recovered, **changed}, state)
+
+    def test_crash_refuses_attached_or_changed_lifetime_and_closes_pidfd(self):
+        module = load_cli()
+        session = Mock()
+        identity = {"pid": 123, "starttime_ticks": 7, "executable_inode": 9, "executable_device": 1}
+        session.data = {"launch": {"attached": True}, "process_identity": identity}
+        with patch.object(module.os, "pidfd_open") as opened:
+            with self.assertRaises(module.DriverError):
+                module.crash_app(session, 1)
+            opened.assert_not_called()
+        session.data["launch"] = {"pid": 123}
+        with patch.object(module.os, "pidfd_open", return_value=41), \
+                patch.object(module.os, "close") as close, \
+                patch.object(module.signal, "pidfd_send_signal") as send, \
+                patch.object(module, "process_identity", return_value={**identity, "starttime_ticks": 8}):
+            with self.assertRaises(module.DriverError):
+                module.crash_app(session, 1)
+            send.assert_not_called()
+            close.assert_called_once_with(41)
+
+    def test_crash_signals_only_verified_pidfd_then_records_window_exit(self):
+        module = load_cli()
+        session = Mock()
+        identity = {"pid": 123, "starttime_ticks": 7, "executable_inode": 9, "executable_device": 1}
+        session.data = {"launch": {"pid": 123}, "process_identity": identity}
+        session.window = "5"
+        session.snapshot.return_value = {"run_id": "run"}
+        with patch.object(module.os, "pidfd_open", return_value=41) as opened, \
+                patch.object(module.os, "close") as close, \
+                patch.object(module.signal, "pidfd_send_signal") as send, \
+                patch.object(module, "process_identity", return_value=identity), \
+                patch.object(module, "run_command", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.assertEqual(module.crash_app(session, 1), {"run_id": "run"})
+        opened.assert_called_once_with(123)
+        send.assert_called_once_with(41, module.signal.SIGKILL)
+        close.assert_called_once_with(41)
+        session.journal.assert_called_once()
+
     def test_history_fixture_requires_exact_paths_counts_and_successful_exit(self):
         module = load_cli()
         with tempfile.TemporaryDirectory() as directory:

@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import signal
 import shlex
 import shutil
 import subprocess
@@ -429,7 +430,9 @@ def launch(args: argparse.Namespace) -> int:
         account.mkdir()
         if args.provider == "codex-fixture":
             profile = {"format": "spica-offline-codex-workflow-v1", "workspace": str(workspace),
-                       "mode": "fail" if args.scenario == "codex-error" else "complete"}
+                       "mode": {"codex-error": "fail", "codex-crash-open": "cancel-open",
+                                "codex-crash-recovery": "cancel-hang"}.get(args.scenario, "complete"),
+                       "gate_timeout_ms": 15000}
         else:
             profile = {"format": "spica-offline-opencode-workflow-v1", "workspace": str(workspace),
                        "mode": "fail" if args.scenario == "opencode-error" else "complete",
@@ -884,12 +887,41 @@ def capture(session: Session, name: str) -> None:
     session.save()
 
 
-def restart_app(session: Session, args: argparse.Namespace) -> dict[str, Any]:
-    before = session.snapshot(args.timeout)
+def crash_app(session: Session, timeout: float) -> dict[str, Any]:
+    """Kill only the exact owned GUI lifetime; provider children are not proof of stopped tools."""
+    if session.data.get("launch", {}).get("attached"):
+        raise DriverError("attached sessions cannot be crashed by this driver", EX_USAGE)
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise DriverError("crash scenarios require Linux pidfd signal support", EX_UNAVAILABLE)
+    before = session.snapshot(timeout)
+    identity = session.data["process_identity"]
+    descriptor = os.pidfd_open(identity["pid"])
+    try:
+        if process_identity(identity["pid"]) != identity:
+            raise DriverError("native process changed before crash injection", EX_STALE)
+        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+    finally:
+        os.close(descriptor)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        windows = run_command(["vd", "windows", session.vd_session], check=False).stdout
+        if session.window not in windows.split():
+            session.data["stopped_unix_ns"] = now_ns()
+            session.journal("scenario.crash", before, before, process_identity=identity,
+                            input_origin="explicit pidfd SIGKILL of owned disposable GUI process")
+            return before
+        time.sleep(.05)
+    raise DriverError("crashed native window did not disappear", EX_TIMEOUT)
+
+
+def restart_app(session: Session, args: argparse.Namespace, *, expected_state: str = "completed",
+                crashed: dict[str, Any] | None = None, directory: str = "restart-process") -> dict[str, Any]:
+    before = crashed if crashed is not None else session.snapshot(args.timeout)
     previous_launch = session.data["launch"]
     # Preserve the private compositor until the new process has been inspected.
-    close_app(session, args.timeout, clean_desktop=False)
-    restarted_output = session.output / "restart-process"
+    if crashed is None:
+        close_app(session, args.timeout, clean_desktop=False)
+    restarted_output = session.output / directory
     restarted_output.mkdir(exist_ok=False)
     live = restarted_output / "live.json"
     process_nonce = secrets.token_hex(16)
@@ -915,9 +947,10 @@ def restart_app(session: Session, args: argparse.Namespace) -> dict[str, Any]:
             current = wait_snapshot(session, lambda value: value.get("connected")
                                     and value.get("thread_id") == before.get("thread_id")
                                     and value.get("run_id") == before.get("run_id")
-                                    and value.get("run_status") == "completed", args.timeout, "durable reopened run")
+                                    and value.get("run_status") == expected_state, args.timeout, "durable reopened run")
             session.journal("scenario.restart", before, current, previous_launch=previous_launch,
-                            launch=restarted, input_origin="ordinary Ctrl+Q and fresh process")
+                            launch=restarted, expected_state=expected_state,
+                            input_origin="fresh process after pidfd crash" if crashed is not None else "ordinary Ctrl+Q and fresh process")
             return current
         time.sleep(.1)
     raise DriverError("restarted native window did not appear", EX_PROCESS)
@@ -1471,6 +1504,90 @@ def scenario_codex_error(session: Session, args: argparse.Namespace) -> None:
     session.data["expected_outcome"] = "codex_send_accepted_specific_provider_failure_retained_and_copyable"
 
 
+def assert_recovered_run(before: dict[str, Any], current: dict[str, Any], expected: str) -> None:
+    if (current.get("thread_id") != before.get("thread_id") or current.get("run_id") != before.get("run_id")
+            or current.get("run_status") != expected or current.get("send_ready")
+            or current.get("pending_command") or "unresolved" not in (current.get("send_disabled_reason") or "").lower()):
+        raise DriverError("recovered run identity/outcome or disabled Send does not preserve unresolved work", EX_ASSERTION)
+    if expected not in {"unknown", "interrupted"}:
+        raise DriverError("active crash recovery must not claim a known terminal outcome", EX_ASSERTION)
+
+
+def scenario_codex_crash(session: Session, args: argparse.Namespace) -> None:
+    opening = args.name == "codex-crash-open"
+    expected = "unknown" if opening else "interrupted"
+    initial = composer_ready(session, args.timeout)
+    prompt = "Offline crash recovery café 世界"
+    perform_input(session, "text", "composer.input", args.timeout, prompt)
+    wait_snapshot(session, lambda s: s.get("draft") == prompt and s.get("send_ready"), args.timeout, "crash-test draft")
+    perform_input(session, "click", "command.send", args.timeout)
+    active = wait_snapshot(session, lambda s: s.get("send_receipt") == "accepted" and s.get("run_id")
+                           and s.get("run_id") == s.get("send_run_id")
+                           and s.get("run_status") == ("starting" if opening else "streaming"),
+                           args.timeout, "accepted active run before crash")
+    deadline = time.monotonic() + args.timeout
+    while True:
+        events = fixture_events(session)
+        ready = (any(e.get("method") == "fixture/gate" and e.get("name") == "release-open"
+                     and e.get("state") == "waiting" for e in events) if opening
+                 else any(e.get("method") == "turn/start" for e in events))
+        if ready:
+            break
+        if time.monotonic() >= deadline:
+            raise DriverError("offline provider did not reach the correlated crash point", EX_TIMEOUT)
+        time.sleep(.02)
+    capture(session, "before-crash.png")
+    old_starts = [e for e in events if e.get("method") in {"thread/start", "turn/start", "thread/resume", "turn/interrupt"}]
+    crashed = crash_app(session, args.timeout)
+    recovered = restart_app(session, args, expected_state=expected, crashed=crashed)
+    recovered = wait_snapshot(session, lambda s: not s.get("pending_command") and not s.get("send_ready")
+                              and "unresolved" in (s.get("send_disabled_reason") or "").lower(),
+                              args.timeout, "recovery blocks replay of unresolved work")
+    assert_recovered_run(active, recovered, expected)
+    draft = "Keep this recovery draft; do not retry automatically 世界"
+    perform_input(session, "text", "composer.input", args.timeout, draft)
+    before_enter = wait_snapshot(session, lambda s: s.get("draft") == draft, args.timeout, "recovery draft")
+    perform_key(session, "Return", args.timeout)
+    refused = session.snapshot(args.timeout)
+    assert_recovered_run(active, refused, expected)
+    assert_no_new_provider_work(before_enter, refused, "disabled recovered Send")
+    if refused.get("draft") != draft:
+        raise DriverError("disabled recovered Send lost the draft", EX_ASSERTION)
+    capture(session, "recovered-unresolved.png")
+    reopened = restart_app(session, args, expected_state=expected, directory="restart-again")
+    assert_recovered_run(active, reopened, expected)
+    trace = [e for e in fixture_events(session) if e.get("method") in {"thread/start", "turn/start", "thread/resume", "turn/interrupt"}]
+    if trace != old_starts:
+        raise DriverError("reopening unresolved work dispatched a provider action", EX_ASSERTION)
+
+    # Change the provider fixture only; app/domain state is changed through GUI input.
+    profile_path = session.output / "codex-fixture-account/workflow-profile.json"
+    profile = json.loads(profile_path.read_text())
+    profile["mode"] = "complete"
+    atomic_json(profile_path, profile)
+    perform_input(session, "click", "workspace.new_thread", args.timeout)
+    wait_snapshot(session, lambda s: s.get("thread_id") != active["thread_id"] and s.get("send_ready"),
+                  args.timeout, "new usable chat after unresolved run")
+    completed = send_turn(session, "Separate new chat after crash", args.timeout)
+    if completed.get("run_id") == active.get("run_id") or completed.get("send_session_id") == active.get("send_session_id"):
+        raise DriverError("new chat reused the unresolved run/session", EX_ASSERTION)
+    tail = [e for e in fixture_events(session) if e.get("method") in {"thread/start", "turn/start", "thread/resume", "turn/interrupt"}]
+    if tail[:len(old_starts)] != old_starts or [e["method"] for e in tail[len(old_starts):]] != ["thread/start", "turn/start"]:
+        raise DriverError("new-chat recovery replayed or resumed the old provider turn", EX_ASSERTION)
+    perform_input(session, "click", active["thread_id"], args.timeout)
+    old = wait_snapshot(session, lambda s: s.get("thread_id") == active["thread_id"]
+                        and s.get("run_id") == active["run_id"] and s.get("run_status") == expected,
+                        args.timeout, "old chat retains its unresolved outcome")
+    assert_recovered_run(active, old, expected)
+    session.journal("scenario.codex-crash", initial, old, old_run_id=active["run_id"],
+                    recovered_state=expected, new_chat_run_id=completed["run_id"],
+                    input_origin="ordinary GUI Send; pidfd SIGKILL only for explicit crash injection",
+                    provider_control="offline profile changed to complete only before separate new-chat Send",
+                    no_replay_across_two_reopens=True)
+    session.data["expected_outcome"] = "claimed_open_unknown_no_replay_new_chat_usable" if opening else "active_turn_interrupted_no_replay_new_chat_usable"
+    session.data["limitations"].append("Crash injection targets the exact disposable GUI process. Unknown/interrupted state does not prove external tools stopped; no installed-provider or physical crash acceptance.")
+
+
 def scenario_opencode_error(session: Session, args: argparse.Namespace) -> None:
     failed = send_turn(session, "offline synthetic OpenCode provider error", args.timeout, terminal="failed")
     current = wait_snapshot(session, lambda value: value.get("run_id") == failed.get("run_id")
@@ -1515,7 +1632,7 @@ def read_private_clipboard(session: Session) -> str:
 
 def scenario(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
-    expected_provider = ("codex-fixture" if args.name in {"codex-session", "codex-error", "codex-large-send"}
+    expected_provider = ("codex-fixture" if args.name in {"codex-session", "codex-error", "codex-large-send", "codex-crash-open", "codex-crash-recovery"}
                         else "opencode-fixture" if args.name in {"opencode-session", "opencode-error", "opencode-large-send"}
                         else "fake")
     args.provider = args.provider or expected_provider
@@ -1543,6 +1660,8 @@ def scenario(args: argparse.Namespace) -> int:
             scenario_history_wide(session, args)
         elif args.name == "codex-error":
             scenario_codex_error(session, args)
+        elif args.name in {"codex-crash-open", "codex-crash-recovery"}:
+            scenario_codex_crash(session, args)
         elif args.name == "opencode-error":
             scenario_opencode_error(session, args)
         elif args.name in {"large-send", "codex-large-send", "opencode-large-send"}:
@@ -1613,6 +1732,8 @@ def scenario(args: argparse.Namespace) -> int:
 
 def scenario_steps(name: str) -> list[str]:
     return {"codex-session": ["launch production Codex adapter with isolated offline app-server fixture", "Send two turns", "restart native app on same private desktop", "Send third turn", "assert one upstream session, distinct commands/runs/turns, exact UTF-8 prompt digests and resumed prior context"],
+            "codex-crash-open": ["hold offline Codex session creation after durable claim", "inject pidfd SIGKILL into the exact owned GUI lifetime", "reopen twice and require unknown state without provider replay", "verify disabled Send retains draft", "complete a separate new chat and retain old unknown outcome"],
+            "codex-crash-recovery": ["hold an active offline Codex turn", "inject pidfd SIGKILL into the exact owned GUI lifetime", "reopen twice and require interrupted state without provider replay", "verify disabled Send retains draft", "complete a separate new chat and retain old interrupted outcome"],
             "codex-error": ["launch production Codex adapter with isolated failing offline fixture", "Send a prompt", "assert accepted command then failed run with retained specific synthetic provider diagnostic", "copy diagnostic with Ctrl+Shift+C and verify correlation without prompt content", "capture failure banner for visual review"],
             "opencode-session": ["launch production OpenCode 2.1.4 adapter with isolated offline ACP fixture", "Send two turns", "restart native app on same private desktop", "Send third turn", "assert one upstream session, distinct commands/runs/turns, exact UTF-8 prompt digests and resumed prior context"],
             "opencode-error": ["launch production OpenCode 2.1.4 adapter with isolated failing offline ACP fixture", "Send a prompt", "assert accepted command then failed run with retained specific synthetic provider diagnostic", "copy diagnostic with Ctrl+Shift+C and verify correlation without prompt content", "capture failure banner for visual review"],
@@ -1733,7 +1854,7 @@ def parser() -> argparse.ArgumentParser:
     item = commands.add_parser("scenario", help="run a bounded offline GUI scenario")
     item.add_argument("name", choices=("send-restart", "disabled-send", "large-send", "composer-capacity", "codex-large-send", "opencode-large-send", "second-turn",
                                              "workspace-diff", "capability-refusal", "followup-refusal", "question-refusal", "attachment-refusal",
-                                             "codex-session", "codex-error", "opencode-session", "opencode-error", "thread-title", "history-deep", "history-wide"))
+                                             "codex-session", "codex-error", "codex-crash-open", "codex-crash-recovery", "opencode-session", "opencode-error", "thread-title", "history-deep", "history-wide"))
     item.add_argument("--provider", choices=("fake", "codex-fixture", "opencode-fixture"), help="offline fixture; inferred from scenario")
     item.add_argument("--prompt", default="offline GUI send")
     item.add_argument("--binary", type=Path)
