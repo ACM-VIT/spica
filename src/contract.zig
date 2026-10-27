@@ -60,6 +60,7 @@ pub const Limits = struct {
     attachment_count: usize = 8,
     attachment_bytes: usize = 256 * 1024,
     attachment_metadata_bytes: usize = 4096,
+    attachment_packet_bytes: usize = 384 * 1024,
     // Synchronous dispatch: no hidden outstanding requests or transport buffers.
     pending_requests: usize = 1,
 };
