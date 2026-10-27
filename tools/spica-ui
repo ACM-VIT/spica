@@ -432,8 +432,13 @@ def launch(args: argparse.Namespace) -> int:
     seeded_orchestration = None
     if args.provider == "codex-orchestration-fixture":
         observer = ROOT / "zig-out/bin/orchestration-smoke"
-        if not observer.is_file():
-            run_command(["python3", "build/driver.py", f"-Doptimize={args.optimize}", "build-orchestration-smoke"], timeout=300)
+        # The observer is a schema-coupled native binary.  A cached binary can
+        # predate the app build (for example after a domain migration), which
+        # makes the public read-only check fail with UnsupportedStore.  The
+        # driver is incremental, so always asking the build graph for this
+        # target is cheap while guaranteeing the observer matches the source
+        # revision used by the scenario.
+        run_command(["python3", "build/driver.py", f"-Doptimize={args.optimize}", "build-orchestration-smoke"], timeout=300)
         seeded_orchestration = json.loads(run_command([str(observer), "--seed-workspace", str(state), str(workspace)], timeout=30).stdout)
     if args.provider in {"codex-fixture", "codex-orchestration-fixture", "opencode-fixture"}:
         account = output / f"{args.provider}-account"
