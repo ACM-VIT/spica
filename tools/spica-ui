@@ -1542,6 +1542,11 @@ def assert_recovered_run(before: dict[str, Any], current: dict[str, Any], expect
         raise DriverError("recovered run identity/outcome or disabled Send does not preserve unresolved work", EX_ASSERTION)
     if expected not in {"unknown", "interrupted"}:
         raise DriverError("active crash recovery must not claim a known terminal outcome", EX_ASSERTION)
+    cards = [(index, target) for index, target in enumerate(current.get("thread_targets", []))
+             if target.get("id") == current.get("thread_id")]
+    states = current.get("thread_run_states", [])
+    if len(cards) != 1 or cards[0][0] >= len(states) or states[cards[0][0]] != expected:
+        raise DriverError("recovered sidebar status disagrees with the unresolved run outcome", EX_ASSERTION)
 
 
 def scenario_codex_crash(session: Session, args: argparse.Namespace) -> None:

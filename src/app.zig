@@ -1541,7 +1541,8 @@ const Conversation = struct {
             .queued, .starting, .streaming, .cancel_requested => .running,
             .awaiting_approval => .approval,
             .failed => .failed,
-            .interrupted, .unknown => .interrupted,
+            .interrupted => .interrupted,
+            .unknown => .unknown,
             .completed, .cancelled => .idle,
         };
     }
@@ -3577,6 +3578,12 @@ test "thread cards own real titles and workspace metadata across refresh" {
     try conversation.updateThreadCard(&view, row);
     try std.testing.expectEqual(@as(usize, 1), view.thread_count);
     try std.testing.expectEqual(Coding.RunStatus.idle, card.run_status);
+    row.latest_run_state = .unknown;
+    try conversation.updateThreadCard(&view, row);
+    try std.testing.expectEqual(Coding.RunStatus.unknown, card.run_status);
+    row.latest_run_state = .interrupted;
+    try conversation.updateThreadCard(&view, row);
+    try std.testing.expectEqual(Coding.RunStatus.interrupted, card.run_status);
     row.title_preview = "\n\t";
     try conversation.updateThreadCard(&view, row);
     try std.testing.expectEqualStrings("New thread", card.label[0..card.len]);

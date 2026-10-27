@@ -91,10 +91,17 @@ class SpicaUiOfflineTests(unittest.TestCase):
         before = {"thread_id": "thread", "run_id": "run"}
         for state in ("unknown", "interrupted"):
             recovered = {**before, "run_status": state, "send_ready": False, "pending_command": False,
+                         "thread_targets": [{"id": "other"}, {"id": "thread"}],
+                         "thread_run_states": ["idle", state],
                          "send_disabled_reason": "This chat has unresolved work. Start a new chat."}
             module.assert_recovered_run(before, recovered, state)
             for changed in ({"thread_id": "other"}, {"run_id": "other"}, {"run_status": "completed"},
                             {"send_ready": True}, {"pending_command": True}, {"send_disabled_reason": "ready"}):
+                with self.assertRaises(module.DriverError):
+                    module.assert_recovered_run(before, {**recovered, **changed}, state)
+            for changed in ({"thread_targets": []}, {"thread_run_states": []},
+                            {"thread_run_states": ["idle", "interrupted" if state == "unknown" else "unknown"]},
+                            {"thread_targets": [{"id": "thread"}, {"id": "thread"}]}):
                 with self.assertRaises(module.DriverError):
                     module.assert_recovered_run(before, {**recovered, **changed}, state)
 

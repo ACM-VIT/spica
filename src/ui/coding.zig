@@ -459,7 +459,7 @@ pub const View = struct {
     /// App/Host consumer for the next bounded page while retaining the draft,
     /// current thread and scroll state in this view.
     pub const Navigation = union(enum) { new_project, new_thread, project: usize, thread: usize, search_more, search_reset };
-    pub const RunStatus = enum { idle, running, approval, failed, interrupted };
+    pub const RunStatus = enum { idle, running, approval, failed, interrupted, unknown };
     pub const Entry = struct {
         id: transcript.Id = .{},
         label: [160]u8 = undefined,
@@ -2014,6 +2014,7 @@ pub const View = struct {
                         .approval => "Approval",
                         .failed => "Failed",
                         .interrupted => "Interrupted",
+                        .unknown => "Unknown",
                         .idle => unreachable,
                     };
                     try self.labels.drawFitted(renderer, text, status_label, row.x + row.w - 76, row.y + 10, 66, 11, muted);
