@@ -215,6 +215,8 @@ pub const ApprovalEvidence = struct {
     expires_at: ?u64 = null,
 };
 pub const Receipt = struct {
+    /// Request delivery/acknowledgement only; never proof of run completion.
+    /// Acknowledged messages may still receive an asynchronous request_failed.
     outcome: enum { acknowledged, rejected, unknown },
     session: ?Session = null,
     inspection: ?enum { active, completed, failed, cancelled, unknown } = null,
