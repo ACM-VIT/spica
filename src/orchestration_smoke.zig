@@ -22,6 +22,7 @@ const Configuration = struct {
     candidate: []const u8,
     runtimes: []const Runtime,
 };
+const worker_count: usize = 2;
 const Consumer = struct {
     host: *domain.Host,
     io: std.Io,
@@ -94,6 +95,77 @@ const Consumer = struct {
     }
 };
 
+/// Read-only observer used by the private-desktop fixture.  It resolves the
+/// durable workspace UUID through Host's public query projection and can later
+/// inspect the coordinator's child rows without opening the SQLite file.
+fn observe(a: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
+    if (args.len < 4 or args.len > 5) return error.ExpectedObservationArguments;
+    const state = args[2];
+    const workspace_root = try std.Io.Dir.cwd().realPathFileAlloc(io, args[3], a);
+    var host = try domain.Host.create(std.heap.page_allocator, io, .{ .state_directory = state, .workspace_root = workspace_root });
+    defer host.destroy();
+    var consumer: Consumer = .{ .host = host, .io = io, .buffer = try a.alloc(u8, 2 * 1024 * 1024) };
+    const projects = try consumer.query(.{ .projects = .{ .limit = 32 } });
+    var workspace_id: []const u8 = "";
+    for (projects.items) |project_row| {
+        if (project_row != .project) continue;
+        const workspaces = try consumer.query(.{ .workspaces = .{ .project = project_row.project.id, .page = .{ .limit = 32 } } });
+        for (workspaces.items) |workspace_row| if (workspace_row == .workspace and std.mem.eql(u8, workspace_row.workspace.binding.canonical_root, workspace_root)) {
+            workspace_id = workspace_row.workspace.id.value;
+            break;
+        };
+        if (workspace_id.len != 0) break;
+    }
+    if (workspace_id.len == 0) return error.WorkspaceNotFound;
+    if (args.len == 4) {
+        const output = try std.json.Stringify.valueAlloc(a, .{ .workspace_id = workspace_id, .workspace_root = workspace_root }, .{});
+        try std.Io.File.stdout().writeStreamingAll(io, output);
+        try std.Io.File.stdout().writeStreamingAll(io, "\n");
+        return;
+    }
+    const parent = c.RunId{ .value = args[4] };
+    const tasks = try consumer.query(.{ .task_list = .{ .parent = parent, .page = .{ .limit = 16 } } });
+    const Observed = struct {
+        id: []const u8,
+        state: []const u8,
+        runtime_kind: []const u8,
+        model_provider: []const u8,
+        model_id: []const u8,
+        effort: []const u8,
+        account_ref: []const u8,
+        workspace_id: []const u8,
+        owned_paths: []const []const u8,
+        requests: u16,
+        result_present: bool,
+        review: []const u8,
+    };
+    const rows = try a.alloc(Observed, tasks.items.len);
+    var count: usize = 0;
+    for (tasks.items) |row| if (row == .task) {
+        const task = row.task.task;
+        rows[count] = .{ .id = task.id.value, .state = @tagName(row.task.state), .runtime_kind = task.packet.selection.runtime_kind, .model_provider = task.packet.selection.model_provider, .model_id = task.packet.selection.model_id, .effort = task.packet.selection.effort, .account_ref = task.packet.selection.account_ref, .workspace_id = task.packet.selection.workspace.value, .owned_paths = task.packet.owned_paths, .requests = task.requests, .result_present = task.result != null, .review = if (task.review) |review| @tagName(review) else "" };
+        count += 1;
+    };
+    const output = try std.json.Stringify.valueAlloc(a, .{ .workspace_id = workspace_id, .workspace_root = workspace_root, .task_count = count, .tasks = rows[0..count] }, .{});
+    try std.Io.File.stdout().writeStreamingAll(io, output);
+    try std.Io.File.stdout().writeStreamingAll(io, "\n");
+}
+
+fn seedWorkspace(a: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
+    if (args.len != 4) return error.ExpectedSeedArguments;
+    const state = args[2];
+    const workspace_root = try std.Io.Dir.cwd().realPathFileAlloc(io, args[3], a);
+    var host = try domain.Host.create(std.heap.page_allocator, io, .{ .state_directory = state, .workspace_root = workspace_root });
+    defer host.destroy();
+    var consumer: Consumer = .{ .host = host, .io = io, .buffer = try a.alloc(u8, 2 * 1024 * 1024) };
+    const project = try common.clone(a, (try consumer.command("seed-project", .absent, .absent, .{ .project_create = .{ .display_name = "Codex orchestration GUI fixture" } })).entity_ids.project.?);
+    const binding = try domain.workspace_binding.capture(a, io, workspace_root);
+    const workspace = try common.clone(a, (try consumer.command("seed-workspace", .absent, .absent, .{ .workspace_register = .{ .project = project, .binding = binding } })).entity_ids.workspace.?);
+    const output = try std.json.Stringify.valueAlloc(a, .{ .workspace_id = workspace.value, .workspace_root = workspace_root }, .{});
+    try std.Io.File.stdout().writeStreamingAll(io, output);
+    try std.Io.File.stdout().writeStreamingAll(io, "\n");
+}
+
 fn terminal(state: t.RunState) bool {
     return switch (state) {
         .completed, .failed, .cancelled, .unknown, .interrupted => true,
@@ -124,6 +196,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer arena.deinit();
     const a = arena.allocator();
     const args = try init.args.toSlice(a);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--seed-workspace")) return seedWorkspace(a, io, args);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--observe-workspace")) return observe(a, io, args);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--observe-tasks")) return observe(a, io, args);
     if (args.len != 3) return error.ExpectedConfigurationAndReport;
     const source = try std.Io.Dir.cwd().readFileAlloc(io, args[1], a, .limited(32768));
     const configuration = (try std.json.parseFromSlice(Configuration, a, source, .{})).value;
@@ -150,14 +225,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const project = try common.clone(a, (try consumer.command("project", .absent, .absent, .{ .project_create = .{ .display_name = "Installed orchestration gate" } })).entity_ids.project.?);
     const binding = try domain.workspace_binding.capture(a, io, workspace);
     const registered = try common.clone(a, (try consumer.command("workspace", .absent, .absent, .{ .workspace_register = .{ .project = project, .binding = binding } })).entity_ids.workspace.?);
+    if (std.mem.eql(u8, registered.value, workspace)) return error.WorkspaceIdWasFilesystemPath;
     const thread = try common.clone(a, (try consumer.command("thread", .absent, .absent, .{ .thread_create = .{ .project = project, .workspace = registered } })).entity_ids.thread.?);
     var instructions: std.Io.Writer.Allocating = .init(a);
     try instructions.writer.writeAll("Use the application's registered delegation and task listing tools to create app-owned children. For OpenCode, call execute with JavaScript: return await tools.spica.task_delegate(ARGUMENT_OBJECT). The server namespace is spica and dotted MCP names normalize to underscores. If the catalog is partial, use search({namespace:'spica',query:'task',limit:5}) inside execute to discover the exact paths, then invoke them. For Codex, call the registered dynamic task_delegate and task_list tools directly. Do not use provider-native subagents, shell, filesystem, network or web search. Call the delegation tool exactly once for EACH of these exact argument objects, without changing any selection or packet field:\n");
-    for (configs[0..configuration.runtimes.len], 0..) |config, index| {
+    // The coordinator always owns exactly two bounded workers.  A single
+    // configured Codex runtime may therefore service both workers; when two
+    // runtimes are supplied, each worker uses its corresponding explicit
+    // selection.  Worker paths remain disjoint in either case.
+    for (0..worker_count) |index| {
+        const config = configs[index % configuration.runtimes.len];
         var selection = config.selection;
         selection.workspace = registered;
         const marker = try std.fmt.allocPrint(a, "SPICA_CHILD_{s}_OK", .{selection.runtime_kind});
-        const packet: t.orchestration.Packet = .{ .purpose = "installed provider orchestration gate", .prompt = try std.fmt.allocPrint(a, "Reply exactly {s}. Do not use tools or delegate.", .{marker}), .selection = selection, .owned_paths = &.{try std.fmt.allocPrint(a, "child-{d}.txt", .{index})}, .acceptance = marker, .result_location = try std.fmt.allocPrint(a, "child-{d}.txt", .{index}), .budget = .{ .max_requests = 2, .max_elapsed_ms = 90000, .max_tokens = 4000 } };
+        const packet: t.orchestration.Packet = .{ .purpose = "installed provider orchestration gate", .prompt = try std.fmt.allocPrint(a, "Reply exactly {s}. No tools.", .{marker}), .selection = selection, .owned_paths = &.{try std.fmt.allocPrint(a, "child-{d}.txt", .{index})}, .acceptance = marker, .result_location = try std.fmt.allocPrint(a, "child-{d}.txt", .{index}), .budget = .{ .max_requests = 2, .max_elapsed_ms = 90000, .max_tokens = 4000 } };
         const arguments = try std.json.Stringify.valueAlloc(a, .{ .request_key = try std.fmt.allocPrint(a, "installed-delegate-{d}", .{index}), .packet = packet }, .{});
         try instructions.writer.print("{s}\n", .{arguments});
     }
@@ -168,8 +249,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const start = clock.spica_monotonic_ms();
     while (clock.spica_monotonic_ms() - start < 180000) {
         const tasks = try consumer.query(.{ .task_list = .{ .parent = parent } });
-        if (tasks.next_cursor != null or tasks.items.len > configuration.runtimes.len) return error.DuplicateDelegation;
-        var complete = tasks.items.len == configuration.runtimes.len;
+        if (tasks.next_cursor != null or tasks.items.len > worker_count) return error.DuplicateDelegation;
+        var complete = tasks.items.len == worker_count;
         for (tasks.items) |row| {
             if (terminal(row.task.state) and row.task.state != .completed) {
                 std.debug.print("CHILD TERMINATED state={s}\n", .{@tagName(row.task.state)});
@@ -185,7 +266,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 return error.CoordinatorFailed;
             }
             const present = try consumer.query(.{ .task_list = .{ .parent = parent } });
-            if (present.items.len != configuration.runtimes.len) {
+            if (present.items.len != worker_count) {
                 std.debug.print("COORDINATOR NO DELEGATION text={s}\n", .{try consumer.text(a, thread)});
                 return error.DelegationMissing;
             }
@@ -216,17 +297,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var expected = config.selection;
             expected.workspace = registered;
             if (c.equal(expected, selection)) {
-                if (verified[config_index]) return error.DuplicateRuntimeChild;
+                if (configuration.runtimes.len > 1 and verified[config_index]) return error.DuplicateRuntimeChild;
                 verified[config_index] = true;
             }
         }
-        const result = try consumer.command(try std.fmt.allocPrint(a, "result-{d}", .{index}), .{ .run = row.task.task.id }, .{ .revision = row.task.revision }, .{ .task_result = .{ .candidate = configuration.candidate, .evidence = args[2], .summary = text } });
-        if (result.committed_revisions.len != 1) return error.ResultRevisionMissing;
-        _ = try consumer.command(try std.fmt.allocPrint(a, "review-{d}", .{index}), .{ .run = row.task.task.id }, .{ .revision = result.committed_revisions[0].revision }, .{ .task_review = .{ .candidate = configuration.candidate, .evidence = args[2], .disposition = .accepted } });
+        if (row.task.task.result == null) {
+            const result = try consumer.command(try std.fmt.allocPrint(a, "result-{d}", .{index}), .{ .run = row.task.task.id }, .{ .revision = row.task.revision }, .{ .task_result = .{ .candidate = configuration.candidate, .evidence = args[2], .summary = text } });
+            if (result.committed_revisions.len != 1) return error.ResultRevisionMissing;
+            _ = try consumer.command(try std.fmt.allocPrint(a, "review-{d}", .{index}), .{ .run = row.task.task.id }, .{ .revision = result.committed_revisions[0].revision }, .{ .task_review = .{ .candidate = configuration.candidate, .evidence = args[2], .disposition = .accepted } });
+        } else if (row.task.task.review != .accepted) return error.ReviewMissing;
         std.debug.print("VERIFIED child={s} runtime={s} model={s} effort={s} text={s}\n", .{ row.task.task.id.value, selection.runtime_kind, selection.model_id, selection.effort, text });
     }
     for (verified[0..configuration.runtimes.len]) |actual| if (!actual) return error.MissingRuntimeChild;
     const completed = try common.clone(a, (try consumer.query(.{ .task_list = .{ .parent = parent } })).items);
+    if (completed.len != worker_count) return error.DuplicateDelegation;
     consumer.host.destroy();
     host_live = false;
     consumer.host = try domain.Host.create(std.heap.page_allocator, io, .{ .state_directory = configuration.state_directory });

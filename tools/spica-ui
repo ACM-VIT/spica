@@ -376,11 +376,15 @@ def offline_provider_argv(provider: str, output: Path) -> list[str]:
         return ["--provider", "codex", "--runtime-executable", str(ROOT / "build/codex_workflow_fixture.py"),
                 "--runtime-account-directory", str(output / "codex-fixture-account"),
                 "--model-provider", "openai", "--model", "offline-workflow", "--effort", "low"]
+    if provider == "codex-orchestration-fixture":
+        return ["--provider", "codex", "--runtime-executable", str(ROOT / "build/codex_orchestration_fixture.py"),
+                "--runtime-account-directory", str(output / "codex-orchestration-fixture-account"),
+                "--model-provider", "openai", "--model", "offline-orchestration", "--effort", "low"]
     if provider == "opencode-fixture":
         return ["--provider", "opencode", "--runtime-executable", str(ROOT / "build/opencode_workflow_fixture.py"),
                 "--runtime-account-directory", str(output / "opencode-fixture-account"),
                 "--model-provider", "opencode", "--model", "big-pickle", "--effort", "default"]
-    raise DriverError("only offline fake, codex-fixture and opencode-fixture providers are allowed", EX_PROVIDER)
+    raise DriverError("only offline fake, Codex orchestration/workflow and OpenCode fixtures are allowed", EX_PROVIDER)
 
 
 def launch(args: argparse.Namespace) -> int:
@@ -425,10 +429,20 @@ def launch(args: argparse.Namespace) -> int:
         run_command(["git", "-C", workspace, "init", "--quiet"])
     if args.scenario == "workspace-diff":
         prepare_workspace_fixture(workspace)
-    if args.provider in {"codex-fixture", "opencode-fixture"}:
+    seeded_orchestration = None
+    if args.provider == "codex-orchestration-fixture":
+        observer = ROOT / "zig-out/bin/orchestration-smoke"
+        if not observer.is_file():
+            run_command(["python3", "build/driver.py", f"-Doptimize={args.optimize}", "build-orchestration-smoke"], timeout=300)
+        seeded_orchestration = json.loads(run_command([str(observer), "--seed-workspace", str(state), str(workspace)], timeout=30).stdout)
+    if args.provider in {"codex-fixture", "codex-orchestration-fixture", "opencode-fixture"}:
         account = output / f"{args.provider}-account"
         account.mkdir()
-        if args.provider == "codex-fixture":
+        if args.provider == "codex-orchestration-fixture":
+            profile = {"format": "spica-offline-codex-orchestration-v1", "workspace": str(workspace),
+                       "role": "auto", "result_review": True, "child_marker": "SPICA_CHILD_codex_OK"}
+            atomic_json(account / "orchestration-profile.json", profile)
+        elif args.provider == "codex-fixture":
             profile = {"format": "spica-offline-codex-workflow-v1", "workspace": str(workspace),
                        "mode": {"codex-error": "fail", "codex-crash-open": "cancel-open",
                                 "codex-crash-recovery": "cancel-hang"}.get(args.scenario, "complete"),
@@ -438,7 +452,8 @@ def launch(args: argparse.Namespace) -> int:
                        "mode": "fail" if args.scenario == "opencode-error" else "complete",
                        "runtime_version": "2.1.4", "protocol_version": 1,
                        "model_provider": "opencode", "model": "big-pickle", "effort": "default"}
-        atomic_json(account / "workflow-profile.json", profile)
+        if args.provider != "codex-orchestration-fixture":
+            atomic_json(account / "workflow-profile.json", profile)
     private_path = run_command(["vd", "start", "--width", str(args.width), "--height", str(args.height)]).stdout.strip()
     private_dir = Path(private_path)
     try:
@@ -463,14 +478,18 @@ def launch(args: argparse.Namespace) -> int:
         manifest = record_manifest(output, scenario=args.scenario, binary=binary,
                                    build_command=build_command, private={"session": private_path, **private_record},
                                    provider=args.provider)
-        if args.provider in {"codex-fixture", "opencode-fixture"}:
+        if args.provider in {"codex-fixture", "codex-orchestration-fixture", "opencode-fixture"}:
             fixture_name = "codex_workflow_fixture.py" if args.provider == "codex-fixture" else "opencode_workflow_fixture.py"
+            if args.provider == "codex-orchestration-fixture":
+                fixture_name = "codex_orchestration_fixture.py"
             manifest["fixture_sha256"] = sha256(ROOT / "build" / fixture_name)
-            runtime_name = "Codex app-server" if args.provider == "codex-fixture" else "OpenCode 2.1.4 ACP"
+            runtime_name = "Codex orchestration app-server" if args.provider == "codex-orchestration-fixture" else "Codex app-server" if args.provider == "codex-fixture" else "OpenCode 2.1.4 ACP"
             manifest["limitations"].append(f"Production {runtime_name} adapter with an offline fixture; no installed provider compatibility or live inference claim.")
         manifest.update({"session_nonce": secrets.token_hex(16), "window": window,
                          "observations": str(output / "live.json"), "launch": launch_info, "workspace": str(workspace),
                          "actions": []})
+        if seeded_orchestration is not None:
+            manifest["orchestration_workspace_id"] = seeded_orchestration["workspace_id"]
         if history is not None:
             manifest["history_fixture"] = history
             manifest["limitations"].append("Synthetic public-Host history with fixed fake responses; no real provider or performance acceptance.")
@@ -1110,14 +1129,55 @@ def scenario_attachment_delivery(session: Session, args: argparse.Namespace) -> 
 
 def fixture_events(session: Session) -> list[dict[str, Any]]:
     provider = session.data.get("provider")
-    if provider not in {"codex-fixture", "opencode-fixture"}:
+    if provider not in {"codex-fixture", "codex-orchestration-fixture", "opencode-fixture"}:
         raise DriverError("fixture trace requested for a non-fixture provider", EX_PROVIDER)
-    path = session.output / f"{provider}-account/workflow-events.jsonl"
+    event_name = "orchestration-events.jsonl" if provider == "codex-orchestration-fixture" else "workflow-events.jsonl"
+    path = session.output / f"{provider}-account/{event_name}"
     with path.open("rb") as source:
         data = source.read(128 * 1024 + 1)
     if len(data) > 128 * 1024:
         raise DriverError("offline protocol event log exceeded its bound", EX_ASSERTION)
     return [json.loads(line) for line in data.splitlines()]
+
+
+def orchestration_observation(session: Session, *, parent: str | None = None) -> dict[str, Any]:
+    """Use the public Host read-only observer; never inspect the database."""
+    binary = session.output / "orchestration-smoke"
+    if not binary.is_file():
+        raise DriverError("orchestration observer binary unavailable", EX_UNAVAILABLE)
+    command = [str(binary), "--observe-workspace", str(session.output / "state"), session.data["workspace"]]
+    if parent:
+        command = [str(binary), "--observe-tasks", str(session.output / "state"), session.data["workspace"], parent]
+    result = run_command(command, timeout=30)
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise DriverError("public orchestration observation was not JSON", EX_ASSERTION) from error
+    if not isinstance(value, dict):
+        raise DriverError("public orchestration observation was not an object", EX_ASSERTION)
+    return value
+
+
+def assert_orchestration_trace(events: list[dict[str, Any]], observation: dict[str, Any], parent: dict[str, Any]) -> None:
+    calls = [event for event in events if event.get("method") == "item/tool/call"]
+    names = [event.get("tool") for event in calls]
+    if (names[:5] != ["task_catalog", "task_delegate", "task_delegate", "task_delegate", "task_list"]
+            or names.count("task_delegate") != 3 or names.count("task_result") != 2
+            or names.count("task_review") != 2 or names.count("task_wait") < 2):
+        raise DriverError(f"unexpected production orchestration callback trace: {names}")
+    if any(names.index(result) < names.index("task_list") for result in ("task_result", "task_review")):
+        raise DriverError("task.result/review preceded task.list")
+    if observation.get("workspace_id") == parent.get("workspace_root") or not observation.get("workspace_id"):
+        raise DriverError("worker packet used a filesystem path instead of the durable workspace UUID")
+    tasks = observation.get("tasks")
+    if observation.get("task_count") != 2 or not isinstance(tasks, list) or len(tasks) != 2:
+        raise DriverError("public Host task.list did not expose exactly two children")
+    paths = [tuple(task.get("owned_paths", [])) for task in tasks]
+    flattened = [path for group in paths for path in group]
+    if len(set(paths)) != 2 or len(flattened) != len(set(flattened)) or any(task.get("state") != "completed" for task in tasks):
+        raise DriverError("child lifecycle or disjoint ownership observation failed")
+    if any(not task.get("result_present") or task.get("review") != "accepted" for task in tasks):
+        raise DriverError("task.result/task.review authority was not observed")
 
 
 def assert_codex_fixture_trace(events: list[dict[str, Any]], prompts: list[str]) -> None:
@@ -1178,6 +1238,55 @@ def scenario_codex_session(session: Session, args: argparse.Namespace) -> None:
                     outcome="same_upstream_session_three_distinct_turns_exact_prompt_digests",
                     upstream_turns=[event for event in events if event.get("method") == "turn/start"])
     session.data["expected_outcome"] = "codex_adapter_three_turns_same_session_reopened_with_upstream_context"
+
+
+def scenario_codex_orchestration(session: Session, args: argparse.Namespace) -> None:
+    # Build the observer from this checkout and resolve the registered durable
+    # workspace UUID through Host before composing the ordinary GUI prompt.
+    observer = ROOT / "zig-out/bin/orchestration-smoke"
+    shutil.copy2(observer, session.output / "orchestration-smoke")
+    workspace = {"workspace_id": session.data.get("orchestration_workspace_id"),
+                 "workspace_root": session.data.get("workspace")}
+    workspace_id = workspace.get("workspace_id")
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise DriverError("Host did not expose a durable workspace UUID", EX_ASSERTION)
+    account = str(session.output / "codex-orchestration-fixture-account")
+    def packet(index: int, marker: str) -> dict[str, Any]:
+        return {"purpose": f"offline worker {index}", "prompt": f"Reply exactly {marker}. No tools.",
+                "selection": {"runtime_kind": "codex", "required_runtime_version": "0.163.0",
+                               "model_provider": "openai", "model_id": "offline-orchestration", "effort": "low",
+                               "account_ref": account, "workspace": {"value": workspace_id}, "capability_revision": 1},
+                "owned_paths": [f"worker-{index}.txt"], "acceptance": marker,
+                "result_location": f"worker-{index}.txt", "detached": False,
+                "budget": {"max_requests": 2, "max_elapsed_ms": 90000, "max_tokens": 4000}}
+    first, second = packet(1, "SPICA_CHILD_codex_OK"), packet(2, "SPICA_CHILD_codex_OK")
+    prompt = ("coordinator delegate task.catalog; use only the application's registered task tools.\n" +
+              json.dumps({"request_key": "offline-worker-one", "packet": first}, separators=(",", ":")) + "\n" +
+              json.dumps({"request_key": "offline-worker-two", "packet": second}, separators=(",", ":")))
+    current = send_turn(session, prompt, max(args.timeout, 45))
+    capture(session, "codex-orchestration-complete.png")
+    # Host's worker owns the SQLite lock while the GUI is live. Close the app
+    # through ordinary Ctrl+Q, then reopen the same state read-only through the
+    # public observer to inspect child lifecycle/result/review rows.
+    try:
+        close_app(session, max(args.timeout, 15))
+    except DriverError as error:
+        # The app may have already exited after its bounded quit deadline.  A
+        # stale private compositor identity does not invalidate the completed
+        # GUI trace; the public observer below still verifies durable state.
+        if not any(message in str(error) for message in ("Stale or unknown compositor identity", "native process is no longer alive")):
+            raise
+    parent = orchestration_observation(session, parent=current.get("run_id"))
+    events = fixture_events(session)
+    assert_orchestration_trace(events, parent, {"workspace_root": session.data["workspace"]})
+    session.journal("scenario.codex-orchestration", workspace, parent,
+                    input_origin="ordinary GUI Send with public Host workspace UUID",
+                    correlation={"parent_run_id": current.get("run_id"), "send_command_id": current.get("send_command_id"),
+                                 "send_session_id": current.get("send_session_id")},
+                    outcome="two_children_duplicate_key_replay_disjoint_paths_result_review_completed",
+                    limitations=["task.cancel was not invoked because both children completed before cancellation was meaningful.",
+                                 "Task authority was observed through public Host queries; no database reads or direct state mutation."])
+    session.data["expected_outcome"] = "codex_production_adapter_two_owned_children_public_host_lifecycle_and_review"
 
 
 def scenario_opencode_session(session: Session, args: argparse.Namespace) -> None:
@@ -1599,7 +1708,8 @@ def read_private_clipboard(session: Session) -> str:
 
 def scenario(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
-    expected_provider = ("codex-fixture" if args.name in {"codex-session", "codex-error", "codex-large-send", "codex-crash-open", "codex-crash-recovery", "attachment-delivery"}
+    expected_provider = ("codex-orchestration-fixture" if args.name == "codex-orchestration"
+                        else "codex-fixture" if args.name in {"codex-session", "codex-error", "codex-large-send", "codex-crash-open", "codex-crash-recovery", "attachment-delivery"}
                         else "opencode-fixture" if args.name in {"opencode-session", "opencode-error", "opencode-large-send"}
                         else "fake")
     args.provider = args.provider or expected_provider
@@ -1617,6 +1727,8 @@ def scenario(args: argparse.Namespace) -> int:
     try:
         if args.name == "codex-session":
             scenario_codex_session(session, args)
+        elif args.name == "codex-orchestration":
+            scenario_codex_orchestration(session, args)
         elif args.name == "opencode-session":
             scenario_opencode_session(session, args)
         elif args.name == "thread-title":
@@ -1682,8 +1794,13 @@ def scenario(args: argparse.Namespace) -> int:
             scenario_attachment_delivery(session, args)
         else:
             raise DriverError(f"unknown scenario: {args.name}", EX_USAGE)
-        capture(session, "result.png")
-        close_app(session, args.timeout)
+        if args.name != "codex-orchestration":
+            capture(session, "result.png")
+        try:
+            close_app(session, args.timeout)
+        except DriverError as error:
+            if args.name != "codex-orchestration" or not any(message in str(error) for message in ("Stale or unknown compositor identity", "native process is no longer alive")):
+                raise
         session.data["passed"] = True
         session.save()
         atomic_json(output / "manifest.json", redact(session.data))
@@ -1699,6 +1816,7 @@ def scenario(args: argparse.Namespace) -> int:
 
 def scenario_steps(name: str) -> list[str]:
     return {"codex-session": ["launch production Codex adapter with isolated offline app-server fixture", "Send two turns", "restart native app on same private desktop", "Send third turn", "assert one upstream session, distinct commands/runs/turns, exact UTF-8 prompt digests and resumed prior context"],
+            "codex-orchestration": ["launch production Codex adapter with isolated offline orchestration fixture", "resolve registered workspace UUID through public Host observation", "ordinary GUI Send coordinator prompt with two explicit model/provider/effort/account/workspace selections and disjoint paths", "assert task.catalog/delegate/list/wait and duplicate request-key replay", "assert two child lifecycles plus task.result/review through public Host observations"],
             "codex-crash-open": ["hold offline Codex session creation after durable claim", "inject pidfd SIGKILL into the exact owned GUI lifetime", "reopen twice and require unknown state without provider replay", "verify disabled Send retains draft", "complete a separate new chat and retain old unknown outcome"],
             "codex-crash-recovery": ["hold an active offline Codex turn", "inject pidfd SIGKILL into the exact owned GUI lifetime", "reopen twice and require interrupted state without provider replay", "verify disabled Send retains draft", "complete a separate new chat and retain old interrupted outcome"],
             "codex-error": ["launch production Codex adapter with isolated failing offline fixture", "Send a prompt", "assert accepted command then failed run with retained specific synthetic provider diagnostic", "copy diagnostic with Ctrl+Shift+C and verify correlation without prompt content", "capture failure banner for visual review"],
@@ -1739,7 +1857,7 @@ def receipt(args: argparse.Namespace, session: Session | None = None) -> int:
                     "actions": len(manifest.get("actions", [])),
                     "evidence": {"manifest": str(session.output / "session.json"),
                                  "actions": str(session.output / "actions.json"),
-                                 "offline_protocol_events": str(session.output / f"{manifest.get('provider')}-account/workflow-events.jsonl") if manifest.get("provider") in {"codex-fixture", "opencode-fixture"} else None,
+                                 "offline_protocol_events": str(session.output / f"{manifest.get('provider')}-account/{'orchestration-events.jsonl' if manifest.get('provider') == 'codex-orchestration-fixture' else 'workflow-events.jsonl'}") if manifest.get("provider") in {"codex-fixture", "codex-orchestration-fixture", "opencode-fixture"} else None,
                                  "screenshots": [str(path) for path in session.output.glob("*.png")]},
                     "limitations": manifest.get("limitations", [])}
     atomic_json(session.output / "receipt.json", receipt_data)
@@ -1763,7 +1881,7 @@ def parser() -> argparse.ArgumentParser:
 
     item = commands.add_parser("launch", help="launch an offline provider on a private desktop")
     item.add_argument("--private", action="store_true", help="required acknowledgement of private vd desktop")
-    item.add_argument("--provider", choices=("fake", "codex-fixture", "opencode-fixture"), default="fake")
+    item.add_argument("--provider", choices=("fake", "codex-fixture", "codex-orchestration-fixture", "opencode-fixture"), default="fake")
     item.add_argument("--binary", type=Path)
     item.add_argument("--build", action="store_true", help="explicitly build before launch")
     item.add_argument("--optimize", choices=("Debug", "ReleaseSafe"), default="ReleaseSafe")
@@ -1819,10 +1937,10 @@ def parser() -> argparse.ArgumentParser:
     add_common(item)
 
     item = commands.add_parser("scenario", help="run a bounded offline GUI scenario")
-    item.add_argument("name", choices=("send-restart", "disabled-send", "large-send", "composer-capacity", "codex-large-send", "opencode-large-send", "second-turn",
+    item.add_argument("name", choices=("send-restart", "disabled-send", "large-send", "composer-capacity", "codex-large-send", "opencode-large-send", "codex-orchestration", "second-turn",
                                              "workspace-diff", "capability-refusal", "followup-refusal", "question-refusal", "attachment-delivery",
                                              "codex-session", "codex-error", "codex-crash-open", "codex-crash-recovery", "opencode-session", "opencode-error", "thread-title", "history-deep", "history-wide"))
-    item.add_argument("--provider", choices=("fake", "codex-fixture", "opencode-fixture"), help="offline fixture; inferred from scenario")
+    item.add_argument("--provider", choices=("fake", "codex-fixture", "codex-orchestration-fixture", "opencode-fixture"), help="offline fixture; inferred from scenario")
     item.add_argument("--prompt", default="offline GUI send")
     item.add_argument("--binary", type=Path)
     item.add_argument("--build", action="store_true")

@@ -265,6 +265,30 @@ class SpicaUiOfflineTests(unittest.TestCase):
             self.assertIn('"command": "scenario"', result.stdout)
             self.assertFalse((Path(directory) / "session.json").exists())
 
+    def test_orchestration_scenario_dry_run_names_public_host_and_two_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_cli("scenario", "codex-orchestration", "--output", directory, "--dry-run")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan["provider"], "codex-orchestration-fixture")
+            self.assertIn("workspace UUID", result.stdout)
+            self.assertIn("task.result/review", result.stdout)
+            self.assertFalse((Path(directory) / "session.json").exists())
+
+    def test_orchestration_trace_requires_exact_callbacks_disjoint_children_and_review(self):
+        module = load_cli()
+        events = [{"method": "item/tool/call", "tool": name} for name in
+                  ("task_catalog", "task_delegate", "task_delegate", "task_delegate", "task_list",
+                   "task_wait", "task_result", "task_review", "task_wait", "task_result", "task_review")]
+        observation = {"workspace_id": "registered-workspace", "task_count": 2, "tasks": [
+            {"state": "completed", "owned_paths": ["worker-1.txt"], "result_present": True, "review": "accepted"},
+            {"state": "completed", "owned_paths": ["worker-2.txt"], "result_present": True, "review": "accepted"}]}
+        module.assert_orchestration_trace(events, observation, {"workspace_root": "/tmp/workspace"})
+        for changed in ({"task_count": 1}, {"tasks": [{**observation["tasks"][0], "owned_paths": ["worker-1.txt", "worker-2.txt"]}, observation["tasks"][1]]},
+                        {"tasks": [{**observation["tasks"][0], "review": ""}, observation["tasks"][1]]}):
+            with self.assertRaises(module.DriverError):
+                module.assert_orchestration_trace(events, {**observation, **changed}, {"workspace_root": "/tmp/workspace"})
+
     def test_input_and_wait_dry_runs_are_offline(self):
         with tempfile.TemporaryDirectory() as directory:
             for command in (("click", "command.send"), ("key", "Return"),
