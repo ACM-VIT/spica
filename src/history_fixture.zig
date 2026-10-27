@@ -15,6 +15,7 @@ const max_generated_turns: usize = 16 * 1024;
 const max_total_prompt_bytes: usize = 128 * 1024 * 1024;
 const max_wait_ms: u64 = 10_000;
 const drain_bytes = 1024 * 1024;
+const fake_assistant_text = "Fake response: café 世界 👩‍💻\n\n```zig\nconst answer = 42;\n```\n";
 
 const Config = struct {
     state_path: []const u8,
@@ -356,7 +357,17 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, config: Config, state_pa
     const retained = retained_arena.allocator();
     const binding = try domain.workspace_binding.capture(retained, io, workspace_path);
     var consumer = Consumer{ .io = io };
-    consumer.host = try domain.Host.create(allocator, io, .{ .state_directory = state_path, .wake = Consumer.wake, .wake_context = &consumer, .workspace_root = binding.canonical_root });
+    // Fixture queries never page through a long-lived snapshot: every lookup
+    // is a fresh bounded observation. Keep only one reader and expire it on
+    // the next worker turn so WAL checkpoints cannot be pinned by the
+    // pressure generator while thousands of commands are being committed.
+    consumer.host = try domain.Host.create(allocator, io, .{
+        .state_directory = state_path,
+        .wake = Consumer.wake,
+        .wake_context = &consumer,
+        .workspace_root = binding.canonical_root,
+        .limits = .{ .snapshot_slots = 1, .snapshot_ttl_ms = 100 },
+    });
     var host_live = true;
     defer if (host_live) consumer.host.destroy();
 
@@ -368,7 +379,11 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, config: Config, state_pa
     const workspace_receipt = try consumer.command(.{ .command_id = .{ .value = workspace_command }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = binding } } });
     const workspace_value = (workspace_receipt.entity_ids.workspace orelse return error.CommandFailed).value;
     const workspace = a.WorkspaceId{ .value = try retained.dupe(u8, workspace_value) };
-    const selection = a.fakeSelection(workspace);
+    var selection = a.fakeSelection(workspace);
+    // Keep the cancellation scenario on the normal fake approval path so a
+    // final run remains cancellable after admission. The pressure fixture
+    // uses the direct-completion key for throughput.
+    selection.model_id = if (config.cancel_last) "history-fixture-cancel" else "history-fixture";
 
     var random = std.Random.Xoroshiro128.init(config.seed);
     var prompt_buffer: [max_content_bytes]u8 = undefined;
@@ -411,7 +426,7 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, config: Config, state_pa
             const block_value = (receipt.entity_ids.assistant_block orelse return error.CommandFailed).value;
             const block = a.BlockId{ .value = try turn_alloc.dupe(u8, block_value) };
             prompt_bytes += prompt.len;
-            const approval = try waitApproval(&consumer, turn_alloc, run);
+            const approval = if (config.cancel_last) try waitApproval(&consumer, turn_alloc, run) else null;
             const cancel = config.cancel_last and thread_index + 1 == config.threads and turn + 1 == config.turns;
             if (cancel) {
                 const run_revision = (try findRun(&consumer, thread, run)).revision;
@@ -419,11 +434,13 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, config: Config, state_pa
                 _ = try waitRun(&consumer, thread, run, .cancelled);
                 cancelled_runs += 1;
             } else {
-                _ = try consumer.command(.{ .command_id = .{ .value = try boundedId(turn_alloc, "fixture-allow", thread_index * config.turns + turn) }, .target = .{ .approval = .{ .value = approval.id } }, .expected_revision = .{ .revision = approval.revision }, .payload = .{ .approval_respond = .{ .decision = .allow, .action_digest = approval.action_digest } } });
+                if (approval) |evidence| {
+                    _ = try consumer.command(.{ .command_id = .{ .value = try boundedId(turn_alloc, "fixture-allow", thread_index * config.turns + turn) }, .target = .{ .approval = .{ .value = evidence.id } }, .expected_revision = .{ .revision = evidence.revision }, .payload = .{ .approval_respond = .{ .decision = .allow, .action_digest = evidence.action_digest } } });
+                }
                 _ = try waitRun(&consumer, thread, run, .completed);
                 completed_runs += 1;
             }
-            try collectMessageBytes(&consumer, thread, user, assistant, &content_bytes);
+            if (config.cancel_last) try collectMessageBytes(&consumer, thread, user, assistant, &content_bytes);
             latest_thread = try copyId(&latest_thread_storage, thread.value);
             latest_run = try copyId(&latest_run_storage, run.value);
             latest_user = try copyId(&latest_user_storage, user.value);
@@ -431,6 +448,17 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, config: Config, state_pa
             latest_block = try copyId(&latest_block_storage, block.value);
             latest_revision = 1 + turn + 1;
         }
+    }
+    // The fake provider emits the same bounded assistant text for every turn.
+    // Count the generated bytes arithmetically and validate one final turn
+    // through the public content query. Querying both blocks for every turn
+    // makes a pressure fixture quadratic in SQLite snapshot churn.
+    if (!config.cancel_last) {
+        var final_bytes: u64 = 0;
+        try collectMessageBytes(&consumer, .{ .value = latest_thread }, .{ .value = latest_user }, .{ .value = latest_assistant }, &final_bytes);
+        const final_prompt = @as(u64, @intCast(config.content_bytes));
+        if (final_bytes != final_prompt + fake_assistant_text.len) return error.ContentMismatch;
+        content_bytes = prompt_bytes + @as(u64, @intCast(config.threads * config.turns)) * fake_assistant_text.len;
     }
     consumer.host.destroy();
     host_live = false;

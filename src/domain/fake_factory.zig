@@ -77,6 +77,15 @@ const Instance = struct {
                 self.awaiting_approval = true;
                 try self.emit("selection", .{ .selection = .{ .requested = self.selection, .effective = self.selection, .readiness = .ready } });
                 try self.emit("response", .{ .chunk = .{ .message = .{ .value = "fake-message" }, .block = .{ .value = "fake-text" }, .offset = 0, .text = "Fake response: café 世界 👩‍💻\n\n```zig\nconst answer = 42;\n```\n" } });
+                // The synthetic history producer uses a dedicated model key
+                // to exercise durable storage at scale without paying for a
+                // permission round trip on every generated turn.
+                if (std.mem.eql(u8, self.selection.model_id, "history-fixture")) {
+                    try self.emit("completed", .completed);
+                    self.active = false;
+                    self.awaiting_approval = false;
+                    return .{ .outcome = .acknowledged };
+                }
                 try self.emit("tool-start", .{ .tool_started = .{ .name = "workspace.inspect", .action_digest = "fake-v1-inspect" } });
                 try self.emit("approval", .{ .approval = .{ .correlation = correlation, .workspace = self.selection.workspace, .action_digest = "fake-v1-inspect", .scope = "one workspace inspection" } });
             },
