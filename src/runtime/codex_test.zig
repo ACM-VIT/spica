@@ -411,6 +411,34 @@ test "Codex initialize account create stream approval cancel exit" {
     try std.testing.expect((try runtime.poll(a)).?.body == .disconnect);
 }
 
+test "Codex active followup uses turn steer and preserves start authority" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(a, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "steer" });
+    defer runtime.deinit();
+    try openErrorFixture(a, &wire, &runtime);
+    const start: c.Correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "run" }, .effect = .{ .value = "start" } };
+    _ = try runtime.asAdapter().dispatch(a, .{ .start = .{ .correlation = start, .prompt = "initial" } });
+    try wire.input.append(a, "{\"id\":4,\"result\":{\"turn\":{\"id\":\"turn\"}}}");
+    try runtime.pump();
+    const followup: c.Correlation = .{ .session = start.session, .run = start.run, .effect = .{ .value = "followup" }, .followup = .{ .value = "followup" } };
+    _ = try runtime.asAdapter().dispatch(a, .{ .message = .{ .correlation = followup, .message = .{ .value = "message" }, .content = "steer this" } });
+    const packet = try std.json.parseFromSlice(std.json.Value, a, wire.lines.items[wire.lines.items.len - 1], .{});
+    try std.testing.expectEqualStrings("turn/steer", packet.value.object.get("method").?.string);
+    const params = packet.value.object.get("params").?.object;
+    try std.testing.expectEqualStrings("upstream", params.get("threadId").?.string);
+    try std.testing.expectEqualStrings("turn", params.get("expectedTurnId").?.string);
+    try std.testing.expectEqualStrings("steer this", params.get("input").?.array.items[0].object.get("text").?.string);
+    try wire.input.append(a, "{\"id\":5,\"result\":{\"turnId\":\"turn\"}}");
+    try runtime.pump();
+    try std.testing.expect(runtime.pending == null);
+    try std.testing.expectEqualStrings("run", runtime.correlation.run.?.value);
+    try std.testing.expect((try runtime.poll(a)) == null);
+    try std.testing.expectEqual(.supported, runtime.discover().capabilities[@intFromEnum(c.Capability.followup_queue)].status);
+}
+
 extern "c" fn getenv([*:0]const u8) ?[*:0]const u8;
 extern "c" fn mkdtemp([*:0]u8) ?[*:0]u8;
 test "Codex installed isolated handshake and unsigned account" {

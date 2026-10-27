@@ -44,7 +44,7 @@ pub const cancel_timeout_ms = 15000;
 pub fn RuntimeFor(comptime T: type) type {
     return struct {
         const Self = @This();
-        const Operation = enum { initialize, account, login, open, restore, start, cancel };
+        const Operation = enum { initialize, account, login, open, restore, start, steer, cancel };
         allocator: std.mem.Allocator,
         state: std.heap.FixedBufferAllocator,
         turn_state: std.heap.FixedBufferAllocator,
@@ -108,6 +108,7 @@ pub fn RuntimeFor(comptime T: type) type {
                 .open => "thread/start",
                 .restore => "thread/resume",
                 .start => "turn/start",
+                .steer => "turn/steer",
                 .cancel => "turn/interrupt",
             };
             const packet = .{ .id = self.next_id, .method = method, .params = params };
@@ -133,7 +134,7 @@ pub fn RuntimeFor(comptime T: type) type {
         }
         pub fn discover(_: *Self) c.Discovery {
             var caps = [_]c.CapabilityInfo{.{ .status = .unsupported, .evidence = "Codex adapter unsupported surface" }} ** @typeInfo(c.Capability).@"enum".fields.len;
-            inline for ([_]c.Capability{ .create, .attach, .start, .stream, .tools, .approval, .cancel, .selection, .workspace, .attachment }) |cap| caps[@intFromEnum(cap)] = .{ .status = .supported, .evidence = "Codex 0.163.0 app-server turn input (text/image)" };
+            inline for ([_]c.Capability{ .create, .attach, .start, .stream, .tools, .approval, .cancel, .selection, .workspace, .message, .followup_queue, .attachment }) |cap| caps[@intFromEnum(cap)] = .{ .status = .supported, .evidence = "Codex 0.163.0 app-server turn input and turn/steer (text/image)" };
             caps[@intFromEnum(c.Capability.coordinator_bridge)] = .{ .status = .unknown, .evidence = "dynamicTools protocol available; live app bridge acceptance required" };
             return .{ .runtime_kind = "codex", .runtime_version = "0.163.0", .capabilities = caps, .limits = .{} };
         }
@@ -212,6 +213,17 @@ pub fn RuntimeFor(comptime T: type) type {
                     if (item_count == 0) return error.InvalidPrompt;
                     try self.rpc(.start, .{ .threadId = self.session.?.upstream.value, .input = items[0..item_count], .model = self.config.selection.model_id, .effort = self.config.selection.effort, .cwd = self.config.cwd }, self.correlation);
                 },
+                .message => |p| {
+                    if (p.attachments.len != 0) return error.AttachmentUnsupported;
+                    if (!self.session_ready or self.session == null or self.turn_terminal or self.turn.len == 0 or
+                        p.correlation.run == null or p.correlation.effect == null or
+                        !c.equal(p.correlation.session, self.session.?.id) or
+                        !c.equal(p.correlation.run, self.correlation.run.?)) return error.InvalidCorrelation;
+                    if (p.content.len == 0) return error.InvalidPrompt;
+                    const Input = struct { type: []const u8, text: []const u8 };
+                    const input = [_]Input{.{ .type = "text", .text = p.content }};
+                    try self.rpc(.steer, .{ .threadId = self.session.?.upstream.value, .expectedTurnId = self.turn, .input = input[0..] }, p.correlation);
+                },
                 .cancel => |p| {
                     if (c.frameBytes(request) > self.discover().limits.frame_bytes) return error.FrameTooLarge;
                     const opening = if (self.pending) |pending| pending.kind == .open or pending.kind == .restore else false;
@@ -261,15 +273,18 @@ pub fn RuntimeFor(comptime T: type) type {
             try self.reply(request_id_json, .{ .success = success, .contentItems = .{.{ .type = "inputText", .text = result }} });
             self.tool = null;
         }
-        fn emit(self: *Self, body: @FieldType(c.Observation, "body")) !void {
+        fn emitCorrelation(self: *Self, correlation: c.Correlation, body: @FieldType(c.Observation, "body")) !void {
             if (self.count == self.queue.len) return error.QueueFull;
             const index = (self.head + self.count) % self.queue.len;
             var fixed = std.heap.FixedBufferAllocator.init(&self.storage[index]);
             self.sequence += 1;
             var id: [512]u8 = undefined;
             const event = try std.fmt.bufPrint(&id, "codex:{s}:{d}", .{ self.config.instance, self.sequence });
-            self.queue[index] = try adapter.clone(fixed.allocator(), c.Observation{ .correlation = self.correlation, .upstream_event = event, .sequence = self.sequence, .runtime_version = "0.163.0", .body = body });
+            self.queue[index] = try adapter.clone(fixed.allocator(), c.Observation{ .correlation = correlation, .upstream_event = event, .sequence = self.sequence, .runtime_version = "0.163.0", .body = body });
             self.count += 1;
+        }
+        fn emit(self: *Self, body: @FieldType(c.Observation, "body")) !void {
+            try self.emitCorrelation(self.correlation, body);
         }
         pub fn poll(self: *Self, allocator: std.mem.Allocator) !?c.Observation {
             if (self.count == 0) return null;
@@ -335,6 +350,13 @@ pub fn RuntimeFor(comptime T: type) type {
                 self.pending = null;
                 const failure = field(value, "error");
                 if (failure != .null) {
+                    if (pending.kind == .steer) {
+                        self.rememberTurnError(failure);
+                        var end = @min(self.diagnostic.len, 2048);
+                        while (end < self.diagnostic.len and end > 0 and self.diagnostic[end] & 0xc0 == 0x80) end -= 1;
+                        try self.emitCorrelation(pending.correlation, .{ .request_failed = .{ .code = "provider_rejected", .detail = self.diagnostic[0..end] } });
+                        return;
+                    }
                     if (pending.kind == .cancel or (pending.kind == .account and self.cancel_request != null)) {
                         self.rememberTurnError(failure);
                         self.session_ready = false;
@@ -413,6 +435,10 @@ pub fn RuntimeFor(comptime T: type) type {
                             self.turn = try self.turn_state.allocator().dupe(u8, turn_id);
                             self.correlation.upstream_turn = .{ .value = self.turn };
                         }
+                    },
+                    .steer => {
+                        const turn_id = text(field(result, "turnId"));
+                        if (turn_id.len == 0 or !eq(turn_id, self.turn)) return error.InvalidCorrelation;
                     },
                     .cancel => {},
                 }
