@@ -83,6 +83,29 @@ test "ACP subsequent turns keep upstream session and bounded retained state" {
     try std.testing.expect((try textFrame(&runtime, a, "late replay")) == null);
 }
 
+test "ACP OpenCode refuses steering and questions without mutating the active turn" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var runtime: Runtime = undefined;
+    try prompting(&runtime, a);
+    defer runtime.shutdown();
+    const before = runtime.transport.len;
+    const discovery = runtime.discover();
+    try std.testing.expectEqual(.unsupported, discovery.capabilities[@intFromEnum(c.Capability.message)].status);
+    try std.testing.expectEqual(.unsupported, discovery.capabilities[@intFromEnum(c.Capability.followup_queue)].status);
+    try std.testing.expectEqual(.unsupported, discovery.capabilities[@intFromEnum(c.Capability.question)].status);
+    try std.testing.expectError(error.CapabilityUnavailable, runtime.dispatch(a, .{ .message = .{
+        .correlation = correlation,
+        .message = .{ .value = "followup-message" },
+        .content = "continue this active turn",
+        .followup = .{ .id = .{ .value = "followup" }, .content = "continue this active turn" },
+    } }));
+    try std.testing.expectEqual(before, runtime.transport.len);
+    try std.testing.expectEqual(.prompting, runtime.phase);
+    try std.testing.expect(c.equal(correlation, runtime.correlation));
+}
+
 test "ACP fresh runtime resumes exact session via either public request without history replay" {
     for ([_]bool{ false, true }) |attach| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
