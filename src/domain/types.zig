@@ -80,8 +80,8 @@ pub const Payload = union(enum) {
     thread_create: struct { project: ProjectId, workspace: adapter.WorkspaceId },
     /// Replace the durable user title for one thread.
     thread_title_set: struct { title: []const u8 },
-    thread_send: struct { text: []const u8, selection: adapter.Selection },
-    thread_send_staged: struct { prompt: PromptRef, selection: adapter.Selection },
+    thread_send: struct { text: []const u8, selection: adapter.Selection, attachments: []const AttachmentId = &.{} },
+    thread_send_staged: struct { prompt: PromptRef, selection: adapter.Selection, attachments: []const AttachmentId = &.{} },
     /// Explicitly discard one bounded orphan upload. Never affects a sent prompt.
     prompt_discard: struct { id: ?[]const u8 = null },
     thread_select: struct { selection: adapter.Selection },
@@ -196,6 +196,7 @@ pub const Query = union(enum) {
     thread: ThreadId,
     messages: struct { thread: ThreadId, anchor: ?adapter.MessageId = null, direction: Direction = .newer, page: Page = .{} },
     blocks: struct { message: adapter.MessageId, page: Page = .{} },
+    attachments: struct { thread: ThreadId, page: Page = .{} },
     content: struct { block: adapter.BlockId, start_byte: u64, end_byte: u64, page: Page = .{} },
     runs: struct { thread: ThreadId, page: Page = .{} },
     effects: struct { run: adapter.RunId, page: Page = .{} },
@@ -259,6 +260,16 @@ pub const Row = union(enum) {
         next_block_cursor: ?[]const u8 = null,
     },
     block: BlockDescriptor,
+    attachment: struct {
+        id: AttachmentId,
+        thread: ThreadId,
+        name: []const u8,
+        media_type: []const u8,
+        byte_length: u64,
+        digest: []const u8,
+        kind: adapter.AttachmentKind,
+        revision: Revision,
+    },
     content: struct { block_id: adapter.BlockId, revision: Revision, start_byte: u64, end_byte: u64, next_byte: ?u64, bytes: []const u8 },
     run: struct { id: adapter.RunId, revision: Revision, thread: ThreadId, session: adapter.RuntimeSessionId, state: RunState, requested: adapter.Selection, effective: ?adapter.Selection, diagnostic: []const u8 = "" },
     effect: struct { id: adapter.EffectId, revision: Revision, run: adapter.RunId, kind: EffectKind, state: EffectState, outcome: []const u8 },
@@ -347,6 +358,10 @@ pub const Limits = struct {
     snapshot_ttl_ms: u64 = 5000,
     subscriber_lag_events: u64 = 4096,
     durable_bytes: u64 = 256 * 1024 * 1024,
+    attachment_count: usize = 8,
+    attachment_bytes: usize = 256 * 1024,
+    attachment_metadata_bytes: usize = 4096,
+    attachment_packet_bytes: usize = 384 * 1024,
 };
 
 /// Versioned structural encoding: declaration field order, explicit union tags,
