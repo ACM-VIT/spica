@@ -12,8 +12,8 @@ for arg in "$@"; do
 Usage: ./tools/agents [OMP session flags] [message ...]
 
 Launch the Spica gpt-6-astra coordinator with project Sol task agents.
-  ./tools/agents                        Task 001 contracts through review/checkpoint, then stop
-  ./tools/agents "Focus task 001 scenarios"  Your message overrides/steers scope
+  ./tools/agents                        Start a task in the current checkout
+  ./tools/agents "Fix the Send workflow"  Your message overrides/steers scope
   ./tools/agents --continue              Continue without injecting startup text
   ./tools/agents --resume [id]           Resume/picker without startup text
   ./tools/agents --restore [id]          Explicit OMP crash recovery
@@ -21,7 +21,7 @@ Launch the Spica gpt-6-astra coordinator with project Sol task agents.
 Other arguments pass through to OMP. Use `omp --help` for all flags.
 Uses existing global account/auth configuration; creates no isolated profile.
 No approval override, goal mode, scheduler or retry loop is added.
-See docs/AGENT_LOOP.md for task packets, budgets and OMP limitations.
+Project working instructions are in AGENTS.md.
 HELP
       exit 0
       ;;

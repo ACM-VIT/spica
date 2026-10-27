@@ -1,9 +1,0 @@
-# 001-contracts / Contracts001 receipt
-
-Status: **review complete; integration checked, final Astra acceptance in task ledger**. Documentation-only v1 contracts and twelve scenario families live in `docs/contracts/core.md` and `docs/contracts/scenarios.md`; this receipt is the third owned path. No production behavior or fake-runtime tests were implemented.
-
-Base `59f708f5280a5344c295d6a2ddc0ecd7bc5b44ad`, branch `rewrite/native-agent-workspace`. Checkpoints: `4bb50f5a5715c324f41684c8e622e78673080b2d`, `b2dea40850dcc9d7ea38b99d507a12b889a18d76`, `aa00abbc40ec2695a4871df38d3eaa104a4b1741`, `749e3b9257e9e8f90a65b26b9c916028883e40fa`. Astra reviewed four repaired ambiguities: late content, withdrawn effects, event-position pairs and root-excluded budgets. Checks exercised that final contract HEAD; this receipt-only checkpoint follows.
-
-Authorized final `./tools/check` ran once: exit 0, 50 formatting checks, 14 tests with two skips. Offline documentation smoke (`python3 .artifacts/contracts001/integration_check.py`): exit 0; 16 relative links/anchors, twelve scenario IDs, seven acceptance-map rows and three immutable pins checked; document hashes unchanged. This establishes documentation consistency, not domain behavior. Exact commands/output/hashes: `.artifacts/contracts001/integration-manifest.json`, `tools-check.log`, `documentation-smoke.log`; temporary checker preserved as non-executable `integration-command.txt`. Focused base/repair diffs: `review.diff`, `repair-1.diff`; checkpoint/file identities: `candidate-identity.txt`.
-
-Limitations: live auth/inference/bridge invocation/cancellation remain unverified. One review-repair round, no failed checks. Actual model `openai-codex/gpt-6.1-sol`, no fallback, medium/default; session `01a168f9-4288-70b9-8f1d-c1f8fdc22b24`; cumulative usage unavailable. Source provenance remains linked; shared ledger never staged.
