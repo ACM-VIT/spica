@@ -113,7 +113,7 @@ class HistoryEvaluationTests(unittest.TestCase):
 
     def test_pointer_uses_painted_target_and_private_window_origin(self):
         gui = m.HistoryInput('private', '5', 'socket', Path('/fresh/live'), 'nonce', None, {}, Mock())
-        current = dict(targets=[dict(id='composer.input', enabled=True, pointer_bounds=[20, 30, 101, 51])])
+        current = dict(targets=[], sidebar_targets=[], navigation_targets=[dict(id='composer.input', enabled=True, pointer_bounds=[20, 30, 101, 51])])
         gui.observe = Mock(return_value=current)
         tree = dict(nodes=[dict(id=5, rect=dict(x=100, y=200))])
         with patch.object(m, 'run', side_effect=[json.dumps(tree), '[{"success":true}]', '']) as command:

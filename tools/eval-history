@@ -129,9 +129,10 @@ class HistoryInput:
         run(*evaluation.key_command(self.session, self.window, value))
 
     def click(self, name):
+        groups = ('targets', 'sidebar_targets', 'navigation_targets')
         current = self.observe(lambda s: any(t.get('id') == name and t.get('enabled')
-                               for group in ('targets', 'sidebar_targets') for t in s.get(group, [])), name)
-        target = next(t for group in ('targets', 'sidebar_targets') for t in current.get(group, []) if t.get('id') == name)
+                               for group in groups for t in s.get(group, [])), name)
+        target = next(t for group in groups for t in current.get(group, []) if t.get('id') == name)
         bounds = target.get('pointer_bounds')
         if not bounds or len(bounds) != 4 or min(bounds[2:]) <= 0:
             raise RuntimeError('input target lacks painted bounds')
