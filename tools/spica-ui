@@ -1205,6 +1205,8 @@ def scenario_codex_error(session: Session, args: argparse.Namespace) -> None:
                             args.timeout, "accepted Send with retained specific provider failure")
     if current.get("send_receipt") != "accepted" or current.get("draft"):
         raise DriverError("provider failure was confused with local admission refusal", EX_ASSERTION)
+    if current.get("notice") != "Offline Codex fixture quota exhausted (synthetic).":
+        raise DriverError("provider failure banner did not show the readable provider message", EX_ASSERTION)
     assert_codex_fixture_trace(fixture_events(session), ["offline synthetic provider error"])
     capture(session, "codex-failure-banner.png")
     perform_key(session, "ctrl+shift+c", args.timeout)
@@ -1218,7 +1220,6 @@ def scenario_codex_error(session: Session, args: argparse.Namespace) -> None:
     atomic_json(session.output / "provider-diagnostic.json", report)
     session.journal("scenario.codex-error", failed, current, input_origin="ordinary GUI Send to offline Codex fixture",
                     receipt_outcome="accepted", run_state="failed", outcome="specific_synthetic_provider_error_preserved_and_copyable")
-    session.data["limitations"].append("Screenshot review found the failure banner renders clipped serialized JSON; readable native failure text remains an open UI fix.")
     session.data["expected_outcome"] = "codex_send_accepted_specific_provider_failure_retained_and_copyable"
 
 

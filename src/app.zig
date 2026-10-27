@@ -959,6 +959,7 @@ const Conversation = struct {
     attempted_selection: ?Coding.Identity = null,
     notice_storage: [1024]u8 = undefined,
     diagnostic_storage: [1024]u8 = undefined,
+    diagnostic_display: [1024]u8 = undefined,
     diagnostic_len: usize = 0,
     preflight_storage: [192]u8 = undefined,
     followup_capability: contract.Status = .unknown,
@@ -1294,12 +1295,12 @@ const Conversation = struct {
             entry.run_status = cardRunStatus(row.state);
         };
         if (view.notice) |message| {
-            if (message.ptr == self.diagnostic_storage[0..].ptr) view.notice = null;
+            if (message.ptr == self.diagnostic_display[0..].ptr) view.notice = null;
         }
         const diagnostic = @import("text/utf8.zig").prefix(row.diagnostic, self.diagnostic_storage.len);
         @memcpy(self.diagnostic_storage[0..diagnostic.len], diagnostic);
         self.diagnostic_len = diagnostic.len;
-        if (diagnostic.len != 0) view.notice = self.diagnostic_storage[0..diagnostic.len];
+        if (diagnostic.len != 0) view.notice = @import("text/diagnostic.zig").readable(row.diagnostic, &self.diagnostic_display);
         const evidence = &view.send_diagnostic;
         // Historical pages may contain older runs before the current Send.
         // They update cards, but cannot borrow that Send's command/receipt.
@@ -1326,7 +1327,7 @@ const Conversation = struct {
         const diagnostic = @import("text/utf8.zig").prefix(row.outcome, self.diagnostic_storage.len);
         @memcpy(self.diagnostic_storage[0..diagnostic.len], diagnostic);
         self.diagnostic_len = diagnostic.len;
-        view.notice = self.diagnostic_storage[0..diagnostic.len];
+        view.notice = @import("text/diagnostic.zig").readable(row.outcome, &self.diagnostic_display);
         evidence.setEffect(row.id.value);
         evidence.setProviderDiagnostic(diagnostic, self.run_state != .failed);
     }
@@ -3288,6 +3289,27 @@ test "run diagnostics own bounded UTF8 bytes and clear when the latest run recov
     try conversation.recordRun(&view, row);
     try std.testing.expect(view.notice == null);
     try std.testing.expectEqualStrings("completed", view.status);
+}
+
+test "provider diagnostic banner shows the message while copied evidence retains raw detail" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    const raw = "{\"failure\":{\"code\":\"failed\",\"detail\":\"{\\\"message\\\":\\\"Quota exhausted café 世界\\\",\\\"codexErrorInfo\\\":{\\\"quota\\\":true}}\"}}";
+    var row: @FieldType(types.Row, "run") = .{ .id = .{ .value = "run" }, .revision = 2, .thread = .{ .value = "thread" }, .session = .{ .value = "session" }, .state = .failed, .requested = usability_selection, .effective = null, .diagnostic = raw };
+    try conversation.recordRun(&view, row);
+    try std.testing.expectEqualStrings("Quota exhausted café 世界", view.notice.?);
+    try std.testing.expectEqualStrings(raw, view.send_diagnostic.provider[0..view.send_diagnostic.provider_len]);
+    row.diagnostic = "";
+    row.state = .completed;
+    try conversation.recordRun(&view, row);
+    try std.testing.expect(view.notice == null);
+    row.id = .{ .value = "later-run" };
+    row.state = .failed;
+    try conversation.recordRun(&view, row);
+    conversation.recordEffect(&view, .{ .id = .{ .value = "start-effect" }, .revision = 1, .run = row.id, .kind = .start, .state = .failed, .outcome = "{\"message\":\"Provider unavailable\"}" });
+    try std.testing.expectEqualStrings("Provider unavailable", view.notice.?);
+    try std.testing.expectEqualStrings("{\"message\":\"Provider unavailable\"}", view.send_diagnostic.provider[0..view.send_diagnostic.provider_len]);
 }
 
 test "presentation API rejects invalid configuration before changing layout or paint" {
