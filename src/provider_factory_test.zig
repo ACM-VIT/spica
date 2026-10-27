@@ -601,7 +601,7 @@ const rejection_fixture =
     \\    def reject(message):
     \\        emit(dict(id=ident, error=dict(code=-32001, message=message, data=dict(access_token='PRIVATE-TOKEN'))))
     \\    if method == 'initialize':
-    \\        reply(dict(userAgent='fixture/0.163.0', protocolVersion=1, agentInfo=dict(version='2.1.4')))
+    \\        reply(dict(userAgent='fixture/0.163.0', protocolVersion=1, agentInfo=dict(version='2.1.4'), agentCapabilities=dict(sessionCapabilities=dict(resume={})) if scenario == 'resume' else {}))
     \\    elif method == 'account/read':
     \\        if scenario == 'account-rpc':
     \\            reject('Account service denied fixture request')
@@ -698,6 +698,40 @@ test "factory setup and catalog RPC rejection reasons survive scratch and instan
         try std.testing.expect(std.mem.indexOf(u8, status.reason, "PRIVATE-TOKEN") == null);
         try std.testing.expectEqual(@intFromPtr(&configured.status_reason), @intFromPtr(status.reason.ptr));
     }
+}
+
+test "factory admits OpenCode continuation only after current catalog resume negotiation" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const executable = try writeRejectionFixture(temporary, a);
+    var opencode = selection;
+    opencode.runtime_kind = "opencode";
+    opencode.required_runtime_version = "2.1.4";
+    opencode.model_provider = "opencode";
+    opencode.workspace.value = root;
+    var environment = [_][:0]const u8{"SPICA_TEST_SCENARIO=resume"};
+    var configured: native.NativeFactory = .{ .configs = &.{.{ .selection = opencode, .executable = executable, .environment = &environment }}, .status = .{ .runtime_kind = "opencode", .workspace_root = root } };
+    const factory = configured.asFactory();
+    const attach = @intFromEnum(c.Capability.attach);
+    try std.testing.expectEqual(.unsupported, factory.discover(opencode).capabilities[attach].status);
+    try factory.runtimeAction(std.testing.allocator, std.testing.io, .refresh);
+    try std.testing.expectEqual(.supported, factory.discover(opencode).capabilities[attach].status);
+    var foreign = opencode;
+    foreign.account_ref = "/different-account";
+    try std.testing.expectEqual(.unsupported, factory.discover(foreign).capabilities[attach].status);
+    environment[0] = "SPICA_TEST_SCENARIO=absent";
+    try factory.runtimeAction(std.testing.allocator, std.testing.io, .refresh);
+    try std.testing.expectEqual(.unsupported, factory.discover(opencode).capabilities[attach].status);
+    environment[0] = "SPICA_TEST_SCENARIO=resume";
+    try factory.runtimeAction(std.testing.allocator, std.testing.io, .refresh);
+    try std.testing.expectEqual(.supported, factory.discover(opencode).capabilities[attach].status);
+    environment[0] = "SPICA_TEST_SCENARIO=disconnect-0";
+    try std.testing.expectError(error.ProviderDisconnected, factory.runtimeAction(std.testing.allocator, std.testing.io, .refresh));
+    try std.testing.expectEqual(.unsupported, factory.discover(opencode).capabilities[attach].status);
 }
 
 test "OpenCode rejected or mismatched first middle last row retains exact good rows and active status" {

@@ -30,6 +30,7 @@ pub const NativeFactory = struct {
     catalog_models: [128]c.Model = undefined,
     catalog_count: usize = 0,
     catalog_authoritative: bool = false,
+    opencode_resume_supported: bool = false,
     status: c.RuntimeStatus = .{},
     status_reason: [1024]u8 = undefined,
     action_diagnostic: catalog.RpcDiagnostic = .{},
@@ -65,6 +66,7 @@ pub const NativeFactory = struct {
                 caps[@intFromEnum(cap)] = .{ .status = .supported, .evidence = "Compiled adapter protocol support; installed version and effective selection require instance handshake" };
             }
             if (std.mem.eql(u8, selection.runtime_kind, "codex")) caps[@intFromEnum(c.Capability.attach)] = .{ .status = .supported, .evidence = "Codex thread/resume protocol; instance handshake required" };
+            if (std.mem.eql(u8, selection.runtime_kind, "opencode") and self.opencode_resume_supported) caps[@intFromEnum(c.Capability.attach)] = .{ .status = .supported, .evidence = "OpenCode session/resume negotiated during catalog refresh; instance handshake required" };
             caps[@intFromEnum(c.Capability.coordinator_bridge)] = .{ .status = .unknown, .evidence = "Host endpoint and actual provider tool callback require consumer verification" };
         }
         return .{ .runtime_kind = selection.runtime_kind, .runtime_version = selection.required_runtime_version, .capabilities = caps, .limits = .{} };
@@ -262,6 +264,7 @@ pub const NativeFactory = struct {
                 self.configs = self.owned_configs[0..@max(self.configs.len, index + 1)];
                 self.catalog_count = 0;
                 self.catalog_authoritative = true;
+                self.opencode_resume_supported = false;
                 const installed = self.owned_configs[index];
                 self.status = .{ .runtime_kind = kind, .workspace_root = installed.selection.workspace.value, .configuration = installed.setup(), .reason = if (restoring) "Saved setup restored. Save or sign in explicitly to discover available models." else "Configured explicitly; refresh catalog to discover models and account readiness." };
                 if (restoring) {
@@ -275,6 +278,7 @@ pub const NativeFactory = struct {
             .refresh => {
                 self.catalog_count = 0;
                 self.catalog_authoritative = true;
+                self.opencode_resume_supported = false;
                 var retained = std.heap.FixedBufferAllocator.init(&self.catalog_storage);
                 const scratch_bytes = try allocator.alloc(u8, 4 * 1024 * 1024);
                 defer allocator.free(scratch_bytes);
@@ -357,7 +361,7 @@ pub const NativeFactory = struct {
         var wire = try transport.Transport.init(allocator, .{ .argv = if (codex) &.{ config.executable, "app-server", "--stdio" } else &.{ config.executable, "acp" }, .cwd = root, .environment = config.environment });
         defer wire.deinit();
         var diagnostic: catalog.RpcDiagnostic = .{};
-        const result = if (codex) catalog.codexWithDiagnostic(scratch, retained, &wire, config.selection, output, &diagnostic) else catalog.opencodeWithDiagnostic(scratch, retained, &wire, config.selection, root, output, &diagnostic);
+        const result = if (codex) catalog.codexWithDiagnostic(scratch, retained, &wire, config.selection, output, &diagnostic) else catalog.opencodeWithCapabilities(scratch, retained, &wire, config.selection, root, output, &diagnostic, &self.opencode_resume_supported);
         return result catch |err| {
             self.action_diagnostic = diagnostic;
             return err;

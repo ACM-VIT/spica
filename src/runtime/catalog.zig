@@ -134,6 +134,14 @@ pub fn opencode(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire:
     return opencodeWithDiagnostic(allocator, retained, wire, selection, cwd, output, &diagnostic);
 }
 pub fn opencodeWithDiagnostic(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire: *transport.Transport, selection: c.Selection, cwd: []const u8, output: []c.Model, diagnostic: *RpcDiagnostic) !usize {
+    var resume_supported = false;
+    return opencodeWithCapabilities(allocator, retained, wire, selection, cwd, output, diagnostic, &resume_supported);
+}
+pub fn opencodeResumeSupported(init: Value) bool {
+    return field(field(field(init, "agentCapabilities"), "sessionCapabilities"), "resume") == .object;
+}
+pub fn opencodeWithCapabilities(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire: *transport.Transport, selection: c.Selection, cwd: []const u8, output: []c.Model, diagnostic: *RpcDiagnostic, resume_supported: *bool) !usize {
+    resume_supported.* = false;
     const init = try call(wire, allocator, diagnostic, 1, "initialize", .{ .protocolVersion = 1, .clientCapabilities = Value{ .object = .empty }, .clientInfo = .{ .name = "spica", .version = "1" } });
     if (field(init, "protocolVersion") != .integer or field(init, "protocolVersion").integer != 1 or !eq(text(field(field(init, "agentInfo"), "version")), "2.1.4")) return error.RuntimeVersionMismatch;
     const session = try call(wire, allocator, diagnostic, 2, "session/new", .{ .cwd = cwd, .mcpServers = @as([0]Value, .{}) });
@@ -153,6 +161,7 @@ pub fn opencodeWithDiagnostic(allocator: std.mem.Allocator, retained: std.mem.Al
         };
         try applyOpenCodeOptions(retained, model, identity, configured);
     }
+    resume_supported.* = opencodeResumeSupported(init);
     return count;
 }
 
@@ -306,5 +315,19 @@ test "Codex catalog auth accepts existing supported accounts and rejects absent 
         const parsed = try std.json.parseFromSlice(Value, std.testing.allocator, case.json, .{});
         defer parsed.deinit();
         try std.testing.expectEqual(if (case.ready) c.Readiness.ready else .unavailable, codexAccountReadiness(parsed.value));
+    }
+}
+
+test "OpenCode resume requires the negotiated ACP capability object" {
+    for ([_]struct { json: []const u8, supported: bool }{
+        .{ .json = "{\"agentCapabilities\":{\"sessionCapabilities\":{\"resume\":{}}}}", .supported = true },
+        .{ .json = "{}", .supported = false },
+        .{ .json = "{\"agentCapabilities\":{\"sessionCapabilities\":{}}}", .supported = false },
+        .{ .json = "{\"agentCapabilities\":{\"sessionCapabilities\":{\"resume\":true}}}", .supported = false },
+        .{ .json = "{\"agentCapabilities\":{\"sessionCapabilities\":{\"load\":{}}}}", .supported = false },
+    }) |case| {
+        const parsed = try std.json.parseFromSlice(Value, std.testing.allocator, case.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.supported, opencodeResumeSupported(parsed.value));
     }
 }
