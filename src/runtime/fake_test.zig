@@ -27,6 +27,46 @@ fn workflowConfig() f.Config {
     return result;
 }
 
+test "fake Start uses dedicated prompt budget without relaxing metadata or ordinary frames" {
+    const limit = @import("prompt.zig").max_bytes;
+    const bytes = try t.allocator.alloc(u8, limit + 1);
+    defer t.allocator.free(bytes);
+    for ([_][]const u8{ "x", "🙂", "\x01" }) |unit| {
+        for (0..limit / unit.len) |index| @memcpy(bytes[index * unit.len ..][0..unit.len], unit);
+        var request = start;
+        request.start.prompt = bytes[0..limit];
+        const script = [_]f.Step{.{ .expect = .{ .request = request, .receipt = ack } }};
+        var runtime = try f.Runtime(1, 1).init(cfg(1, 1), &script);
+        var bad = request;
+        bytes[limit] = 'x';
+        bad.start.prompt = bytes;
+        try t.expectError(error.FrameTooLarge, runtime.dispatch(bad));
+        bad.start.prompt = "\xff";
+        try t.expectError(error.FrameTooLarge, runtime.dispatch(bad));
+        bad.start.prompt = "";
+        try t.expectError(error.FrameTooLarge, runtime.dispatch(bad));
+        bad = request;
+        bad.start.prompt_ref = .{ .id = "unresolved", .byte_length = limit, .sha256 = [_]u8{0} ** 32 };
+        try t.expectError(error.FrameTooLarge, runtime.dispatch(bad));
+        bad = request;
+        bad.start.correlation.session.value = bytes[0..limit];
+        try t.expectError(error.FrameTooLarge, runtime.dispatch(bad));
+        try t.expectEqual(@as(usize, 0), runtime.position);
+        try t.expectEqual(@as(usize, 0), runtime.call_count);
+        try t.expect(c.equal(c.Counters{}, runtime.counters));
+        try t.expect(runtime.poll() == null);
+        _ = try runtime.dispatch(request);
+        try t.expectEqualStrings(bytes[0..limit], runtime.takeCall().?.request.start.prompt);
+        try t.expectEqual(@as(u64, 1), runtime.counters.S);
+        try t.expect(runtime.finished());
+
+        var ordinary = try f.Runtime(1, 1).init(cfg(1, 1), &.{});
+        try t.expectError(error.FrameTooLarge, ordinary.cancel(.{ .correlation = corr, .reason = bytes[0..limit] }));
+        try t.expectEqual(@as(usize, 0), ordinary.position);
+        try t.expect(c.equal(c.Counters{}, ordinary.counters));
+    }
+}
+
 test "Unicode lifecycle keeps duplicates, reordering, approval, unknown and exact counters" {
     const response: c.Request = .{ .respond_approval = .{ .correlation = corr, .decision = .allow, .action_digest = approval.action_digest } };
     const cancel: c.Request = .{ .cancel = .{ .correlation = corr, .reason = "stop" } };

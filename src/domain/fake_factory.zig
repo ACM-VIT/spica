@@ -4,6 +4,7 @@ const std = @import("std");
 const c = @import("../contract.zig");
 const common = @import("../runtime/adapter.zig");
 const fake = @import("../runtime/fake.zig");
+const prompt = @import("../runtime/prompt.zig");
 const Instance = struct {
     arena: std.heap.ArenaAllocator,
     turn_arena: std.heap.ArenaAllocator,
@@ -53,6 +54,10 @@ const Instance = struct {
                 return .{ .outcome = .acknowledged, .session = .{ .id = self.session, .instance = .{ .value = self.session.value }, .upstream = .{ .value = self.session.value } }, .continuity = if (open == .existing) .proven else .not_requested };
             },
             .start => |start| {
+                prompt.validate(start) catch return error.FrameTooLarge;
+                var metadata = request;
+                metadata.start.prompt = "";
+                if (c.frameBytes(metadata) > discover(self).limits.frame_bytes) return error.FrameTooLarge;
                 if (!self.opened or !c.equal(start.correlation.session, self.session) or start.correlation.run == null or start.correlation.effect == null) return error.InvalidCorrelation;
                 if (self.active or self.count != 0) return error.QueueFull;
                 // Queued observations borrow this turn's storage. Reuse it only
@@ -144,6 +149,52 @@ fn destroy(_: *anyopaque, allocator: std.mem.Allocator, adapter: common.Adapter)
 }
 pub fn factory(context: *anyopaque) common.Factory {
     return .{ .context = context, .vtable = &.{ .discover = factoryDiscover, .accountStatus = factoryAccount, .resolveSelection = Instance.resolve, .create = create, .destroy = destroy } };
+}
+
+test "fake factory Start validates dedicated prompts before changing session state" {
+    var context: u8 = 0;
+    const backend = factory(&context);
+    const allocator = std.testing.allocator;
+    const selection = c.fakeSelection(.{ .value = "workspace" });
+    const session: c.RuntimeSessionId = .{ .value = "prompt-session" };
+    const bytes = try allocator.alloc(u8, prompt.max_bytes + 1);
+    defer allocator.free(bytes);
+    for ([_][]const u8{ "x", "🙂", "\x01" }) |unit| {
+        for (0..prompt.max_bytes / unit.len) |index| @memcpy(bytes[index * unit.len ..][0..unit.len], unit);
+        bytes[prompt.max_bytes] = 'x';
+        const adapter = try backend.create(allocator, selection, "/tmp", session, null);
+        defer {
+            adapter.shutdown();
+            backend.destroy(allocator, adapter);
+        }
+        _ = try adapter.dispatch(allocator, .{ .open = .{ .create = .{ .effect = .{ .value = "open" }, .session = session, .selection = selection } } });
+        const instance = Instance.cast(adapter.context);
+        const start: c.Request = .{ .start = .{ .correlation = .{ .session = session, .run = .{ .value = "run" }, .effect = .{ .value = "start" } }, .prompt = bytes[0..prompt.max_bytes] } };
+        var bad = start;
+        bad.start.prompt = bytes;
+        try std.testing.expectError(error.FrameTooLarge, adapter.dispatch(allocator, bad));
+        bad.start.prompt = "\xff";
+        try std.testing.expectError(error.FrameTooLarge, adapter.dispatch(allocator, bad));
+        bad.start.prompt = "";
+        try std.testing.expectError(error.FrameTooLarge, adapter.dispatch(allocator, bad));
+        bad = start;
+        bad.start.prompt_ref = .{ .id = "unresolved", .byte_length = prompt.max_bytes, .sha256 = [_]u8{0} ** 32 };
+        try std.testing.expectError(error.FrameTooLarge, adapter.dispatch(allocator, bad));
+        bad = start;
+        bad.start.correlation.session.value = bytes[0..prompt.max_bytes];
+        try std.testing.expectError(error.FrameTooLarge, adapter.dispatch(allocator, bad));
+        try std.testing.expect(!instance.active and instance.correlation == null);
+        try std.testing.expectEqual(@as(usize, 0), instance.turn_arena.queryCapacity());
+        try std.testing.expect((try adapter.poll(allocator)) == null);
+        _ = try adapter.dispatch(allocator, start);
+        try std.testing.expect(instance.active);
+        try std.testing.expectEqual(@as(usize, 4), instance.count);
+        var observed = std.heap.ArenaAllocator.init(allocator);
+        defer observed.deinit();
+        while (try adapter.poll(observed.allocator())) |event| {
+            try std.testing.expectEqualStrings("run", event.correlation.run.?.value);
+        }
+    }
 }
 
 test "fake session turns retain distinct authority with bounded storage and cancel the requested run" {

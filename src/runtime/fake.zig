@@ -1,4 +1,5 @@
 const c = @import("../contract.zig");
+const prompt = @import("prompt.zig");
 pub const contract = c;
 
 pub const Step = union(enum) {
@@ -107,7 +108,14 @@ pub fn Runtime(comptime queue_capacity: usize, comptime call_capacity: usize) ty
             return self.dispatch(.{ .attach = request });
         }
         pub fn dispatch(self: *Self, request: c.Request) c.Error!c.Receipt {
-            if (c.frameBytes(request) > self.config.discovery.limits.frame_bytes) return error.FrameTooLarge;
+            // Start payloads use the dedicated prompt budget. Only their
+            // metadata belongs to the ordinary bounded command frame.
+            var metadata = request;
+            if (request == .start) {
+                prompt.validate(request.start) catch return error.FrameTooLarge;
+                metadata.start.prompt = "";
+            }
+            if (c.frameBytes(metadata) > self.config.discovery.limits.frame_bytes) return error.FrameTooLarge;
             switch (request) {
                 .open => |open| switch (open) {
                     .create => |create| {
