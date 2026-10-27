@@ -877,8 +877,14 @@ pub const View = struct {
         };
     }
 
+    pub fn titleEditAvailable(self: *const View) bool {
+        return self.custom_root == null and self.navigation_enabled and self.active_thread.len != 0 and
+            !self.setup_open and !self.workspace_open and !self.workflow_open and !self.scope_open and !self.picker_open and !self.effort_open;
+    }
+
     fn titleInsert(self: *View, bytes: []const u8) !void {
         if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.InvalidUtf8;
+        for (bytes) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidTitle;
         const start = if (self.title_select_all) 0 else self.title_len;
         if (start + bytes.len > self.title_buffer.len) return error.TextTooLarge;
         @memcpy(self.title_buffer[start..][0..bytes.len], bytes);
@@ -1057,7 +1063,8 @@ pub const View = struct {
                 if (self.custom_root == null) {
                     const x = event.button.x;
                     const y = event.button.y;
-                    if (widgets.contains(self.title_bounds, x, y) and self.navigation_enabled) {
+                    if (self.title_editing and !widgets.contains(self.title_bounds, x, y)) self.finishTitle(.cancel);
+                    if (widgets.contains(self.title_bounds, x, y) and self.titleEditAvailable()) {
                         self.beginTitleEdit();
                         try self.focus(window, true);
                         return true;
@@ -1374,7 +1381,7 @@ pub const View = struct {
                 const mods = event.key.mod;
                 const ctrl = mods & c.SDL_KMOD_CTRL != 0;
                 const shift = mods & c.SDL_KMOD_SHIFT != 0;
-                if (key == c.SDLK_F2 and self.custom_root == null and !self.setup_open and !self.workspace_open and !self.workflow_open) {
+                if (key == c.SDLK_F2 and self.titleEditAvailable()) {
                     self.beginTitleEdit();
                     try self.focus(window, true);
                     return true;
@@ -1892,16 +1899,17 @@ pub const View = struct {
         try self.labels.drawFitted(renderer, text, project_name, header_x + 24, (bounds.header.height - 16) / 2, project_width, 14, muted);
         try self.labels.draw(text, "/", header_x + 34 + project_width, (bounds.header.height - 16) / 2, 14, muted);
         const title_x = header_x + 52 + project_width;
-        self.title_bounds = .{ .x = title_x, .y = 6, .w = @max(0, bounds.header.width - title_x - metrics.gutter), .h = @max(0, bounds.header.height - 12) };
-        _ = self.navigation_targets.add("thread.title.edit", "textbox", self.title_bounds, self.navigation_enabled and self.active_thread.len != 0) catch {};
-        if (self.title_editing) {
-            try widgets.panel(renderer, self.title_bounds, 4, palette.surface);
-            try self.labels.drawFitted(renderer, text, self.title_buffer[0..self.title_len], title_x + 6, (bounds.header.height - 16) / 2, self.title_bounds.w - 12, 14, foreground);
-        } else try self.labels.drawFitted(renderer, text, thread_name, title_x, (bounds.header.height - 16) / 2, self.title_bounds.w, 14, foreground);
         self.workspace_toggle_bounds = if (bounds.header.width - title_x >= 132)
             .{ .x = bounds.header.width - metrics.gutter - 104, .y = 10, .w = 104, .h = 28 }
         else
             .{ .x = 8, .y = height - 72, .w = 104, .h = 28 };
+        const title_end = if (self.workspace_toggle_bounds.y == 10) self.workspace_toggle_bounds.x - 8 else bounds.header.width - metrics.gutter;
+        self.title_bounds = .{ .x = title_x, .y = 6, .w = @max(0, title_end - title_x), .h = @max(0, bounds.header.height - 12) };
+        _ = self.navigation_targets.add("thread.title.edit", "textbox", self.title_bounds, self.titleEditAvailable()) catch {};
+        if (self.title_editing) {
+            try widgets.panel(renderer, self.title_bounds, 4, palette.surface);
+            try self.labels.drawFitted(renderer, text, self.title_buffer[0..self.title_len], title_x + 6, (bounds.header.height - 16) / 2, self.title_bounds.w - 12, 14, foreground);
+        } else try self.labels.drawFitted(renderer, text, thread_name, title_x, (bounds.header.height - 16) / 2, self.title_bounds.w, 14, foreground);
         if (self.workspace_toggle_bounds.w != 0) {
             try widgets.panel(renderer, self.workspace_toggle_bounds, @min(metrics.radius, 5), if (self.workspace_open) palette.sidebar_active else palette.surface);
             try icon(renderer, .branch, self.workspace_toggle_bounds.x + 7, self.workspace_toggle_bounds.y + 6, muted);
@@ -3525,6 +3533,38 @@ test "user bubbles align after chronological admission and retain exact text hit
     try view.draw(renderer, text, undefined, boxes);
     try std.testing.expectEqual(retained_layout, first.layout);
     try std.testing.expectEqualStrings("Message in a chat.", first.selectedBytes());
+}
+
+test "title editor validates replacement atomically and respects modal availability" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.insert("retained composer draft", .typing);
+    view.thread_count = 1;
+    view.active_thread = try transcript.Id.init("thread");
+    view.threads[0].id = view.active_thread;
+    view.threads[0].len = 4;
+    @memcpy(view.threads[0].label[0..4], "chat");
+    view.navigation_enabled = true;
+    try std.testing.expect(view.titleEditAvailable());
+    view.effort_open = true;
+    try std.testing.expect(!view.titleEditAvailable());
+    view.effort_open = false;
+    view.workflow_open = true;
+    try std.testing.expect(!view.titleEditAvailable());
+    view.workflow_open = false;
+    view.beginTitleEdit();
+    try std.testing.expectError(error.InvalidTitle, view.titleInsert("line\nbreak"));
+    try std.testing.expectError(error.InvalidUtf8, view.titleInsert("\xff"));
+    try std.testing.expectError(error.TextTooLarge, view.titleInsert("🎮" ** 40 ++ "x"));
+    try std.testing.expect(view.title_select_all);
+    try std.testing.expectEqualStrings("chat", view.title_buffer[0..view.title_len]);
+    try view.titleInsert("🎮" ** 40);
+    try std.testing.expectEqual(@as(usize, 160), view.title_len);
+    try std.testing.expectError(error.TextTooLarge, view.titleInsert("x"));
+    try std.testing.expectEqualStrings("🎮" ** 40, view.title_buffer[0..view.title_len]);
+    view.finishTitle(.cancel);
+    try std.testing.expect(!view.title_editing);
+    try std.testing.expectEqualStrings("retained composer draft", view.editor.textBytes());
 }
 
 test "bounded sidebar search owns Unicode and preserves source indices and drafts" {

@@ -541,10 +541,12 @@ pub const App = struct {
         self.snapshot.title_editing = self.view.title_editing;
         self.snapshot.title_text = if (self.view.title_editing) self.view.title_buffer[0..self.view.title_len] else blk: {
             var current: []const u8 = "";
-            for (self.view.threads[0..self.view.thread_count]) |*entry| if (entry.id.eql(self.view.active_thread.slice())) current = entry.label[0..entry.len];
+            for (self.view.threads[0..self.view.thread_count]) |*entry| {
+                if (entry.id.eql(self.view.active_thread.slice())) current = entry.label[0..entry.len];
+            }
             break :blk current;
         };
-        self.snapshot.title_target = .{ .id = "thread.title.edit", .role = "textbox", .key = "F2", .enabled = self.view.custom_root == null and self.view.navigation_enabled and self.view.active_thread.len != 0 and self.view.title_bounds.w > 0 and self.view.title_bounds.h > 0, .pointer_bounds = .{ @intFromFloat(self.view.title_bounds.x), @intFromFloat(self.view.title_bounds.y), @intFromFloat(self.view.title_bounds.w), @intFromFloat(self.view.title_bounds.h) } };
+        self.snapshot.title_target = .{ .id = "thread.title.edit", .role = "textbox", .key = "F2", .enabled = self.view.titleEditAvailable() and self.view.title_bounds.w > 0 and self.view.title_bounds.h > 0, .pointer_bounds = .{ @intFromFloat(self.view.title_bounds.x), @intFromFloat(self.view.title_bounds.y), @intFromFloat(self.view.title_bounds.w), @intFromFloat(self.view.title_bounds.h) } };
         self.snapshot.sidebar_search = self.view.search_query[0..self.view.search_len];
         self.snapshot.sidebar_search_focused = self.view.search_focused;
         self.snapshot.sidebar_scope_open = self.view.scope_open;

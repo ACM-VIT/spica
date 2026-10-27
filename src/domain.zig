@@ -304,6 +304,7 @@ pub const Owner = struct {
                     !std.unicode.utf8ValidateSlice(p.title) or
                     std.mem.indexOfScalar(u8, p.title, 0) != null)
                     return .invalid_command;
+                for (p.title) |byte| if (byte < 0x20 or byte == 0x7f) return .invalid_command;
                 const thread = e.target.thread.value;
                 if (try self.field(allocator, "SELECT id FROM threads WHERE id=?", &.{.{ .text = thread }}) == null) return .not_found;
                 try db.execute("UPDATE threads SET title=?,revision=revision+1 WHERE id=?", &.{ .{ .blob = p.title }, .{ .text = thread } });

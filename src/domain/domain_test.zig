@@ -280,6 +280,52 @@ test "explicit chat titles are durable, bounded, revisioned and idempotent" {
     try std.testing.expectEqualStrings(title, try retained.bytes(0));
 }
 
+test "title validation is transactional at Unicode byte boundaries and survives reopen" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "title-boundaries", .utc_ms = 1 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const title = "🎮" ** 40;
+    const command: t.CommandEnvelope = .{ .command_id = .{ .value = "exact-title" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_title_set = .{ .title = title } } };
+    const accepted = try owner.command(allocator, command);
+    try std.testing.expectEqual(.accepted, accepted.outcome);
+    var conflict = command;
+    conflict.payload.thread_title_set.title = "different";
+    try std.testing.expectEqual(t.Reason.command_id_conflict, (try owner.command(allocator, conflict)).reason.?);
+    const invalid = [_][]const u8{ "", title ++ "x", "\xff", "line\nbreak", "tab\t", "\x7f", "nul\x00" };
+    for (invalid, 0..) |value, index| {
+        const rejected = try owner.command(allocator, .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "invalid-title-{d}", .{index}) }, .target = command.target, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_title_set = .{ .title = value } } });
+        try std.testing.expectEqual(t.Reason.invalid_command, rejected.reason.?);
+    }
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM events WHERE kind='ThreadTitleChanged'"));
+    try f.store.close();
+    var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    f.store = try storage.Store.open(std.testing.io, try f.path(&directory));
+    const stored = try f.store.prepare("SELECT title,revision FROM threads WHERE id=?", &.{.{ .text = conversation.thread.value }});
+    defer stored.deinit();
+    try std.testing.expect(try stored.step());
+    try std.testing.expectEqualStrings(title, try stored.bytes(0));
+    try std.testing.expectEqual(@as(i64, 2), stored.integer(1));
+    const retry = try owner.command(allocator, command);
+    try std.testing.expectEqualSlices(u8, try t.encode(accepted, try allocator.alloc(u8, 4096)), try t.encode(retry, try allocator.alloc(u8, 4096)));
+}
+
+test "schema five adds empty titles without changing existing messages or revisions" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try seed(&f.store);
+    try f.store.exec("ALTER TABLE threads DROP COLUMN title; UPDATE meta SET schema_version=5; PRAGMA user_version=5");
+    try f.store.close();
+    var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    f.store = try storage.Store.open(std.testing.io, try f.path(&directory));
+    try std.testing.expectEqual(@as(i64, 6), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM threads WHERE id='h' AND title='' AND revision=1"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM messages WHERE id='m'"));
+}
+
 test "real reducers accept arbitrary prompt dedup before revision and withdraw queued effects" {
     var f = try Fixture.init();
     defer f.deinit();
