@@ -372,7 +372,11 @@ def offline_provider_argv(provider: str, output: Path) -> list[str]:
         return ["--provider", "codex", "--runtime-executable", str(ROOT / "build/codex_workflow_fixture.py"),
                 "--runtime-account-directory", str(output / "codex-fixture-account"),
                 "--model-provider", "openai", "--model", "offline-workflow", "--effort", "low"]
-    raise DriverError("only offline fake and codex-fixture providers are allowed", EX_PROVIDER)
+    if provider == "opencode-fixture":
+        return ["--provider", "opencode", "--runtime-executable", str(ROOT / "build/opencode_workflow_fixture.py"),
+                "--runtime-account-directory", str(output / "opencode-fixture-account"),
+                "--model-provider", "opencode", "--model", "big-pickle", "--effort", "default"]
+    raise DriverError("only offline fake, codex-fixture and opencode-fixture providers are allowed", EX_PROVIDER)
 
 
 def launch(args: argparse.Namespace) -> int:
@@ -413,11 +417,18 @@ def launch(args: argparse.Namespace) -> int:
     run_command(["git", "-C", workspace, "init", "--quiet"])
     if args.scenario == "workspace-diff":
         prepare_workspace_fixture(workspace)
-    if args.provider == "codex-fixture":
-        account = output / "codex-fixture-account"
+    if args.provider in {"codex-fixture", "opencode-fixture"}:
+        account = output / f"{args.provider}-account"
         account.mkdir()
-        atomic_json(account / "workflow-profile.json", {"format": "spica-offline-codex-workflow-v1",
-                    "workspace": str(workspace), "mode": "fail" if args.scenario == "codex-error" else "complete"})
+        if args.provider == "codex-fixture":
+            profile = {"format": "spica-offline-codex-workflow-v1", "workspace": str(workspace),
+                       "mode": "fail" if args.scenario == "codex-error" else "complete"}
+        else:
+            profile = {"format": "spica-offline-opencode-workflow-v1", "workspace": str(workspace),
+                       "mode": "fail" if args.scenario == "opencode-error" else "complete",
+                       "runtime_version": "2.1.4", "protocol_version": 1,
+                       "model_provider": "opencode", "model": "big-pickle", "effort": "default"}
+        atomic_json(account / "workflow-profile.json", profile)
     private_path = run_command(["vd", "start", "--width", str(args.width), "--height", str(args.height)]).stdout.strip()
     private_dir = Path(private_path)
     try:
@@ -442,9 +453,11 @@ def launch(args: argparse.Namespace) -> int:
         manifest = record_manifest(output, scenario=args.scenario, binary=binary,
                                    build_command=build_command, private={"session": private_path, **private_record},
                                    provider=args.provider)
-        if args.provider == "codex-fixture":
-            manifest["fixture_sha256"] = sha256(ROOT / "build/codex_workflow_fixture.py")
-            manifest["limitations"].append("Production Codex adapter with an offline app-server fixture; no installed Codex compatibility or live context acceptance claim.")
+        if args.provider in {"codex-fixture", "opencode-fixture"}:
+            fixture_name = "codex_workflow_fixture.py" if args.provider == "codex-fixture" else "opencode_workflow_fixture.py"
+            manifest["fixture_sha256"] = sha256(ROOT / "build" / fixture_name)
+            runtime_name = "Codex app-server" if args.provider == "codex-fixture" else "OpenCode 2.1.4 ACP"
+            manifest["limitations"].append(f"Production {runtime_name} adapter with an offline fixture; no installed provider compatibility or live inference claim.")
         manifest.update({"session_nonce": secrets.token_hex(16), "window": window,
                          "observations": str(output / "live.json"), "launch": launch_info, "workspace": str(workspace),
                          "actions": []})
@@ -1122,7 +1135,10 @@ def scenario_attachment_refusal(session: Session, args: argparse.Namespace) -> N
 
 
 def fixture_events(session: Session) -> list[dict[str, Any]]:
-    path = session.output / "codex-fixture-account/workflow-events.jsonl"
+    provider = session.data.get("provider")
+    if provider not in {"codex-fixture", "opencode-fixture"}:
+        raise DriverError("fixture trace requested for a non-fixture provider", EX_PROVIDER)
+    path = session.output / f"{provider}-account/workflow-events.jsonl"
     with path.open("rb") as source:
         data = source.read(128 * 1024 + 1)
     if len(data) > 128 * 1024:
@@ -1143,6 +1159,25 @@ def assert_codex_fixture_trace(events: list[dict[str, Any]], prompts: list[str])
             raise DriverError("Codex upstream session context or exact prompt bytes changed", EX_ASSERTION)
     if len({turn.get("turn_id") for turn in turns}) != len(turns):
         raise DriverError("Codex fixture reused an upstream turn identity", EX_ASSERTION)
+
+
+def assert_opencode_fixture_trace(events: list[dict[str, Any]], prompts: list[str], *, require_resume: bool = False) -> None:
+    starts = [event for event in events if event.get("method") == "session/new"]
+    resumes = [event for event in events if event.get("method") == "session/resume"]
+    turns = [event for event in events if event.get("method") == "session/prompt"]
+    if not prompts or len(starts) != 1 or len(turns) != len(prompts) or not starts[0].get("session_id"):
+        raise DriverError("OpenCode fixture created a fresh session or missed/duplicated a prompt")
+    session_id = starts[0]["session_id"]
+    for index, (turn, prompt) in enumerate(zip(turns, prompts)):
+        data = prompt.encode("utf-8")
+        if (turn.get("session_id") != session_id or turn.get("prior_turns") != index
+                or not turn.get("turn_id") or turn.get("prompt_bytes") != len(data)
+                or turn.get("prompt_sha256") != hashlib.sha256(data).hexdigest()):
+            raise DriverError("OpenCode upstream session context or exact prompt bytes changed")
+    if len({turn.get("turn_id") for turn in turns}) != len(turns):
+        raise DriverError("OpenCode fixture reused an upstream turn identity")
+    if require_resume and not resumes:
+        raise DriverError("OpenCode restart did not resume the upstream session")
 
 
 def scenario_codex_session(session: Session, args: argparse.Namespace) -> None:
@@ -1169,18 +1204,42 @@ def scenario_codex_session(session: Session, args: argparse.Namespace) -> None:
     session.data["expected_outcome"] = "codex_adapter_three_turns_same_session_reopened_with_upstream_context"
 
 
+def scenario_opencode_session(session: Session, args: argparse.Namespace) -> None:
+    prompts = ["first offline OpenCode turn café 世界", "second offline OpenCode turn with retained context",
+               "third offline OpenCode turn after restart"]
+    turns = [send_turn(session, prompt, args.timeout) for prompt in prompts[:2]]
+    capture(session, "opencode-second-turn.png")
+    restart_app(session, args)
+    turns.append(send_turn(session, prompts[2], args.timeout))
+    events = fixture_events(session)
+    assert_opencode_fixture_trace(events, prompts, require_resume=True)
+    if (not turns[0].get("send_session_id") or len({turn.get("send_session_id") for turn in turns}) != 1
+            or len({turn.get("run_id") for turn in turns}) != 3
+            or len({turn.get("send_command_id") for turn in turns}) != 3
+            or len({turn.get("thread_id") for turn in turns}) != 1
+            or not any("prior turns 2" in value for value in turns[-1].get("transcript", []))):
+        raise DriverError("GUI and offline OpenCode session/restart evidence do not agree", EX_ASSERTION)
+    session.journal("scenario.opencode-session", turns[0], turns[-1],
+                    input_origin="ordinary GUI Send before and after restart",
+                    outcome="same_upstream_session_three_distinct_turns_exact_prompt_digests",
+                    upstream_turns=[event for event in events if event.get("method") == "session/prompt"])
+    session.data["expected_outcome"] = "opencode_adapter_three_turns_same_session_reopened_with_upstream_context"
+
+
 def full_size_prompts() -> list[str]:
     return ["x" * 65536, "🙂" * 16384, '\n"\\\t' * 16384, "x" * 2047 + "€" + "\x01" * 63486]
 
 
 def scenario_large_send(session: Session, args: argparse.Namespace) -> None:
-    prompts = full_size_prompts() if args.provider == "codex-fixture" else full_size_prompts()[:1]
+    prompts = full_size_prompts() if args.provider in {"codex-fixture", "opencode-fixture"} else full_size_prompts()[:1]
     for prompt in prompts:
         current = send_turn(session, prompt, args.timeout)
         if current.get("send_prompt_bytes") != 65536 or current.get("draft"):
             raise DriverError("full-size Send did not report exact bytes and clear its admitted draft", EX_ASSERTION)
     if args.provider == "codex-fixture":
         assert_codex_fixture_trace(fixture_events(session), prompts)
+    elif args.provider == "opencode-fixture":
+        assert_opencode_fixture_trace(fixture_events(session), prompts)
     session.data["expected_outcome"] = "full_64KiB_send_completed_exact_prompt_bytes"
 
 
@@ -1223,6 +1282,34 @@ def scenario_codex_error(session: Session, args: argparse.Namespace) -> None:
     session.data["expected_outcome"] = "codex_send_accepted_specific_provider_failure_retained_and_copyable"
 
 
+def scenario_opencode_error(session: Session, args: argparse.Namespace) -> None:
+    failed = send_turn(session, "offline synthetic OpenCode provider error", args.timeout, terminal="failed")
+    current = wait_snapshot(session, lambda value: value.get("run_id") == failed.get("run_id")
+                            and value.get("send_stage") == "provider_failed"
+                            and "Offline synthetic OpenCode provider failure (synthetic)." in value.get("send_provider_diagnostic", ""),
+                            args.timeout, "accepted Send with retained OpenCode provider failure")
+    if current.get("send_receipt") != "accepted" or current.get("draft"):
+        raise DriverError("OpenCode provider failure was confused with local admission refusal", EX_ASSERTION)
+    if current.get("notice") != "Offline synthetic OpenCode provider failure (synthetic).":
+        raise DriverError("OpenCode provider failure banner did not show the readable provider message", EX_ASSERTION)
+    assert_opencode_fixture_trace(fixture_events(session), ["offline synthetic OpenCode provider error"])
+    capture(session, "opencode-failure-banner.png")
+    perform_key(session, "ctrl+shift+c", args.timeout)
+    copied = read_private_clipboard(session)
+    report = json.loads(copied)
+    if (report.get("run_id") != current.get("run_id") or report.get("command_id") != current.get("send_command_id")
+            or report.get("receipt") != "accepted" or report.get("run_state") != "failed"
+            or "Offline synthetic OpenCode provider failure (synthetic)." not in report.get("provider_diagnostic", "")
+            or "offline synthetic OpenCode provider error" in copied):
+        raise DriverError("copied OpenCode diagnostic lost correlation or included the prompt", EX_ASSERTION)
+    atomic_json(session.output / "provider-diagnostic.json", report)
+    session.journal("scenario.opencode-error", failed, current,
+                    input_origin="ordinary GUI Send to offline OpenCode fixture",
+                    receipt_outcome="accepted", run_state="failed",
+                    outcome="specific_synthetic_provider_error_preserved_and_copyable")
+    session.data["expected_outcome"] = "opencode_send_accepted_specific_provider_failure_retained_and_copyable"
+
+
 def read_private_clipboard(session: Session) -> str:
     # vd run returns process metadata on stdout; the command's stdout goes to
     # its explicitly selected log. Never interpret that launch receipt as data.
@@ -1239,7 +1326,9 @@ def read_private_clipboard(session: Session) -> str:
 
 def scenario(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
-    expected_provider = "codex-fixture" if args.name in {"codex-session", "codex-error", "codex-large-send"} else "fake"
+    expected_provider = ("codex-fixture" if args.name in {"codex-session", "codex-error", "codex-large-send"}
+                        else "opencode-fixture" if args.name in {"opencode-session", "opencode-error", "opencode-large-send"}
+                        else "fake")
     args.provider = args.provider or expected_provider
     if args.provider != expected_provider:
         raise DriverError(f"{args.name} requires the offline {expected_provider} provider", EX_PROVIDER)
@@ -1255,9 +1344,13 @@ def scenario(args: argparse.Namespace) -> int:
     try:
         if args.name == "codex-session":
             scenario_codex_session(session, args)
+        elif args.name == "opencode-session":
+            scenario_opencode_session(session, args)
         elif args.name == "codex-error":
             scenario_codex_error(session, args)
-        elif args.name in {"large-send", "codex-large-send"}:
+        elif args.name == "opencode-error":
+            scenario_opencode_error(session, args)
+        elif args.name in {"large-send", "codex-large-send", "opencode-large-send"}:
             scenario_large_send(session, args)
         elif args.name == "composer-capacity":
             scenario_composer_capacity(session, args)
@@ -1326,9 +1419,12 @@ def scenario(args: argparse.Namespace) -> int:
 def scenario_steps(name: str) -> list[str]:
     return {"codex-session": ["launch production Codex adapter with isolated offline app-server fixture", "Send two turns", "restart native app on same private desktop", "Send third turn", "assert one upstream session, distinct commands/runs/turns, exact UTF-8 prompt digests and resumed prior context"],
             "codex-error": ["launch production Codex adapter with isolated failing offline fixture", "Send a prompt", "assert accepted command then failed run with retained specific synthetic provider diagnostic", "copy diagnostic with Ctrl+Shift+C and verify correlation without prompt content", "capture failure banner for visual review"],
+            "opencode-session": ["launch production OpenCode 2.1.4 adapter with isolated offline ACP fixture", "Send two turns", "restart native app on same private desktop", "Send third turn", "assert one upstream session, distinct commands/runs/turns, exact UTF-8 prompt digests and resumed prior context"],
+            "opencode-error": ["launch production OpenCode 2.1.4 adapter with isolated failing offline ACP fixture", "Send a prompt", "assert accepted command then failed run with retained specific synthetic provider diagnostic", "copy diagnostic with Ctrl+Shift+C and verify correlation without prompt content", "capture failure banner for visual review"],
             "disabled-send": ["launch fake", "snapshot empty composer", "assert command.send disabled"],
             "large-send": ["launch fake", "paste and Send all 65536 composer bytes", "assert accepted command, correlated completed run and empty draft"],
             "codex-large-send": ["launch production Codex adapter with offline fixture", "Send exact 65536-byte ASCII, emoji, escaped JSON and split-codepoint prompts", "assert four completed turns and matching upstream prompt digests"],
+            "opencode-large-send": ["launch production OpenCode 2.1.4 adapter with offline ACP fixture", "Send exact 65536-byte ASCII, emoji, escaped JSON and split-codepoint prompts", "assert four completed turns and matching upstream prompt digests"],
             "composer-capacity": ["launch fake", "type a retained draft", "select all and paste 65537 bytes", "assert whole paste refused and original draft revision retained without Send"],
             "send-restart": ["launch fake", "type prompt and Send", "correlate command and new run", "allow fake approval", "close app while retaining private desktop", "relaunch and assert same completed thread/run"],
             "second-turn": ["run send-restart", "send second prompt in reopened thread", "assert distinct command/run and same thread", "record fake-only context limitation"],
@@ -1356,7 +1452,7 @@ def receipt(args: argparse.Namespace, session: Session | None = None) -> int:
                     "actions": len(manifest.get("actions", [])),
                     "evidence": {"manifest": str(session.output / "session.json"),
                                  "actions": str(session.output / "actions.json"),
-                                 "offline_protocol_events": str(session.output / "codex-fixture-account/workflow-events.jsonl") if manifest.get("provider") == "codex-fixture" else None,
+                                 "offline_protocol_events": str(session.output / f"{manifest.get('provider')}-account/workflow-events.jsonl") if manifest.get("provider") in {"codex-fixture", "opencode-fixture"} else None,
                                  "screenshots": [str(path) for path in session.output.glob("*.png")]},
                     "limitations": manifest.get("limitations", [])}
     atomic_json(session.output / "receipt.json", receipt_data)
@@ -1380,7 +1476,7 @@ def parser() -> argparse.ArgumentParser:
 
     item = commands.add_parser("launch", help="launch an offline provider on a private desktop")
     item.add_argument("--private", action="store_true", help="required acknowledgement of private vd desktop")
-    item.add_argument("--provider", choices=("fake", "codex-fixture"), default="fake")
+    item.add_argument("--provider", choices=("fake", "codex-fixture", "opencode-fixture"), default="fake")
     item.add_argument("--binary", type=Path)
     item.add_argument("--build", action="store_true", help="explicitly build before launch")
     item.add_argument("--optimize", choices=("Debug", "ReleaseSafe"), default="ReleaseSafe")
@@ -1436,10 +1532,10 @@ def parser() -> argparse.ArgumentParser:
     add_common(item)
 
     item = commands.add_parser("scenario", help="run a bounded offline GUI scenario")
-    item.add_argument("name", choices=("send-restart", "disabled-send", "large-send", "composer-capacity", "codex-large-send", "second-turn",
+    item.add_argument("name", choices=("send-restart", "disabled-send", "large-send", "composer-capacity", "codex-large-send", "opencode-large-send", "second-turn",
                                              "workspace-diff", "capability-refusal", "followup-refusal", "question-refusal", "attachment-refusal",
-                                             "codex-session", "codex-error"))
-    item.add_argument("--provider", choices=("fake", "codex-fixture"), help="offline fixture; inferred from scenario")
+                                             "codex-session", "codex-error", "opencode-session", "opencode-error"))
+    item.add_argument("--provider", choices=("fake", "codex-fixture", "opencode-fixture"), help="offline fixture; inferred from scenario")
     item.add_argument("--prompt", default="offline GUI send")
     item.add_argument("--binary", type=Path)
     item.add_argument("--build", action="store_true")

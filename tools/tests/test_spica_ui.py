@@ -154,8 +154,8 @@ class SpicaUiOfflineTests(unittest.TestCase):
 
     def test_new_scenarios_have_offline_plans(self):
         with tempfile.TemporaryDirectory() as directory:
-            for name in ("second-turn", "large-send", "codex-large-send", "composer-capacity", "workspace-diff", "capability-refusal",
-                         "followup-refusal", "question-refusal", "attachment-refusal", "codex-session", "codex-error"):
+            for name in ("second-turn", "large-send", "codex-large-send", "opencode-large-send", "composer-capacity", "workspace-diff", "capability-refusal",
+                         "followup-refusal", "question-refusal", "attachment-refusal", "codex-session", "codex-error", "opencode-session", "opencode-error"):
                 result = self.run_cli("scenario", name, "--output", directory, "--dry-run")
                 self.assertEqual(result.returncode, 0, (name, result.stderr))
                 self.assertTrue(json.loads(result.stdout)["steps"])
@@ -171,6 +171,33 @@ class SpicaUiOfflineTests(unittest.TestCase):
             self.assertFalse((Path(directory) / "codex-fixture-account").exists())
             mismatch = self.run_cli("scenario", "codex-session", "--provider", "fake", "--dry-run")
             self.assertEqual(mismatch.returncode, 15)
+
+    def test_opencode_fixture_dry_run_pins_exact_acp_fixture_and_disposable_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_cli("launch", "--provider", "opencode-fixture", "--private",
+                                  "--output", directory, "--dry-run")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            argv = json.loads(result.stdout)["argv"]
+            self.assertEqual(argv[argv.index("--runtime-executable") + 1],
+                             str(ROOT / "build/opencode_workflow_fixture.py"))
+            self.assertEqual(argv[argv.index("--runtime-account-directory") + 1],
+                             str(Path(directory) / "opencode-fixture-account"))
+            self.assertFalse((Path(directory) / "opencode-fixture-account").exists())
+            mismatch = self.run_cli("scenario", "opencode-session", "--provider", "fake", "--dry-run")
+            self.assertEqual(mismatch.returncode, 15)
+
+    def test_opencode_fixture_trace_rejects_fresh_sessions_missing_turns_and_changed_prompt_bytes(self):
+        module = load_cli()
+        prompt = "café 世界"
+        start = {"method": "session/new", "session_id": "session"}
+        turn = {"method": "session/prompt", "session_id": "session", "turn_id": "turn", "prior_turns": 0,
+                "prompt_bytes": len(prompt.encode()), "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()}
+        module.assert_opencode_fixture_trace([start, turn], [prompt])
+        for events in ([start, start, turn], [start], [start, {**turn, "prior_turns": 1}],
+                       [start, {**turn, "session_id": "other"}], [start, {**turn, "turn_id": ""}],
+                       [start, {**turn, "prompt_bytes": 2}], [start, {**turn, "prompt_sha256": "wrong"}]):
+            with self.assertRaises(module.DriverError):
+                module.assert_opencode_fixture_trace(events, [prompt])
 
     def test_codex_fixture_trace_rejects_fresh_sessions_missing_turns_and_changed_prompt_bytes(self):
         module = load_cli()
