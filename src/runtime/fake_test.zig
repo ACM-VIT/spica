@@ -227,7 +227,7 @@ test "queued followup and bounded attachments retain typed identity and capabili
     try t.expectError(error.CapabilityUnavailable, blocked.message(queued.message));
     var too_large = workflowConfig();
     too_large.discovery.limits.attachment_bytes = 4;
-    var bounded = try f.Runtime(1, 1).init(too_large, &.{});
+    var bounded = try f.Runtime(8, 8).init(too_large, &.{});
     try t.expectError(error.InvalidAttachment, bounded.message(queued.message));
 }
 
