@@ -151,7 +151,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .assets = build_options.asset_directory,
         .libraries = build_options.native_library_dir,
     });
-    var app = App.initWithFonts(std.heap.page_allocator, resources.fonts.slice()) catch |err| {
+    const app = try std.heap.page_allocator.create(App);
+    defer std.heap.page_allocator.destroy(app);
+    app.initIntoWithFonts(std.heap.page_allocator, resources.fonts.slice()) catch |err| {
         std.log.err("Native foundation startup failed: {s}; SDL: {s}", .{ @errorName(err), c.SDL_GetError() });
         return err;
     };

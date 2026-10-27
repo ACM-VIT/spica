@@ -10,10 +10,10 @@ import unittest
 
 
 class HistoryFixtureTest(unittest.TestCase):
-    def invoke(self, root, *, turns=1, content=96, name="boundary", extra=()):
+    def invoke(self, root, *, threads=1, turns=1, content=96, name="boundary", extra=()):
         return subprocess.run([str(pathlib.Path("zig-out/bin/build-history-fixture").resolve()),
             "--state", str(root / "state"), "--workspace", str(root / "workspace"),
-            "--threads", "1", "--turns", str(turns), "--content-bytes", str(content),
+            "--threads", str(threads), "--turns", str(turns), "--content-bytes", str(content),
             "--seed", "17", "--name", name, *extra], text=True, capture_output=True, timeout=45)
 
     def test_deep_history_pages_and_late_cancellation(self):
@@ -29,6 +29,18 @@ class HistoryFixtureTest(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT state FROM runs WHERE id=?", (manifest["latest_run_id"],)).fetchone()[0], "cancelled")
                 self.assertEqual(db.execute("SELECT sum(length(bytes)) FROM chunks").fetchone()[0], manifest["content_bytes"])
                 self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+    def test_wide_fixture_remains_bounded_beyond_startup_scan_budget(self):
+        with tempfile.TemporaryDirectory(prefix="spica-history-wide-") as directory:
+            root = pathlib.Path(directory)
+            result = self.invoke(root, threads=160)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["generated_threads"], 160)
+        with tempfile.TemporaryDirectory(prefix="spica-history-wide-limit-") as directory:
+            root = pathlib.Path(directory)
+            result = self.invoke(root, threads=257)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root / "state").exists())
 
     def test_exact_prompt_limit_and_unicode_header_truncation(self):
         for length in (26, 27, 28, 29, 65536):

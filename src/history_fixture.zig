@@ -8,7 +8,7 @@ const domain = @import("domain");
 const t = domain.types;
 const a = t.adapter;
 
-const max_threads: usize = 64;
+const max_threads: usize = 256;
 const max_turns: usize = 4096;
 const max_content_bytes: usize = domain.max_prompt_bytes;
 const max_generated_turns: usize = 16 * 1024;

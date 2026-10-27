@@ -39,7 +39,7 @@ EX_ASSERTION = 16
 EX_PROCESS = 17
 EX_BUILD = 18
 
-HISTORY_CASES = {"history-deep": (2, 130), "history-wide": (40, 2)}
+HISTORY_CASES = {"history-deep": (2, 130), "history-wide": (160, 2)}
 
 
 class DriverError(Exception):
@@ -1384,6 +1384,37 @@ def scenario_history_wide(session: Session, args: argparse.Namespace) -> None:
         raise DriverError("history search lost active draft or title", EX_ASSERTION)
     assert_no_new_provider_work(before, found, "history search")
     capture(session, "history-search.png")
+    # Broad queries fill the same 32 slots. Advancing those results must be
+    # possible even though the first page already contains matching cards.
+    perform_key(session, "ctrl+a", args.timeout)
+    perform_key(session, "BackSpace", args.timeout)
+    perform_input(session, "text", "sidebar.search", args.timeout, "turn=0")
+    broad = wait_snapshot(session, lambda s: s.get("sidebar_search") == "turn=0"
+                          and s.get("thread_more_available")
+                          and len([label for label in s.get("thread_labels", []) if label]) == 32,
+                          args.timeout, "bounded first page of matching chats")
+    capture(session, "history-search-more.png")
+    page_count = (HISTORY_CASES['history-wide'][0] + 31) // 32
+    for page_number in range(1, page_count):
+        if page_number == page_count - 1:
+            perform_input(session, "click", "sidebar.search.more", args.timeout)
+        else:
+            perform_key(session, "ctrl+Page_Down", args.timeout)
+        broad = wait_snapshot(session, lambda s: s.get("thread_labels") != broad.get("thread_labels")
+                              and len([label for label in s.get("thread_labels", []) if label]) == 32,
+                              args.timeout, f"matching chat page {page_number + 1}")
+    if broad.get("thread_more_available") or broad.get("draft") != draft or broad.get("title_text") != before.get("title_text"):
+        raise DriverError("matching chat pagination lost its end, draft or active title", EX_ASSERTION)
+    assert_no_new_provider_work(before, broad, "matching chat pagination")
+    capture(session, "history-search-last-page.png")
+    # Narrow again: changed revisions restart from durable history, rather
+    # than searching only the most recently resident result page.
+    perform_key(session, "ctrl+a", args.timeout)
+    perform_key(session, "BackSpace", args.timeout)
+    perform_input(session, "text", "sidebar.search", args.timeout, query)
+    wait_snapshot(session, lambda s: s.get("sidebar_search") == query
+                  and any(t.get("id") == target and t.get("enabled") for t in target_groups(s)),
+                  args.timeout, "narrow query after paginating matches")
     perform_input(session, "click", target, args.timeout)
     selected = wait_snapshot(session, lambda s: s.get("thread_id") == target and s.get("sidebar_search") == ""
                              and s.get("draft") == "" and history_ordinals(s), args.timeout, "select matched durable chat")
@@ -1739,7 +1770,7 @@ def scenario_steps(name: str) -> list[str]:
             "opencode-error": ["launch production OpenCode 2.1.4 adapter with isolated failing offline ACP fixture", "Send a prompt", "assert accepted command then failed run with retained specific synthetic provider diagnostic", "copy diagnostic with Ctrl+Shift+C and verify correlation without prompt content", "capture failure banner for visual review"],
             "thread-title": ["launch fake and complete a turn", "save a Unicode title with F2 and Enter", "cancel a pointer edit with Escape", "click composer while editing and verify draft input", "open Changes and search renamed chat", "switch chats and verify draft", "restart and verify durable title"],
             "history-deep": ["seed 2 chats with 130 turns each through public Host before launch", "navigate previous, first, next and latest bounded history pages", "switch populated chats and retain draft", "Send a new turn", "restart and verify appended history"],
-            "history-wide": ["seed 40 chats through public Host before launch", "type a query matching chat outside first 32 cards", "wait for automatic durable search without Enter", "verify active title and draft", "select matched chat"],
+            "history-wide": ["seed 160 chats through public Host before launch", "type a query matching chat beyond 128 rows", "wait for automatic durable search without Enter", "page through all 32-card matching result sets", "verify active title and draft", "select matched chat"],
             "disabled-send": ["launch fake", "snapshot empty composer", "assert command.send disabled"],
             "large-send": ["launch fake", "paste and Send all 65536 composer bytes", "assert accepted command, correlated completed run and empty draft"],
             "codex-large-send": ["launch production Codex adapter with offline fixture", "Send exact 65536-byte ASCII, emoji, escaped JSON and split-codepoint prompts", "assert four completed turns and matching upstream prompt digests"],

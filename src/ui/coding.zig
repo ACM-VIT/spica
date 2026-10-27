@@ -253,6 +253,8 @@ pub const View = struct {
     project_count: usize = 0,
     threads: [32]Entry = @splat(.{}),
     thread_count: usize = 0,
+    active_thread_title: [160]u8 = undefined,
+    active_thread_title_len: usize = 0,
     active_project: transcript.Id = .{},
     active_thread: transcript.Id = .{},
     navigation: ?Navigation = null,
@@ -294,6 +296,7 @@ pub const View = struct {
     model_action: ?enum { restart, next } = null,
     selected_model_cache: ?Model = null,
     search_more_available: bool = false,
+    search_more_bounds: c.SDL_FRect = zero_rect,
     const zero_rect: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     pub const picker_row_height: f32 = 48;
     pub const sidebar_card_stride: f32 = 83;
@@ -597,6 +600,12 @@ pub const View = struct {
         self.history_position = next.position;
         self.history_restore = next.position != null;
         self.active_thread = id;
+        self.active_thread_title_len = 0;
+        for (self.threads[0..self.thread_count]) |*entry| if (entry.id.eql(id.slice())) {
+            self.active_thread_title_len = entry.len;
+            @memcpy(self.active_thread_title[0..entry.len], entry.label[0..entry.len]);
+            break;
+        };
         self.rendered_selection = null;
         self.preedit_len = 0;
         self.preedit_changed = true;
@@ -633,9 +642,17 @@ pub const View = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) !View {
+        var view: View = undefined;
+        try view.initInto(allocator);
+        return view;
+    }
+
+    /// Initialize the fixed-capacity view in its owner's storage. Production
+    /// startup must not duplicate these large arrays in nested stack frames.
+    pub fn initInto(self: *View, allocator: std.mem.Allocator) !void {
         var editor = try Composer.init(allocator);
         errdefer editor.deinit();
-        return .{ .allocator = allocator, .editor = editor, .scratch = try allocator.alloc(u8, 64 * 1024 + 1), .attachments = attachment_text.Store.init(allocator) };
+        self.* = .{ .allocator = allocator, .editor = editor, .scratch = try allocator.alloc(u8, 64 * 1024 + 1), .attachments = attachment_text.Store.init(allocator) };
     }
 
     pub fn deinit(self: *View) void {
@@ -875,6 +892,13 @@ pub const View = struct {
             self.title_action = null;
             return;
         };
+        if (self.active_thread_title_len != 0) {
+            self.title_len = self.active_thread_title_len;
+            @memcpy(self.title_buffer[0..self.title_len], self.active_thread_title[0..self.title_len]);
+            self.title_select_all = true;
+            self.title_editing = true;
+            self.title_action = null;
+        }
     }
 
     pub fn titleEditAvailable(self: *const View) bool {
@@ -906,7 +930,7 @@ pub const View = struct {
         return .{ .x = x, .y = y, .w = right - x, .h = bottom - y };
     }
 
-    fn threadMatches(self: *const View, entry: *const Entry) bool {
+    pub fn threadMatches(self: *const View, entry: *const Entry) bool {
         if (self.scope_project.len != 0 and !entry.project_id.eql(self.scope_project.slice())) return false;
         const query = std.mem.trim(u8, self.search_query[0..self.search_len], " \t\r\n");
         if (query.len == 0) return true;
@@ -918,7 +942,7 @@ pub const View = struct {
         return false;
     }
 
-    fn visibleThreadCount(self: *const View) usize {
+    pub fn visibleThreadCount(self: *const View) usize {
         var count: usize = 0;
         for (self.threads[0..self.thread_count]) |*entry| if (self.threadMatches(entry)) {
             count += 1;
@@ -1162,6 +1186,10 @@ pub const View = struct {
                         if (!c.SDL_SetTextInputArea(window, &area, 0)) return error.TextInputArea;
                         return true;
                     }
+                    if (self.search_len != 0 and self.search_more_available and self.navigation_enabled and widgets.contains(self.search_more_bounds, x, y)) {
+                        self.navigation = .search_more;
+                        return true;
+                    }
                     self.search_focused = false;
                     if (widgets.contains(self.scope_bounds, x, y)) {
                         self.scope_open = true;
@@ -1209,6 +1237,11 @@ pub const View = struct {
                         if (widgets.contains(self.sidebar_rows, x, y)) {
                             for (0..self.thread_count) |index| if (widgets.contains(self.threadRowBounds(index), x, y)) {
                                 self.navigation = .{ .thread = index };
+                                if (self.search_len != 0) {
+                                    self.search_len = 0;
+                                    self.search_select_all = false;
+                                    self.sidebarChanged();
+                                }
                             };
                         }
                         return true;
@@ -1531,6 +1564,10 @@ pub const View = struct {
                 }
                 if (self.search_focused and self.custom_root == null) {
                     if (!self.window_active) return false;
+                    if (ctrl and key == c.SDLK_PAGEDOWN and self.search_more_available and self.navigation_enabled) {
+                        self.navigation = .search_more;
+                        return true;
+                    }
                     if (ctrl and key == c.SDLK_A) self.search_select_all = true;
                     if (ctrl and key == c.SDLK_V) {
                         const value = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
@@ -1868,7 +1905,10 @@ pub const View = struct {
         try icon(renderer, .folder, self.new_project_bounds.x + 6, action_y + 5, sidebar_muted);
         try icon(renderer, .plus, self.new_project_bounds.x + 8, action_y + 7, sidebar_muted);
         try icon(renderer, .pen, self.new_thread_bounds.x + 6, action_y + 6, sidebar_muted);
-        self.sidebar_rows = .{ .x = 8, .y = row_top + 40, .w = sidebar - 16, .h = @max(0, height - row_top - 84) };
+        const more_height: f32 = if (self.search_len != 0 and self.search_more_available) 24 else 0;
+        self.search_more_bounds = if (more_height != 0) .{ .x = 8, .y = row_top + 36, .w = sidebar - 16, .h = more_height } else zero_rect;
+        if (more_height != 0) try self.labels.drawFitted(renderer, text, "More matches · Ctrl+PgDn", 18, row_top + 40, sidebar - 36, 12, sidebar_muted);
+        self.sidebar_rows = .{ .x = 8, .y = row_top + 40 + more_height, .w = sidebar - 16, .h = @max(0, height - row_top - 84 - more_height) };
         const rows_height = @as(f32, @floatFromInt(self.visibleThreadCount())) * sidebar_card_stride;
         self.sidebar_scroll = std.math.clamp(self.sidebar_scroll, 0, @max(0, rows_height - self.sidebar_rows.h));
         self.project_bounds = @splat(zero_rect);
@@ -1876,7 +1916,7 @@ pub const View = struct {
         var clip = widgets.Clip.push(renderer, self.sidebar_rows);
         defer clip.restore(renderer);
         try self.drawThreads(renderer, text, foreground, sidebar_muted);
-        if (self.visibleThreadCount() == 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0 and self.search_more_available) "No match here · Enter searches older threads" else if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
+        if (self.visibleThreadCount() == 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0 and self.thread_search_busy) "Searching older threads…" else if (self.search_len != 0 and self.search_more_available) "No match here · Enter searches older threads" else if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
         clip.restore(renderer);
         // Connection is the implemented utility. Do not imitate unavailable
         // Usage, Pull Requests or Settings destinations from the reference.
@@ -1894,6 +1934,7 @@ pub const View = struct {
             thread_name = entry.label[0..entry.len];
             if (entry.project_name.len != 0) project_name = entry.project_name.slice();
         };
+        if (std.mem.eql(u8, thread_name, "New chat") and self.active_thread_title_len != 0) thread_name = self.active_thread_title[0..self.active_thread_title_len];
         const project_width = @min(@max(0, bounds.header.width - header_x - metrics.gutter) * 0.3, try self.labels.width(text, @import("../text/utf8.zig").prefix(project_name, 128), 14));
         try icon(renderer, .folder, header_x, (bounds.header.height - 16) / 2, muted);
         try self.labels.drawFitted(renderer, text, project_name, header_x + 24, (bounds.header.height - 16) / 2, project_width, 14, muted);
@@ -3623,6 +3664,34 @@ test "bounded sidebar search owns Unicode and preserves source indices and draft
     try std.testing.expectEqualStrings("draft must stay intact", draft);
 }
 
+test "search filtering preserves the active title editor when its card is absent" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.active_thread = try transcript.Id.init("active");
+    view.active_thread_title_len = "Pinned chat".len;
+    @memcpy(view.active_thread_title[0..view.active_thread_title_len], "Pinned chat");
+    view.navigation_enabled = true;
+    view.beginTitleEdit();
+    try std.testing.expect(view.title_editing);
+    try std.testing.expectEqualStrings("Pinned chat", view.title_buffer[0..view.title_len]);
+    view.title_editing = false;
+    view.thread_count = view.threads.len;
+    for (view.threads[0..], 0..) |*entry, index| {
+        var id: [32]u8 = undefined;
+        entry.id = try transcript.Id.init(try std.fmt.bufPrint(&id, "thread-{d}", .{index}));
+        entry.len = 6;
+        @memcpy(entry.label[0..6], "needle");
+    }
+    view.search_len = 6;
+    @memcpy(view.search_query[0..6], "needle");
+    try std.testing.expectEqual(view.threads.len, view.visibleThreadCount());
+    view.thread_count = 0;
+    try std.testing.expectEqual(@as(usize, 0), view.visibleThreadCount());
+    view.beginTitleEdit();
+    try std.testing.expect(view.title_editing);
+    try std.testing.expectEqualStrings("Pinned chat", view.title_buffer[0..view.title_len]);
+}
+
 test "flat rendered sidebar cards clip hits filter real project IDs and use bundled chrome" {
     for ([_][2]f32{ .{ 720, 480 }, .{ 900, 650 }, .{ 1100, 740 }, .{ 1280, 800 } }) |size| {
         const surface = c.SDL_CreateSurface(@intFromFloat(size[0]), @intFromFloat(size[1]), c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
@@ -3710,6 +3779,10 @@ test "flat rendered sidebar cards clip hits filter real project IDs and use bund
         event.button.y = filtered.y + 40;
         try std.testing.expect(try view.handle(event, undefined, undefined));
         try std.testing.expectEqual(@as(usize, 1), view.navigation.?.thread);
+        try std.testing.expectEqual(@as(usize, 0), view.search_len);
+        // Selecting a result clears search, just like keyboard Enter. Start
+        // another query before checking its intersection with project scope.
+        try view.searchInsert("NEEDLE");
         event.button.x = view.scope_bounds.x + 4;
         event.button.y = view.scope_bounds.y + 4;
         try std.testing.expect(try view.handle(event, undefined, undefined));
