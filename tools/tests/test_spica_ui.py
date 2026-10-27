@@ -291,7 +291,7 @@ class SpicaUiOfflineTests(unittest.TestCase):
     def test_new_scenarios_have_offline_plans(self):
         with tempfile.TemporaryDirectory() as directory:
             for name in ("second-turn", "large-send", "codex-large-send", "opencode-large-send", "composer-capacity", "workspace-diff", "capability-refusal",
-                         "followup-refusal", "question-refusal", "attachment-refusal", "codex-session", "codex-error", "opencode-session", "opencode-error"):
+                         "followup-refusal", "question-refusal", "attachment-delivery", "codex-session", "codex-error", "opencode-session", "opencode-error"):
                 result = self.run_cli("scenario", name, "--output", directory, "--dry-run")
                 self.assertEqual(result.returncode, 0, (name, result.stderr))
                 self.assertTrue(json.loads(result.stdout)["steps"])

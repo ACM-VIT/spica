@@ -1057,7 +1057,7 @@ def scenario_followup_refusal(session: Session, args: argparse.Namespace) -> Non
     session.data["expected_outcome"] = "followup_refused_draft_retained_active_run_cancelled"
 
 
-def scenario_attachment_refusal(session: Session, args: argparse.Namespace) -> None:
+def scenario_attachment_delivery(session: Session, args: argparse.Namespace) -> None:
     before = composer_ready(session, args.timeout)
     draft = "attachment draft café 世界"
     perform_input(session, "text", "composer.input", args.timeout, draft)
@@ -1072,110 +1072,41 @@ def scenario_attachment_refusal(session: Session, args: argparse.Namespace) -> N
     path_ready = wait_snapshot(session, lambda value: value.get("workflow_path") == str(small),
                                args.timeout, "UTF-8 attachment path")
     perform_input(session, "click", "attachment.add", args.timeout)
-    refused = wait_snapshot(session, lambda value: value.get("workflow_error") in {"capability_unavailable", "attachment_unsupported"}
-                            and value.get("attachment_count") == 1
-                            and not value.get("pending_command"), args.timeout,
-                            "Host attachment capability refusal")
-    assert_attachment_refusal(before, refused, str(small), draft, small.stat().st_size)
-    capture(session, "attachment-retained.png")
-    session.journal("scenario.attachment-add-refusal", path_ready, refused,
+    admitted = wait_snapshot(session, lambda value: value.get("attachment_count") == 1
+                             and not value.get("pending_command")
+                             and value.get("workflow_error") in {None, ""}, args.timeout,
+                             "Host attachment admission")
+    if (admitted.get("workflow_path") != str(small) or admitted.get("draft") != draft
+            or admitted.get("attachment_bytes") != small.stat().st_size):
+        raise DriverError("Host attachment admission lost the local file or draft", EX_ASSERTION)
+    capture(session, "attachment-admitted.png")
+    session.journal("scenario.attachment-add", path_ready, admitted,
                     input_origin="ordinary vd path text and painted Add pointer",
-                    command_state=state_receipt(refused),
-                    receipt_outcome=refused.get("workflow_error"),
-                    run_state={"id": refused.get("run_id"), "status": refused.get("run_status")},
-                    outcome="local_bytes_retained_host_attachment_refused")
+                    command_state=state_receipt(admitted), receipt_outcome="accepted",
+                    run_state={"id": admitted.get("run_id"), "status": admitted.get("run_status")},
+                    outcome="local_bytes_retained_and_host_attachment_admitted")
     perform_input(session, "click", "workflow.close", args.timeout)
     closed = wait_snapshot(session, lambda value: not value.get("workflow_open"),
-                           args.timeout, "workflow close after attachment refusal")
-    assert_send_blocked_by_attachment(closed)
-    session.journal("scenario.attachment-send-blocked", refused, closed,
-                    input_origin="painted workflow close target",
-                    command_state=state_receipt(closed),
-                    receipt_outcome="Send target disabled by local attachment",
-                    run_state={"id": closed.get("run_id"), "status": closed.get("run_status")},
-                    outcome="send_blocked_no_new_command_or_run")
-    perform_key(session, "Return", args.timeout)
-    blocked = wait_snapshot(session, lambda value: value.get("draft") == draft
-                            and value.get("attachment_count") == 1
-                            and not value.get("pending_command"), args.timeout,
-                            "blocked Send input with local attachment")
-    assert_send_blocked_by_attachment(blocked)
-    assert_no_new_provider_work(closed, blocked, "blocked Send input")
-    capture(session, "attachment-send-blocked.png")
-    session.journal("scenario.attachment-send-input", closed, blocked,
-                    input_origin="ordinary vd keyboard Return",
-                    command_state=state_receipt(blocked),
-                    receipt_outcome="command.send remained disabled",
-                    run_state={"id": blocked.get("run_id"), "status": blocked.get("run_status")},
-                    outcome="blocked_send_input_no_new_command_or_run")
-    old_thread = closed["thread_id"]
-    perform_input(session, "click", "workspace.new_thread", args.timeout)
-    new_chat = wait_snapshot(session, lambda value: value.get("thread_count", 0) >= 2
-                             and value.get("thread_id") != old_thread,
-                             args.timeout, "new chat after attachment refusal")
-    old_target = find_target(new_chat, old_thread)
-    perform_input(session, "click", old_thread, args.timeout)
-    restored = wait_snapshot(session, lambda value: value.get("thread_id") == old_thread
-                             and value.get("draft") == draft
-                             and value.get("attachment_count") == 1
-                             and value.get("attachment_bytes") == small.stat().st_size,
-                             args.timeout, "retained draft and attachment after chat switch")
-    session.journal("scenario.attachment-retained-switch", new_chat, restored,
-                    input_origin="ordinary vd pointer on thread target",
-                    command_state=state_receipt(restored),
-                    receipt_outcome="local retained state restored",
-                    run_state={"id": restored.get("run_id"), "status": restored.get("run_status")},
-                    outcome="new_chat_and_back_retained_draft_and_file",
-                    target_bounds=old_target.get("pointer_bounds"))
-    perform_key(session, "F10", args.timeout)
-    wait_snapshot(session, lambda value: value.get("workflow_open"),
-                  args.timeout, "workflow panel for attachment removal")
-    perform_input(session, "click", "attachment.remove.0", args.timeout)
-    removed = wait_snapshot(session, lambda value: value.get("attachment_count") == 0
-                            and not value.get("pending_command")
-                            and "removed" in value.get("workflow_feedback", "").lower(),
-                            args.timeout, "local attachment removal receipt")
-    if removed.get("draft") != draft:
-        raise DriverError("removing the attachment changed the composer draft", EX_ASSERTION)
-    assert_no_new_provider_work(restored, removed, "attachment removal")
-    session.journal("scenario.attachment-remove", restored, removed,
-                    input_origin="ordinary vd pointer on painted Remove target",
-                    command_state=state_receipt(removed),
-                    receipt_outcome=removed.get("workflow_error") or removed.get("workflow_feedback"),
-                    run_state={"id": removed.get("run_id"), "status": removed.get("run_status")},
-                    outcome="local_file_removed_provider_removal_refused")
-    oversized = attachment_fixture(session.output, "oversized-café.txt", 256 * 1024 + 1)
-    perform_input(session, "click", "attachment.path", args.timeout)
-    perform_input(session, "text", "attachment.path", args.timeout, str(oversized), str(oversized))
-    oversized_path = wait_snapshot(session, lambda value: value.get("workflow_path") == str(oversized),
-                                    args.timeout, "oversized UTF-8 attachment path")
-    oversized_before = dict(oversized_path)
-    perform_input(session, "click", "attachment.add", args.timeout)
-    oversized_refused = wait_snapshot(session, lambda value: value.get("workflow_error") in {"StreamTooLong", "AttachmentLimit"}
-                                       and not value.get("workflow_busy"), args.timeout,
-                                       "oversized attachment refusal")
-    assert_oversized_attachment_refusal(oversized_before, oversized_refused, str(oversized), draft, 256 * 1024)
-    capture(session, "attachment-oversized-refused.png")
-    session.journal("scenario.attachment-oversized", oversized_path, oversized_refused,
-                    input_origin="ordinary vd path text and painted Add pointer",
-                    command_state=state_receipt(oversized_refused),
-                    receipt_outcome=oversized_refused.get("workflow_error"),
-                    run_state={"id": oversized_refused.get("run_id"), "status": oversized_refused.get("run_status")},
-                    outcome="256KiB_plus_one_read_refused_without_local_admission")
-    perform_input(session, "click", "workflow.close", args.timeout)
-    recovered = wait_snapshot(session, lambda value: not value.get("workflow_open")
-                              and value.get("draft") == draft
-                              and any(item.get("id") == "composer.input" and item.get("enabled")
-                                      for item in target_groups(value)), args.timeout,
-                              "composer target after workflow closure")
-    session.journal("scenario.attachment-panel-recovery", oversized_refused, recovered,
-                    input_origin="painted workflow close target",
-                    command_state=state_receipt(recovered),
-                    receipt_outcome="composer.input recovered",
-                    run_state={"id": recovered.get("run_id"), "status": recovered.get("run_status")},
-                    outcome="workflow_closed_composer_target_recovered")
-    session.data["expected_outcome"] = "attachment_refusal_retained_utf8_local_state_blocked_send_switch_remove_oversized_refused"
-
+                           args.timeout, "workflow close after attachment admission")
+    if not closed.get("send_ready"):
+        raise DriverError("Send remained disabled after a supported attachment was admitted", EX_ASSERTION)
+    perform_input(session, "click", "command.send", args.timeout)
+    accepted = wait_snapshot(session, lambda value: value.get("send_receipt") == "accepted"
+                             and value.get("send_run_id"), args.timeout, "attachment Send receipt")
+    completed = wait_snapshot(session, lambda value: value.get("run_id") == accepted.get("send_run_id")
+                              and value.get("run_status") == "completed", args.timeout,
+                              "attachment run completion")
+    events = fixture_events(session)
+    turns = [event for event in events if event.get("method") == "turn/start"]
+    digest = hashlib.sha256(small.read_bytes()).hexdigest()
+    if not turns or not turns[-1].get("attachments") or turns[-1]["attachments"][0].get("sha256") != digest:
+        raise DriverError("Codex fixture did not receive the admitted attachment digest", EX_ASSERTION)
+    session.journal("scenario.attachment-send", closed, completed,
+                    input_origin="painted workflow close target and Send pointer",
+                    command_state=state_receipt(completed), receipt_outcome="accepted",
+                    run_state={"id": completed.get("run_id"), "status": completed.get("run_status")},
+                    outcome="attachment_delivered_to_codex_fixture")
+    session.data["expected_outcome"] = "attachment_admitted_and_delivered_to_codex_fixture"
 
 def fixture_events(session: Session) -> list[dict[str, Any]]:
     provider = session.data.get("provider")
@@ -1668,7 +1599,7 @@ def read_private_clipboard(session: Session) -> str:
 
 def scenario(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
-    expected_provider = ("codex-fixture" if args.name in {"codex-session", "codex-error", "codex-large-send", "codex-crash-open", "codex-crash-recovery"}
+    expected_provider = ("codex-fixture" if args.name in {"codex-session", "codex-error", "codex-large-send", "codex-crash-open", "codex-crash-recovery", "attachment-delivery"}
                         else "opencode-fixture" if args.name in {"opencode-session", "opencode-error", "opencode-large-send"}
                         else "fake")
     args.provider = args.provider or expected_provider
@@ -1747,8 +1678,8 @@ def scenario(args: argparse.Namespace) -> int:
             session.data["expected_outcome"] = "unavailable_gui_capability_refused_without_input"
         elif args.name == "followup-refusal":
             scenario_followup_refusal(session, args)
-        elif args.name == "attachment-refusal":
-            scenario_attachment_refusal(session, args)
+        elif args.name == "attachment-delivery":
+            scenario_attachment_delivery(session, args)
         else:
             raise DriverError(f"unknown scenario: {args.name}", EX_USAGE)
         capture(session, "result.png")
@@ -1787,7 +1718,7 @@ def scenario_steps(name: str) -> list[str]:
             "capability-refusal": ["launch fake", "refuse unavailable followup.enqueue and question.answer", "assert no input or command/run change"],
             "followup-refusal": ["launch fake", "start an active fake run", "type a draft and open F10", "click Queue and assert FollowupCapabilityUnavailable with draft retained", "cancel the active run with F6"],
             "question-refusal": ["launch fake", "refuse unavailable question.answer", "assert no input or command/run change"],
-            "attachment-refusal": ["launch fake", "open F10 and add a UTF-8 file through attachment.path/add", "assert local bytes and draft retained after Host capability refusal", "assert Send blocked without a new command/run", "switch to a new chat and back", "remove the file", "refuse a 256 KiB + 1 file read", "close the panel and recover composer target"],
+            "attachment-delivery": ["launch the offline Codex fixture", "open F10 and add a UTF-8 text file through attachment.path/add", "assert Host metadata admission retains the local bytes and draft", "close the panel and Send the prompt with the admitted attachment", "assert one completed Codex turn contains the exact attachment digest"],
             }.get(name, [])
 
 
@@ -1889,7 +1820,7 @@ def parser() -> argparse.ArgumentParser:
 
     item = commands.add_parser("scenario", help="run a bounded offline GUI scenario")
     item.add_argument("name", choices=("send-restart", "disabled-send", "large-send", "composer-capacity", "codex-large-send", "opencode-large-send", "second-turn",
-                                             "workspace-diff", "capability-refusal", "followup-refusal", "question-refusal", "attachment-refusal",
+                                             "workspace-diff", "capability-refusal", "followup-refusal", "question-refusal", "attachment-delivery",
                                              "codex-session", "codex-error", "codex-crash-open", "codex-crash-recovery", "opencode-session", "opencode-error", "thread-title", "history-deep", "history-wide"))
     item.add_argument("--provider", choices=("fake", "codex-fixture", "opencode-fixture"), help="offline fixture; inferred from scenario")
     item.add_argument("--prompt", default="offline GUI send")

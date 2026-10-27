@@ -2436,7 +2436,10 @@ const Conversation = struct {
             },
             .prompt_cleanup => app.view.workflowNotice("One unfinished upload discarded. Your draft is retained; close More and retry Send."),
             .attachment_add, .attachment_remove => {
-                app.view.workflowNotice("Host accepted metadata command; provider delivery remains unavailable.");
+                app.view.workflowNotice(if (pending.kind == .attachment_add)
+                    "Attachment admitted. It will be delivered with the next Send."
+                else
+                    "Attachment removed from the current draft.");
                 self.refresh = true;
             },
             .followup_enqueue, .followup_edit => {
