@@ -193,7 +193,11 @@ class Fixture:
                 return
         self.opened = upstream
         self.record(method, session_id=upstream, prior_turns=len(state[upstream]))
-        self.reply(request, {"sessionId": upstream})
+        self.reply(request, {"sessionId": upstream, "configOptions": [{
+            "id": "model", "category": "model", "name": "Model", "type": "select",
+            "currentValue": f"{MODEL_PROVIDER}/{MODEL}",
+            "options": [{"value": f"{MODEL_PROVIDER}/{MODEL}", "name": "Offline OpenCode workflow fixture"}],
+        }]})
 
     def configure(self, request: dict, params: dict) -> None:
         if params.get("sessionId") != self.opened or params.get("configId") != "model":

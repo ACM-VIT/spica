@@ -49,6 +49,24 @@ class SpicaUiOfflineTests(unittest.TestCase):
         self.assertIn("scenario", result.stdout)
         self.assertIn("ordinary private-desktop", result.stdout)
 
+    def test_title_assertion_requires_header_sidebar_commit_and_retained_draft(self):
+        module = load_cli()
+        saved = {"title_editing": False, "pending_command": False, "title_text": "Native café 🎮",
+                 "thread_labels": ["Native café 🎮"], "draft": "retained"}
+        module.assert_chat_title(saved, "Native café 🎮", "retained")
+        for changed in ({"title_editing": True}, {"pending_command": True}, {"title_text": "old"},
+                        {"thread_labels": ["old"]}, {"draft": "lost"}):
+            with self.assertRaises(module.DriverError):
+                module.assert_chat_title({**saved, **changed}, "Native café 🎮", "retained")
+
+    def test_title_scenario_dry_run_is_offline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_cli("scenario", "thread-title", "--output", directory, "--dry-run")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Unicode title", result.stdout)
+            self.assertIn("restart", result.stdout)
+            self.assertFalse((Path(directory) / "session.json").exists())
+
     def test_vd_symlink_resolves_to_packaged_resource_directory(self):
         module = load_cli()
         with tempfile.TemporaryDirectory() as directory:
@@ -193,6 +211,9 @@ class SpicaUiOfflineTests(unittest.TestCase):
         turn = {"method": "session/prompt", "session_id": "session", "turn_id": "turn", "prior_turns": 0,
                 "prompt_bytes": len(prompt.encode()), "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()}
         module.assert_opencode_fixture_trace([start, turn], [prompt])
+        module.assert_opencode_fixture_trace([{"method": "session/new", "session_id": "unprompted-catalog"}, start, turn], [prompt])
+        with self.assertRaises(module.DriverError):
+            module.assert_opencode_fixture_trace([start, turn, {"method": "session/resume", "session_id": "wrong"}], [prompt], require_resume=True)
         for events in ([start, start, turn], [start], [start, {**turn, "prior_turns": 1}],
                        [start, {**turn, "session_id": "other"}], [start, {**turn, "turn_id": ""}],
                        [start, {**turn, "prompt_bytes": 2}], [start, {**turn, "prompt_sha256": "wrong"}]):

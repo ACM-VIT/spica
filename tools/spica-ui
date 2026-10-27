@@ -1162,12 +1162,14 @@ def assert_codex_fixture_trace(events: list[dict[str, Any]], prompts: list[str])
 
 
 def assert_opencode_fixture_trace(events: list[dict[str, Any]], prompts: list[str], *, require_resume: bool = False) -> None:
-    starts = [event for event in events if event.get("method") == "session/new"]
-    resumes = [event for event in events if event.get("method") == "session/resume"]
     turns = [event for event in events if event.get("method") == "session/prompt"]
+    # ACP catalog discovery creates an unprompted session. Correlate work to
+    # the actual prompted session instead of mistaking catalog IO for a turn.
+    session_id = turns[0].get("session_id") if turns else None
+    starts = [event for event in events if event.get("method") == "session/new" and event.get("session_id") == session_id]
+    resumes = [event for event in events if event.get("method") == "session/resume" and event.get("session_id") == session_id]
     if not prompts or len(starts) != 1 or len(turns) != len(prompts) or not starts[0].get("session_id"):
         raise DriverError("OpenCode fixture created a fresh session or missed/duplicated a prompt")
-    session_id = starts[0]["session_id"]
     for index, (turn, prompt) in enumerate(zip(turns, prompts)):
         data = prompt.encode("utf-8")
         if (turn.get("session_id") != session_id or turn.get("prior_turns") != index
@@ -1224,6 +1226,68 @@ def scenario_opencode_session(session: Session, args: argparse.Namespace) -> Non
                     outcome="same_upstream_session_three_distinct_turns_exact_prompt_digests",
                     upstream_turns=[event for event in events if event.get("method") == "session/prompt"])
     session.data["expected_outcome"] = "opencode_adapter_three_turns_same_session_reopened_with_upstream_context"
+
+
+def assert_chat_title(current: dict[str, Any], title: str, draft: str | None = None) -> None:
+    if (current.get("title_editing") or current.get("pending_command")
+            or current.get("title_text") != title or title not in current.get("thread_labels", [])
+            or (draft is not None and current.get("draft") != draft)):
+        raise DriverError("saved chat title/header/sidebar or retained draft disagree", EX_ASSERTION)
+
+
+def scenario_thread_title(session: Session, args: argparse.Namespace) -> None:
+    first = send_turn(session, "offline title editing fixture", args.timeout)
+    draft = "Retained draft café 世界"
+    title = "Native 日本語 café 🎮"
+    perform_input(session, "text", "composer.input", args.timeout, draft)
+    perform_key(session, "F2", args.timeout)
+    wait_snapshot(session, lambda s: s.get("title_editing"), args.timeout, "F2 title editor")
+    perform_input(session, "text", "thread.title.edit", args.timeout, title)
+    wait_snapshot(session, lambda s: s.get("title_text") == title, args.timeout, "Unicode title input")
+    capture(session, "title-editing.png")
+    perform_key(session, "Return", args.timeout)
+    saved = wait_snapshot(session, lambda s: not s.get("title_editing") and not s.get("pending_command")
+                          and s.get("title_text") == title and title in s.get("thread_labels", []),
+                          args.timeout, "durable title saved and projected")
+    assert_chat_title(saved, title, draft)
+    assert_no_new_provider_work(first, saved, "title save")
+
+    perform_input(session, "text", "thread.title.edit", args.timeout, "cancelled title")
+    perform_key(session, "Escape", args.timeout)
+    cancelled = wait_snapshot(session, lambda s: not s.get("title_editing") and s.get("title_text") == title,
+                              args.timeout, "Escape retains committed title")
+    assert_chat_title(cancelled, title, draft)
+    perform_input(session, "text", "thread.title.edit", args.timeout, "abandoned title")
+    perform_input(session, "text", "composer.input", args.timeout, "!")
+    unfocused = wait_snapshot(session, lambda s: not s.get("title_editing") and s.get("draft") == draft + "!",
+                             args.timeout, "outside click returns input to composer")
+    assert_chat_title(unfocused, title, draft + "!")
+
+    perform_input(session, "click", "workspace.changes", args.timeout)
+    wait_snapshot(session, lambda s: s.get("workspace_open") and not s.get("title_editing"),
+                  args.timeout, "Changes button remains outside title target")
+    capture(session, "title-changes.png")
+    perform_key(session, "Escape", args.timeout)
+    wait_snapshot(session, lambda s: not s.get("workspace_open"), args.timeout, "Changes closed")
+    perform_input(session, "text", "sidebar.search", args.timeout, title)
+    searched = wait_snapshot(session, lambda s: s.get("sidebar_search") == title, args.timeout, "search renamed chat")
+    find_target(searched, first["thread_id"])
+    perform_key(session, "ctrl+a", args.timeout)
+    perform_key(session, "BackSpace", args.timeout)
+    perform_input(session, "click", "workspace.new_thread", args.timeout)
+    wait_snapshot(session, lambda s: s.get("thread_id") != first["thread_id"], args.timeout, "switch to new chat")
+    perform_input(session, "click", first["thread_id"], args.timeout)
+    returned = wait_snapshot(session, lambda s: s.get("thread_id") == first["thread_id"]
+                             and s.get("draft") == draft + "!" and s.get("title_text") == title,
+                             args.timeout, "renamed chat and draft restored")
+    assert_chat_title(returned, title, draft + "!")
+    restart_app(session, args)
+    reopened = wait_snapshot(session, lambda s: s.get("title_text") == title and title in s.get("thread_labels", []),
+                             args.timeout, "title survives process restart")
+    assert_chat_title(reopened, title)
+    session.journal("scenario.thread-title", first, reopened, outcome="Unicode_title_saved_cancelled_searched_switched_reopened",
+                    input_origin="ordinary private vd keyboard and pointer", draft_retained_before_restart=True)
+    session.data["expected_outcome"] = "durable_unicode_chat_title_with_draft_and_focus_retention"
 
 
 def full_size_prompts() -> list[str]:
@@ -1346,6 +1410,8 @@ def scenario(args: argparse.Namespace) -> int:
             scenario_codex_session(session, args)
         elif args.name == "opencode-session":
             scenario_opencode_session(session, args)
+        elif args.name == "thread-title":
+            scenario_thread_title(session, args)
         elif args.name == "codex-error":
             scenario_codex_error(session, args)
         elif args.name == "opencode-error":
@@ -1421,6 +1487,7 @@ def scenario_steps(name: str) -> list[str]:
             "codex-error": ["launch production Codex adapter with isolated failing offline fixture", "Send a prompt", "assert accepted command then failed run with retained specific synthetic provider diagnostic", "copy diagnostic with Ctrl+Shift+C and verify correlation without prompt content", "capture failure banner for visual review"],
             "opencode-session": ["launch production OpenCode 2.1.4 adapter with isolated offline ACP fixture", "Send two turns", "restart native app on same private desktop", "Send third turn", "assert one upstream session, distinct commands/runs/turns, exact UTF-8 prompt digests and resumed prior context"],
             "opencode-error": ["launch production OpenCode 2.1.4 adapter with isolated failing offline ACP fixture", "Send a prompt", "assert accepted command then failed run with retained specific synthetic provider diagnostic", "copy diagnostic with Ctrl+Shift+C and verify correlation without prompt content", "capture failure banner for visual review"],
+            "thread-title": ["launch fake and complete a turn", "save a Unicode title with F2 and Enter", "cancel a pointer edit with Escape", "click composer while editing and verify draft input", "open Changes and search renamed chat", "switch chats and verify draft", "restart and verify durable title"],
             "disabled-send": ["launch fake", "snapshot empty composer", "assert command.send disabled"],
             "large-send": ["launch fake", "paste and Send all 65536 composer bytes", "assert accepted command, correlated completed run and empty draft"],
             "codex-large-send": ["launch production Codex adapter with offline fixture", "Send exact 65536-byte ASCII, emoji, escaped JSON and split-codepoint prompts", "assert four completed turns and matching upstream prompt digests"],
@@ -1534,7 +1601,7 @@ def parser() -> argparse.ArgumentParser:
     item = commands.add_parser("scenario", help="run a bounded offline GUI scenario")
     item.add_argument("name", choices=("send-restart", "disabled-send", "large-send", "composer-capacity", "codex-large-send", "opencode-large-send", "second-turn",
                                              "workspace-diff", "capability-refusal", "followup-refusal", "question-refusal", "attachment-refusal",
-                                             "codex-session", "codex-error", "opencode-session", "opencode-error"))
+                                             "codex-session", "codex-error", "opencode-session", "opencode-error", "thread-title"))
     item.add_argument("--provider", choices=("fake", "codex-fixture", "opencode-fixture"), help="offline fixture; inferred from scenario")
     item.add_argument("--prompt", default="offline GUI send")
     item.add_argument("--binary", type=Path)

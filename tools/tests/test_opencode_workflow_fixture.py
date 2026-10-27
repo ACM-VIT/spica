@@ -65,6 +65,10 @@ class OpenCodeWorkflowFixtureTests(unittest.TestCase):
         self.assertEqual(output[0]["result"]["agentInfo"]["version"], "2.1.4")
         self.assertIn("resume", output[0]["result"]["agentCapabilities"]["sessionCapabilities"])
         self.assertTrue(output[1]["result"]["sessionId"])
+        model = output[1]["result"]["configOptions"][0]
+        self.assertEqual(model["id"], "model")
+        self.assertEqual(model["currentValue"], "opencode/big-pickle")
+        self.assertEqual(model["options"][0]["value"], "opencode/big-pickle")
         return output[1]["result"]["sessionId"]
 
     def test_handshake_model_prompt_and_exact_utf8_digests(self):
