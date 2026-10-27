@@ -156,7 +156,7 @@ class SpicaUiOfflineTests(unittest.TestCase):
     def test_new_scenarios_have_offline_plans(self):
         with tempfile.TemporaryDirectory() as directory:
             for name in ("second-turn", "oversized-send", "workspace-diff", "capability-refusal",
-                         "followup-refusal", "question-refusal"):
+                         "followup-refusal", "question-refusal", "attachment-refusal"):
                 result = self.run_cli("scenario", name, "--output", directory, "--dry-run")
                 self.assertEqual(result.returncode, 0, (name, result.stderr))
                 self.assertTrue(json.loads(result.stdout)["steps"])
@@ -245,6 +245,63 @@ class SpicaUiOfflineTests(unittest.TestCase):
         supported = {**snapshot, "targets": [{"id": "question.answer", "enabled": True, "pointer_bounds": [0, 0, 20, 20]}]}
         with patch.object(module, "composer_ready", return_value=supported), self.assertRaises(module.DriverError):
             module.capability_refusal(session, 1, ("question.answer",))
+
+    def test_followup_refusal_checks_all_slots_and_preserves_draft(self):
+        module = load_cli()
+        before = {"run_id": "run", "send_command_id": "send", "send_run_id": "run", "pending_command": False}
+        refused = {**before, "draft": "draft café 世界", "workflow_error": "FollowupCapabilityUnavailable",
+                   "followup_ids": ["", ""], "followup_states": ["", ""]}
+        module.assert_followup_refusal(before, refused, refused["draft"])
+        for changed in ({"followup_ids": ["", "unexpected"]}, {"followup_states": ["", "queued"]},
+                        {"draft": ""}, {"run_id": "other"}, {"pending_command": True}):
+            with self.assertRaises(module.DriverError):
+                module.assert_followup_refusal(before, {**refused, **changed}, refused["draft"])
+
+    def test_cancellation_requires_cancelled_same_run_and_retained_draft(self):
+        module = load_cli()
+        before = {"run_id": "run"}
+        cancelled = {"run_id": "run", "run_status": "cancelled", "draft": "retained", "pending_command": False}
+        module.assert_cancelled_draft(before, cancelled, "retained")
+        for changed in ({"run_status": "completed"}, {"run_status": "interrupted"},
+                        {"run_id": "other"}, {"draft": ""}, {"pending_command": True}):
+            with self.assertRaises(module.DriverError):
+                module.assert_cancelled_draft(before, {**cancelled, **changed}, "retained")
+
+    def test_attachment_refusal_preserves_local_bytes_draft_and_provider_identity(self):
+        module = load_cli()
+        before = {"thread_id": "thread", "run_id": "", "send_command_id": "", "send_run_id": "",
+                  "pending_command": False}
+        current = {**before, "draft": "attachment draft café 世界", "workflow_path": "/tmp/notes-café.txt",
+                   "attachment_count": 1, "attachment_bytes": 64, "workflow_error": "capability_unavailable",
+                   "workflow_feedback": "Attachments are unavailable. File kept locally; nothing sent."}
+        module.assert_attachment_refusal(before, current, current["workflow_path"], current["draft"], 64)
+        for changed in ({"attachment_count": 0}, {"attachment_bytes": 0}, {"draft": ""},
+                        {"send_command_id": "new"}, {"workflow_error": "unexpected"}):
+            with self.assertRaises(module.DriverError):
+                module.assert_attachment_refusal(before, {**current, **changed}, current["workflow_path"], current["draft"], 64)
+
+    def test_oversized_attachment_refusal_is_local_read_refusal_without_command_or_run(self):
+        module = load_cli()
+        before = {"thread_id": "thread", "run_id": "", "send_command_id": "", "send_run_id": "",
+                  "pending_command": False}
+        current = {**before, "draft": "draft", "workflow_path": "/tmp/oversized-café.txt", "attachment_count": 0,
+                   "attachment_bytes": 0, "workflow_error": "StreamTooLong",
+                   "workflow_feedback": "File is too large. Draft files are limited to 256 KiB total."}
+        module.assert_oversized_attachment_refusal(before, current, current["workflow_path"], "draft", 256 * 1024)
+        with self.assertRaises(module.DriverError):
+            module.assert_oversized_attachment_refusal(before, {**current, "attachment_count": 1},
+                                                       current["workflow_path"], "draft", 256 * 1024)
+
+    def test_send_blocked_by_attachment_requires_disabled_painted_target(self):
+        module = load_cli()
+        value = {"attachment_count": 1, "send_disabled_reason": "Attachments are local only. Remove them before Send.",
+                 "targets": [{"id": "command.send", "enabled": False, "pointer_bounds": [1, 2, 3, 4]}]}
+        module.assert_send_blocked_by_attachment(value)
+        with self.assertRaises(module.DriverError):
+            module.assert_send_blocked_by_attachment({**value, "attachment_count": 0})
+        with self.assertRaises(module.DriverError):
+            module.assert_send_blocked_by_attachment({**value, "targets": [{"id": "command.send", "enabled": True,
+                                                                              "pointer_bounds": [1, 2, 3, 4]}]})
 
     def test_restart_keeps_private_desktop_and_uses_fresh_observations(self):
         module = load_cli()
