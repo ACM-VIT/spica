@@ -786,3 +786,65 @@ test "Codex Start serializes exact full composer prompts including sixfold escap
         try std.testing.expectEqualStrings(prompt, params.get("input").?.array.items[0].object.get("text").?.string);
     }
 }
+
+fn attachmentForTest(bytes: []const u8, image: bool, digest: *[64]u8) c.Attachment {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+    digest.* = std.fmt.bytesToHex(hash, .lower);
+    return .{ .metadata = .{ .id = .{ .value = "a" }, .name = "fixture", .media_type = if (image) "image/png" else "text/plain", .kind = if (image) .image else .file, .byte_length = bytes.len, .digest = digest }, .content = bytes };
+}
+
+test "Codex production Start serializer delivers binary images and maximal escaped UTF8 text" {
+    for (0..3) |scenario| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var wire: Mock = .{ .allocator = a };
+        var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "attachments" });
+        defer runtime.deinit();
+        try openErrorFixture(a, &wire, &runtime);
+        const bytes = try a.alloc(u8, 256 * 1024);
+        @memset(bytes, if (scenario == 0) 0xff else if (scenario == 1) 1 else 'x');
+        if (scenario == 2) @memcpy(bytes[0.."café 世界".len], "café 世界");
+        var digest: [64]u8 = undefined;
+        const attachment = attachmentForTest(bytes, scenario == 0, &digest);
+        const start: c.Request = .{ .start = .{ .correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "run" }, .effect = .{ .value = "start" } }, .prompt = "\x01" ** 65536, .attachments = &.{attachment} } };
+        _ = try runtime.dispatch(a, start);
+        const line = wire.lines.items[wire.lines.items.len - 1];
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, line, .{});
+        const items = parsed.value.object.get("params").?.object.get("input").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), items.len);
+        if (scenario == 0) {
+            try std.testing.expectEqualStrings("image", items[1].object.get("type").?.string);
+            const url = items[1].object.get("url").?.string;
+            const prefix = "data:image/png;base64,";
+            try std.testing.expect(std.mem.startsWith(u8, url, prefix));
+            const decoded = try a.alloc(u8, bytes.len);
+            try std.base64.standard.Decoder.decode(decoded, url[prefix.len..]);
+            try std.testing.expectEqualSlices(u8, bytes, decoded);
+        } else {
+            const text_bytes = items[1].object.get("text").?.string;
+            try std.testing.expect(std.mem.endsWith(u8, text_bytes, bytes));
+            if (scenario == 1) try std.testing.expect(line.len > 6 * (65536 + 256 * 1024));
+        }
+        try std.testing.expect(line.len <= @import("prompt.zig").json_bytes);
+        try std.testing.expect(runtime.turn_state.end_index < runtime.turn_state.buffer.len);
+    }
+}
+
+test "Codex rejects malformed direct attachment input before mutating turn or wire" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "attachments" });
+    defer runtime.deinit();
+    try openErrorFixture(a, &wire, &runtime);
+    const before = wire.lines.items.len;
+    var digest: [64]u8 = undefined;
+    const attachment = attachmentForTest("\xff", false, &digest);
+    const start: c.Request = .{ .start = .{ .correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "run" }, .effect = .{ .value = "start" } }, .prompt = "hello", .attachments = &.{attachment} } };
+    try std.testing.expectError(error.InvalidAttachment, runtime.dispatch(a, start));
+    try std.testing.expectEqual(before, wire.lines.items.len);
+    try std.testing.expect(runtime.pending == null and runtime.turn_terminal);
+}

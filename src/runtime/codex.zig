@@ -24,6 +24,10 @@ fn prefix(bytes: []const u8, limit: usize) []const u8 {
     if (width > end - last) end = last;
     return bytes[0..end];
 }
+fn codexAttachmentSupported(media_type: []const u8, kind: c.AttachmentKind) bool {
+    if ((kind == .image) != std.mem.startsWith(u8, media_type, "image/")) return false;
+    return eq(media_type, "text/plain") or eq(media_type, "image/png") or eq(media_type, "image/jpeg") or eq(media_type, "image/gif") or eq(media_type, "image/webp");
+}
 pub const Config = struct {
     selection: c.Selection,
     cwd: []const u8,
@@ -129,7 +133,7 @@ pub fn RuntimeFor(comptime T: type) type {
         }
         pub fn discover(_: *Self) c.Discovery {
             var caps = [_]c.CapabilityInfo{.{ .status = .unsupported, .evidence = "Codex adapter unsupported surface" }} ** @typeInfo(c.Capability).@"enum".fields.len;
-            inline for ([_]c.Capability{ .create, .attach, .start, .stream, .tools, .approval, .cancel, .selection, .workspace }) |cap| caps[@intFromEnum(cap)] = .{ .status = .supported, .evidence = "Codex 0.163.0 app-server protocol" };
+            inline for ([_]c.Capability{ .create, .attach, .start, .stream, .tools, .approval, .cancel, .selection, .workspace, .attachment }) |cap| caps[@intFromEnum(cap)] = .{ .status = .supported, .evidence = "Codex 0.163.0 app-server turn input (text/image)" };
             caps[@intFromEnum(c.Capability.coordinator_bridge)] = .{ .status = .unknown, .evidence = "dynamicTools protocol available; live app bridge acceptance required" };
             return .{ .runtime_kind = "codex", .runtime_version = "0.163.0", .capabilities = caps, .limits = .{} };
         }
@@ -167,6 +171,8 @@ pub fn RuntimeFor(comptime T: type) type {
                 },
                 .start => |p| {
                     try prompt_wire.validate(p);
+                    if (c.frameBytes(request) > (c.Limits{}).frame_bytes + (c.Limits{}).attachment_packet_bytes) return error.FrameTooLarge;
+                    for (p.attachments) |attachment| if (!codexAttachmentSupported(attachment.metadata.media_type, attachment.metadata.kind)) return error.AttachmentUnsupported;
                     if (!self.session_ready) return error.SessionUnavailable;
                     if (p.correlation.run == null or p.correlation.effect == null or self.session == null or !eq(p.correlation.session.value, self.session.?.id.value) or self.turn.len != 0) return error.InvalidCorrelation;
                     // Queued observations own their bytes. Reclaim only completed
@@ -178,7 +184,31 @@ pub fn RuntimeFor(comptime T: type) type {
                     self.offset = 0;
                     self.turn_error_len = 0;
                     self.diagnostic = "";
-                    try self.rpc(.start, .{ .threadId = self.session.?.upstream.value, .input = .{.{ .type = "text", .text = p.prompt }}, .model = self.config.selection.model_id, .effort = self.config.selection.effort, .cwd = self.config.cwd }, self.correlation);
+                    const Input = struct { type: []const u8, text: ?[]const u8 = null, url: ?[]const u8 = null };
+                    var items: [9]Input = undefined;
+                    var item_count: usize = 0;
+                    if (p.prompt.len != 0) {
+                        items[item_count] = .{ .type = "text", .text = p.prompt };
+                        item_count += 1;
+                    }
+                    for (p.attachments) |attachment| {
+                        if (eq(attachment.metadata.media_type, "text/plain")) {
+                            const text_bytes = try self.turn_state.allocator().alloc(u8, attachment.content.len + attachment.metadata.name.len + 64);
+                            var writer = std.Io.Writer.fixed(text_bytes);
+                            try writer.print("[Attached text file {s}]\n", .{attachment.metadata.name});
+                            try writer.writeAll(attachment.content);
+                            items[item_count] = .{ .type = "text", .text = writer.buffered() };
+                        } else {
+                            const encoded_len = std.base64.standard.Encoder.calcSize(attachment.content.len);
+                            const encoded = try self.turn_state.allocator().alloc(u8, encoded_len);
+                            _ = std.base64.standard.Encoder.encode(encoded, attachment.content);
+                            const url = try std.fmt.allocPrint(self.turn_state.allocator(), "data:{s};base64,{s}", .{ attachment.metadata.media_type, encoded });
+                            items[item_count] = .{ .type = "image", .url = url };
+                        }
+                        item_count += 1;
+                    }
+                    if (item_count == 0) return error.InvalidPrompt;
+                    try self.rpc(.start, .{ .threadId = self.session.?.upstream.value, .input = items[0..item_count], .model = self.config.selection.model_id, .effort = self.config.selection.effort, .cwd = self.config.cwd }, self.correlation);
                 },
                 .cancel => |p| {
                     if (c.frameBytes(request) > self.discover().limits.frame_bytes) return error.FrameTooLarge;

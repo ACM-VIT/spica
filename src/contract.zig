@@ -337,6 +337,38 @@ pub fn validateAttachments(attachments: []const Attachment, limits: Limits) Erro
     if (content_bytes > limits.attachment_bytes or metadata_bytes > limits.attachment_metadata_bytes) return error.InvalidAttachment;
 }
 
+/// Metadata-only journal references are allowed here; runtime admission additionally
+/// requires bodies and verifies their digest before mutating provider state.
+pub fn validateNativeAttachments(attachments: []const Attachment, limits: Limits) Error!void {
+    if (attachments.len > @min(limits.attachment_count, 8)) return error.InvalidAttachment;
+    var content_bytes: usize = 0;
+    var metadata_bytes: usize = 0;
+    for (attachments, 0..) |attachment, index| {
+        const m = attachment.metadata;
+        if (m.id.value.len == 0 or m.id.value.len > 128 or m.name.len == 0 or m.name.len > 256 or
+            m.media_type.len == 0 or m.media_type.len > 128 or m.digest.len != 64 or
+            m.byte_length > @min(limits.attachment_bytes, 256 * 1024)) return error.InvalidAttachment;
+        for ([_][]const u8{ m.id.value, m.name, m.media_type, m.digest }) |value| {
+            if (!std.unicode.utf8ValidateSlice(value) or std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidAttachment;
+        }
+        for (m.digest) |byte| if (!std.ascii.isHex(byte)) return error.InvalidAttachment;
+        const image_type = std.mem.startsWith(u8, m.media_type, "image/");
+        if ((m.kind == .image) != image_type) return error.InvalidAttachment;
+        for (attachments[0..index]) |previous| if (equal(m.id, previous.metadata.id)) return error.InvalidAttachment;
+        if (attachment.content.len != 0 and attachment.content.len != m.byte_length) return error.InvalidAttachment;
+        content_bytes +|= @intCast(m.byte_length);
+        metadata_bytes +|= m.name.len +| m.media_type.len +| m.digest.len +| m.id.value.len;
+    }
+    if (content_bytes > @min(limits.attachment_bytes, 256 * 1024) or metadata_bytes > @min(limits.attachment_metadata_bytes, 4096)) return error.InvalidAttachment;
+}
+
+pub fn attachmentDigestMatches(attachment: Attachment) bool {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(attachment.content, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.ascii.eqlIgnoreCase(&hex, attachment.metadata.digest);
+}
+
 pub fn validateFollowup(followup: Followup, limits: Limits) Error!void {
     if (followup.id.value.len == 0 or followup.content.len == 0 or followup.content.len > limits.followup_bytes) return error.InvalidFollowup;
     if (frameBytes(followup) > limits.frame_bytes) return error.FrameTooLarge;
