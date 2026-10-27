@@ -919,6 +919,13 @@ const Conversation = struct {
     title_pending: [types.max_title_bytes]u8 = undefined,
     title_pending_len: usize = 0,
     card_rows_seen: usize = 0,
+    /// Search revisions are owned by the native consumer. A Host page carries
+    /// the revision that requested it; pages from an older revision are
+    /// discarded before they can mutate resident cards.
+    thread_search_revision: u64 = 0,
+    thread_search_started: bool = false,
+    thread_search_active: bool = false,
+    thread_search_rows_seen: usize = 0,
     /// Cursor retained after the resident thread-card budget is full. Search
     /// can advance through bounded Host pages without growing the UI arrays.
     thread_page_snapshot: ?types.SnapshotId = null,
@@ -934,7 +941,7 @@ const Conversation = struct {
     approval_live: bool = false,
     subscription: ?types.SubscriptionId = null,
     subscribe_ticket: ?types.Ticket = null,
-    query: ?struct { ticket: types.Ticket, kind: QueryKind } = null,
+    query: ?struct { ticket: types.Ticket, kind: QueryKind, search_revision: u64 } = null,
     command: ?PendingCommand = null,
     unknown_send: ?PendingCommand = null,
     receipt_lookup_attempted: bool = false,
@@ -1433,21 +1440,31 @@ const Conversation = struct {
                 try self.selectThread(app, app.view.threads[index].id);
             },
             .search_more => {
-                if (self.thread_page_anchor == null) {
+                if (self.thread_page_cursor == null and self.thread_page_anchor == null) {
                     app.view.search_more_available = false;
                     self.notice(&app.view, "No additional thread page is available for this search.");
                     return;
                 }
+                const cursor = self.thread_page_cursor;
+                const anchor = self.thread_page_anchor;
                 self.thread_page_cursor = null;
-                const anchor = self.thread_page_anchor orelse {
-                    app.view.search_more_available = false;
-                    self.notice(&app.view, "Thread search cursor expired; refresh the thread list and try again.");
-                    return;
-                };
+                self.thread_page_anchor = null;
+                self.thread_search_active = app.view.search_len != 0;
+                self.thread_search_started = true;
+                self.thread_search_revision = app.view.thread_search_revision;
+                self.card_rows_seen = 0;
+                self.thread_search_rows_seen = 0;
                 app.view.thread_count = 0;
                 app.view.search_more_available = false;
-                self.card_rows_seen = 0;
-                try self.ask(.cards, .{ .threads = .{ .anchor = .{ .value = anchor.slice() }, .page = .{ .limit = page.limit, .max_bytes = page.max_bytes } } });
+                app.view.thread_search_busy = true;
+                if (cursor) |next| {
+                    try self.ask(.cards, .{ .threads = .{ .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = self.thread_page_snapshot, .cursor = next.slice() } } });
+                } else if (anchor) |last| {
+                    try self.ask(.cards, .{ .threads = .{ .anchor = .{ .value = last.slice() }, .page = .{ .limit = page.limit, .max_bytes = page.max_bytes } } });
+                } else {
+                    app.view.thread_search_busy = false;
+                    self.notice(&app.view, "Thread search cursor expired; refresh the thread list and try again.");
+                }
             },
             .search_reset => {
                 self.thread_page_snapshot = null;
@@ -1557,6 +1574,10 @@ const Conversation = struct {
             entry.workspace_name = try displayId(std.fs.path.basename(if (row.workspace_root.len != 0) row.workspace_root else self.workspace_root));
             entry.branch = try displayId(row.workspace_branch);
             entry.run_status = if (row.latest_run_state) |state| cardRunStatus(state) else .idle;
+            if (entry.id.eql(view.active_thread.slice())) {
+                view.active_thread_title_len = entry.len;
+                @memcpy(view.active_thread_title[0..entry.len], entry.label[0..entry.len]);
+            }
             return;
         };
     }
@@ -1739,7 +1760,7 @@ const Conversation = struct {
         const attachment_loader = try attachment_text.Loader.create(allocator, io, wake, Wake.presentationNotify);
         errdefer attachment_loader.destroy();
         const inspection_worker = try inspection.Worker.create(allocator, io, .{ .context = wake, .notify = Wake.presentationNotify }, .{});
-        self.* = .{ .allocator = allocator, .io = io, .host = host, .worker = worker, .attachment_loader = attachment_loader, .inspection_worker = inspection_worker, .wake = wake, .workspace_root = root, .query = .{ .ticket = ticket, .kind = .projects } };
+        self.* = .{ .allocator = allocator, .io = io, .host = host, .worker = worker, .attachment_loader = attachment_loader, .inspection_worker = inspection_worker, .wake = wake, .workspace_root = root, .query = .{ .ticket = ticket, .kind = .projects, .search_revision = 0 } };
         return self;
     }
 
@@ -1754,7 +1775,45 @@ const Conversation = struct {
 
     fn ask(self: *Conversation, kind: QueryKind, value: types.Query) !void {
         std.debug.assert(self.query == null);
-        self.query = .{ .ticket = try self.host.query(value), .kind = kind };
+        self.query = .{ .ticket = try self.host.query(value), .kind = kind, .search_revision = self.thread_search_revision };
+    }
+
+    fn resetThreadCards(self: *Conversation, view: *Coding) void {
+        self.card_rows_seen = 0;
+        self.thread_search_rows_seen = 0;
+        self.thread_page_snapshot = null;
+        self.thread_page_cursor = null;
+        self.thread_page_anchor = null;
+        view.thread_count = 0;
+        view.search_more_available = false;
+    }
+
+    /// Start one bounded scan for the current sidebar revision. Host owns the
+    /// durable query; this state only owns copied card descriptors and cursors.
+    fn beginThreadSearch(self: *Conversation, app: *App) !void {
+        if (self.query != null or self.command != null or self.refresh) return;
+        self.thread_search_revision = app.view.thread_search_revision;
+        self.thread_search_started = true;
+        self.thread_search_active = std.mem.trim(u8, app.view.search_query[0..app.view.search_len], " \t\r\n").len != 0;
+        self.resetThreadCards(&app.view);
+        app.view.thread_search_busy = true;
+        if (self.thread_search_active) {
+            try self.ask(.cards, .{ .threads = .{ .page = page } });
+        } else {
+            try self.ask(.threads, .{ .threads = .{ .page = page } });
+        }
+    }
+
+    fn pumpThreadSearch(self: *Conversation, app: *App) !void {
+        // Empty initial state is populated by the normal startup chain. Once
+        // a user has edited search, every later revision (including clear) is
+        // explicitly rebuilt here.
+        if (!self.thread_search_started and app.view.search_len == 0) return;
+        if (!self.thread_search_started or self.thread_search_revision != app.view.thread_search_revision) try self.beginThreadSearch(app);
+    }
+
+    fn staleThreadPage(kind: QueryKind, requested_revision: u64, current_revision: u64) bool {
+        return (kind == .threads or kind == .cards) and requested_revision != current_revision;
     }
 
     fn submit(self: *Conversation, kind: CommandKind, target: types.Target, revision: types.Precondition, payload: types.Payload, draft_revision: u64) !void {
@@ -1996,6 +2055,19 @@ const Conversation = struct {
                     const pending = self.query orelse continue;
                     if (pending.ticket.value != value.ticket.value) return error.UnexpectedQueryTicket;
                     self.query = null;
+                    // Search text can change while a public Host page is in
+                    // flight. The page belongs to the old revision and must
+                    // never briefly replace the new result set.
+                    if (staleThreadPage(pending.kind, pending.search_revision, app.view.thread_search_revision)) {
+                        self.thread_search_active = false;
+                        // Keep the state machine armed even when the new
+                        // query is empty; clearing search while a page is in
+                        // flight must rebuild the ordinary first page.
+                        self.thread_search_started = true;
+                        self.thread_search_rows_seen = 0;
+                        app.view.thread_search_busy = false;
+                        continue;
+                    }
                     try self.consume(app, pending.kind, value.page);
                 },
                 .subscribed => |value| {
@@ -2077,6 +2149,7 @@ const Conversation = struct {
                 },
             }
         }
+        try self.pumpThreadSearch(app);
         if (self.query == null and self.unknown_send != null and !self.receipt_lookup_attempted) {
             try self.ask(.send_receipt, .{ .command_receipt = .{ .value = &self.unknown_send.?.id } });
             self.receipt_lookup_attempted = true;
@@ -2317,6 +2390,8 @@ const Conversation = struct {
             .title => {
                 app.view.title_editing = false;
                 app.view.title_select_all = false;
+                app.view.active_thread_title_len = self.title_pending_len;
+                @memcpy(app.view.active_thread_title[0..self.title_pending_len], self.title_pending[0..self.title_pending_len]);
                 self.title_pending_len = 0;
                 self.refresh = true;
                 self.notice(&app.view, "Chat title saved.");
@@ -2630,9 +2705,25 @@ const Conversation = struct {
             .threads, .cards => {
                 for (value.items) |row| {
                     self.card_rows_seen += 1;
+                    self.thread_search_rows_seen += 1;
                     if (!std.mem.eql(u8, row.thread.workspace_root, self.workspace_root)) continue;
                     try self.updateThreadCard(&app.view, row.thread);
-                    if (std.mem.eql(u8, row.thread.project.value, self.project.slice())) {
+                    if (kind == .cards and self.thread_search_active) {
+                        var found: ?usize = null;
+                        for (app.view.threads[0..app.view.thread_count], 0..) |*entry, index| {
+                            if (entry.id.eql(row.thread.id.value)) {
+                                found = index;
+                                break;
+                            }
+                        }
+                        if (found) |index| if (!app.view.threadMatches(&app.view.threads[index])) {
+                            var at = index;
+                            while (at + 1 < app.view.thread_count) : (at += 1) app.view.threads[at] = app.view.threads[at + 1];
+                            app.view.thread_count -= 1;
+                            app.view.threads[app.view.thread_count] = .{};
+                        };
+                    }
+                    if (!(kind == .cards and self.thread_search_active) and std.mem.eql(u8, row.thread.project.value, self.project.slice())) {
                         if (self.startup_runtime) |runtime| {
                             if (row.thread.selection) |selection| {
                                 if (std.mem.eql(u8, selection.runtime_kind, @tagName(runtime)) and std.mem.eql(u8, selection.account_ref, self.startup_account[0..self.startup_account_len])) self.thread = try Id.init(row.thread.id.value);
@@ -2643,15 +2734,21 @@ const Conversation = struct {
                 if (value.next_cursor != null and app.view.thread_count < app.view.threads.len and self.card_rows_seen < 128) {
                     self.thread_page_snapshot = value.snapshot_id;
                     self.thread_page_cursor = try Id.init(value.next_cursor.?);
-                    app.view.search_more_available = false;
+                    app.view.thread_search_busy = kind == .cards and self.thread_search_active;
                     try self.ask(kind, .{ .threads = .{ .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = value.next_cursor } } });
                 } else {
                     self.thread_page_snapshot = value.snapshot_id;
                     self.thread_page_cursor = if (value.next_cursor) |cursor| try Id.init(cursor) else null;
                     self.thread_page_anchor = if (value.items.len != 0) try Id.init(value.items[value.items.len - 1].thread.id.value) else self.thread_page_anchor;
-                    app.view.search_more_available = self.thread_page_cursor != null;
+                    if (kind == .cards and self.thread_search_active) {
+                        app.view.thread_search_busy = false;
+                        app.view.search_more_available = app.view.visibleThreadCount() == 0 and self.thread_page_cursor != null;
+                    } else app.view.search_more_available = self.thread_page_cursor != null;
                     self.startup_runtime = null;
-                    if (kind == .cards) {
+                    if (kind == .cards and self.thread_search_active) {
+                        // Search is presentation-only. Do not select a thread,
+                        // reload history, or disturb the current draft here.
+                    } else if (kind == .cards) {
                         try self.ask(.thread, .{ .thread = .{ .value = self.thread.slice() } });
                     } else if (self.thread.len != 0) {
                         try self.selectThread(app, self.thread);
@@ -3464,6 +3561,38 @@ test "thread cards own real titles and workspace metadata across refresh" {
     const full_branch = [_]u8{'b'} ** 255 ++ "é";
     try std.testing.expectEqual(@as(u16, 255), (try Conversation.displayId(full_branch)).len);
     try std.testing.expectEqual(@as(usize, 257), full_branch.len);
+}
+
+test "native thread search keeps only bounded matches and rejects stale revisions" {
+    try std.testing.expect(Conversation.staleThreadPage(.cards, 3, 4));
+    try std.testing.expect(!Conversation.staleThreadPage(.cards, 4, 4));
+    try std.testing.expect(!Conversation.staleThreadPage(.projects, 3, 4));
+
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    app.view.search_len = 6;
+    @memcpy(app.view.search_query[0..6], "needle");
+    app.view.thread_search_revision = 9;
+    app.view.active_thread = try Id.init("active");
+    app.view.active_thread_title_len = 11;
+    @memcpy(app.view.active_thread_title[0..11], "Pinned chat");
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/search") };
+    conversation.thread_search_active = true;
+    conversation.thread_search_started = true;
+    conversation.thread_search_revision = 9;
+    var first_page = [_]types.Row{
+        .{ .thread = .{ .id = .{ .value = "old" }, .revision = 1, .project = .{ .value = "project" }, .workspace = .{ .value = "workspace" }, .session = null, .title_preview = "unrelated", .workspace_root = "/tmp/search" } },
+    };
+    try conversation.consume(&app, .cards, .{ .snapshot_id = .{ .slot = 1, .generation = 1 }, .snapshot_position = .{}, .items = &first_page, .expires_at = 0 });
+    var older_page = [_]types.Row{
+        .{ .thread = .{ .id = .{ .value = "match" }, .revision = 1, .project = .{ .value = "project" }, .workspace = .{ .value = "workspace" }, .session = null, .title_preview = "Needle in an older page", .workspace_root = "/tmp/search" } },
+    };
+    try conversation.consume(&app, .cards, .{ .snapshot_id = .{ .slot = 1, .generation = 1 }, .snapshot_position = .{}, .items = &older_page, .expires_at = 0 });
+    try std.testing.expectEqual(@as(usize, 1), app.view.thread_count);
+    try std.testing.expectEqualStrings("Needle in an older page", app.view.threads[0].label[0..app.view.threads[0].len]);
+    try std.testing.expectEqualStrings("Pinned chat", app.view.active_thread_title[0..app.view.active_thread_title_len]);
+    try std.testing.expect(!app.view.search_more_available);
 }
 
 test "ordinary startup seeds independent provider forms and blocks synthetic execution" {

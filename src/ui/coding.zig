@@ -253,6 +253,8 @@ pub const View = struct {
     project_count: usize = 0,
     threads: [32]Entry = @splat(.{}),
     thread_count: usize = 0,
+    active_thread_title: [160]u8 = undefined,
+    active_thread_title_len: usize = 0,
     active_project: transcript.Id = .{},
     active_thread: transcript.Id = .{},
     navigation: ?Navigation = null,
@@ -597,6 +599,11 @@ pub const View = struct {
         self.history_position = next.position;
         self.history_restore = next.position != null;
         self.active_thread = id;
+        for (self.threads[0..self.thread_count]) |*entry| if (entry.id.eql(id.slice())) {
+            self.active_thread_title_len = entry.len;
+            @memcpy(self.active_thread_title[0..entry.len], entry.label[0..entry.len]);
+            break;
+        };
         self.rendered_selection = null;
         self.preedit_len = 0;
         self.preedit_changed = true;
@@ -875,6 +882,13 @@ pub const View = struct {
             self.title_action = null;
             return;
         };
+        if (self.active_thread_title_len != 0) {
+            self.title_len = self.active_thread_title_len;
+            @memcpy(self.title_buffer[0..self.title_len], self.active_thread_title[0..self.title_len]);
+            self.title_select_all = true;
+            self.title_editing = true;
+            self.title_action = null;
+        }
     }
 
     pub fn titleEditAvailable(self: *const View) bool {
@@ -906,7 +920,7 @@ pub const View = struct {
         return .{ .x = x, .y = y, .w = right - x, .h = bottom - y };
     }
 
-    fn threadMatches(self: *const View, entry: *const Entry) bool {
+    pub fn threadMatches(self: *const View, entry: *const Entry) bool {
         if (self.scope_project.len != 0 and !entry.project_id.eql(self.scope_project.slice())) return false;
         const query = std.mem.trim(u8, self.search_query[0..self.search_len], " \t\r\n");
         if (query.len == 0) return true;
@@ -918,7 +932,7 @@ pub const View = struct {
         return false;
     }
 
-    fn visibleThreadCount(self: *const View) usize {
+    pub fn visibleThreadCount(self: *const View) usize {
         var count: usize = 0;
         for (self.threads[0..self.thread_count]) |*entry| if (self.threadMatches(entry)) {
             count += 1;
@@ -1876,7 +1890,7 @@ pub const View = struct {
         var clip = widgets.Clip.push(renderer, self.sidebar_rows);
         defer clip.restore(renderer);
         try self.drawThreads(renderer, text, foreground, sidebar_muted);
-        if (self.visibleThreadCount() == 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0 and self.search_more_available) "No match here · Enter searches older threads" else if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
+        if (self.visibleThreadCount() == 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0 and self.thread_search_busy) "Searching older threads…" else if (self.search_len != 0 and self.search_more_available) "No match here · Enter searches older threads" else if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
         clip.restore(renderer);
         // Connection is the implemented utility. Do not imitate unavailable
         // Usage, Pull Requests or Settings destinations from the reference.
@@ -1894,6 +1908,7 @@ pub const View = struct {
             thread_name = entry.label[0..entry.len];
             if (entry.project_name.len != 0) project_name = entry.project_name.slice();
         };
+        if (std.mem.eql(u8, thread_name, "New chat") and self.active_thread_title_len != 0) thread_name = self.active_thread_title[0..self.active_thread_title_len];
         const project_width = @min(@max(0, bounds.header.width - header_x - metrics.gutter) * 0.3, try self.labels.width(text, @import("../text/utf8.zig").prefix(project_name, 128), 14));
         try icon(renderer, .folder, header_x, (bounds.header.height - 16) / 2, muted);
         try self.labels.drawFitted(renderer, text, project_name, header_x + 24, (bounds.header.height - 16) / 2, project_width, 14, muted);
@@ -3621,6 +3636,34 @@ test "bounded sidebar search owns Unicode and preserves source indices and draft
     try std.testing.expectError(error.InvalidUtf8, view.searchInsert("\xff"));
     const draft = try view.editor.materialize(view.scratch);
     try std.testing.expectEqualStrings("draft must stay intact", draft);
+}
+
+test "search filtering preserves the active title editor when its card is absent" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.active_thread = try transcript.Id.init("active");
+    view.active_thread_title_len = "Pinned chat".len;
+    @memcpy(view.active_thread_title[0..view.active_thread_title_len], "Pinned chat");
+    view.navigation_enabled = true;
+    view.beginTitleEdit();
+    try std.testing.expect(view.title_editing);
+    try std.testing.expectEqualStrings("Pinned chat", view.title_buffer[0..view.title_len]);
+    view.title_editing = false;
+    view.thread_count = view.threads.len;
+    for (view.threads[0..], 0..) |*entry, index| {
+        var id: [32]u8 = undefined;
+        entry.id = try transcript.Id.init(try std.fmt.bufPrint(&id, "thread-{d}", .{index}));
+        entry.len = 6;
+        @memcpy(entry.label[0..6], "needle");
+    }
+    view.search_len = 6;
+    @memcpy(view.search_query[0..6], "needle");
+    try std.testing.expectEqual(view.threads.len, view.visibleThreadCount());
+    view.thread_count = 0;
+    try std.testing.expectEqual(@as(usize, 0), view.visibleThreadCount());
+    view.beginTitleEdit();
+    try std.testing.expect(view.title_editing);
+    try std.testing.expectEqualStrings("Pinned chat", view.title_buffer[0..view.title_len]);
 }
 
 test "flat rendered sidebar cards clip hits filter real project IDs and use bundled chrome" {
