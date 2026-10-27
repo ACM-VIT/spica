@@ -215,15 +215,37 @@ pub fn RuntimeFor(comptime T: type) type {
                     try self.rpc(.start, .{ .threadId = self.session.?.upstream.value, .input = items[0..item_count], .model = self.config.selection.model_id, .effort = self.config.selection.effort, .cwd = self.config.cwd }, self.correlation);
                 },
                 .message => |p| {
-                    if (p.attachments.len != 0) return error.AttachmentUnsupported;
+                    if (c.frameBytes(request) > (c.Limits{}).frame_bytes + (c.Limits{}).attachment_packet_bytes) return error.FrameTooLarge;
+                    for (p.attachments) |attachment| if (!codexAttachmentSupported(attachment.metadata.media_type, attachment.metadata.kind)) return error.AttachmentUnsupported;
                     if (!self.session_ready or self.session == null or self.turn_terminal or self.turn.len == 0 or
                         p.correlation.run == null or p.correlation.effect == null or
                         !c.equal(p.correlation.session, self.session.?.id) or
                         !c.equal(p.correlation.run, self.correlation.run.?)) return error.InvalidCorrelation;
                     if (p.content.len == 0) return error.InvalidPrompt;
-                    const Input = struct { type: []const u8, text: []const u8 };
-                    const input = [_]Input{.{ .type = "text", .text = p.content }};
-                    try self.rpc(.steer, .{ .threadId = self.session.?.upstream.value, .expectedTurnId = self.turn, .input = input[0..] }, p.correlation);
+                    const Input = struct { type: []const u8, text: ?[]const u8 = null, url: ?[]const u8 = null };
+                    var items: [9]Input = undefined;
+                    var item_count: usize = 0;
+                    items[item_count] = .{ .type = "text", .text = p.content };
+                    item_count += 1;
+                    for (p.attachments) |attachment| {
+                        if (eq(attachment.metadata.media_type, "text/plain")) {
+                            const text_bytes = try self.turn_state.allocator().alloc(u8, attachment.content.len + attachment.metadata.name.len + 64);
+                            var writer = std.Io.Writer.fixed(text_bytes);
+                            try writer.print("[Attached text file {s}]\n", .{attachment.metadata.name});
+                            try writer.writeAll(attachment.content);
+                            items[item_count] = .{ .type = "text", .text = writer.buffered() };
+                        } else {
+                            const encoded_len = std.base64.standard.Encoder.calcSize(attachment.content.len);
+                            const mime = attachment.metadata.media_type;
+                            const prefix_len = "data:".len + mime.len + ";base64,".len;
+                            const url = try self.turn_state.allocator().alloc(u8, prefix_len + encoded_len);
+                            _ = try std.fmt.bufPrint(url[0..prefix_len], "data:{s};base64,", .{mime});
+                            _ = std.base64.standard.Encoder.encode(url[prefix_len..], attachment.content);
+                            items[item_count] = .{ .type = "image", .url = url };
+                        }
+                        item_count += 1;
+                    }
+                    try self.rpc(.steer, .{ .threadId = self.session.?.upstream.value, .expectedTurnId = self.turn, .input = items[0..item_count] }, p.correlation);
                 },
                 .answer_question => |p| {
                     const pending = self.question orelse return error.InvalidQuestion;

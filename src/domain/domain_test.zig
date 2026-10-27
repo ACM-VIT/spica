@@ -1798,7 +1798,7 @@ test "attachment staging custom count bytes and Unicode metadata byte budgets su
     try std.testing.expectEqual(rejected.commit_sequence, (try owner.command(allocator, uploadEnvelope(conversation, "unicode-over-budget", 2, a2))).commit_sequence);
 }
 
-test "followup attachments are explicitly refused without changing active run or queued message" {
+test "Codex followup attachments retain durable metadata and hydrate at dispatch" {
     var f = try Fixture.init();
     defer f.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1808,19 +1808,28 @@ test "followup attachments are explicitly refused without changing active run or
     var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "attachment-followup", .utc_ms = 1, .factory = runtime.factory() };
     const turn = try FollowupTurn.begin(&owner, allocator);
     const attachment = try fixtureAttachment(allocator, "a", "file body");
+    const uploaded = try owner.command(allocator, uploadEnvelope(turn.conversation, "attached-upload", 2, attachment));
+    try std.testing.expectEqual(.accepted, uploaded.outcome);
     const revision: u64 = @intCast(try f.store.scalar("SELECT revision FROM runs"));
     const enqueue = try owner.command(allocator, .{ .command_id = .{ .value = "attached-followup" }, .target = .{ .run = turn.sent.entity_ids.run.? }, .expected_revision = .{ .revision = revision }, .payload = .{ .followup_enqueue = .{ .content = "continue", .attachments = &.{attachment} } } });
-    try std.testing.expectEqual(.attachment_unsupported, enqueue.reason.?);
-    try std.testing.expectEqual(revision, @as(u64, @intCast(try f.store.scalar("SELECT revision FROM runs"))));
-    const queued = try turn.enqueue(&owner, allocator, "plain-followup");
+    try std.testing.expectEqual(.accepted, enqueue.outcome);
+    const queued = enqueue;
+    const stored = try f.store.prepare("SELECT request FROM effects WHERE id=?", &.{.{ .text = queued.entity_ids.followup.?.value }});
+    defer stored.deinit();
+    try std.testing.expect(try stored.step());
+    const encoded_request = try stored.bytes(0);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_request, "file body") == null);
     const effect_revision: u64 = @intCast(try f.store.scalar("SELECT revision FROM effects WHERE kind='message'"));
     const edited = try owner.command(allocator, .{ .command_id = .{ .value = "attached-edit" }, .target = .{ .effect = .{ .value = queued.entity_ids.followup.?.value } }, .expected_revision = .{ .revision = effect_revision }, .payload = .{ .followup_edit = .{ .content = "replace", .attachments = &.{attachment} } } });
-    try std.testing.expectEqual(.attachment_unsupported, edited.reason.?);
-    try std.testing.expectEqual(effect_revision, @as(u64, @intCast(try f.store.scalar("SELECT revision FROM effects WHERE kind='message'"))));
+    try std.testing.expectEqual(.accepted, edited.outcome);
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='streaming'"));
-    const pending = (try owner.claimNext(allocator)).?;
-    try std.testing.expectEqual(@as(usize, 0), pending.request.message.attachments.len);
-    try std.testing.expectEqualStrings("later 世界", pending.request.message.content);
+    var pending = (try owner.claimNext(allocator)).?;
+    try std.testing.expectEqual(@as(usize, 1), pending.request.message.attachments.len);
+    try std.testing.expectEqual(@as(usize, 0), pending.request.message.attachments[0].content.len);
+    try owner.hydrateMessageAttachments(allocator, &pending.request);
+    try std.testing.expectEqualStrings("file body", pending.request.message.attachments[0].content);
+    const remove_busy = try owner.command(allocator, .{ .command_id = .{ .value = "attached-remove-busy" }, .target = .{ .thread = turn.conversation.thread }, .expected_revision = .{ .revision = @intCast(try f.store.scalar("SELECT revision FROM threads")) }, .payload = .{ .attachment_remove = .{ .value = "a" } } });
+    try std.testing.expectEqual(.busy, remove_busy.reason.?);
 }
 
 test "attachment schema v6 migration preserves prior data and reopens with durable bodies and references" {

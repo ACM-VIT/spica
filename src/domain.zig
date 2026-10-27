@@ -150,8 +150,13 @@ pub const Owner = struct {
                 metadata[i].content = &.{};
             }
             persisted.start.attachments = metadata[0..persisted.start.attachments.len];
-        } else if (persisted == .message and persisted.message.attachments.len != 0) {
-            return error.CapabilityUnavailable;
+        } else if (persisted == .message) {
+            if (persisted.message.attachments.len > metadata.len) return error.Limit;
+            for (persisted.message.attachments, 0..) |attachment, i| {
+                metadata[i] = attachment;
+                metadata[i].content = &.{};
+            }
+            persisted.message.attachments = metadata[0..persisted.message.attachments.len];
         }
         const bytes = try encoded(allocator, persisted);
         const digest = t.digest(bytes);
@@ -381,15 +386,18 @@ pub const Owner = struct {
             },
             .followup_enqueue => |p| {
                 if (e.target != .run or e.expected_revision != .revision or p.content.len == 0) return .followup_invalid;
-                if (p.attachments.len != 0) return .attachment_unsupported;
                 const run = e.target.run.value;
                 const state = try self.field(allocator, "SELECT state FROM runs WHERE id=?", &.{.{ .text = run }}) orelse return .not_found;
                 if (!(std.mem.eql(u8, state, "starting") or std.mem.eql(u8, state, "streaming") or std.mem.eql(u8, state, "awaiting_approval"))) return .busy;
+                const requested = try self.field(allocator, "SELECT requested FROM runs WHERE id=?", &.{.{ .text = run }}) orelse return error.Corrupt;
+                const selection = try t.decode(a.Selection, requested, allocator);
                 if (self.factory) |runtime| {
-                    const requested = try self.field(allocator, "SELECT requested FROM runs WHERE id=?", &.{.{ .text = run }}) orelse return error.Corrupt;
-                    const selection = try t.decode(a.Selection, requested, allocator);
                     if (runtime.discover(selection).capabilities[@intFromEnum(a.Capability.followup_queue)].status != .supported) return .capability_unavailable;
+                    if (p.attachments.len != 0 and runtime.discover(selection).capabilities[@intFromEnum(a.Capability.attachment)].status != .supported) return .attachment_unsupported;
+                } else if (p.attachments.len != 0 and !std.mem.eql(u8, selection.runtime_kind, "codex")) {
+                    return .attachment_unsupported;
                 }
+                if (try self.validateFollowupAttachments(allocator, run, selection, p.attachments)) |reason| return reason;
                 const count = try self.scalar("SELECT count(*) FROM effects WHERE run_id=? AND kind='message' AND state='planned' AND instr(CAST(request AS TEXT),'\"followup\":{\"id\"')>0", &.{.{ .text = run }});
                 if (count >= 8) return .followup_limit;
                 const session = try self.field(allocator, "SELECT session_id FROM runs WHERE id=?", &.{.{ .text = run }}) orelse return error.Corrupt;
@@ -413,15 +421,28 @@ pub const Owner = struct {
             },
             .followup_edit => |p| {
                 if (e.target != .effect or e.expected_revision != .revision or p.content.len == 0) return .followup_invalid;
-                if (p.attachments.len != 0) return .attachment_unsupported;
                 const statement = try db.prepare("SELECT run_id,session_id,kind,state,request FROM effects WHERE id=?", &.{.{ .text = e.target.effect.value }});
                 defer statement.deinit();
                 if (!try statement.step()) return .followup_not_found;
                 if (!std.mem.eql(u8, try statement.bytes(2), "message") or !std.mem.eql(u8, try statement.bytes(3), "planned")) return .followup_invalid;
                 var request = try t.decode(a.Request, try statement.bytes(4), allocator);
                 if (request != .message or request.message.followup == null) return .followup_invalid;
+                const requested = try self.field(allocator, "SELECT requested FROM runs WHERE id=?", &.{.{ .text = try statement.bytes(0) }}) orelse return error.Corrupt;
+                const selection = try t.decode(a.Selection, requested, allocator);
+                if (p.attachments.len != 0) {
+                    if (self.factory) |runtime| {
+                        if (runtime.discover(selection).capabilities[@intFromEnum(a.Capability.attachment)].status != .supported) return .attachment_unsupported;
+                    } else if (!std.mem.eql(u8, selection.runtime_kind, "codex")) return .attachment_unsupported;
+                }
+                if (try self.validateFollowupAttachments(allocator, try statement.bytes(0), selection, p.attachments)) |reason| return reason;
                 request.message.content = p.content;
-                request.message.attachments = p.attachments;
+                var metadata: [8]a.Attachment = undefined;
+                if (p.attachments.len > metadata.len) return .attachment_limit;
+                for (p.attachments, 0..) |attachment, i| {
+                    metadata[i] = attachment;
+                    metadata[i].content = &.{};
+                }
+                request.message.attachments = metadata[0..p.attachments.len];
                 request.message.followup.?.content = p.content;
                 if (a.frameBytes(request) > @min(attachment_packet_limit, start_frame_limit +| self.limits.attachment_packet_bytes)) return .admission_limit;
                 const bytes = try encoded(allocator, request);
@@ -558,7 +579,7 @@ pub const Owner = struct {
                 const found = try self.database.prepare("SELECT revision FROM attachments WHERE id=? AND thread_id=?", &.{ .{ .text = attachment_id.value }, .{ .text = thread } });
                 defer found.deinit();
                 if (!try found.step()) return .not_found;
-                if (try self.scalar("SELECT count(*) FROM attachment_refs WHERE attachment_id=?", &.{.{ .text = attachment_id.value }}) != 0) return .busy;
+                if (try self.scalar("SELECT count(*) FROM attachment_refs WHERE attachment_id=?", &.{.{ .text = attachment_id.value }}) != 0 or try self.followupReferencesAttachment(allocator, attachment_id.value)) return .busy;
                 try db.execute("DELETE FROM attachments WHERE id=? AND thread_id=?", &.{ .{ .text = attachment_id.value }, .{ .text = thread } });
                 try db.execute("UPDATE threads SET revision=revision+1 WHERE id=?", &.{.{ .text = thread }});
                 r.entity_ids = .{ .thread = e.target.thread, .attachment = attachment_id };
@@ -1346,6 +1367,38 @@ pub const Owner = struct {
         if (task != null and count == 0) return error.AuthorityUnavailable;
         return rows[0..count];
     }
+    /// Follow-up journals carry attachment metadata only. The durable body is
+    /// owned by the thread attachment row and remains protected from removal
+    /// while any follow-up effect still references it.
+    fn validateFollowupAttachments(self: *Owner, allocator: std.mem.Allocator, run: []const u8, selection: a.Selection, references: []const a.Attachment) !?t.Reason {
+        if (references.len == 0) return null;
+        a.validateNativeAttachments(references, .{ .attachment_count = self.limits.attachment_count, .attachment_bytes = self.limits.attachment_bytes, .attachment_metadata_bytes = self.limits.attachment_metadata_bytes }) catch return .attachment_limit;
+        const thread = try self.field(allocator, "SELECT thread_id FROM runs WHERE id=?", &.{.{ .text = run }}) orelse return .not_found;
+        const provider: attachments.Provider = if (std.mem.eql(u8, selection.runtime_kind, "codex")) .codex else .opencode;
+        for (references) |reference| {
+            const row = try self.database.prepare("SELECT name,media_type,byte_length,digest,kind,content FROM attachments WHERE id=? AND thread_id=?", &.{ .{ .text = reference.metadata.id.value }, .{ .text = thread } });
+            defer row.deinit();
+            if (!try row.step()) return .not_found;
+            const metadata: a.AttachmentMetadata = .{ .id = reference.metadata.id, .name = try row.bytes(0), .media_type = try row.bytes(1), .byte_length = @intCast(row.integer(2)), .digest = try row.bytes(3), .kind = std.meta.stringToEnum(a.AttachmentKind, try row.bytes(4)) orelse return error.Corrupt };
+            if (!a.equal(reference.metadata, metadata)) return .attachment_limit;
+            const body: a.Attachment = .{ .metadata = metadata, .content = try row.bytes(5) };
+            attachments.validate(body, true) catch return .attachment_limit;
+            if (!attachments.supported(metadata.media_type, metadata.kind, provider)) return .attachment_unsupported;
+            if (reference.content.len != 0 and (!a.equal(reference.metadata, metadata) or !attachments.digestMatches(reference))) return .attachment_limit;
+        }
+        return null;
+    }
+
+    fn followupReferencesAttachment(self: *Owner, allocator: std.mem.Allocator, attachment_id: []const u8) !bool {
+        const rows = try self.database.prepare("SELECT request FROM effects WHERE kind='message' AND state IN('planned','in_flight','confirmed','unknown')", &.{});
+        defer rows.deinit();
+        while (try rows.step()) {
+            const request = t.decode(a.Request, try rows.bytes(0), allocator) catch continue;
+            if (request == .message) for (request.message.attachments) |reference| if (std.mem.eql(u8, reference.metadata.id.value, attachment_id)) return true;
+        }
+        return false;
+    }
+
     /// Materialize only immutable refs belonging to the Start's durable user
     /// message. Draft rows in the same thread do not grant dispatch authority.
     pub fn hydrateStartAttachments(self: *Owner, allocator: std.mem.Allocator, request: *a.Request) !void {
@@ -1368,6 +1421,31 @@ pub const Owner = struct {
             hydrated[index] = try @import("runtime/adapter.zig").clone(allocator, borrowed);
         }
         start.attachments = hydrated;
+    }
+
+    /// Materialize a queued follow-up's attachment bodies immediately before
+    /// provider dispatch. The run/thread join is the authority boundary; a
+    /// metadata-only journal cannot smuggle a body or another thread's file.
+    pub fn hydrateMessageAttachments(self: *Owner, allocator: std.mem.Allocator, request: *a.Request) !void {
+        if (request.* != .message or request.message.attachments.len == 0) return;
+        const message = &request.message;
+        const run = message.correlation.run orelse return error.Corrupt;
+        const hydrated = try allocator.alloc(a.Attachment, message.attachments.len);
+        const thread = try self.field(allocator, "SELECT thread_id FROM runs WHERE id=? AND session_id=?", &.{ .{ .text = run.value }, .{ .text = message.correlation.session.value } }) orelse return error.Corrupt;
+        a.validateNativeAttachments(message.attachments, .{ .attachment_count = self.limits.attachment_count, .attachment_bytes = self.limits.attachment_bytes, .attachment_metadata_bytes = self.limits.attachment_metadata_bytes }) catch return error.Corrupt;
+        for (message.attachments, 0..) |reference, index| {
+            const row = try self.database.prepare("SELECT name,media_type,byte_length,digest,kind,content FROM attachments WHERE id=? AND thread_id=?", &.{ .{ .text = reference.metadata.id.value }, .{ .text = thread } });
+            defer row.deinit();
+            if (!try row.step()) return error.Corrupt;
+            const content = try row.bytes(5);
+            const metadata: a.AttachmentMetadata = .{ .id = reference.metadata.id, .name = try row.bytes(0), .media_type = try row.bytes(1), .byte_length = @intCast(row.integer(2)), .digest = try row.bytes(3), .kind = std.meta.stringToEnum(a.AttachmentKind, try row.bytes(4)) orelse return error.Corrupt };
+            if (!a.equal(reference.metadata, metadata)) return error.Corrupt;
+            const body: a.Attachment = .{ .metadata = metadata, .content = content };
+            attachments.validate(body, true) catch return error.Corrupt;
+            if (!attachments.digestMatches(body)) return error.Corrupt;
+            hydrated[index] = try @import("runtime/adapter.zig").clone(allocator, body);
+        }
+        message.attachments = hydrated;
     }
 
     pub fn recover(self: *Owner) !void {
@@ -1996,6 +2074,7 @@ pub const Host = struct {
                     request.start.prompt_ref = null;
                 };
                 try owner.hydrateStartAttachments(allocator, &request);
+                try owner.hydrateMessageAttachments(allocator, &request);
                 try owner.delivered(allocator, effect.id, try entry.adapter.dispatch(allocator, request));
             } else {
                 try owner.delivered(allocator, effect.id, .{ .outcome = .unknown, .detail = "No live instance for durable session; explicit reconciliation required" });
