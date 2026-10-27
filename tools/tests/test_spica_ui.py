@@ -11,6 +11,7 @@ import importlib.machinery
 import importlib.util
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -72,6 +73,45 @@ class SpicaUiOfflineTests(unittest.TestCase):
             with self.assertRaises(module.DriverError) as failure:
                 module.run_command(["wl-copy", content], private=True)
             self.assertNotIn(content, str(failure.exception))
+
+    def test_process_identity_tracks_the_current_executable_lifetime(self):
+        module = load_cli()
+        identity = module.process_identity(os.getpid())
+        self.assertEqual(identity["pid"], os.getpid())
+        self.assertGreater(identity["starttime_ticks"], 0)
+        self.assertGreater(identity["executable_inode"], 0)
+        self.assertEqual(identity, module.process_identity(os.getpid()))
+
+    def test_liveness_rejects_pid_reuse_and_window_reassignment(self):
+        module = load_cli()
+        identity = {"pid": 42, "starttime_ticks": 10, "executable_device": 1, "executable_inode": 2}
+        session = module.Session(Path("/unused"), {"launch": {"pid": 42}, "process_identity": identity})
+        with patch.object(module, "process_identity", return_value=identity), \
+                patch.object(module, "window_node", return_value={"pid": 42}):
+            session.require_live()
+        for actual, window_pid in (({**identity, "starttime_ticks": 11}, 42), (identity, 43)):
+            with patch.object(module, "process_identity", return_value=actual), \
+                    patch.object(module, "window_node", return_value={"pid": window_pid}), \
+                    self.assertRaises(module.DriverError) as failure:
+                session.require_live()
+            self.assertEqual(failure.exception.code, module.EX_STALE)
+
+    def test_snapshot_rejects_other_sessions_and_backwards_counters_but_allows_idle(self):
+        module = load_cli()
+        observed = {"version": 2, "process_nonce": "a" * 32, "generation": 10, "frame_id": 10, "event_sequence": 8}
+        session = module.Session(Path("/unused"), {"process_nonce": "a" * 32, "observations": "/unused/live.json"})
+        session.require_live = Mock()
+        session.save = Mock()
+        with patch.object(module, "read_json", return_value=observed):
+            session.snapshot()
+            session.snapshot()  # An event-driven idle application need not repaint.
+        for changed in ({"process_nonce": "b" * 32}, {"generation": 9}, {"frame_id": 9},
+                        {"event_sequence": 7}, {"generation": None}, {"version": "2"},
+                        {"version": 999}, {"frame_id": True}):
+            with patch.object(module, "read_json", return_value={**observed, **changed}), \
+                    self.assertRaises(module.DriverError) as failure:
+                session.snapshot()
+            self.assertEqual(failure.exception.code, module.EX_STALE)
 
     def test_launch_dry_run_does_not_require_binary_or_vd(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -208,9 +248,12 @@ class SpicaUiOfflineTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, '7 app' if argv[1] == "windows" else '{"pid":101}', '')
 
             with patch.object(module, "close_app") as close, patch.object(module, "run_command", side_effect=command), \
+                    patch.object(module, "bind_process") as bind, \
                     patch.object(module, "wait_snapshot", return_value=before):
                 module.restart_app(session, argparse.Namespace(timeout=1, quit_after_ms=1000))
             close.assert_called_once_with(session, 1, clean_desktop=False)
+            bind.assert_called_once()
+            self.assertEqual(bind.call_args.args[1], 101)
             self.assertEqual(session.data["launch"]["pid"], 101)
             self.assertEqual(session.observations, output / "restart-process" / "live.json")
             self.assertEqual(session.data["actions"][0]["action"], "scenario.restart")

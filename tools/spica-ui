@@ -144,6 +144,43 @@ def session_file(output: Path) -> Path:
     return output / "session.json"
 
 
+def process_identity(pid: int) -> dict[str, Any]:
+    if not isinstance(pid, int) or pid <= 0:
+        raise DriverError("native process identity is missing", EX_STALE)
+    try:
+        # comm can contain spaces and closing parentheses. Remaining fields
+        # start with state (field 3); starttime is field 22.
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        fields = stat[stat.rindex(")") + 2:].split()
+        executable = Path(f"/proc/{pid}/exe").stat()
+        if fields[0] in {"Z", "X"}:
+            raise ValueError("process exited")
+        return {"pid": pid, "starttime_ticks": int(fields[19]),
+                "executable_device": executable.st_dev, "executable_inode": executable.st_ino}
+    except (OSError, ValueError, IndexError) as error:
+        raise DriverError("native process is no longer alive", EX_STALE) from error
+
+
+def bind_process(session: "Session", pid: int, nonce: str | None = None) -> None:
+    identity = process_identity(pid)
+    try:
+        arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        export_path = Path(os.fsdecode(arguments[arguments.index(b"--automation-live") + 1]))
+        exported_nonce = arguments[arguments.index(b"--automation-session") + 1].decode("ascii")
+        if not export_path.is_absolute():
+            export_path = Path(f"/proc/{pid}/cwd").resolve(strict=True) / export_path
+    except (OSError, ValueError, IndexError, UnicodeDecodeError) as error:
+        raise DriverError("process needs --automation-live and --automation-session for correlated attachment", EX_STALE) from error
+    if (export_path.resolve() != session.observations or len(exported_nonce) != 32
+            or any(byte not in "0123456789abcdefABCDEF" for byte in exported_nonce)
+            or (nonce is not None and nonce != exported_nonce)):
+        raise DriverError("process does not match the requested observation export/session", EX_STALE)
+    if identity != process_identity(pid):
+        raise DriverError("native process changed while attaching", EX_STALE)
+    session.data.update({"process_identity": identity, "process_nonce": exported_nonce,
+                         "binary_sha256": sha256(Path(f"/proc/{pid}/exe"))})
+
+
 class Session:
     def __init__(self, output: Path, data: dict[str, Any]):
         self.output = output
@@ -181,17 +218,24 @@ class Session:
 
     def require_live(self) -> None:
         pid = self.data.get("launch", {}).get("pid")
-        if not pid or not Path(f"/proc/{pid}/exe").exists():
-            raise DriverError("native process is no longer alive", EX_STALE)
-        windows = run_command(["vd", "windows", self.vd_session], check=False).stdout
-        if self.window not in windows.split():
-            raise DriverError("native window is no longer present", EX_STALE)
+        identity = self.data.get("process_identity")
+        if not identity or process_identity(pid) != identity:
+            raise DriverError("native process lifetime differs from the recorded session", EX_STALE)
+        if window_node(self).get("pid") != pid:
+            raise DriverError("private window belongs to a different native process", EX_STALE)
 
     def snapshot(self, timeout: float = 5) -> dict[str, Any]:
         self.require_live()
         value = read_json(self.observations, time.monotonic() + timeout)
-        if value.get("version", 0) < 1:
+        if type(value.get("version")) is not int or value["version"] != 2:
             raise DriverError("unsupported observation schema", EX_STALE)
+        if not self.data.get("process_nonce") or value.get("process_nonce") != self.data["process_nonce"]:
+            raise DriverError("observation belongs to a different process session", EX_STALE)
+        previous = self.data.get("last_observation")
+        for key in ("generation", "frame_id", "event_sequence"):
+            counter = value.get(key)
+            if type(counter) is not int or counter < 0 or (previous and counter < previous.get(key, 0)):
+                raise DriverError("observation counters are invalid or moved backwards", EX_STALE)
         self.data["last_observation"] = {
             "generation": value.get("generation"),
             "frame_id": value.get("frame_id"),
@@ -330,7 +374,8 @@ def launch(args: argparse.Namespace) -> int:
                 "output": str(output), "binary": str(binary), "build": bool(args.build),
                 "state_directory": str(output / "state"), "workspace": str(output / "workspace"),
                 "argv": [str(binary), "--provider", "fake", "--state-directory", str(output / "state"), "--workspace", str(output / "workspace"),
-                         "--automation-live", str(output / "live.json"), "--automation-output", str(output / "final.json")]}
+                         "--automation-live", str(output / "live.json"), "--automation-output", str(output / "final.json"),
+                         "--automation-session", "<fresh 32-digit process nonce>"]}
         print(json.dumps(plan, indent=2))
         return 0
     if not args.private:
@@ -361,9 +406,11 @@ def launch(args: argparse.Namespace) -> int:
     private_path = run_command(["vd", "start", "--width", str(args.width), "--height", str(args.height)]).stdout.strip()
     private_dir = Path(private_path)
     try:
+        process_nonce = secrets.token_hex(16)
         private_record = json.loads((private_dir / "session.json").read_text(encoding="utf-8"))
         argv = [str(binary), "--provider", "fake", "--state-directory", str(state), "--workspace", str(workspace),
                 "--automation-live", str(output / "live.json"), "--automation-output", str(output / "final.json"),
+                "--automation-session", process_nonce,
                 "--quit-after-ms", str(args.quit_after_ms)]
         launch_result = run_command(["vd", "run", private_path, "--bg", "--log", str(output / "app.log"), "--", *argv])
         launch_info = json.loads(launch_result.stdout)
@@ -383,6 +430,7 @@ def launch(args: argparse.Namespace) -> int:
                          "observations": str(output / "live.json"), "launch": launch_info, "workspace": str(workspace),
                          "actions": []})
         session = Session(output, manifest)
+        bind_process(session, launch_info["pid"], process_nonce)
         session.save()
         # Require a first painted snapshot so every subsequent action has a fresh baseline.
         session.snapshot(args.timeout)
@@ -424,17 +472,15 @@ def attach(args: argparse.Namespace) -> int:
     pid = node.get("pid")
     if not isinstance(pid, int) or pid <= 0:
         raise DriverError("private window has no native process identity", EX_STALE)
+    bind_process(session, pid)
+    # A running binary can outlive a rebuild that unlinks its original inode.
+    # The hash above comes from /proc/pid/exe, not a newer file at that path.
     try:
-        binary = Path(f"/proc/{pid}/exe").resolve(strict=True)
-        arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-        marker = arguments.index(b"--automation-live")
-        exported = Path(os.fsdecode(arguments[marker + 1])).resolve()
-    except (OSError, ValueError, IndexError) as error:
-        raise DriverError("window process does not expose the requested observation export", EX_STALE) from error
-    if exported != observations:
-        raise DriverError("observation export belongs to a different process", EX_STALE)
+        binary = os.readlink(f"/proc/{pid}/exe")
+    except OSError as error:
+        raise DriverError("native process exited while attaching", EX_STALE) from error
     manifest.update({"launch": {"attached": True, "pid": pid}, "binary": str(binary),
-                     "binary_sha256": sha256(binary), "provider": "attached; not inferred"})
+                     "provider": "attached; not inferred"})
     session.save()
     session.snapshot(args.timeout)
     atomic_json(output / "manifest.json", redact(manifest))
@@ -710,9 +756,11 @@ def restart_app(session: Session, args: argparse.Namespace) -> dict[str, Any]:
     restarted_output = session.output / "restart-process"
     restarted_output.mkdir(exist_ok=False)
     live = restarted_output / "live.json"
+    process_nonce = secrets.token_hex(16)
     argv = [session.data["binary"], "--provider", "fake", "--workspace", session.data["workspace"],
             "--state-directory", str(session.output / "state"), "--automation-live", str(live),
             "--automation-output", str(restarted_output / "final.json"),
+            "--automation-session", process_nonce,
             "--quit-after-ms", str(args.quit_after_ms)]
     restarted = json.loads(run_command(["vd", "run", str(session.vd_session), "--bg", "--log",
                            str(restarted_output / "app.log"), "--", *argv]).stdout)
@@ -724,6 +772,8 @@ def restart_app(session: Session, args: argparse.Namespace) -> dict[str, Any]:
                                  "observations": str(live), "launch": restarted,
                                  "window": windows.splitlines()[0].split()[0]})
             session.data.pop("stopped_unix_ns", None)
+            session.data.pop("last_observation", None)
+            bind_process(session, restarted["pid"], process_nonce)
             session.save()
             current = wait_snapshot(session, lambda value: value.get("connected")
                                     and value.get("thread_id") == before.get("thread_id")
@@ -948,7 +998,7 @@ def parser() -> argparse.ArgumentParser:
     item = commands.add_parser("attach", help="attach to an already launched private desktop app")
     item.add_argument("--session", required=True)
     item.add_argument("--window", required=True)
-    item.add_argument("--observations", required=True)
+    item.add_argument("--observations", required=True, help="live export from an app launched with --automation-session")
     add_common(item)
 
     item = commands.add_parser("snapshot", help="print the latest read-only observation")

@@ -150,6 +150,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return err;
     };
     defer app.deinit();
+    app.snapshot.process_nonce = options.automation_session orelse "";
     var wake = Wake{ .event_type = c.SDL_RegisterEvents(1) };
     if (wake.event_type == 0) return error.UserEventRegistration;
     var host: ?*Host = null;

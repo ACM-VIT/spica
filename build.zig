@@ -112,6 +112,9 @@ pub fn build(b: *std.Build) void {
     const bootstrap_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "build", "-p", "*_test.py" });
     bootstrap_tests.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     test_step.dependOn(&bootstrap_tests.step);
+    const gui_driver_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "tools/tests", "-p", "test_*.py" });
+    gui_driver_tests.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    test_step.dependOn(&gui_driver_tests.step);
 }
 
 fn foundationDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const u8) void {

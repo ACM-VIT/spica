@@ -8,6 +8,7 @@ pub const Options = struct {
     metrics_capacity: u32 = 8192,
     state_directory: ?[]const u8 = null,
     automation_live: ?[]const u8 = null,
+    automation_session: ?[]const u8 = null,
     lua_module: ?[]const u8 = null,
     provider: enum { fake, codex, opencode } = .fake,
     /// Ordinary startup is configured in-app; explicit fake is a fixture opt-in.
@@ -73,6 +74,13 @@ pub const Options = struct {
                 index += 1;
                 if (index == args.len or args[index].len == 0) return error.MissingOptionValue;
                 options.automation_live = args[index];
+            } else if (std.mem.eql(u8, flag, "--automation-session")) {
+                index += 1;
+                if (index == args.len) return error.MissingOptionValue;
+                const value = args[index];
+                if (value.len != 32) return error.InvalidAutomationSession;
+                for (value) |byte| if (!std.ascii.isHex(byte)) return error.InvalidAutomationSession;
+                options.automation_session = value;
             } else if (std.mem.eql(u8, flag, "--metrics-output") or std.mem.eql(u8, flag, "--automation-output")) {
                 index += 1;
                 if (index == args.len) return error.MissingOptionValue;
@@ -91,6 +99,7 @@ pub const Options = struct {
             if (!std.fs.path.isAbsolute(options.runtime_account_directory.?) or !std.fs.path.isAbsolute(options.workspace.?)) return error.AbsoluteRuntimePathsRequired;
         }
         if (!options.help) {
+            if (options.automation_session != null and options.automation_live == null and options.automation_output == null) return error.AutomationExportRequired;
             if (options.additional_provider) |provider| {
                 if (options.provider == .fake or std.mem.eql(u8, @tagName(provider), @tagName(options.provider))) return error.DistinctNativeProvidersRequired;
                 if (options.additional_runtime_account_directory == null or options.additional_model_provider == null) return error.ExplicitAdditionalAccountRequired;
@@ -151,11 +160,22 @@ pub const help =
     \\--quit-after-ms exits after a bounded smoke run (0 exits immediately).
     \\--automation-output PATH exports the read-only final native snapshot.
     \\--automation-live PATH enables bounded read-only painted snapshots (adds file I/O).
+    \\--automation-session HEX supplies a 32-digit process nonce for correlated GUI testing.
     \\--metrics-output PATH enables bounded frame timestamps and text-cache ledger.
     \\--metrics-capacity N bounds retained attempts (default 8192; max 1048576).
     \\Keep the checkout's .deps and assets; rebuild after moving the checkout.
     \\
 ;
+
+test "automation session identity is bounded and requires an observation export" {
+    const nonce = "0123456789abcdef0123456789abcdef";
+    const options = try Options.parse(&.{ "spica", "--automation-live", "/tmp/live.json", "--automation-session", nonce });
+    try std.testing.expectEqualStrings(nonce, options.automation_session.?);
+    try std.testing.expectError(error.AutomationExportRequired, Options.parse(&.{ "spica", "--automation-session", nonce }));
+    try std.testing.expectError(error.InvalidAutomationSession, Options.parse(&.{ "spica", "--automation-session", "short" }));
+    try std.testing.expectError(error.InvalidAutomationSession, Options.parse(&.{ "spica", "--automation-session", "z" ** 32 }));
+    try std.testing.expectError(error.MissingOptionValue, Options.parse(&.{ "spica", "--automation-session" }));
+}
 
 test "smoke deadline is bounded and legacy runtime flags are rejected" {
     try std.testing.expect((try Options.parse(&.{"spica"})).quit_after_ms == null);

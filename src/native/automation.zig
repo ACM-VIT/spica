@@ -3,6 +3,7 @@
 /// authenticate their physical source. The runner separately attests real vd input.
 pub const Snapshot = struct {
     version: u32 = 2,
+    process_nonce: []const u8 = "",
     generation: u64 = 1,
     frame_id: u64 = 0,
     event_sequence: u64 = 0,
