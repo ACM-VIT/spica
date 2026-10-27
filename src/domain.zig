@@ -749,9 +749,27 @@ pub const Owner = struct {
         const db = self.database;
         try db.begin();
         errdefer db.rollback() catch {};
-        const s = try db.prepare("SELECT run_id,session_id,kind,revision,state FROM effects WHERE id=?", &.{.{ .text = effect.value }});
+        const s = try db.prepare("SELECT run_id,session_id,kind,revision,state,evidence FROM effects WHERE id=?", &.{.{ .text = effect.value }});
         defer s.deinit();
-        if (!try s.step() or !std.mem.eql(u8, try s.bytes(4), "in_flight")) return error.Conflict;
+        if (!try s.step()) return error.Conflict;
+        const evidence = try encoded(allocator, receipt);
+        // Keep event/retry evidence fixed in size even for detailed receipts.
+        // The complete current evidence remains on the effect itself.
+        const delivery_proof = try encoded(allocator, .{ .outcome = receipt.outcome, .digest = t.digest(evidence) });
+        if (!s.isNull(5) and std.mem.eql(u8, try s.bytes(5), evidence)) {
+            try db.rollback();
+            return;
+        }
+        if (!std.mem.eql(u8, try s.bytes(4), "in_flight")) {
+            // A later request outcome may replace effects.evidence. Retain the
+            // original receipt identity in its indexed effect event so a retry
+            // remains idempotent after refusal or restart, without replay.
+            const aggregate = try encoded(allocator, t.AggregateRef{ .effect = effect });
+            const original = try self.field(allocator, "SELECT payload FROM events WHERE aggregate=? AND kind='EffectDelivery' ORDER BY sequence DESC,event_index DESC LIMIT 1", &.{.{ .blob = aggregate }}) orelse return error.Conflict;
+            if (!std.mem.eql(u8, original, delivery_proof)) return error.Conflict;
+            try db.rollback();
+            return;
+        }
         if (s.integer(3) == std.math.maxInt(i64)) return error.Limit;
         const run = try allocator.dupe(u8, try s.bytes(0));
         const session = try allocator.dupe(u8, try s.bytes(1));
@@ -768,8 +786,8 @@ pub const Owner = struct {
             .rejected => "failed",
             .unknown => "unknown",
         };
-        try db.execute("UPDATE effects SET state=?,outcome=?,evidence=?,revision=revision+1 WHERE id=?", &.{ .{ .text = state }, .{ .blob = receipt.detail }, .{ .blob = try encoded(allocator, receipt) }, .{ .text = effect.value } });
-        try self.event(allocator, sequence, 0, .{ .effect = effect }, @intCast(s.integer(3) + 1), "EffectDelivery", null, effect, "");
+        try db.execute("UPDATE effects SET state=?,outcome=?,evidence=?,revision=revision+1 WHERE id=?", &.{ .{ .text = state }, .{ .blob = receipt.detail }, .{ .blob = evidence }, .{ .text = effect.value } });
+        try self.event(allocator, sequence, 0, .{ .effect = effect }, @intCast(s.integer(3) + 1), "EffectDelivery", null, effect, delivery_proof);
         if (receipt.session) |live| {
             if (!std.mem.eql(u8, live.id.value, session)) return error.Conflict;
             const revision_statement = try db.prepare("SELECT revision,upstream_session FROM sessions WHERE id=?", &.{.{ .text = session }});
@@ -785,7 +803,10 @@ pub const Owner = struct {
         if (!try revision_statement.step()) return error.Corrupt;
         const current = try revision_statement.bytes(1);
         // Delivery after terminal evidence never revives the lifecycle.
-        if (!(std.mem.eql(u8, current, "completed") or std.mem.eql(u8, current, "cancelled") or std.mem.eql(u8, current, "failed") or std.mem.eql(u8, current, "unknown") or std.mem.eql(u8, current, "interrupted"))) {
+        // Message delivery resolves only that effect. It neither starts a new
+        // turn nor supplies evidence about the independent Start's lifecycle,
+        // tools or cancellation, including when delivery itself is uncertain.
+        if (!std.mem.eql(u8, kind, "message") and !(std.mem.eql(u8, current, "completed") or std.mem.eql(u8, current, "cancelled") or std.mem.eql(u8, current, "failed") or std.mem.eql(u8, current, "unknown") or std.mem.eql(u8, current, "interrupted"))) {
             const applied_state = if (std.mem.eql(u8, current, "cancel_requested") and std.mem.eql(u8, kind, "create_session")) current else next_state;
             try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = applied_state }, .{ .text = run } });
             try self.event(allocator, sequence, 2, .{ .run = .{ .value = run } }, @intCast(revision_statement.integer(0) + 1), "RunDelivery", null, effect, "");
@@ -801,6 +822,9 @@ pub const Owner = struct {
     /// transaction succeeds. Duplicate identity requires byte-equal evidence.
     pub fn observe(self: *Owner, allocator: std.mem.Allocator, input: a.Observation) !void {
         if (a.frameBytes(input) > 4096 or input.upstream_event.len == 0) return error.Limit;
+        // Never infer a request outcome's run from the newest turn in a
+        // session. Both identities must come from the dispatched request.
+        if (input.body == .request_failed and (input.correlation.run == null or input.correlation.effect == null)) return error.Conflict;
         var observation = input;
         const run = observation.correlation.run orelse if (self.factory != null) a.RunId{
             .value = try self.field(allocator, "SELECT id FROM runs WHERE session_id=? ORDER BY rowid DESC LIMIT 1", &.{.{ .text = observation.correlation.session.value }}) orelse return error.Conflict,
@@ -837,9 +861,6 @@ pub const Owner = struct {
                 observation.correlation.upstream_tool = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ run.value, upstream });
                 if (observation.correlation.tool) |tool| observation.correlation.tool = .{ .value = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ run.value, tool.value }) };
             }
-            if (observation.correlation.effect) |effect_id| {
-                if (try self.field(allocator, "SELECT id FROM effects WHERE id=? AND session_id=? AND run_id=?", &.{ .{ .text = effect_id.value }, .{ .text = session.value }, .{ .text = run.value } }) == null) return error.Conflict;
-            }
             if (observation.body == .approval) {
                 if (!a.equal(input.body.approval.correlation, input.correlation)) return error.Conflict;
                 observation.body.approval.correlation = observation.correlation;
@@ -864,6 +885,9 @@ pub const Owner = struct {
                 chunk.message = .{ .value = message };
                 chunk.block = .{ .value = block };
             }
+        }
+        if (observation.correlation.effect) |effect_id| {
+            if (try self.field(allocator, "SELECT id FROM effects WHERE id=? AND session_id=? AND run_id=?", &.{ .{ .text = effect_id.value }, .{ .text = session.value }, .{ .text = run.value } }) == null) return error.Conflict;
         }
         const state_statement = try db.prepare("SELECT state,revision FROM runs WHERE id=? AND session_id=?", &.{ .{ .text = run.value }, .{ .text = session.value } });
         defer state_statement.deinit();
@@ -953,6 +977,19 @@ pub const Owner = struct {
             .cancelled => |cancelled| if (!terminal) {
                 next_state = if (cancelled.tools_stopped) "cancelled" else "unknown";
             },
+            .request_failed => |failure| {
+                const effect_id = observation.correlation.effect.?;
+                const pending = try db.prepare("SELECT revision,request FROM effects WHERE id=? AND run_id=? AND session_id=? AND kind='message' AND state IN('in_flight','confirmed','unknown')", &.{ .{ .text = effect_id.value }, .{ .text = run.value }, .{ .text = session.value } });
+                defer pending.deinit();
+                if (!try pending.step()) return error.Conflict;
+                if (pending.integer(0) == std.math.maxInt(i64)) return error.Limit;
+                const request = try t.decode(a.Request, try pending.bytes(1), allocator);
+                if (request != .message or !a.equal(request.message.correlation.effect, observation.correlation.effect) or !a.equal(request.message.correlation.run, observation.correlation.run) or !a.equal(request.message.correlation.session, session)) return error.Conflict;
+                if (observation.correlation.followup != null and !a.equal(request.message.correlation.followup, observation.correlation.followup)) return error.Conflict;
+                try db.execute("UPDATE effects SET state='failed',outcome=?,evidence=?,revision=revision+1 WHERE id=?", &.{ .{ .blob = failure.detail }, .{ .blob = try encoded(allocator, observation.body) }, .{ .text = effect_id.value } });
+                try self.event(allocator, sequence, index, .{ .effect = effect_id }, @intCast(pending.integer(0) + 1), "RequestFailed", null, effect_id, "");
+                index += 1;
+            },
             .failure => |failure| if (!terminal) {
                 // A definitive rejection before session publication resolves the
                 // committed open claim; no dependent start may remain runnable.
@@ -1004,8 +1041,12 @@ pub const Owner = struct {
             try self.event(allocator, sequence, index, .{ .session = session }, @intCast(session_revision.integer(0) + 1), "CursorCommitted", null, observation.correlation.effect, "");
             index += 1;
         }
-        try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = next_state }, .{ .text = run.value } });
-        try self.event(allocator, sequence, index, .{ .run = run }, @intCast(state_statement.integer(1) + 1), "ObservationCommitted", null, observation.correlation.effect, "");
+        // Request diagnostics live on the effect, not the run's terminal
+        // diagnostic projection. Cursor/observation identity still commits.
+        if (observation.body != .request_failed) {
+            try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = next_state }, .{ .text = run.value } });
+            try self.event(allocator, sequence, index, .{ .run = run }, @intCast(state_statement.integer(1) + 1), "ObservationCommitted", null, observation.correlation.effect, "");
+        }
         try self.finalizeMessages(run.value);
         try db.publishChanges(sequence, null);
         try db.commit();
@@ -2453,5 +2494,139 @@ test "reopened uncertain runs do not block setup or replay claimed work" {
         const next = (try owner.command(allocator, .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "live-thread-{d}", .{i}) }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
         const run = try owner.command(allocator, .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "live-send-{d}", .{i}) }, .target = .{ .thread = next }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "Still bounded to three live runs", .selection = a.fakeSelection(workspace) } } });
         if (i < 3) try std.testing.expectEqual(.accepted, run.outcome) else try std.testing.expectEqual(.admission_limit, run.reason.?);
+    }
+}
+
+const FollowupLifetimeProbe = struct {
+    arena: std.heap.ArenaAllocator,
+    session: a.RuntimeSessionId = .{ .value = "" },
+    start: ?a.Correlation = null,
+    next: ?a.Observation = null,
+    message_outcome: @FieldType(a.Receipt, "outcome"),
+    messages: usize = 0,
+    starts: usize = 0,
+    shutdowns: usize = 0,
+    destroys: usize = 0,
+    fn cast(context: *anyopaque) *FollowupLifetimeProbe {
+        return @ptrCast(@alignCast(context));
+    }
+    fn discover(_: *anyopaque) a.Discovery {
+        var capabilities = @import("runtime/fake.zig").defaultCapabilities();
+        // Only this deterministic test fixture implements message refusal.
+        capabilities[@intFromEnum(a.Capability.followup_queue)].status = .supported;
+        return .{ .capabilities = capabilities, .limits = .{} };
+    }
+    fn account(_: *anyopaque) a.Account {
+        return .{ .reference = "fixture", .readiness = .ready };
+    }
+    fn selection(_: *anyopaque, requested: a.Selection) a.SelectionResult {
+        return .{ .requested = requested, .effective = requested, .readiness = .ready };
+    }
+    fn dispatch(context: *anyopaque, _: std.mem.Allocator, request: a.Request) !a.Receipt {
+        const self = cast(context);
+        switch (request) {
+            .open => return .{ .outcome = .acknowledged, .session = .{ .id = self.session, .instance = .{ .value = "probe-instance" }, .upstream = .{ .value = "probe-session" } } },
+            .start => |start| {
+                self.starts += 1;
+                self.start = try common.clone(self.arena.allocator(), start.correlation);
+                self.next = .{ .correlation = self.start.?, .upstream_event = "before-followup", .body = .{ .chunk = .{ .message = .{ .value = "message" }, .block = .{ .value = "block" }, .offset = 0, .text = "before " } } };
+                return .{ .outcome = .acknowledged };
+            },
+            .message => |message| {
+                self.messages += 1;
+                if (self.message_outcome == .acknowledged) self.next = .{ .correlation = try common.clone(self.arena.allocator(), message.correlation), .upstream_event = "request-refused", .body = .{ .request_failed = .{ .code = "busy", .detail = "followup refused asynchronously" } } };
+                return .{ .outcome = self.message_outcome, .detail = "message delivery" };
+            },
+            else => return error.UnexpectedRequest,
+        }
+    }
+    fn pump(_: *anyopaque) !void {}
+    fn poll(context: *anyopaque, allocator: std.mem.Allocator) !?a.Observation {
+        const self = cast(context);
+        const next = self.next orelse return null;
+        const copied = try common.clone(allocator, next);
+        self.next = null;
+        return copied;
+    }
+    fn shutdown(context: *anyopaque) void {
+        cast(context).shutdowns += 1;
+    }
+    fn create(context: *anyopaque, _: std.mem.Allocator, _: a.Selection, _: []const u8, session: a.RuntimeSessionId, _: ?common.Bridge) !common.Adapter {
+        const self = cast(context);
+        self.session = try common.clone(self.arena.allocator(), session);
+        return .{ .context = self, .vtable = &.{ .discover = discover, .accountStatus = account, .resolveSelection = selection, .dispatch = dispatch, .pump = pump, .poll = poll, .shutdown = shutdown } };
+    }
+    fn discoverFactory(context: *anyopaque, _: a.Selection) a.Discovery {
+        return discover(context);
+    }
+    fn accountFactory(context: *anyopaque, _: a.Selection) a.Account {
+        return account(context);
+    }
+    fn destroy(context: *anyopaque, _: std.mem.Allocator, _: common.Adapter) void {
+        cast(context).destroys += 1;
+    }
+    fn factory(self: *FollowupLifetimeProbe) Factory {
+        return .{ .context = self, .vtable = &.{ .discover = discoverFactory, .accountStatus = accountFactory, .resolveSelection = selection, .create = create, .destroy = destroy } };
+    }
+};
+
+test "Host retains provider after followup delivery or refusal until original Start completes" {
+    for ([_]@FieldType(a.Receipt, "outcome"){ .rejected, .acknowledged, .unknown }) |outcome| {
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = path_buffer[0..try temporary.dir.realPath(std.testing.io, &path_buffer)];
+        var probe: FollowupLifetimeProbe = .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .message_outcome = outcome };
+        defer probe.arena.deinit();
+        // Exercise the real dispatch/pump/release path synchronously. No worker
+        // thread, timing sleeps or internal mutation of domain state is needed.
+        const host = try std.testing.allocator.create(Host);
+        defer std.testing.allocator.destroy(host);
+        host.* = .{ .allocator = std.testing.allocator, .io = std.testing.io, .options = .{ .state_directory = path }, .database = try store.Store.open(std.testing.io, path), .path = undefined, .restore_arena = undefined };
+        defer host.database.close() catch @panic("test host database close failed");
+        host.mcp = try Mcp.init();
+        defer host.mcp.?.deinit();
+        host.registry = .{ .allocator = std.testing.allocator, .factory = probe.factory() };
+        defer host.registry.?.deinit(&host.mcp.?);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var pump_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer pump_arena.deinit();
+        const allocator = arena.allocator();
+        var owner: Owner = .{ .database = &host.database, .io = std.testing.io, .epoch = "host-followup", .utc_ms = 1000, .factory = probe.factory(), .runtime_registry = &host.registry.? };
+        const project = (try owner.command(allocator, .{ .command_id = .{ .value = "project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "Followup lifetime" } } })).entity_ids.project.?;
+        const workspace = (try owner.command(allocator, .{ .command_id = .{ .value = "workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = try workspace_binding.capture(allocator, std.testing.io, path) } } })).entity_ids.workspace.?;
+        const thread = (try owner.command(allocator, .{ .command_id = .{ .value = "thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+        const sent = try owner.command(allocator, .{ .command_id = .{ .value = "send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "original turn", .selection = a.fakeSelection(workspace) } } });
+        try std.testing.expectEqual(.accepted, sent.outcome);
+        try host.dispatch(&owner, allocator, (try owner.claimNext(allocator)).?);
+        try host.pumpRuntimes(&owner, &pump_arena);
+        const start = (try owner.claimNext(allocator)).?;
+        try host.dispatch(&owner, allocator, start);
+        try host.pumpRuntimes(&owner, &pump_arena);
+        const queued = try owner.command(allocator, .{ .command_id = .{ .value = "followup" }, .target = .{ .run = sent.entity_ids.run.? }, .expected_revision = .{ .revision = @intCast(try host.database.scalar("SELECT revision FROM runs")) }, .payload = .{ .followup_enqueue = .{ .content = "queued request" } } });
+        try std.testing.expectEqual(.accepted, queued.outcome);
+        const message = (try owner.claimNext(allocator)).?;
+        try host.dispatch(&owner, allocator, message);
+        try host.pumpRuntimes(&owner, &pump_arena);
+        try std.testing.expectEqual(@as(usize, 0), probe.shutdowns);
+        try std.testing.expectEqual(@as(usize, 0), probe.destroys);
+        try std.testing.expect(host.registry.?.find(sent.entity_ids.session.?) != null);
+        try std.testing.expectEqual(@as(i64, 1), try host.database.scalar("SELECT count(*) FROM runs WHERE state='streaming'"));
+        try std.testing.expect(a.equal(start.request.start.correlation, probe.start.?));
+        probe.next = .{ .correlation = probe.start.?, .upstream_event = "after-followup", .body = .{ .chunk = .{ .message = .{ .value = "message" }, .block = .{ .value = "block" }, .offset = 7, .text = "世界" } } };
+        try host.pumpRuntimes(&owner, &pump_arena);
+        try std.testing.expectEqual(@as(i64, 13), try host.database.scalar("SELECT committed_bytes FROM blocks WHERE kind='text' AND message_id=(SELECT id FROM messages WHERE role='assistant')"));
+        probe.next = .{ .correlation = probe.start.?, .upstream_event = "completed", .body = .completed };
+        try host.pumpRuntimes(&owner, &pump_arena);
+        try std.testing.expectEqual(@as(i64, 1), try host.database.scalar("SELECT count(*) FROM runs WHERE state='completed'"));
+        try std.testing.expect(host.registry.?.find(sent.entity_ids.session.?) == null);
+        try std.testing.expectEqual(@as(usize, 1), probe.shutdowns);
+        try std.testing.expectEqual(@as(usize, 1), probe.destroys);
+        try std.testing.expectEqual(@as(usize, 1), probe.starts);
+        try std.testing.expectEqual(@as(usize, 1), probe.messages);
+        try std.testing.expect((try owner.claimNext(allocator)) == null);
+        try host.pumpRuntimes(&owner, &pump_arena);
+        try std.testing.expectEqual(@as(usize, 1), probe.shutdowns);
     }
 }

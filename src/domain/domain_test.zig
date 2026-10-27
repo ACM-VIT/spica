@@ -1286,3 +1286,303 @@ test "schema 4 inline Send retry retains original receipt before reserving promp
     command.payload.thread_send.text = "changed";
     try std.testing.expectEqual(t.Reason.command_id_conflict, (try owner.command(allocator, command)).reason.?);
 }
+
+const FollowupTurn = struct {
+    conversation: Conversation,
+    sent: t.Receipt,
+    start: domain.Owner.Claimed,
+    fn begin(owner: *domain.Owner, allocator: std.mem.Allocator) !FollowupTurn {
+        const conversation = try Conversation.create(owner, allocator);
+        const sent = try owner.command(allocator, conversation.send("followup-start", "first turn", 1));
+        try std.testing.expectEqual(.accepted, sent.outcome);
+        const open = (try owner.claimNext(allocator)).?;
+        try owner.delivered(allocator, open.id, .{ .outcome = .acknowledged, .session = .{ .id = sent.entity_ids.session.?, .instance = .{ .value = "followup-instance" }, .upstream = .{ .value = "followup-session" } } });
+        const start = (try owner.claimNext(allocator)).?;
+        try std.testing.expect(start.request == .start);
+        try owner.delivered(allocator, start.id, .{ .outcome = .acknowledged });
+        const self: FollowupTurn = .{ .conversation = conversation, .sent = sent, .start = start };
+        try owner.observe(allocator, self.chunk("before-followup", 0, "before "));
+        return self;
+    }
+    fn chunk(self: FollowupTurn, label: []const u8, offset: u64, text: []const u8) t.adapter.Observation {
+        return .{ .correlation = self.start.request.start.correlation, .upstream_event = label, .body = .{ .chunk = .{ .message = self.sent.entity_ids.assistant_message.?, .block = self.sent.entity_ids.assistant_block.?, .offset = offset, .text = text } } };
+    }
+    fn enqueue(self: FollowupTurn, owner: *domain.Owner, allocator: std.mem.Allocator, id: []const u8) !t.Receipt {
+        const revision: u64 = @intCast(try owner.database.scalar("SELECT revision FROM runs"));
+        const envelope: t.CommandEnvelope = .{ .command_id = .{ .value = id }, .target = .{ .run = self.sent.entity_ids.run.? }, .expected_revision = .{ .revision = revision }, .payload = .{ .followup_enqueue = .{ .content = "later 世界" } } };
+        const receipt = try owner.command(allocator, envelope);
+        try std.testing.expectEqual(.accepted, receipt.outcome);
+        const position = try owner.database.position();
+        try std.testing.expectEqual(receipt.commit_sequence, (try owner.command(allocator, envelope)).commit_sequence);
+        try std.testing.expectEqual(position, try owner.database.position());
+        return receipt;
+    }
+    fn complete(self: FollowupTurn, owner: *domain.Owner, allocator: std.mem.Allocator) !void {
+        try owner.observe(allocator, .{ .correlation = self.start.request.start.correlation, .upstream_event = "natural-completion", .body = .completed });
+    }
+};
+
+test "message delivery outcomes preserve streaming Start and persist unknown without replay" {
+    for ([_]t.adapter.Receipt{ .{ .outcome = .acknowledged }, .{ .outcome = .rejected, .detail = "request refused" }, .{ .outcome = .unknown, .detail = "delivery result lost" } }) |receipt| {
+        var f = try Fixture.init();
+        defer f.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var runtime: AsyncAdapter = .{};
+        var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "followup-delivery", .utc_ms = 1000, .factory = runtime.factory() };
+        const turn = try FollowupTurn.begin(&owner, allocator);
+        const queued = try turn.enqueue(&owner, allocator, "queued");
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='message' AND state='planned'"));
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM events WHERE kind='FollowupQueued'"));
+        const followup = (try owner.claimNext(allocator)).?;
+        try std.testing.expectEqualStrings(queued.effect_ids[0].value, followup.id.value);
+        const revision = try f.store.scalar("SELECT revision FROM runs");
+        const position = try f.store.position();
+        var wrong = receipt;
+        wrong.session = .{ .id = .{ .value = "wrong-session" }, .instance = .{ .value = "instance" }, .upstream = .{ .value = "upstream" } };
+        try std.testing.expectError(error.Conflict, owner.delivered(allocator, followup.id, wrong));
+        try std.testing.expectEqual(position, try f.store.position());
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='message' AND state='in_flight'"));
+        try owner.delivered(allocator, followup.id, receipt);
+        const delivered_position = try f.store.position();
+        try owner.delivered(allocator, followup.id, receipt);
+        try std.testing.expectEqual(delivered_position, try f.store.position());
+        try std.testing.expectEqual(revision, try f.store.scalar("SELECT revision FROM runs"));
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='streaming'"));
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM messages WHERE role='assistant' AND incomplete=1"));
+        const expected_state = switch (receipt.outcome) {
+            .acknowledged => "confirmed",
+            .rejected => "failed",
+            .unknown => "unknown",
+        };
+        {
+            const state = try f.store.prepare("SELECT state FROM effects WHERE kind='message'", &.{});
+            defer state.deinit();
+            try std.testing.expect(try state.step());
+            try std.testing.expectEqualStrings(expected_state, try state.bytes(0));
+        }
+        // Continuation bytes and completion retain the independent Start ID.
+        try owner.observe(allocator, turn.chunk("after-followup", 7, "世界"));
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM observations o JOIN effects e ON e.id=json_extract(CAST(o.correlation AS TEXT),'$.effect.value') WHERE e.kind='start' AND o.upstream_event LIKE '%:after-followup'"));
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='start' AND state='confirmed'"));
+        try turn.complete(&owner, allocator);
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='completed'"));
+        try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM messages WHERE incomplete=1"));
+        // Real close/reopen retains delivery evidence and cannot claim it again.
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try f.path(&path_buffer);
+        try f.store.close();
+        f.store = try storage.Store.open(std.testing.io, path);
+        owner.epoch = "followup-restart";
+        try owner.recover();
+        try std.testing.expect((try owner.claimNext(allocator)) == null);
+        const persisted = try f.store.prepare("SELECT state,evidence FROM effects WHERE kind='message'", &.{});
+        defer persisted.deinit();
+        try std.testing.expect(try persisted.step());
+        try std.testing.expectEqualStrings(expected_state, try persisted.bytes(0));
+        var encoded_receipt: [4096]u8 = undefined;
+        try std.testing.expectEqualStrings(try t.encode(receipt, &encoded_receipt), try persisted.bytes(1));
+        if (receipt.outcome == .unknown) {
+            const blocked = try owner.command(allocator, turn.conversation.send("unsafe-retry", "do not replay", 2));
+            try std.testing.expectEqual(t.Reason.unresolved_effects, blocked.reason.?);
+        }
+    }
+}
+
+test "asynchronous request refusal validates exact identity and leaves Start diagnostics and lifecycle intact" {
+    for ([_]bool{ false, true }) |normalize| {
+        var f = try Fixture.init();
+        defer f.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var runtime: AsyncAdapter = .{};
+        var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "request-refusal", .utc_ms = 1000, .factory = if (normalize) runtime.factory() else null };
+        const turn = try FollowupTurn.begin(&owner, allocator);
+        _ = try turn.enqueue(&owner, allocator, "refused-followup");
+        const followup = (try owner.claimNext(allocator)).?;
+        const acknowledgement: t.adapter.Receipt = .{ .outcome = .acknowledged, .detail = &([_]u8{'a'} ** 2048) };
+        try owner.delivered(allocator, followup.id, acknowledgement);
+        try std.testing.expect((try f.store.scalar("SELECT max(length(payload)) FROM events WHERE kind='EffectDelivery'")) <= 256);
+        try std.testing.expectEqual(@as(i64, 2048), try f.store.scalar("SELECT length(outcome) FROM effects WHERE kind='message'"));
+        var refusal: t.adapter.Observation = .{ .correlation = followup.request.message.correlation, .upstream_event = "async-refusal", .cursor = .{ .value = "refusal-cursor" }, .body = .{ .request_failed = .{ .code = "busy", .detail = "cannot accept this message" } } };
+        const position = try f.store.position();
+        const revision = try f.store.scalar("SELECT revision FROM runs");
+        const changes = try f.store.scalar("SELECT count(*) FROM aggregate_changes");
+        for (0..8) |invalid| {
+            var wrong = refusal;
+            switch (invalid) {
+                0 => wrong.correlation.session.value = "wrong-session",
+                1 => wrong.correlation.run = .{ .value = "wrong-run" },
+                2 => wrong.correlation.effect = .{ .value = "wrong-effect" },
+                3 => wrong.correlation.effect = turn.start.id,
+                4 => wrong.correlation.run = null,
+                5 => wrong.correlation.effect = null,
+                6 => wrong.correlation.followup = .{ .value = "wrong-followup" },
+                7 => wrong.body.request_failed.detail = &([_]u8{'x'} ** 4096),
+                else => unreachable,
+            }
+            try std.testing.expectError(if (invalid == 7) error.Limit else error.Conflict, owner.observe(allocator, wrong));
+            try std.testing.expectEqual(position, try f.store.position());
+            try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM observations WHERE cursor='refusal-cursor'"));
+            try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='message' AND state='confirmed'"));
+            try std.testing.expectEqual(changes, try f.store.scalar("SELECT count(*) FROM aggregate_changes"));
+        }
+        try owner.observe(allocator, refusal);
+        const committed = try f.store.position();
+        try owner.delivered(allocator, followup.id, acknowledgement);
+        try std.testing.expectEqual(committed, try f.store.position());
+        try std.testing.expectError(error.Conflict, owner.delivered(allocator, followup.id, .{ .outcome = .unknown }));
+        try owner.observe(allocator, refusal);
+        try std.testing.expectEqual(committed, try f.store.position());
+        refusal.body.request_failed.detail = "conflicting duplicate";
+        try std.testing.expectError(error.Conflict, owner.observe(allocator, refusal));
+        try std.testing.expectEqual(committed, try f.store.position());
+        try std.testing.expectEqual(revision, try f.store.scalar("SELECT revision FROM runs"));
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='streaming'"));
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='message' AND state='failed' AND CAST(outcome AS TEXT)='cannot accept this message' AND evidence IS NOT NULL"));
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM events WHERE kind='RequestFailed' AND json_extract(CAST(aggregate AS TEXT),'$.effect.value')=effect_id"));
+        try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM observations WHERE evidence IS NOT NULL"));
+        try owner.observe(allocator, turn.chunk("after-refusal", 7, "still streaming"));
+        try turn.complete(&owner, allocator);
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='completed'"));
+    }
+}
+
+test "unknown followup does not resolve tools and late refusal cannot undo cancellation" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "followup-cancel", .utc_ms = 1000 };
+    const turn = try FollowupTurn.begin(&owner, allocator);
+    var tool = turn.start.request.start.correlation;
+    tool.tool = .{ .value = "live-tool" };
+    tool.upstream_tool = "live-upstream-tool";
+    try owner.observe(allocator, .{ .correlation = tool, .upstream_event = "tool-start", .body = .{ .tool_started = .{ .name = "work", .action_digest = "work-digest" } } });
+    _ = try turn.enqueue(&owner, allocator, "unknown-followup");
+    const followup = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, followup.id, .{ .outcome = .unknown });
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM tools WHERE outcome='pending'"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT unresolved_tools FROM runs WHERE state='streaming'"));
+    const cancel = try owner.command(allocator, .{ .command_id = .{ .value = "cancel-active" }, .target = .{ .run = turn.sent.entity_ids.run.? }, .expected_revision = .{ .revision = @intCast(try f.store.scalar("SELECT revision FROM runs")) }, .payload = .{ .run_cancel = .{ .reason = "stop" } } });
+    try std.testing.expectEqual(.accepted, cancel.outcome);
+    try owner.observe(allocator, .{ .correlation = followup.request.message.correlation, .upstream_event = "late-refusal", .body = .{ .request_failed = .{ .code = "refused", .detail = "message refused" } } });
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='cancel_requested'"));
+    const cancel_effect = (try owner.claimNext(allocator)).?;
+    try std.testing.expect(cancel_effect.request == .cancel);
+    try owner.delivered(allocator, cancel_effect.id, .{ .outcome = .acknowledged });
+    try owner.observe(allocator, .{ .correlation = cancel_effect.request.cancel.correlation, .upstream_event = "cancel-no-tool-proof", .body = .{ .cancelled = .{ .tools_stopped = false } } });
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='unknown'"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM tools WHERE outcome='pending'"));
+}
+
+test "provider and Start failures remain terminal despite request-scoped refusal support" {
+    for (0..3) |scenario| {
+        var f = try Fixture.init();
+        defer f.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "terminal-failure", .utc_ms = 1000 };
+        const conversation = try Conversation.create(&owner, allocator);
+        const sent = try owner.command(allocator, conversation.send("start", "terminal fixture", 1));
+        const open = (try owner.claimNext(allocator)).?;
+        try owner.delivered(allocator, open.id, .{ .outcome = .acknowledged, .session = .{ .id = sent.entity_ids.session.?, .instance = .{ .value = "instance" }, .upstream = .{ .value = "session" } } });
+        const start = (try owner.claimNext(allocator)).?;
+        if (scenario == 0) {
+            try owner.delivered(allocator, start.id, .{ .outcome = .rejected, .detail = "start refused" });
+        } else {
+            if (scenario == 2) try owner.delivered(allocator, start.id, .{ .outcome = .acknowledged });
+            try owner.observe(allocator, .{ .correlation = if (scenario == 1) start.request.start.correlation else .{ .session = sent.entity_ids.session.?, .run = sent.entity_ids.run }, .upstream_event = "provider-failure", .body = .{ .failure = .{ .code = "provider_failed", .detail = "terminal provider failure" } } });
+        }
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='failed'"));
+        try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM messages WHERE incomplete=1"));
+        try std.testing.expect((try owner.claimNext(allocator)) == null);
+        if (scenario != 2) try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='start' AND state='failed'"));
+    }
+}
+
+test "message delivery cannot clear awaiting approval or cancellation" {
+    for ([_]bool{ false, true }) |cancel| {
+        for ([_]@FieldType(t.adapter.Receipt, "outcome"){ .acknowledged, .rejected, .unknown }) |outcome| {
+            var f = try Fixture.init();
+            defer f.deinit();
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "delivery-state", .utc_ms = 1000 };
+            const turn = try FollowupTurn.begin(&owner, allocator);
+            var correlation = turn.start.request.start.correlation;
+            correlation.tool = .{ .value = "approval-tool" };
+            correlation.upstream_tool = "upstream-tool";
+            try owner.observe(allocator, .{ .correlation = correlation, .upstream_event = "tool", .body = .{ .tool_started = .{ .name = "read", .action_digest = "digest" } } });
+            correlation.approval = .{ .value = "approval" };
+            correlation.upstream_request = "approval-request";
+            try owner.observe(allocator, .{ .correlation = correlation, .upstream_event = "approval", .body = .{ .approval = .{ .correlation = correlation, .workspace = turn.conversation.workspace, .action_digest = "digest", .scope = "one read" } } });
+            _ = try turn.enqueue(&owner, allocator, "waiting-followup");
+            const message = (try owner.claimNext(allocator)).?;
+            if (cancel) {
+                const receipt = try owner.command(allocator, .{ .command_id = .{ .value = "cancel-waiting" }, .target = .{ .run = turn.sent.entity_ids.run.? }, .expected_revision = .{ .revision = @intCast(try f.store.scalar("SELECT revision FROM runs")) }, .payload = .{ .run_cancel = .{ .reason = "cancel before message result" } } });
+                try std.testing.expectEqual(.accepted, receipt.outcome);
+            }
+            const revision = try f.store.scalar("SELECT revision FROM runs");
+            try owner.delivered(allocator, message.id, .{ .outcome = outcome });
+            try std.testing.expectEqual(revision, try f.store.scalar("SELECT revision FROM runs"));
+            const state = try f.store.prepare("SELECT state,unresolved_tools FROM runs", &.{});
+            defer state.deinit();
+            try std.testing.expect(try state.step());
+            try std.testing.expectEqualStrings(if (cancel) "cancel_requested" else "awaiting_approval", try state.bytes(0));
+            try std.testing.expectEqual(@as(i64, 1), state.integer(1));
+            try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM tools WHERE outcome='pending'"));
+            try std.testing.expectEqual(@as(i64, if (cancel) 0 else 1), try f.store.scalar("SELECT count(*) FROM approvals WHERE state='pending'"));
+        }
+    }
+}
+
+test "late request refusal stays with its original run across reopen and a newer turn" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var runtime: AsyncAdapter = .{};
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "late-request", .utc_ms = 1000, .factory = runtime.factory() };
+    const turn = try FollowupTurn.begin(&owner, allocator);
+    _ = try turn.enqueue(&owner, allocator, "late-followup");
+    const message = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, message.id, .{ .outcome = .acknowledged });
+    try turn.complete(&owner, allocator);
+    const second = try owner.command(allocator, turn.conversation.send("second", "new independent turn", 2));
+    try std.testing.expectEqual(.accepted, second.outcome);
+    const resumed = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, resumed.id, .{ .outcome = .acknowledged, .session = .{ .id = second.entity_ids.session.?, .instance = .{ .value = "followup-instance" }, .upstream = .{ .value = "followup-session" } }, .continuity = .proven });
+    const start = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, start.id, .{ .outcome = .acknowledged });
+    const refusal: t.adapter.Observation = .{ .correlation = message.request.message.correlation, .upstream_event = "late-refusal", .body = .{ .request_failed = .{ .code = "late", .detail = "old message refused" } } };
+    const position = try f.store.position();
+    var wrong = refusal;
+    wrong.correlation.run = second.entity_ids.run;
+    try std.testing.expectError(error.Conflict, owner.observe(allocator, wrong));
+    try std.testing.expectEqual(position, try f.store.position());
+    try owner.observe(allocator, refusal);
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='completed'"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='streaming'"));
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try f.path(&path_buffer);
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, path);
+    owner.epoch = "late-request-restart";
+    try owner.recover();
+    const recovered = try f.store.position();
+    try owner.delivered(allocator, message.id, .{ .outcome = .acknowledged });
+    try std.testing.expectEqual(recovered, try f.store.position());
+    try owner.observe(allocator, refusal);
+    try std.testing.expectEqual(recovered, try f.store.position());
+    try std.testing.expect((try owner.claimNext(allocator)) == null);
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='message' AND state='failed' AND CAST(outcome AS TEXT)='old message refused'"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='completed'"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='interrupted'"));
+}
