@@ -8,6 +8,12 @@ from pathlib import Path
 import platform
 import time
 
+MAX_MEMBERS = 4096
+MAX_TASKS = 16384
+MAX_CHILDREN_BYTES = 64 * 1024
+READ_ERRORS = (OSError, ValueError, IndexError, KeyError)
+DISCOVERY = 'per_thread_children_v1'
+
 
 def fields(path):
     result = {}
@@ -30,28 +36,74 @@ def identity(row):
     return row['pid'], row['starttime_ticks']
 
 
+def children_snapshot(directory, task_budget):
+    """Inspect every thread: a worker thread can own children the leader omits.
+
+    Kernel children lists can skip processes during concurrent exits. Recheck
+    topology after reading memory; this remains an observed, non-atomic census.
+    https://www.kernel.org/doc/html/latest/filesystems/proc.html#proc-pid-task-tid-children-information-about-task-children
+    """
+    tasks, children = [], set()
+    for task in (directory / 'task').iterdir():
+        if not task.name.isdigit():
+            continue
+        if task_budget[0] == 0:
+            raise ValueError('process-tree task discovery limit')
+        task_budget[0] -= 1
+        before = stat(task / 'stat')
+        with (task / 'children').open() as source:
+            raw = source.read(MAX_CHILDREN_BYTES + 1)
+        if len(raw) > MAX_CHILDREN_BYTES:
+            raise ValueError('process-tree children byte limit')
+        found = {int(value) for value in raw.split()}
+        if any(value <= 0 for value in found) or len(children | found) > MAX_MEMBERS:
+            raise ValueError('process-tree children count limit or invalid PID')
+        children |= found
+        after = stat(task / 'stat')
+        if before['pid'] != int(task.name) or identity(before) != identity(after):
+            raise ValueError('thread identity changed during child discovery')
+        tasks.append(identity(after))
+    if not tasks:
+        raise ValueError('process has no readable tasks')
+    return tuple(sorted(tasks)), frozenset(children)
+
+
 def sample(pid, proc=Path('/proc'), expected_root=None):
     begin = time.monotonic()
-    errors, table = [], {}
-    for directory in proc.iterdir():
-        if not directory.name.isdigit():
-            continue
-        try:
-            row = stat(directory / 'stat')
-            table[row['pid']] = row
-        except (OSError, ValueError, IndexError) as error:
-            errors.append(dict(pid=int(directory.name), stage='enumeration', error=str(error)))
-    root = table.get(pid)
-    if root is None or (expected_root is not None and identity(root) != expected_root):
+    errors, table, topologies = [], {}, {}
+    try:
+        root = stat(proc / str(pid) / 'stat')
+    except READ_ERRORS as error:
+        # Denial/malformed reads are not authoritative evidence of exit.
         return dict(monotonic_seconds=begin, duration_seconds=time.monotonic() - begin,
-                    root_exited=True, complete=False, members=[], errors=errors + [dict(pid=pid, stage='root', error='missing or reused root')],
+                    root_exited=isinstance(error, FileNotFoundError), complete=False, members=[],
+                    discovery=DISCOVERY,
+                    errors=[dict(pid=pid, stage='root', error=str(error))],
                     rss_bytes=None, pss_bytes=None)
-    selected = {pid}
-    while True:
-        children = {p for p, row in table.items() if row['ppid'] in selected}
-        if children <= selected:
-            break
-        selected |= children
+    if root['pid'] != pid or (expected_root is not None and identity(root) != expected_root):
+        return dict(monotonic_seconds=begin, duration_seconds=time.monotonic() - begin,
+                    root_exited=root['pid'] == pid, complete=False, members=[], discovery=DISCOVERY,
+                    errors=[dict(pid=pid, stage='root', error='reused root or root stat PID mismatch')], rss_bytes=None, pss_bytes=None)
+    table[pid] = root
+    selected, task_budget = [pid], [MAX_TASKS]
+    for member_pid in selected:
+        try:
+            topology = children_snapshot(proc / str(member_pid), task_budget)
+            topologies[member_pid] = topology
+            for child_pid in sorted(topology[1]):
+                child = stat(proc / str(child_pid) / 'stat')
+                if child['pid'] != child_pid or child['ppid'] != member_pid or child_pid == pid:
+                    raise ValueError('child identity or parent changed during discovery')
+                if child_pid in table:
+                    if identity(child) != identity(table[child_pid]) or child['ppid'] != table[child_pid]['ppid']:
+                        raise ValueError('child identity changed during discovery')
+                    continue
+                if len(table) == MAX_MEMBERS:
+                    raise ValueError('process-tree member discovery limit')
+                table[child_pid] = child
+                selected.append(child_pid)
+        except READ_ERRORS as error:
+            errors.append(dict(pid=member_pid, stage='children', error=str(error)))
     members = []
     for member_pid in sorted(selected):
         original = table[member_pid]
@@ -59,8 +111,8 @@ def sample(pid, proc=Path('/proc'), expected_root=None):
         directory = proc / str(member_pid)
         try:
             before = stat(directory / 'stat')
-            if identity(before) != identity(original):
-                raise ValueError('PID identity changed before memory read')
+            if identity(before) != identity(original) or before['ppid'] != original['ppid']:
+                raise ValueError('PID identity changed or process reparented before memory read')
             memory = fields(directory / 'smaps_rollup')
             member.update({key: int(memory[field].split()[0]) * 1024 for key, field in
                            [('rss_bytes', 'Rss'), ('pss_bytes', 'Pss'), ('anonymous_bytes', 'Anonymous')]})
@@ -68,10 +120,10 @@ def sample(pid, proc=Path('/proc'), expected_root=None):
             member.update(voluntary_context_switches=int(status['voluntary_ctxt_switches']),
                           involuntary_context_switches=int(status['nonvoluntary_ctxt_switches']))
             after = stat(directory / 'stat')
-            if identity(after) != identity(original):
-                raise ValueError('PID identity changed around memory read')
+            if identity(after) != identity(original) or after['ppid'] != original['ppid']:
+                raise ValueError('PID identity changed or process reparented around memory read')
             member['cpu_ticks'] = after['cpu_ticks']
-        except (OSError, ValueError, IndexError, KeyError) as error:
+        except READ_ERRORS as error:
             member['errors'].append(str(error))
             # Never retain apparently valid memory from an inconsistent instance.
             for key in ('rss_bytes', 'pss_bytes', 'anonymous_bytes'):
@@ -79,9 +131,28 @@ def sample(pid, proc=Path('/proc'), expected_root=None):
         parent = table.get(original['ppid'])
         member['parent_identity'] = list(identity(parent)) if parent else None
         members.append(member)
+    root_exited, task_budget = False, [MAX_TASKS]
+    for member_pid in selected:
+        try:
+            current = stat(proc / str(member_pid) / 'stat')
+            if identity(current) != identity(table[member_pid]) or current['ppid'] != table[member_pid]['ppid']:
+                if member_pid == pid and identity(current) != identity(root):
+                    root_exited = True
+                raise ValueError('PID identity or parent changed at sample boundary')
+        except READ_ERRORS as error:
+            if member_pid == pid and isinstance(error, FileNotFoundError):
+                root_exited = True
+            errors.append(dict(pid=member_pid, stage='identity', error=str(error)))
+            continue
+        if member_pid in topologies:
+            try:
+                if children_snapshot(proc / str(member_pid), task_budget) != topologies[member_pid]:
+                    raise ValueError('process-tree topology changed during sample')
+            except READ_ERRORS as error:
+                errors.append(dict(pid=member_pid, stage='topology', error=str(error)))
     complete = not errors and all(not member['errors'] for member in members)
     return dict(monotonic_seconds=begin, duration_seconds=time.monotonic() - begin,
-                root_exited=False, complete=complete, members=members, errors=errors,
+                root_exited=root_exited, complete=complete, members=members, errors=errors, discovery=DISCOVERY,
                 rss_bytes=sum(m['rss_bytes'] for m in members if 'rss_bytes' in m) if any('rss_bytes' in m for m in members) else None,
                 pss_bytes=sum(m['pss_bytes'] for m in members if 'pss_bytes' in m) if any('pss_bytes' in m for m in members) else None)
 
@@ -117,6 +188,7 @@ def cpu_delta(previous, current, ticks=None):
 
 def summarize(samples):
     result = dict(samples=len(samples), complete_samples=sum(s['complete'] for s in samples),
+                  discovery_methods=sorted({s.get('discovery', 'legacy_global_proc') for s in samples}),
                   incomplete_samples=sum(not s['complete'] for s in samples),
                   missing_intervals=sum(s.get('missed_intervals', 0) for s in samples),
                   coverage='complete_observed_samples' if samples and all(s['complete'] for s in samples) else 'incomplete_or_unavailable',
@@ -145,17 +217,20 @@ def collect(pid, seconds, interval=0.25, proc=Path('/proc')):
         if row['root_exited']:
             break
         if expected is None:
-            expected = identity(next(m for m in row['members'] if m['pid'] == pid))
+            root = next((m for m in row['members'] if m['pid'] == pid), None)
+            if root is not None:
+                expected = identity(root)
         due += interval
         # Skip missed deadlines, do not manufacture catch-up observations.
         skipped = max(0, math.floor((time.monotonic() - due) / interval))
         row['missed_intervals'] = skipped
         due += skipped * interval
         time.sleep(max(0, min(due, start + seconds) - time.monotonic()))
-    return dict(version=2, pid=pid, requested_interval_seconds=interval, begin_monotonic_seconds=start,
+    return dict(version=3, pid=pid, requested_interval_seconds=interval, begin_monotonic_seconds=start,
                 end_monotonic_seconds=time.monotonic(), clock_ticks=os.sysconf('SC_CLK_TCK'),
                 summary=summarize(samples), samples=samples,
-                limitations='RSS sums double-count shared pages; PSS is proportional, not VRAM/system memory. Enumeration can miss short-lived descendants; exited child CPU tails and first-seen child prefixes are unknown. Partial samples are not complete peaks. No waited-child usage is added.')
+                discovery='bounded per-thread children lists, identities and topology checked around memory reads',
+                limitations='RSS sums double-count shared pages; PSS is proportional, not VRAM/system memory. Per-thread children lists are non-atomic and can skip descendants during exits, even when endpoint checks agree. Short-lived descendants, exited child CPU tails and first-seen child prefixes are unknown. Partial samples are not complete peaks. No waited-child usage is added.')
 
 
 def main():
