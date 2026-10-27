@@ -53,6 +53,7 @@ fn field(value: std.json.Value, name: []const u8) ?std.json.Value {
 fn extract(allocator: std.mem.Allocator, input: []const u8, depth: usize) ?[]const u8 {
     const text = std.mem.trim(u8, input, " \t\r\n");
     if (text.len == 0) return null;
+    if (std.mem.eql(u8, text, "CancellationTimeout")) return "Stop timed out. Tool state is unknown.";
     if (text[0] != '{' and text[0] != '[' and text[0] != '"') return text;
     if (depth == 3 or !shallow(text)) return null;
     const value = std.json.parseFromSliceLeaky(std.json.Value, allocator, text, .{ .allocate = .alloc_always, .max_value_len = input_limit }) catch return null;
@@ -64,7 +65,7 @@ fn extract(allocator: std.mem.Allocator, input: []const u8, depth: usize) ?[]con
     }
     for ([_][]const u8{ "disconnect", "ambiguous" }) |kind| {
         if (field(value, kind)) |detail| {
-            if (field(detail, "reason")) |reason| if (reason == .string and reason.string.len != 0) return reason.string;
+            if (field(detail, "reason")) |reason| if (reason == .string and reason.string.len != 0) return extract(allocator, reason.string, depth + 1);
         }
     }
     return null;
@@ -83,6 +84,8 @@ test "provider diagnostic display decodes nested messages and owns Unicode outpu
     try std.testing.expectEqualStrings("Quota exhausted café 世界", readable(nested, &output));
     try std.testing.expectEqualStrings("Login expired", readable("{\"failure\":{\"detail\":\"Login expired\"}}", &output));
     try std.testing.expectEqualStrings("lost", readable("{\"disconnect\":{\"reason\":\"lost\"}}", &output));
+    try std.testing.expectEqualStrings("Interrupt refused café", readable("{\"ambiguous\":{\"reason\":\"{\\\"message\\\":\\\"Interrupt refused café\\\",\\\"code\\\":-32000}\"}}", &output));
+    try std.testing.expectEqualStrings("Stop timed out. Tool state is unknown.", readable("{\"ambiguous\":{\"reason\":\"CancellationTimeout\"}}", &output));
     try std.testing.expectEqualStrings("Retry soon", readable("{\"message\":\"Retry\\nsoon\"}", &output));
     var tiny: [4]u8 = undefined;
     try std.testing.expectEqualStrings("caf", readable("café", &tiny));
@@ -94,6 +97,7 @@ test "provider diagnostic display refuses malformed deep oversized and exhausted
     const cases = [_][]const u8{
         "{\"failure\":",
         "{\"failure\":{\"detail\":\"{bad\"}}",
+        "{\"ambiguous\":{\"reason\":\"{bad\"}}",
         "{\"message\":27}",
         "{\"message\":\"\\ud800\"}",
         "[[[[[[[[[0]]]]]]]]]",

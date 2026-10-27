@@ -36,6 +36,7 @@ pub const Tool = struct { type: []const u8 = "function", name: []const u8, descr
 pub const ToolBinding = struct { wire_name: []const u8, application_name: []const u8 };
 pub const ToolCall = adapter.ToolCall;
 pub const Runtime = RuntimeFor(transport.Transport);
+pub const cancel_timeout_ms = 15000;
 pub fn RuntimeFor(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -59,6 +60,13 @@ pub fn RuntimeFor(comptime T: type) type {
         turn_error_len: usize = 0,
         next_id: u64 = 1,
         pending: ?struct { id: u64, kind: Operation, correlation: c.Correlation } = null,
+        // One durable Stop may race session/turn publication or account refresh.
+        // Keep its identity outside the reusable RPC/turn storage; accepting it
+        // is not evidence that any provider tool has stopped.
+        cancel_storage: [4096]u8 = undefined,
+        cancel_request: ?c.Correlation = null,
+        cancel_issued: bool = false,
+        cancel_started_ms: u64 = 0,
         session: ?c.Session = null,
         session_ready: bool = false,
         correlation: c.Correlation = .{ .session = .{ .value = "" } },
@@ -138,7 +146,7 @@ pub fn RuntimeFor(comptime T: type) type {
         }
         pub fn dispatch(self: *Self, allocator: std.mem.Allocator, request: c.Request) !c.Receipt {
             if (self.disconnected) return .{ .outcome = .rejected, .detail = "Codex disconnected" };
-            if (!self.initialized or self.pending != null) return .{ .outcome = .rejected, .detail = "Codex initialization/request pending" };
+            if (!self.initialized or (self.pending != null and request != .cancel)) return .{ .outcome = .rejected, .detail = "Codex initialization/request pending" };
             switch (request) {
                 .open => |open| switch (open) {
                     .create => |p| {
@@ -173,8 +181,20 @@ pub fn RuntimeFor(comptime T: type) type {
                     try self.rpc(.start, .{ .threadId = self.session.?.upstream.value, .input = .{.{ .type = "text", .text = p.prompt }}, .model = self.config.selection.model_id, .effort = self.config.selection.effort, .cwd = self.config.cwd }, self.correlation);
                 },
                 .cancel => |p| {
-                    if (self.turn.len == 0 or !eq(p.correlation.session.value, self.correlation.session.value) or !c.equal(p.correlation.run, self.correlation.run)) return error.InvalidCorrelation;
-                    try self.rpc(.cancel, .{ .threadId = self.session.?.upstream.value, .turnId = self.turn }, p.correlation);
+                    if (c.frameBytes(request) > self.discover().limits.frame_bytes) return error.FrameTooLarge;
+                    const opening = if (self.pending) |pending| pending.kind == .open or pending.kind == .restore else false;
+                    if (p.correlation.run == null or p.correlation.effect == null or
+                        !eq(p.correlation.session.value, self.correlation.session.value) or
+                        (!opening and (self.turn_terminal or !c.equal(p.correlation.run, self.correlation.run))) or
+                        (p.correlation.upstream_turn != null and !eq(p.correlation.upstream_turn.?.value, self.turn))) return error.InvalidCorrelation;
+                    if (self.cancel_request == null) {
+                        var fixed = std.heap.FixedBufferAllocator.init(&self.cancel_storage);
+                        self.cancel_request = try adapter.clone(fixed.allocator(), p.correlation);
+                        self.cancel_issued = false;
+                        self.cancel_started_ms = self.nowMilliseconds();
+                    } else if (!c.equal(self.cancel_request.?.session, p.correlation.session) or
+                        !c.equal(self.cancel_request.?.run, p.correlation.run)) return error.InvalidCorrelation;
+                    try self.flushCancel();
                 },
                 .respond_approval => |p| {
                     const approval = self.approval orelse return error.InvalidCorrelation;
@@ -227,6 +247,10 @@ pub fn RuntimeFor(comptime T: type) type {
             return result;
         }
         pub fn pump(self: *Self) !void {
+            if (self.cancel_request != null and self.nowMilliseconds() -| self.cancel_started_ms >= cancel_timeout_ms) {
+                try self.disconnect("Codex cancellation timed out; tool state unknown");
+                return error.CancellationTimeout;
+            }
             self.wire.pump() catch |err| {
                 try self.disconnect(@errorName(err));
                 return err;
@@ -254,6 +278,7 @@ pub fn RuntimeFor(comptime T: type) type {
             self.approval = null;
             self.tool = null;
             self.readiness = .unavailable;
+            self.cancel_request = null;
         }
         fn rememberTurnError(self: *Self, failure: Value) void {
             // Retain only the error, never turn.items/history. Retry notifications
@@ -278,6 +303,16 @@ pub fn RuntimeFor(comptime T: type) type {
                 self.pending = null;
                 const failure = field(value, "error");
                 if (failure != .null) {
+                    if (pending.kind == .cancel or (pending.kind == .account and self.cancel_request != null)) {
+                        self.rememberTurnError(failure);
+                        self.session_ready = false;
+                        if (pending.kind == .account) self.readiness = .unavailable;
+                        self.cancel_request = null;
+                        // A refused interrupt or refresh blocking Stop does not
+                        // prove execution failed or stopped.
+                        try self.emit(.{ .ambiguous = .{ .reason = self.diagnostic } });
+                        return;
+                    }
                     if (pending.kind == .initialize or pending.kind == .account or pending.kind == .login) {
                         self.setup_diagnostic.remember(switch (pending.kind) {
                             .initialize => "initialize",
@@ -291,6 +326,7 @@ pub fn RuntimeFor(comptime T: type) type {
                     } else {
                         self.rememberTurnError(failure);
                         self.session_ready = false;
+                        self.cancel_request = null;
                     }
                     if (self.correlation.session.value.len != 0) {
                         var end = @min(self.diagnostic.len, 2048);
@@ -348,6 +384,7 @@ pub fn RuntimeFor(comptime T: type) type {
                     },
                     .cancel => {},
                 }
+                try self.flushCancel();
                 try self.refreshAccount();
                 return;
             }
@@ -441,6 +478,7 @@ pub fn RuntimeFor(comptime T: type) type {
                 self.turn = "";
                 self.approval = null;
                 self.tool = null;
+                self.cancel_request = null;
             } else if (eq(method, "item/commandExecution/requestApproval") or eq(method, "item/fileChange/requestApproval")) {
                 if (self.approval != null) return error.TooManyApprovals;
                 const a = self.turn_state.allocator();
@@ -481,6 +519,28 @@ pub fn RuntimeFor(comptime T: type) type {
             if (!self.account_refresh or self.pending != null or self.diagnostic.len != 0) return;
             self.account_refresh = false;
             try self.rpc(.account, .{ .refreshToken = false }, self.correlation);
+        }
+        fn flushCancel(self: *Self) !void {
+            const correlation = self.cancel_request orelse return;
+            if (self.pending != null or self.disconnected or self.cancel_issued) return;
+            if (self.turn_terminal) {
+                // No Start was dispatched while this session was opening. The
+                // Host already withdrew its planned Start when admitting Stop.
+                if (self.correlation.run == null and self.session_ready) {
+                    const previous = self.correlation;
+                    self.correlation = correlation;
+                    defer self.correlation = previous;
+                    try self.emit(.{ .cancelled = .{ .tools_stopped = true } });
+                }
+                self.cancel_request = null;
+                return;
+            }
+            if (self.turn.len == 0) return;
+            try self.rpc(.cancel, .{ .threadId = self.session.?.upstream.value, .turnId = self.turn }, correlation);
+            self.cancel_issued = true;
+        }
+        fn nowMilliseconds(self: *Self) u64 {
+            return if (@hasDecl(T, "monotonicMs")) self.wire.monotonicMs() else transport.c.spica_monotonic_ms();
         }
         pub fn asAdapter(self: *Self) adapter.Adapter {
             return .{ .context = self, .vtable = &.{ .discover = discoverAny, .accountStatus = accountAny, .resolveSelection = selectionAny, .dispatch = dispatchAny, .pump = pumpAny, .poll = pollAny, .shutdown = shutdownAny, .pollTool = pollToolAny, .respondTool = respondToolAny, .ready = readyAny } };

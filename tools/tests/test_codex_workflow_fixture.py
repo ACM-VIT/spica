@@ -98,6 +98,62 @@ class CodexWorkflowFixtureTests(unittest.TestCase):
         self.assertEqual(oversized.returncode, 1)
         self.assertEqual(json.loads((self.account / "workflow-state.json").read_text())[thread], [])
 
+    def test_cancellation_targets_exact_active_turn_and_separates_rpc_from_terminal(self):
+        thread = self.create()
+        for mode in ("cancel-start", "cancel-refuse", "cancel-hang"):
+            with self.subTest(mode=mode):
+                self.profile(mode)
+                (self.account / "release-start").touch()
+                state = json.loads((self.account / "workflow-state.json").read_text())
+                turn = thread + "-turn-" + str(len(state[thread]) + 1)
+                result = self.run_server([
+                    dict(id=1, method="thread/resume", params=self.selection(thread)),
+                    dict(id=2, method="turn/start", params=dict(threadId=thread, model="offline-workflow", effort="low",
+                        cwd=str(self.workspace), input=[dict(type="text", text="synthetic cancellation")])),
+                    dict(id=3, method="turn/interrupt", params=dict(threadId=thread, turnId=turn))])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                output = [json.loads(line) for line in result.stdout.splitlines()]
+                terminal = [value for value in output if value.get("method") == "turn/completed"]
+                replies = [value for value in output if value.get("id") == 3]
+                if mode == "cancel-start":
+                    self.assertEqual(replies, [dict(id=3, result={})])
+                    self.assertEqual(terminal[0]["params"]["turn"]["status"], "interrupted")
+                elif mode == "cancel-refuse":
+                    self.assertIn("tool state unknown", replies[0]["error"]["message"])
+                    self.assertFalse(terminal)
+                else:
+                    self.assertFalse(replies)
+                    self.assertFalse(terminal)
+        events = [json.loads(line) for line in (self.account / "workflow-events.jsonl").read_text().splitlines()]
+        self.assertEqual(sum(event["method"] == "turn/interrupt" for event in events), 3)
+
+    def test_open_gate_is_explicit_bounded_and_rejects_unexpected_start(self):
+        self.profile("cancel-open")
+        (self.account / "release-open").touch()
+        thread = self.create()
+        result = self.turn(thread, "must not start")
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("must not start", result.stderr)
+        self.assertEqual(json.loads((self.account / "workflow-state.json").read_text())[thread], [])
+        (self.account / "release-open").unlink()
+        profile = json.loads((self.account / "workflow-profile.json").read_text())
+        profile["gate_timeout_ms"] = 30
+        (self.account / "workflow-profile.json").write_text(json.dumps(profile))
+        timeout = self.run_server([dict(id=1, method="thread/resume", params=self.selection(thread))])
+        self.assertEqual(timeout.returncode, 1)
+        self.assertFalse(timeout.stdout)
+
+    def test_cancel_fixture_refuses_a_different_turn(self):
+        thread = self.create()
+        self.profile("cancel-refuse")
+        result = self.run_server([
+            dict(id=1, method="thread/resume", params=self.selection(thread)),
+            dict(id=2, method="turn/start", params=dict(threadId=thread, model="offline-workflow", effort="low",
+                cwd=str(self.workspace), input=[dict(type="text", text="synthetic cancellation")])),
+            dict(id=3, method="turn/interrupt", params=dict(threadId=thread, turnId="wrong-turn"))])
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(any(json.loads(line).get("id") == 3 for line in result.stdout.splitlines()))
+
 
 if __name__ == "__main__":
     unittest.main()

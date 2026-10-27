@@ -6,6 +6,10 @@ const Mock = struct {
     lines: std.ArrayList([]const u8) = .empty,
     input: std.ArrayList([]const u8) = .empty,
     exited: bool = false,
+    now_ms: u64 = 0,
+    pub fn monotonicMs(self: *@This()) u64 {
+        return self.now_ms;
+    }
     pub fn send(self: *@This(), line: []const u8) !void {
         try self.lines.append(self.allocator, try self.allocator.dupe(u8, line));
     }
@@ -178,6 +182,184 @@ test "Codex uncertain cancellation and process death prohibit subsequent turns" 
         try std.testing.expectEqual(before, wire.lines.items.len);
     }
 }
+
+const stop_correlation: c.Correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "run" }, .effect = .{ .value = "stop" } };
+
+test "Codex Stop during pending Start retains exact identity and interrupts only once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "early-stop" });
+    defer runtime.deinit();
+    try openErrorFixture(a, &wire, &runtime);
+    var start = stop_correlation;
+    start.effect = .{ .value = "start" };
+    _ = try runtime.dispatch(a, .{ .start = .{ .correlation = start, .prompt = "pending turn" } });
+    const before = wire.lines.items.len;
+    var bad = stop_correlation;
+    bad.run = .{ .value = "another-run" };
+    try std.testing.expectError(error.InvalidCorrelation, runtime.dispatch(a, .{ .cancel = .{ .correlation = bad, .reason = "stale" } }));
+    try std.testing.expect(runtime.cancel_request == null);
+    var effect = [_]u8{ 's', 't', 'o', 'p' };
+    var transient = stop_correlation;
+    transient.effect = .{ .value = &effect };
+    try std.testing.expectEqual(.acknowledged, (try runtime.dispatch(a, .{ .cancel = .{ .correlation = transient, .reason = "Stop before turn ID" } })).outcome);
+    @memset(&effect, 'x');
+    for (0..128) |_| _ = try runtime.dispatch(a, .{ .cancel = .{ .correlation = stop_correlation, .reason = "same Stop" } });
+    try std.testing.expectEqual(before, wire.lines.items.len);
+    try std.testing.expectEqualStrings("stop", runtime.cancel_request.?.effect.?.value);
+    try wire.input.append(a, "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"upstream\",\"turn\":{\"id\":\"exact-turn\"}}}");
+    try runtime.pump();
+    try std.testing.expectEqual(before, wire.lines.items.len);
+    try wire.input.append(a, "{\"id\":4,\"result\":{\"turn\":{\"id\":\"exact-turn\"}}}");
+    try runtime.pump();
+    try std.testing.expectEqual(before + 1, wire.lines.items.len);
+    const packet = try std.json.parseFromSlice(std.json.Value, a, wire.lines.items[before], .{});
+    try std.testing.expectEqualStrings("turn/interrupt", packet.value.object.get("method").?.string);
+    const params = packet.value.object.get("params").?.object;
+    try std.testing.expectEqualStrings("exact-turn", params.get("turnId").?.string);
+    try std.testing.expectEqualStrings("upstream", params.get("threadId").?.string);
+    try std.testing.expectEqualStrings("stop", runtime.pending.?.correlation.effect.?.value);
+    try wire.input.append(a, "{\"id\":5,\"result\":{}}");
+    try runtime.pump();
+    _ = try runtime.dispatch(a, .{ .cancel = .{ .correlation = stop_correlation, .reason = "no repeated interrupt" } });
+    try std.testing.expectEqual(before + 1, wire.lines.items.len);
+    try std.testing.expect((try runtime.poll(a)) == null);
+    try wire.input.append(a, "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"upstream\",\"turn\":{\"id\":\"exact-turn\",\"status\":\"interrupted\"}}}");
+    try runtime.pump();
+    const result = (try runtime.poll(a)).?;
+    try std.testing.expect(result.body == .cancelled);
+    try std.testing.expect(!result.body.cancelled.tools_stopped);
+    try std.testing.expectEqualStrings("run", result.correlation.run.?.value);
+    try std.testing.expect(runtime.cancel_request == null);
+}
+
+test "Codex Stop during session opening proves no Start was dispatched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "opening-stop" });
+    defer runtime.deinit();
+    try initializeFixture(&runtime, &wire, a);
+    _ = try runtime.dispatch(a, .{ .open = .{ .create = .{ .effect = .{ .value = "open" }, .session = .{ .value = "session" }, .selection = selection } } });
+    const before = wire.lines.items.len;
+    _ = try runtime.dispatch(a, .{ .cancel = .{ .correlation = stop_correlation, .reason = "withdrawn Start" } });
+    try wire.input.append(a, "{\"id\":3,\"result\":{\"thread\":{\"id\":\"upstream\"},\"model\":\"gpt-6.1-sol\",\"modelProvider\":\"openai\",\"cwd\":\"/tmp/project\",\"reasoningEffort\":\"medium\"}}");
+    try runtime.pump();
+    try std.testing.expectEqual(before, wire.lines.items.len);
+    const opened = (try runtime.poll(a)).?;
+    try std.testing.expect(opened.body == .session);
+    try std.testing.expectEqualStrings("open", opened.correlation.effect.?.value);
+    try std.testing.expect((try runtime.poll(a)).?.body == .selection);
+    const cancelled = (try runtime.poll(a)).?;
+    try std.testing.expect(cancelled.body.cancelled.tools_stopped);
+    try std.testing.expect(c.equal(stop_correlation, cancelled.correlation));
+    try std.testing.expect(runtime.cancel_request == null);
+}
+
+test "Codex natural completion wins Stop before the Start response" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "completion-stop" });
+    defer runtime.deinit();
+    try openErrorFixture(a, &wire, &runtime);
+    _ = try runtime.dispatch(a, .{ .start = .{ .correlation = stop_correlation, .prompt = "finishes before Stop reaches provider" } });
+    _ = try runtime.dispatch(a, .{ .cancel = .{ .correlation = stop_correlation, .reason = "stop" } });
+    const before = wire.lines.items.len;
+    try wire.input.append(a, "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"upstream\",\"turn\":{\"id\":\"turn\",\"status\":\"completed\"}}}");
+    try wire.input.append(a, "{\"id\":4,\"result\":{\"turn\":{\"id\":\"turn\"}}}");
+    try runtime.pump();
+    try std.testing.expectEqual(before, wire.lines.items.len);
+    try std.testing.expect((try runtime.poll(a)).?.body == .completed);
+    try std.testing.expect((try runtime.poll(a)) == null);
+    try std.testing.expect(runtime.cancel_request == null);
+}
+
+test "Codex Stop waits for account refresh without replacing active run authority" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "refresh-stop" });
+    defer runtime.deinit();
+    try startErrorFixture(a, &wire, &runtime);
+    try wire.input.append(a, "{\"method\":\"account/updated\",\"params\":{}}");
+    try runtime.pump();
+    const before = wire.lines.items.len;
+    _ = try runtime.dispatch(a, .{ .cancel = .{ .correlation = stop_correlation, .reason = "stop" } });
+    try std.testing.expectEqual(before, wire.lines.items.len);
+    try wire.input.append(a, "{\"id\":5,\"result\":{\"account\":{\"type\":\"chatgpt\"}}}");
+    try runtime.pump();
+    try std.testing.expectEqual(before + 1, wire.lines.items.len);
+    try std.testing.expectEqualStrings("stop", runtime.pending.?.correlation.effect.?.value);
+    try std.testing.expectEqualStrings("start", runtime.correlation.effect.?.value);
+}
+
+test "Codex refused interrupt preserves uncertainty instead of inventing failed execution" {
+    for ([_]bool{ false, true }) |refresh| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var wire: Mock = .{ .allocator = a };
+        var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "refused-stop" });
+        defer runtime.deinit();
+        try startErrorFixture(a, &wire, &runtime);
+        if (refresh) {
+            try wire.input.append(a, "{\"method\":\"account/updated\",\"params\":{}}");
+            try runtime.pump();
+        }
+        _ = try runtime.dispatch(a, .{ .cancel = .{ .correlation = stop_correlation, .reason = "stop" } });
+        try wire.input.append(a, "{\"id\":5,\"error\":{\"code\":-32000,\"message\":\"interrupt refused\"}}");
+        try runtime.pump();
+        const result = (try runtime.poll(a)).?;
+        try std.testing.expect(result.body == .ambiguous);
+        try std.testing.expect(std.mem.indexOf(u8, result.body.ambiguous.reason, "interrupt refused") != null);
+        try std.testing.expectEqualStrings("run", result.correlation.run.?.value);
+        try std.testing.expect(!runtime.session_ready);
+        try std.testing.expect(runtime.cancel_request == null);
+    }
+}
+
+test "Codex Stop deadline cannot be extended by retries and never claims stopped tools" {
+    const Phase = enum { opening, starting, interrupt, terminal };
+    for ([_]Phase{ .opening, .starting, .interrupt, .terminal }) |phase| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var wire: Mock = .{ .allocator = a };
+        var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "hung-stop" });
+        defer runtime.deinit();
+        switch (phase) {
+            .opening => {
+                try initializeFixture(&runtime, &wire, a);
+                _ = try runtime.dispatch(a, .{ .open = .{ .create = .{ .effect = .{ .value = "open" }, .session = .{ .value = "session" }, .selection = selection } } });
+            },
+            .starting => {
+                try openErrorFixture(a, &wire, &runtime);
+                _ = try runtime.dispatch(a, .{ .start = .{ .correlation = stop_correlation, .prompt = "no turn ID response" } });
+            },
+            .interrupt, .terminal => try startErrorFixture(a, &wire, &runtime),
+        }
+        _ = try runtime.dispatch(a, .{ .cancel = .{ .correlation = stop_correlation, .reason = "stop" } });
+        if (phase == .terminal) try wire.input.append(a, "{\"id\":5,\"result\":{}}");
+        wire.now_ms = codex.cancel_timeout_ms - 1;
+        try runtime.pump();
+        _ = try runtime.dispatch(a, .{ .cancel = .{ .correlation = stop_correlation, .reason = "retry cannot extend deadline" } });
+        wire.now_ms += 1;
+        try std.testing.expectError(error.CancellationTimeout, runtime.pump());
+        const result = (try runtime.poll(a)).?;
+        try std.testing.expect(result.body == .disconnect);
+        try std.testing.expectEqual(.unknown, result.body.disconnect.continuity);
+        try std.testing.expect(runtime.disconnected);
+        try std.testing.expect(runtime.cancel_request == null);
+        try std.testing.expect((try runtime.poll(a)) == null);
+    }
+}
+
 test "Codex initialize account create stream approval cancel exit" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -322,7 +504,7 @@ test "Codex open and restore RPC errors publish session correlated failure befor
     }
 }
 
-fn startErrorFixture(a: std.mem.Allocator, wire: *Mock, runtime: *codex.RuntimeFor(Mock)) !void {
+fn openErrorFixture(a: std.mem.Allocator, wire: *Mock, runtime: *codex.RuntimeFor(Mock)) !void {
     try wire.input.append(a, "{\"id\":1,\"result\":{\"userAgent\":\"codex/0.163.0\"}}");
     try wire.input.append(a, "{\"id\":2,\"result\":{\"account\":{\"type\":\"chatgpt\"}}}");
     try runtime.pump();
@@ -331,6 +513,10 @@ fn startErrorFixture(a: std.mem.Allocator, wire: *Mock, runtime: *codex.RuntimeF
     try runtime.pump();
     _ = try runtime.poll(a);
     _ = try runtime.poll(a);
+}
+
+fn startErrorFixture(a: std.mem.Allocator, wire: *Mock, runtime: *codex.RuntimeFor(Mock)) !void {
+    try openErrorFixture(a, wire, runtime);
     _ = try runtime.dispatch(a, .{ .start = .{ .correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "run" }, .effect = .{ .value = "start" } }, .prompt = "fixture only" } });
     try wire.input.append(a, "{\"id\":4,\"result\":{\"turn\":{\"id\":\"turn\"}}}");
     try runtime.pump();

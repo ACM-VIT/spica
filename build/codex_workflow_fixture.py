@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 import uuid
 
 FORMAT = "spica-offline-codex-workflow-v1"
@@ -19,6 +20,7 @@ MODEL = "offline-workflow"
 ERROR = "Offline Codex fixture quota exhausted (synthetic)."
 MAX_FRAME = 512 * 1024
 MAX_LOG = 128 * 1024
+CANCEL_MODES = {"cancel-open", "cancel-start", "cancel-refuse", "cancel-hang"}
 
 
 def read_json(path: Path, limit: int):
@@ -34,13 +36,27 @@ class Fixture:
         self.account = account.resolve(strict=True)
         self.profile = read_json(self.account / "workflow-profile.json", 4096)
         if (self.profile.get("format") != FORMAT
-                or self.profile.get("mode") not in {"complete", "fail"}
+                or self.profile.get("mode") not in {"complete", "fail"} | CANCEL_MODES
                 or Path(self.profile.get("workspace", "")).resolve() != Path.cwd().resolve()):
             raise ValueError("explicit disposable workflow profile required")
         self.state_path = self.account / "workflow-state.json"
         self.log_path = self.account / "workflow-events.jsonl"
         self.lock = (self.account / "workflow.lock").open("a")
         self.opened = None
+        self.active = None
+        self.gate_timeout_ms = self.profile.get("gate_timeout_ms", 10000)
+        if type(self.gate_timeout_ms) is not int or not 1 <= self.gate_timeout_ms <= 15000:
+            raise ValueError("bounded fixture gate deadline required")
+
+    def gate(self, name):
+        """Explicit provider-side delay; never mutate native app state."""
+        self.record("fixture/gate", name=name, state="waiting")
+        deadline = time.monotonic() + self.gate_timeout_ms / 1000
+        while not (self.account / name).is_file():
+            if time.monotonic() >= deadline:
+                raise ValueError("offline fixture gate timed out")
+            time.sleep(.01)
+        self.record("fixture/gate", name=name, state="released")
 
     def record(self, method, **values):
         entry = dict(method=method, pid=os.getpid(), **values)
@@ -106,8 +122,12 @@ class Fixture:
                 self.save(state)
             self.opened = thread
             self.record(method, thread_id=thread, prior_turns=len(state[thread]))
+            if self.profile["mode"] == "cancel-open":
+                self.gate("release-open")
             self.reply(request, dict(thread=dict(id=thread), model=MODEL, modelProvider="openai", cwd=params["cwd"], reasoningEffort="low"))
         elif method == "turn/start":
+            if self.profile["mode"] == "cancel-open" or self.active is not None:
+                raise ValueError("unexpected Start in cancellation fixture")
             thread = params.get("threadId")
             inputs = params.get("input")
             if (thread != self.opened or not isinstance(inputs, list) or len(inputs) != 1
@@ -128,15 +148,30 @@ class Fixture:
             state[thread].append(details)
             self.save(state)
             self.record(method, **details)
+            if self.profile["mode"] == "cancel-start":
+                self.gate("release-start")
             self.reply(request, dict(turn=dict(id=turn)))
             self.notify("turn/started", dict(threadId=thread, turn=dict(id=turn)))
-            if self.profile["mode"] == "fail":
+            if self.profile["mode"] in CANCEL_MODES:
+                self.active = (thread, turn)
+            elif self.profile["mode"] == "fail":
                 self.notify("turn/completed", dict(threadId=thread, turn=dict(id=turn, status="failed",
                             error=dict(message=ERROR, codexErrorInfo="usageLimitExceeded", additionalDetails="Offline synthetic failure; no account was queried."))))
             else:
                 message = f"Offline Codex fixture: turn {prior + 1}; prior turns {prior}; prompt bytes {len(prompt)}. café 世界"
                 self.notify("item/agentMessage/delta", dict(threadId=thread, turnId=turn, itemId=turn + "-message", delta=message))
                 self.notify("turn/completed", dict(threadId=thread, turn=dict(id=turn, status="completed")))
+        elif method == "turn/interrupt":
+            target = (params.get("threadId"), params.get("turnId"))
+            if self.active is None or target != self.active:
+                raise ValueError("interrupt must target the exact active fixture turn")
+            self.record(method, thread_id=target[0], turn_id=target[1])
+            if self.profile["mode"] == "cancel-refuse":
+                self.emit(dict(id=request["id"], error=dict(code=-32000, message="Offline synthetic interrupt refused; tool state unknown.")))
+            elif self.profile["mode"] != "cancel-hang":
+                self.reply(request, {})
+                self.notify("turn/completed", dict(threadId=target[0], turn=dict(id=target[1], status="interrupted")))
+                self.active = None
         else:
             self.emit(dict(id=request["id"], error=dict(code=-32601, message="Unsupported offline fixture method")))
 
