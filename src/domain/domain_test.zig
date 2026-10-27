@@ -1402,7 +1402,10 @@ test "asynchronous request refusal validates exact identity and leaves Start dia
         const turn = try FollowupTurn.begin(&owner, allocator);
         _ = try turn.enqueue(&owner, allocator, "refused-followup");
         const followup = (try owner.claimNext(allocator)).?;
-        try owner.delivered(allocator, followup.id, .{ .outcome = .acknowledged });
+        const acknowledgement: t.adapter.Receipt = .{ .outcome = .acknowledged, .detail = &([_]u8{'a'} ** 2048) };
+        try owner.delivered(allocator, followup.id, acknowledgement);
+        try std.testing.expect((try f.store.scalar("SELECT max(length(payload)) FROM events WHERE kind='EffectDelivery'")) <= 256);
+        try std.testing.expectEqual(@as(i64, 2048), try f.store.scalar("SELECT length(outcome) FROM effects WHERE kind='message'"));
         var refusal: t.adapter.Observation = .{ .correlation = followup.request.message.correlation, .upstream_event = "async-refusal", .cursor = .{ .value = "refusal-cursor" }, .body = .{ .request_failed = .{ .code = "busy", .detail = "cannot accept this message" } } };
         const position = try f.store.position();
         const revision = try f.store.scalar("SELECT revision FROM runs");
@@ -1428,7 +1431,7 @@ test "asynchronous request refusal validates exact identity and leaves Start dia
         }
         try owner.observe(allocator, refusal);
         const committed = try f.store.position();
-        try owner.delivered(allocator, followup.id, .{ .outcome = .acknowledged });
+        try owner.delivered(allocator, followup.id, acknowledgement);
         try std.testing.expectEqual(committed, try f.store.position());
         try std.testing.expectError(error.Conflict, owner.delivered(allocator, followup.id, .{ .outcome = .unknown }));
         try owner.observe(allocator, refusal);

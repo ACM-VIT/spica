@@ -753,17 +753,20 @@ pub const Owner = struct {
         defer s.deinit();
         if (!try s.step()) return error.Conflict;
         const evidence = try encoded(allocator, receipt);
+        // Keep event/retry evidence fixed in size even for detailed receipts.
+        // The complete current evidence remains on the effect itself.
+        const delivery_proof = try encoded(allocator, .{ .outcome = receipt.outcome, .digest = t.digest(evidence) });
         if (!s.isNull(5) and std.mem.eql(u8, try s.bytes(5), evidence)) {
             try db.rollback();
             return;
         }
         if (!std.mem.eql(u8, try s.bytes(4), "in_flight")) {
             // A later request outcome may replace effects.evidence. Retain the
-            // original receipt in its indexed effect event so an exact retry
+            // original receipt identity in its indexed effect event so a retry
             // remains idempotent after refusal or restart, without replay.
             const aggregate = try encoded(allocator, t.AggregateRef{ .effect = effect });
             const original = try self.field(allocator, "SELECT payload FROM events WHERE aggregate=? AND kind='EffectDelivery' ORDER BY sequence DESC,event_index DESC LIMIT 1", &.{.{ .blob = aggregate }}) orelse return error.Conflict;
-            if (!std.mem.eql(u8, original, evidence)) return error.Conflict;
+            if (!std.mem.eql(u8, original, delivery_proof)) return error.Conflict;
             try db.rollback();
             return;
         }
@@ -784,7 +787,7 @@ pub const Owner = struct {
             .unknown => "unknown",
         };
         try db.execute("UPDATE effects SET state=?,outcome=?,evidence=?,revision=revision+1 WHERE id=?", &.{ .{ .text = state }, .{ .blob = receipt.detail }, .{ .blob = evidence }, .{ .text = effect.value } });
-        try self.event(allocator, sequence, 0, .{ .effect = effect }, @intCast(s.integer(3) + 1), "EffectDelivery", null, effect, evidence);
+        try self.event(allocator, sequence, 0, .{ .effect = effect }, @intCast(s.integer(3) + 1), "EffectDelivery", null, effect, delivery_proof);
         if (receipt.session) |live| {
             if (!std.mem.eql(u8, live.id.value, session)) return error.Conflict;
             const revision_statement = try db.prepare("SELECT revision,upstream_session FROM sessions WHERE id=?", &.{.{ .text = session }});
