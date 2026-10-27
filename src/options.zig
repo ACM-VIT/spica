@@ -163,7 +163,7 @@ pub const help =
     \\--automation-session HEX supplies a 32-digit process nonce for correlated GUI testing.
     \\--metrics-output PATH enables bounded frame timestamps and text-cache ledger.
     \\--metrics-capacity N bounds retained attempts (default 8192; max 1048576).
-    \\Keep the checkout's .deps and assets; rebuild after moving the checkout.
+    \\Development builds use checkout resources; Linux packages resolve resources beside the executable.
     \\
 ;
 

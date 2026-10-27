@@ -3,24 +3,29 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const relocatable = b.option(bool, "relocatable", "Resolve Linux packaged resources relative to the executable") orelse false;
+    if (relocatable and target.result.os.tag != .linux) @panic("Relocatable packaging currently supports Linux only");
     const test_filter = b.option([]const u8, "test-filter", "Compile matching Zig tests only; leave unset for integration checks");
     const bootstrap = b.addSystemCommand(&.{ "python3", "build/bootstrap.py" });
     b.step("deps", "Acquire and build locked native dependencies").dependOn(&bootstrap.step);
     const prefix = b.fmt(".deps/install/{s}-{s}", .{ @tagName(target.result.os.tag), @tagName(target.result.cpu.arch) });
-    const options = b.addOptions();
-    options.addOption([]const u8, "native_library_dir", b.path(b.fmt("{s}/lib", .{prefix})).getPath(b));
-    options.addOption([]const u8, "asset_directory", b.path("assets").getPath(b));
-    options.addOption([]const u8, "font_directory", b.path(".deps/install/fonts").getPath(b));
+    const options = resourceOptions(b, prefix, relocatable);
+    // Tests load checkout fixtures and native libraries even when the app is
+    // being built for a relocatable package.
+    const test_options = resourceOptions(b, prefix, false);
 
     // build/driver.py probes installed macOS SDKs and supplies SDKROOT/ZIG_LIBC
     // so native dependencies and Zig's bundled libc++ use a compatible SDK.
     const module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
     module.addOptions("build_options", options);
-    if (target.result.os.tag == .linux) module.addRPathSpecial(b.fmt("$ORIGIN/../../{s}/lib", .{prefix}));
-    foundationDependencies(b, module, prefix);
-    libraryDependencies(b, module, prefix);
+    if (target.result.os.tag == .linux) module.addRPathSpecial(if (relocatable) "$ORIGIN/../lib" else b.fmt("$ORIGIN/../../{s}/lib", .{prefix}));
+    foundationDependencies(b, module, prefix, relocatable);
+    libraryDependencies(b, module, prefix, relocatable);
     scriptDependencies(b, module, prefix);
     const exe = b.addExecutable(.{ .name = "spica", .root_module = module });
+    // Zig otherwise adds absolute -L directories to RUNPATH implicitly.
+    // Packaged libraries must also resolve their own dependencies from lib/.
+    if (relocatable) exe.each_lib_rpath = false;
     b.installArtifact(exe);
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
@@ -84,9 +89,9 @@ pub fn build(b: *std.Build) void {
     b.step("test-core", "Run isolated core and Unicode editing regressions").dependOn(&core_run.step);
 
     const test_module = b.createModule(.{ .root_source_file = b.path("src/test.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
-    test_module.addOptions("build_options", options);
-    foundationDependencies(b, test_module, prefix);
-    libraryDependencies(b, test_module, prefix);
+    test_module.addOptions("build_options", test_options);
+    foundationDependencies(b, test_module, prefix, false);
+    libraryDependencies(b, test_module, prefix, false);
     scriptDependencies(b, test_module, prefix);
     test_module.addCSourceFile(.{ .file = b.path("src/native/parse_arena_test.c"), .flags = &.{ "-std=c11", "-O2" } });
     const tests = b.addTest(.{ .root_module = test_module, .filters = if (test_filter) |filter| &.{filter} else &.{} });
@@ -117,7 +122,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&gui_driver_tests.step);
 }
 
-fn foundationDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const u8) void {
+fn resourceOptions(b: *std.Build, prefix: []const u8, relocatable: bool) *std.Build.Step.Options {
+    const options = b.addOptions();
+    options.addOption(bool, "relocatable", relocatable);
+    options.addOption([]const u8, "native_library_dir", if (relocatable) "../lib" else b.path(b.fmt("{s}/lib", .{prefix})).getPath(b));
+    options.addOption([]const u8, "asset_directory", if (relocatable) "../share/spica/assets" else b.path("assets").getPath(b));
+    options.addOption([]const u8, "font_directory", if (relocatable) "../share/spica/fonts" else b.path(".deps/install/fonts").getPath(b));
+    return options;
+}
+
+fn foundationDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const u8, relocatable: bool) void {
     module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{prefix}) });
     module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/freetype2", .{prefix}) });
     module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/harfbuzz", .{prefix}) });
@@ -128,7 +142,7 @@ fn foundationDependencies(b: *std.Build, module: *std.Build.Module, prefix: []co
         module.addCSourceFile(.{ .file = b.path("src/native/" ++ name ++ ".c"), .flags = &.{ "-std=c11", "-O2" } });
     }
     module.addLibraryPath(b.path(b.fmt("{s}/lib", .{prefix})));
-    module.addRPath(b.path(b.fmt("{s}/lib", .{prefix})));
+    if (!relocatable) module.addRPath(b.path(b.fmt("{s}/lib", .{prefix})));
     // Never let pkg-config substitute system versions for the pinned native builds.
     inline for (.{ "SDL3", "freetype", "harfbuzz", "unibreak", "fribidi" }) |name| {
         module.linkSystemLibrary(name, .{ .use_pkg_config = .no });
@@ -141,7 +155,7 @@ fn foundationDependencies(b: *std.Build, module: *std.Build.Module, prefix: []co
 
 // Library regressions retain the reusable content and OS boundaries. These
 // are deliberately absent from the starter's executable dependency graph.
-fn libraryDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const u8) void {
+fn libraryDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const u8, relocatable: bool) void {
     module.addIncludePath(b.path("src/platform"));
     inline for (.{ "parse_arena", "markdown", "highlight" }) |name| {
         module.addCSourceFile(.{ .file = b.path("src/native/" ++ name ++ ".c"), .flags = &.{ "-std=c11", "-O2" } });
@@ -159,7 +173,7 @@ fn libraryDependencies(b: *std.Build, module: *std.Build.Module, prefix: []const
     module.addCSourceFile(.{ .file = b.path(process_backend), .flags = &.{ "-std=c11", "-O2" } });
     storageDependencies(b, module);
     module.addLibraryPath(b.path(b.fmt("{s}/lib", .{prefix})));
-    module.addRPath(b.path(b.fmt("{s}/lib", .{prefix})));
+    if (!relocatable) module.addRPath(b.path(b.fmt("{s}/lib", .{prefix})));
     inline for (.{ "cmark-gfm-extensions", "cmark-gfm", "tree-sitter" }) |name| {
         // Link only the locked builds in .deps. With pkg-config on (Zig's default), any library that
         // also has a system install with a .pc file (Homebrew, apt, etc.) resolves to that copy

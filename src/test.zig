@@ -28,4 +28,5 @@ test {
     _ = @import("native/text_test.zig");
     _ = @import("native/metrics.zig");
     _ = @import("platform/process_test.zig");
+    _ = @import("platform/resources.zig");
 }

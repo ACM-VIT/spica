@@ -16,6 +16,11 @@ const design = @import("ui/design.zig");
 const attachment_text = @import("text/attachments.zig");
 const inspection = @import("domain/inspection.zig");
 
+fn fontPath(directory: []const u8, name: []const u8, buffer: []u8) ![:0]const u8 {
+    if (!std.fs.path.isAbsolute(directory) or std.mem.indexOfScalar(u8, directory, 0) != null) return error.InvalidFontDirectory;
+    return std.fmt.bufPrintZ(buffer, "{s}/{s}", .{ directory, name }) catch error.FontPathTooLong;
+}
+
 /// Only a payload-free wake crosses worker threads. Registered after SDL init;
 /// its storage and SDL outlive both Host and presentation worker joins.
 pub const Wake = struct {
@@ -208,6 +213,14 @@ pub const App = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator) !App {
+        return initWithFonts(allocator, build_options.font_directory);
+    }
+
+    pub fn initWithFonts(allocator: std.mem.Allocator, font_directory: []const u8) !App {
+        // Native font records own paths with this same bound. Reuse one path
+        // buffer: opening a face copies the path and retains its file handle.
+        var font_path: [1024]u8 = undefined;
+        const primary = try fontPath(font_directory, "Inter.ttf", &font_path);
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) return error.SDLInitialization;
         errdefer c.SDL_Quit();
         const window = c.SDL_CreateWindow("Spica", 1100, 740, c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY) orelse return error.WindowCreation;
@@ -215,13 +228,13 @@ pub const App = struct {
         if (!c.SDL_SetWindowMinimumSize(window, 720, 480)) return error.WindowMinimumSize;
         const renderer = try createRenderer(window);
         errdefer c.SDL_DestroyRenderer(renderer);
-        const text = c.spica_text_create(renderer, build_options.font_directory ++ "/Inter.ttf") orelse return error.FontInitialization;
+        const text = c.spica_text_create(renderer, primary.ptr) orelse return error.FontInitialization;
         errdefer c.spica_text_destroy(text);
         // Preserve real faces and the engine's OS fallback path, shaping, bidi,
         // grapheme carets, bounded atlas, and device-pixel rasterization.
-        if (!c.spica_text_set_monospace(text, build_options.font_directory ++ "/JetBrainsMono-Regular.ttf")) return error.FontInitialization;
+        if (!c.spica_text_set_monospace(text, (try fontPath(font_directory, "JetBrainsMono-Regular.ttf", &font_path)).ptr)) return error.FontInitialization;
         inline for (.{ "InterVariable-Italic.ttf", "JetBrainsMono-Bold.ttf", "JetBrainsMono-Italic.ttf", "JetBrainsMono-BoldItalic.ttf" }) |font| {
-            if (!c.spica_text_add_fallback(text, build_options.font_directory ++ "/" ++ font, 0)) return error.FontInitialization;
+            if (!c.spica_text_add_fallback(text, (try fontPath(font_directory, font, &font_path)).ptr, 0)) return error.FontInitialization;
         }
         var layout = try Layout.init(allocator, 1100, 740);
         errdefer layout.deinit();
