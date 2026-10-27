@@ -599,6 +599,7 @@ pub const View = struct {
         self.history_position = next.position;
         self.history_restore = next.position != null;
         self.active_thread = id;
+        self.active_thread_title_len = 0;
         for (self.threads[0..self.thread_count]) |*entry| if (entry.id.eql(id.slice())) {
             self.active_thread_title_len = entry.len;
             @memcpy(self.active_thread_title[0..entry.len], entry.label[0..entry.len]);
