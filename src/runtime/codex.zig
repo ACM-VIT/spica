@@ -80,6 +80,7 @@ pub fn RuntimeFor(comptime T: type) type {
         offset: u64 = 0,
         sequence: u64 = 0,
         approval: ?struct { id_json: []const u8, evidence: c.ApprovalEvidence } = null,
+        question: ?struct { id_json: []const u8, evidence: c.Question } = null,
         tool: ?ToolCall = null,
         queue: [16]c.Observation = undefined,
         storage: [16][8192]u8 = undefined,
@@ -134,7 +135,7 @@ pub fn RuntimeFor(comptime T: type) type {
         }
         pub fn discover(_: *Self) c.Discovery {
             var caps = [_]c.CapabilityInfo{.{ .status = .unsupported, .evidence = "Codex adapter unsupported surface" }} ** @typeInfo(c.Capability).@"enum".fields.len;
-            inline for ([_]c.Capability{ .create, .attach, .start, .stream, .tools, .approval, .cancel, .selection, .workspace, .message, .followup_queue, .attachment }) |cap| caps[@intFromEnum(cap)] = .{ .status = .supported, .evidence = "Codex 0.163.0 app-server turn input and turn/steer (text/image)" };
+            inline for ([_]c.Capability{ .create, .attach, .start, .stream, .tools, .approval, .cancel, .selection, .workspace, .message, .followup_queue, .question, .attachment }) |cap| caps[@intFromEnum(cap)] = .{ .status = .supported, .evidence = "Codex 0.163.0 app-server turns, steering and user input" };
             caps[@intFromEnum(c.Capability.coordinator_bridge)] = .{ .status = .unknown, .evidence = "dynamicTools protocol available; live app bridge acceptance required" };
             return .{ .runtime_kind = "codex", .runtime_version = "0.163.0", .capabilities = caps, .limits = .{} };
         }
@@ -223,6 +224,24 @@ pub fn RuntimeFor(comptime T: type) type {
                     const Input = struct { type: []const u8, text: []const u8 };
                     const input = [_]Input{.{ .type = "text", .text = p.content }};
                     try self.rpc(.steer, .{ .threadId = self.session.?.upstream.value, .expectedTurnId = self.turn, .input = input[0..] }, p.correlation);
+                },
+                .answer_question => |p| {
+                    const pending = self.question orelse return error.InvalidQuestion;
+                    if (!self.session_ready or self.session == null or self.turn_terminal or
+                        !c.equal(p.correlation.session, self.session.?.id) or
+                        !c.equal(p.correlation.run, self.correlation.run) or
+                        !c.equal(p.question, pending.evidence.id) or
+                        !c.equal(p.correlation.question, pending.evidence.correlation.question)) return error.InvalidQuestion;
+                    const answer_allocator = self.turn_state.allocator();
+                    var answers = try std.json.ObjectMap.init(answer_allocator, &.{}, &.{});
+                    var values = std.json.Array.init(self.turn_state.allocator());
+                    for (p.answer.choice_ids) |choice| try values.append(.{ .string = choice });
+                    if (p.answer.text.len != 0) try values.append(.{ .string = p.answer.text });
+                    var answer = try std.json.ObjectMap.init(answer_allocator, &.{}, &.{});
+                    try answer.put(answer_allocator, "answers", .{ .array = values });
+                    try answers.put(answer_allocator, p.question.value, .{ .object = answer });
+                    try self.reply(pending.id_json, .{ .answers = std.json.Value{ .object = answers } });
+                    self.question = null;
                 },
                 .cancel => |p| {
                     if (c.frameBytes(request) > self.discover().limits.frame_bytes) return error.FrameTooLarge;
@@ -323,6 +342,7 @@ pub fn RuntimeFor(comptime T: type) type {
             if (self.correlation.session.value.len != 0) try self.emit(.{ .disconnect = .{ .reason = reason, .continuity = .unknown } });
             self.disconnected = true;
             self.approval = null;
+            self.question = null;
             self.tool = null;
             self.readiness = .unavailable;
             self.cancel_request = null;
@@ -535,6 +555,7 @@ pub fn RuntimeFor(comptime T: type) type {
                 if (!eq(status, "completed") and !eq(status, "failed")) self.session_ready = false;
                 self.turn = "";
                 self.approval = null;
+                self.question = null;
                 self.tool = null;
                 self.cancel_request = null;
             } else if (eq(method, "item/commandExecution/requestApproval") or eq(method, "item/fileChange/requestApproval")) {
@@ -551,6 +572,41 @@ pub fn RuntimeFor(comptime T: type) type {
                 self.correlation = correlation;
                 defer self.correlation = previous;
                 try self.emit(.{ .approval = evidence });
+            } else if (eq(method, "item/tool/requestUserInput")) {
+                if (self.question != null) return error.TooManyQuestions;
+                const questions = field(params, "questions");
+                if (questions != .array or questions.array.items.len != 1) return error.UnsupportedQuestion;
+                const input = questions.array.items[0];
+                const question_id = text(field(input, "id"));
+                const prompt = text(field(input, "question"));
+                if (question_id.len == 0 or prompt.len == 0) return error.InvalidQuestion;
+                const a = self.turn_state.allocator();
+                const id_json = try std.json.Stringify.valueAlloc(a, field(value, "id"), .{});
+                const choices_value = field(input, "options");
+                if (choices_value != .array or choices_value.array.items.len > 16) return error.InvalidQuestion;
+                const choices = try a.alloc(c.QuestionChoice, choices_value.array.items.len);
+                for (choices_value.array.items, 0..) |option, index| {
+                    const label = text(field(option, "label"));
+                    if (label.len == 0) return error.InvalidQuestion;
+                    choices[index] = .{ .id = try a.dupe(u8, label), .label = try a.dupe(u8, label) };
+                }
+                var correlation = self.correlation;
+                correlation.question = .{ .value = try a.dupe(u8, question_id) };
+                correlation.upstream_request = id_json;
+                const evidence: c.Question = .{
+                    .id = correlation.question.?,
+                    .correlation = correlation,
+                    .prompt = try a.dupe(u8, prompt),
+                    .choices = choices,
+                    .allow_multiple = false,
+                    .allow_freeform = choices.len == 0,
+                };
+                try c.validateQuestion(evidence, .{});
+                self.question = .{ .id_json = id_json, .evidence = evidence };
+                const previous = self.correlation;
+                self.correlation = correlation;
+                defer self.correlation = previous;
+                try self.emit(.{ .question = evidence });
             } else if (eq(method, "item/tool/call")) {
                 if (self.tool != null) return error.TooManyToolCalls;
                 if (self.correlation.run == null or self.correlation.session.value.len == 0 or self.turn.len == 0 or !eq(turn_id, self.turn) or text(field(params, "callId")).len == 0 or text(field(params, "tool")).len == 0 or (field(value, "id") != .integer and field(value, "id") != .string)) return error.InvalidCorrelation;

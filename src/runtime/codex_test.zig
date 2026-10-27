@@ -439,6 +439,30 @@ test "Codex active followup uses turn steer and preserves start authority" {
     try std.testing.expectEqual(.supported, runtime.discover().capabilities[@intFromEnum(c.Capability.followup_queue)].status);
 }
 
+test "Codex user input request emits a bounded question and answers by provider id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(a, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "question" });
+    defer runtime.deinit();
+    try startErrorFixture(a, &wire, &runtime);
+    try wire.input.append(a, "{\"id\":7,\"method\":\"item/tool/requestUserInput\",\"params\":{\"threadId\":\"upstream\",\"turnId\":\"turn\",\"itemId\":\"question-item\",\"questions\":[{\"id\":\"scope\",\"header\":\"Scope\",\"question\":\"Which scope?\",\"options\":[{\"label\":\"Safe\",\"description\":\"Read only\"}]}]}}");
+    try runtime.pump();
+    const pending = (try runtime.poll(a)).?.body.question;
+    try std.testing.expectEqualStrings("scope", pending.id.value);
+    try std.testing.expectEqualStrings("Which scope?", pending.prompt);
+    try std.testing.expectEqualStrings("Safe", pending.choices[0].id);
+    const answer_correlation: c.Correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "run" }, .effect = .{ .value = "answer-effect" }, .question = pending.id };
+    _ = try runtime.asAdapter().dispatch(a, .{ .answer_question = .{ .correlation = answer_correlation, .question = pending.id, .answer = .{ .choice_ids = &.{"Safe"} } } });
+    const response = try std.json.parseFromSlice(std.json.Value, a, wire.lines.items[wire.lines.items.len - 1], .{});
+    try std.testing.expectEqual(@as(i64, 7), response.value.object.get("id").?.integer);
+    const answers = response.value.object.get("result").?.object.get("answers").?.object.get("scope").?.object.get("answers").?.array;
+    try std.testing.expectEqualStrings("Safe", answers.items[0].string);
+    try std.testing.expect(runtime.question == null);
+    try std.testing.expectEqual(.supported, runtime.discover().capabilities[@intFromEnum(c.Capability.question)].status);
+}
+
 extern "c" fn getenv([*:0]const u8) ?[*:0]const u8;
 extern "c" fn mkdtemp([*:0]u8) ?[*:0]u8;
 test "Codex installed isolated handshake and unsigned account" {
