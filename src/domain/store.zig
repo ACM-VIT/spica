@@ -133,7 +133,7 @@ pub const Store = struct {
             if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name='title'") == 0)
                 try result.exec("ALTER TABLE threads ADD COLUMN title TEXT NOT NULL DEFAULT ''");
             try result.exec("UPDATE meta SET schema_version=6 WHERE singleton=1; PRAGMA user_version=6; COMMIT");
-        }
+        } else if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name='title'") != 1) return error.Corrupt;
         try result.exec("CREATE TABLE IF NOT EXISTS thread_selections(thread_id TEXT PRIMARY KEY REFERENCES threads(id),selection BLOB NOT NULL CHECK(length(selection)<=16384))");
         // The implicit rowid suffix supports latest selection/status lookups
         // without scanning completed runs from other threads.
