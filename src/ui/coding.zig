@@ -20,6 +20,7 @@ const script_api = @import("../script.zig");
 // Native geometry/strokes are implemented here against Spica's bounded views.
 
 pub const Intent = enum { send, cancel, allow, deny };
+pub const TitleAction = enum { save, cancel };
 
 /// Bounded Send evidence owned by the native consumer. It is intentionally
 /// separate from provider contracts: receipts and run rows remain the
@@ -206,6 +207,12 @@ pub const View = struct {
     new_thread_bounds: c.SDL_FRect = zero_rect,
     project_bounds: [16]c.SDL_FRect = @splat(zero_rect),
     thread_bounds: [32]c.SDL_FRect = @splat(zero_rect),
+    title_bounds: c.SDL_FRect = zero_rect,
+    title_editing: bool = false,
+    title_select_all: bool = false,
+    title_buffer: [160]u8 = undefined,
+    title_len: usize = 0,
+    title_action: ?TitleAction = null,
     setup_open: bool = false,
     setup_busy: bool = false,
     setup_login_pending: bool = false,
@@ -549,6 +556,9 @@ pub const View = struct {
 
     pub fn selectThread(self: *View, id: transcript.Id) !void {
         if (self.active_thread.eql(id.slice())) return;
+        self.title_editing = false;
+        self.title_select_all = false;
+        self.title_action = null;
         if (self.active_thread.len == 0) {
             self.active_thread = id;
             return;
@@ -855,6 +865,32 @@ pub const View = struct {
         return clippedRect(self.thread_bounds[index], self.sidebar_rows);
     }
 
+    pub fn beginTitleEdit(self: *View) void {
+        if (self.active_thread.len == 0) return;
+        for (self.threads[0..self.thread_count]) |*entry| if (entry.id.eql(self.active_thread.slice())) {
+            self.title_len = entry.len;
+            @memcpy(self.title_buffer[0..self.title_len], entry.label[0..entry.len]);
+            self.title_select_all = true;
+            self.title_editing = true;
+            self.title_action = null;
+            return;
+        };
+    }
+
+    fn titleInsert(self: *View, bytes: []const u8) !void {
+        if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.InvalidUtf8;
+        const start = if (self.title_select_all) 0 else self.title_len;
+        if (start + bytes.len > self.title_buffer.len) return error.TextTooLarge;
+        @memcpy(self.title_buffer[start..][0..bytes.len], bytes);
+        self.title_len = start + bytes.len;
+        self.title_select_all = false;
+    }
+
+    fn finishTitle(self: *View, action: TitleAction) void {
+        self.title_action = action;
+        if (action == .cancel) self.title_editing = false;
+    }
+
     fn clippedRect(row: c.SDL_FRect, viewport: c.SDL_FRect) c.SDL_FRect {
         const x = @max(row.x, viewport.x);
         const y = @max(row.y, viewport.y);
@@ -1021,6 +1057,11 @@ pub const View = struct {
                 if (self.custom_root == null) {
                     const x = event.button.x;
                     const y = event.button.y;
+                    if (widgets.contains(self.title_bounds, x, y) and self.navigation_enabled) {
+                        self.beginTitleEdit();
+                        try self.focus(window, true);
+                        return true;
+                    }
                     if (widgets.contains(self.workflow_button, x, y) and !self.setup_open and !self.workspace_open) {
                         self.workflow_open = !self.workflow_open;
                         self.workflow_path_focus = false;
@@ -1310,6 +1351,11 @@ pub const View = struct {
                     try self.setupInsert(std.mem.span(event.text.text));
                     return true;
                 }
+                if (self.title_editing and self.custom_root == null) {
+                    if (!self.window_active) return false;
+                    try self.titleInsert(std.mem.span(event.text.text));
+                    return true;
+                }
                 if (self.workspace_open and self.custom_root == null) return true;
                 if (self.custom_root == null and self.search_focused) {
                     if (!self.window_active) return false;
@@ -1328,6 +1374,31 @@ pub const View = struct {
                 const mods = event.key.mod;
                 const ctrl = mods & c.SDL_KMOD_CTRL != 0;
                 const shift = mods & c.SDL_KMOD_SHIFT != 0;
+                if (key == c.SDLK_F2 and self.custom_root == null and !self.setup_open and !self.workspace_open and !self.workflow_open) {
+                    self.beginTitleEdit();
+                    try self.focus(window, true);
+                    return true;
+                }
+                if (self.title_editing and self.custom_root == null) {
+                    if (key == c.SDLK_ESCAPE) {
+                        self.finishTitle(.cancel);
+                    } else if (key == c.SDLK_RETURN or key == c.SDLK_KP_ENTER) {
+                        self.finishTitle(.save);
+                    } else if (ctrl and key == c.SDLK_A) {
+                        self.title_select_all = true;
+                    } else if (key == c.SDLK_BACKSPACE or key == c.SDLK_DELETE) {
+                        if (self.title_select_all) self.title_len = 0 else if (self.title_len != 0) {
+                            self.title_len -= 1;
+                            while (self.title_len > 0 and self.title_buffer[self.title_len] & 0xc0 == 0x80) self.title_len -= 1;
+                        }
+                        self.title_select_all = false;
+                    } else if (ctrl and key == c.SDLK_V) {
+                        const value = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+                        defer c.SDL_free(value);
+                        try self.titleInsert(std.mem.span(value));
+                    }
+                    return true;
+                }
                 if (key == c.SDLK_F10 and self.custom_root == null and !self.setup_open and !self.workspace_open) {
                     self.workflow_open = !self.workflow_open;
                     self.workflow_path_focus = false;
@@ -1821,7 +1892,12 @@ pub const View = struct {
         try self.labels.drawFitted(renderer, text, project_name, header_x + 24, (bounds.header.height - 16) / 2, project_width, 14, muted);
         try self.labels.draw(text, "/", header_x + 34 + project_width, (bounds.header.height - 16) / 2, 14, muted);
         const title_x = header_x + 52 + project_width;
-        try self.labels.drawFitted(renderer, text, thread_name, title_x, (bounds.header.height - 16) / 2, bounds.header.width - title_x - metrics.gutter, 14, foreground);
+        self.title_bounds = .{ .x = title_x, .y = 6, .w = @max(0, bounds.header.width - title_x - metrics.gutter), .h = @max(0, bounds.header.height - 12) };
+        _ = self.navigation_targets.add("thread.title.edit", "textbox", self.title_bounds, self.navigation_enabled and self.active_thread.len != 0) catch {};
+        if (self.title_editing) {
+            try widgets.panel(renderer, self.title_bounds, 4, palette.surface);
+            try self.labels.drawFitted(renderer, text, self.title_buffer[0..self.title_len], title_x + 6, (bounds.header.height - 16) / 2, self.title_bounds.w - 12, 14, foreground);
+        } else try self.labels.drawFitted(renderer, text, thread_name, title_x, (bounds.header.height - 16) / 2, self.title_bounds.w, 14, foreground);
         self.workspace_toggle_bounds = if (bounds.header.width - title_x >= 132)
             .{ .x = bounds.header.width - metrics.gutter - 104, .y = 10, .w = 104, .h = 28 }
         else

@@ -38,7 +38,7 @@ pub fn startPreflight(prompt_bytes: usize) StartPreflight {
 
 // Every nested lookup is a point/range lookup on an existing primary/unique
 // index (plus runs_by_thread). The preview reads only a prefix of one chunk.
-const thread_columns = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)),coalesce((SELECT substr(bytes,1,163) FROM chunks WHERE block_id=(SELECT id FROM blocks WHERE message_id=(SELECT id FROM messages WHERE thread_id=threads.id AND ordinal=0 AND role='user') AND ordinal=0) AND byte_offset=0),''),(SELECT state FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1),coalesce((SELECT substr(display_name,1,256) FROM projects WHERE id=threads.project_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.expected_branch') FROM workspaces WHERE id=threads.workspace_id),'') FROM threads ";
+const thread_columns = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)),coalesce((SELECT substr(bytes,1,163) FROM chunks WHERE block_id=(SELECT id FROM blocks WHERE message_id=(SELECT id FROM messages WHERE thread_id=threads.id AND ordinal=0 AND role='user') AND ordinal=0) AND byte_offset=0),''),(SELECT state FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1),coalesce((SELECT substr(display_name,1,256) FROM projects WHERE id=threads.project_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.expected_branch') FROM workspaces WHERE id=threads.workspace_id),''),coalesce(title,'') FROM threads ";
 
 /// Internal single-thread reducer. Every returned slice belongs to the operation
 /// allocator; callers must copy before resetting it. Never call from the UI.
@@ -258,6 +258,7 @@ pub const Owner = struct {
         const seq = r.commit_sequence;
         var aggregate: t.AggregateRef = undefined;
         var revision_value: u64 = 1;
+        var event_payload: []const u8 = "";
         switch (e.payload) {
             .unsupported => return .unsupported_kind,
             .runtime_configure, .runtime_refresh, .runtime_login => {
@@ -296,6 +297,20 @@ pub const Owner = struct {
                 try db.execute("INSERT INTO threads(id,revision,project_id,workspace_id) VALUES(?,1,?,?)", &.{ .{ .text = key }, .{ .text = p.project.value }, .{ .text = p.workspace.value } });
                 r.entity_ids.thread = .{ .value = key };
                 aggregate = .{ .thread = r.entity_ids.thread.? };
+            },
+            .thread_title_set => |p| {
+                if (e.target != .thread or e.expected_revision != .revision or
+                    p.title.len == 0 or p.title.len > t.max_title_bytes or
+                    !std.unicode.utf8ValidateSlice(p.title) or
+                    std.mem.indexOfScalar(u8, p.title, 0) != null)
+                    return .invalid_command;
+                const thread = e.target.thread.value;
+                if (try self.field(allocator, "SELECT id FROM threads WHERE id=?", &.{.{ .text = thread }}) == null) return .not_found;
+                try db.execute("UPDATE threads SET title=?,revision=revision+1 WHERE id=?", &.{ .{ .blob = p.title }, .{ .text = thread } });
+                r.entity_ids.thread = e.target.thread;
+                aggregate = .{ .thread = e.target.thread };
+                revision_value = e.expected_revision.revision + 1;
+                event_payload = try encoded(allocator, p);
             },
             .thread_select => |p| {
                 if (e.target != .thread or e.expected_revision != .revision) return .invalid_command;
@@ -606,6 +621,7 @@ pub const Owner = struct {
             .task_delegate, .task_send, .task_cancel, .task_result, .task_review => return self.taskCommand(allocator, e, r),
         }
         const event_kind = switch (e.payload) {
+            .thread_title_set => "ThreadTitleChanged",
             .followup_enqueue => "FollowupQueued",
             .followup_edit => "FollowupEdited",
             .followup_cancel => "FollowupCancelled",
@@ -615,7 +631,7 @@ pub const Owner = struct {
             .attachment_remove => "AttachmentRejected",
             else => @tagName(e.payload),
         };
-        try self.event(allocator, seq, if (e.payload == .thread_send or e.payload == .thread_send_staged) 1 else 0, aggregate, revision_value, event_kind, e.command_id, null, "");
+        try self.event(allocator, seq, if (e.payload == .thread_send or e.payload == .thread_send_staged) 1 else 0, aggregate, revision_value, event_kind, e.command_id, null, event_payload);
         return null;
     }
     fn taskCommand(self: *Owner, allocator: std.mem.Allocator, e: t.CommandEnvelope, r: *t.Receipt) anyerror!?t.Reason {
@@ -1994,7 +2010,11 @@ pub const Host = struct {
             const row: t.Row = switch (q) {
                 .projects => .{ .project = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .display_name = try text(allocator, s, 3) } },
                 .workspaces => .{ .workspace = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .binding = try t.decode(t.WorkspaceBinding, try s.bytes(4), allocator) } },
-                .threads, .thread => .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator), .title_preview = try allocator.dupe(u8, @import("text/utf8.zig").prefix(try s.bytes(7), 160)), .latest_run_state = if (s.isNull(8)) null else try enumeration(t.RunState, s, 8), .project_name = try text(allocator, s, 9), .workspace_root = try text(allocator, s, 10), .workspace_branch = try text(allocator, s, 11) } },
+                .threads, .thread => blk: {
+                    const explicit_title = try allocator.dupe(u8, @import("text/utf8.zig").prefix(try s.bytes(12), t.max_title_bytes));
+                    const prompt_preview = @import("text/utf8.zig").prefix(try s.bytes(7), t.max_title_bytes);
+                    break :blk .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator), .title_preview = if (explicit_title.len != 0) explicit_title else try allocator.dupe(u8, prompt_preview), .title = explicit_title, .latest_run_state = if (s.isNull(8)) null else try enumeration(t.RunState, s, 8), .project_name = try text(allocator, s, 9), .workspace_root = try text(allocator, s, 10), .workspace_branch = try text(allocator, s, 11) } };
+                },
                 .blocks => .{ .block = try descriptor(allocator, s) },
                 .messages => blk: {
                     const message_id = a.MessageId{ .value = try text(allocator, s, 1) };

@@ -20,6 +20,8 @@ pub const SnapshotId = struct { slot: u8, generation: u64 };
 pub const SubscriptionId = struct { slot: u8, generation: u64 };
 pub const Ticket = struct { value: u64 };
 pub const Revision = u64;
+/// Maximum UTF-8 byte length for an explicit editable thread title.
+pub const max_title_bytes: usize = 160;
 pub const EventPosition = struct {
     commit_sequence: u64 = 0,
     event_index: u32 = 0,
@@ -76,6 +78,8 @@ pub const Payload = union(enum) {
     project_create: struct { display_name: []const u8 },
     workspace_register: struct { project: ProjectId, binding: WorkspaceBinding },
     thread_create: struct { project: ProjectId, workspace: adapter.WorkspaceId },
+    /// Replace the durable user title for one thread.
+    thread_title_set: struct { title: []const u8 },
     thread_send: struct { text: []const u8, selection: adapter.Selection },
     thread_send_staged: struct { prompt: PromptRef, selection: adapter.Selection },
     /// Explicitly discard one bounded orphan upload. Never affects a sent prompt.
@@ -235,8 +239,10 @@ pub const Row = union(enum) {
         session: ?adapter.RuntimeSessionId,
         selection: ?adapter.Selection = null,
         /// At most 160 UTF-8 bytes from the first user prompt, read without
-        /// decoding history. Presentation may collapse whitespace for a title.
+        /// decoding history. Explicit user titles take precedence over it.
         title_preview: []const u8 = "",
+        /// Explicit title bytes, empty when the thread still uses automatic naming.
+        title: []const u8 = "",
         latest_run_state: ?RunState = null,
         project_name: []const u8 = "",
         workspace_root: []const u8 = "",

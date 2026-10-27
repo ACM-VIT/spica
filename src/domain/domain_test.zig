@@ -247,6 +247,39 @@ const Conversation = struct {
     }
 };
 
+test "explicit chat titles are durable, bounded, revisioned and idempotent" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "title", .utc_ms = 1 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const title = "日本語 café 🎮";
+    const command: t.CommandEnvelope = .{ .command_id = .{ .value = "title" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_title_set = .{ .title = title } } };
+    const accepted = try owner.command(allocator, command);
+    try std.testing.expectEqual(.accepted, accepted.outcome);
+    try std.testing.expectEqual(@as(u64, 2), accepted.committed_revisions[0].revision);
+    const retry = try owner.command(allocator, command);
+    try std.testing.expectEqualSlices(u8, try t.encode(accepted, try allocator.alloc(u8, 4096)), try t.encode(retry, try allocator.alloc(u8, 4096)));
+    const stale = try owner.command(allocator, .{ .command_id = .{ .value = "title-stale" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_title_set = .{ .title = "other" } } });
+    try std.testing.expectEqual(t.Reason.revision_conflict, stale.reason.?);
+    var stored = try f.store.prepare("SELECT title FROM threads WHERE id=?", &.{.{ .text = conversation.thread.value }});
+    defer stored.deinit();
+    try std.testing.expect(try stored.step());
+    try std.testing.expectEqualStrings(title, try stored.bytes(0));
+    const after_send = try owner.command(allocator, conversation.send("after-title-send", "automatic naming must not replace", 2));
+    try std.testing.expectEqual(.accepted, after_send.outcome);
+    var bytes: [t.max_title_bytes + 8]u8 = undefined;
+    @memset(&bytes, 'x');
+    const boundary = try owner.command(allocator, .{ .command_id = .{ .value = "title-boundary" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 3 }, .payload = .{ .thread_title_set = .{ .title = bytes[0 .. t.max_title_bytes + 1] } } });
+    try std.testing.expectEqual(t.Reason.invalid_command, boundary.reason.?);
+    var retained = try f.store.prepare("SELECT title FROM threads WHERE id=?", &.{.{ .text = conversation.thread.value }});
+    defer retained.deinit();
+    try std.testing.expect(try retained.step());
+    try std.testing.expectEqualStrings(title, try retained.bytes(0));
+}
+
 test "real reducers accept arbitrary prompt dedup before revision and withdraw queued effects" {
     var f = try Fixture.init();
     defer f.deinit();

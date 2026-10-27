@@ -10,7 +10,7 @@ extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, Closed };
 pub const application_id = 0x53504334;
-pub const schema_version = 5;
+pub const schema_version = 6;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
 
 pub const Statement = struct {
@@ -127,6 +127,13 @@ pub const Store = struct {
             try result.exec(prompt_schema);
             try result.exec("UPDATE meta SET schema_version=5 WHERE singleton=1; PRAGMA user_version=5; COMMIT");
         } else if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN('prompt_uploads','prompt_chunks')") != 2) return error.Corrupt;
+        if (fresh or version < 6) {
+            try result.exec("BEGIN IMMEDIATE");
+            errdefer result.exec("ROLLBACK") catch {};
+            if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name='title'") == 0)
+                try result.exec("ALTER TABLE threads ADD COLUMN title TEXT NOT NULL DEFAULT ''");
+            try result.exec("UPDATE meta SET schema_version=6 WHERE singleton=1; PRAGMA user_version=6; COMMIT");
+        }
         try result.exec("CREATE TABLE IF NOT EXISTS thread_selections(thread_id TEXT PRIMARY KEY REFERENCES threads(id),selection BLOB NOT NULL CHECK(length(selection)<=16384))");
         // The implicit rowid suffix supports latest selection/status lookups
         // without scanning completed runs from other threads.

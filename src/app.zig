@@ -404,6 +404,14 @@ pub const App = struct {
                 self.view.notice = @errorName(err);
             };
         }
+        if (self.view.title_action) |action| {
+            self.view.title_action = null;
+            if (action == .cancel) {
+                self.view.title_editing = false;
+            } else if (self.conversation) |conversation| conversation.rename(self) catch |err| {
+                self.view.notice = @errorName(err);
+            };
+        }
         if (self.view.takeWorkspaceDiffRequest()) |file| if (self.conversation) |conversation| conversation.requestInspectionDiff(&self.view, file);
         if (self.view.takeWorkspaceRefreshRequest()) if (self.conversation) |conversation| if (conversation.inspection_binding) |binding| conversation.requestInspectionStatus(&self.view, binding);
         if (self.view.setup_action) |action| {
@@ -530,6 +538,13 @@ pub const App = struct {
             const bounds = self.view.threadRowBounds(index);
             self.snapshot.thread_targets[index] = .{ .id = entry.id.slice(), .role = "thread", .enabled = self.view.custom_root == null and self.view.navigation_enabled and bounds.w > 0 and bounds.h > 0, .pointer_bounds = .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } };
         }
+        self.snapshot.title_editing = self.view.title_editing;
+        self.snapshot.title_text = if (self.view.title_editing) self.view.title_buffer[0..self.view.title_len] else blk: {
+            var current: []const u8 = "";
+            for (self.view.threads[0..self.view.thread_count]) |*entry| if (entry.id.eql(self.view.active_thread.slice())) current = entry.label[0..entry.len];
+            break :blk current;
+        };
+        self.snapshot.title_target = .{ .id = "thread.title.edit", .role = "textbox", .key = "F2", .enabled = self.view.custom_root == null and self.view.navigation_enabled and self.view.active_thread.len != 0 and self.view.title_bounds.w > 0 and self.view.title_bounds.h > 0, .pointer_bounds = .{ @intFromFloat(self.view.title_bounds.x), @intFromFloat(self.view.title_bounds.y), @intFromFloat(self.view.title_bounds.w), @intFromFloat(self.view.title_bounds.h) } };
         self.snapshot.sidebar_search = self.view.search_query[0..self.view.search_len];
         self.snapshot.sidebar_search_focused = self.view.search_focused;
         self.snapshot.sidebar_scope_open = self.view.scope_open;
@@ -899,6 +914,8 @@ const Conversation = struct {
     workspace_branch: Id = .{},
     thread: Id = .{},
     thread_revision: u64 = 0,
+    title_pending: [types.max_title_bytes]u8 = undefined,
+    title_pending_len: usize = 0,
     card_rows_seen: usize = 0,
     /// Cursor retained after the resident thread-card budget is full. Search
     /// can advance through bounded Host pages without growing the UI arrays.
@@ -1527,7 +1544,7 @@ const Conversation = struct {
     fn updateThreadCard(self: *Conversation, view: *Coding, row: @FieldType(types.Row, "thread")) !void {
         if (row.project_name.len != 0) try addEntry(&view.projects, &view.project_count, row.project.value, row.project_name);
         var title: [160]u8 = undefined;
-        try addEntry(&view.threads, &view.thread_count, row.id.value, cardTitle(&title, row.title_preview));
+        try addEntry(&view.threads, &view.thread_count, row.id.value, if (row.title.len != 0) row.title else cardTitle(&title, row.title_preview));
         for (view.threads[0..view.thread_count]) |*entry| if (entry.id.eql(row.id.value)) {
             entry.project_id = try Id.init(row.project.value);
             for (view.projects[0..view.project_count]) |*project| if (project.id.eql(row.project.value)) {
@@ -1705,7 +1722,7 @@ const Conversation = struct {
     }
 
     const QueryKind = enum { send_receipt, capabilities, projects, workspaces, inspection_workspace, threads, cards, thread, models, runtime_status, startup_status, runs, effects, approvals, tasks, messages, blocks, content };
-    const CommandKind = enum { prompt_cleanup, followup_enqueue, followup_edit, followup_cancel, followup_order, attachment_add, attachment_remove, project, workspace, thread, selection, send, cancel, approval, configure, login, refresh_models };
+    const CommandKind = enum { prompt_cleanup, followup_enqueue, followup_edit, followup_cancel, followup_order, attachment_add, attachment_remove, project, workspace, thread, title, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
     fn create(allocator: std.mem.Allocator, io: std.Io, host: *domain.Host, file: std.Io.File, wake: *Wake, workspace_root: []const u8) !*Conversation {
@@ -1741,6 +1758,18 @@ const Conversation = struct {
     fn submit(self: *Conversation, kind: CommandKind, target: types.Target, revision: types.Precondition, payload: types.Payload, draft_revision: u64) !void {
         if (self.command != null) return error.CommandPending;
         return self.submitIdentified(kind, target, revision, payload, draft_revision, try self.commandId());
+    }
+
+    fn rename(self: *Conversation, app: *App) !void {
+        if (!app.view.title_editing or self.thread.len == 0) return error.NoThread;
+        const title = app.view.title_buffer[0..app.view.title_len];
+        if (title.len == 0 or title.len > types.max_title_bytes or !std.unicode.utf8ValidateSlice(title)) {
+            self.notice(&app.view, "Title must contain 1–160 valid UTF-8 bytes.");
+            return;
+        }
+        @memcpy(self.title_pending[0..title.len], title);
+        self.title_pending_len = title.len;
+        try self.submit(.title, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .thread_title_set = .{ .title = self.title_pending[0..self.title_pending_len] } }, app.view.revision);
     }
 
     fn commandId(self: *Conversation) ![32]u8 {
@@ -2263,6 +2292,10 @@ const Conversation = struct {
             if (pending.kind == .send) {
                 app.view.send_diagnostic.setReceipt(.rejected, if (value.reason) |reason| @tagName(reason) else "command_rejected");
             }
+            if (pending.kind == .title) {
+                app.view.title_editing = true;
+                self.notice(&app.view, if (value.reason) |reason| rejectionMessage(reason) else "Title was rejected; your edit is retained.");
+            }
             if (pending.kind == .refresh_models) self.catalog_refresh_inflight = false;
             if (pending.kind == .configure) {
                 self.setup_login_after_configure = null;
@@ -2279,6 +2312,13 @@ const Conversation = struct {
             return;
         }
         switch (pending.kind) {
+            .title => {
+                app.view.title_editing = false;
+                app.view.title_select_all = false;
+                self.title_pending_len = 0;
+                self.refresh = true;
+                self.notice(&app.view, "Chat title saved.");
+            },
             .prompt_cleanup => app.view.workflowNotice("One unfinished upload discarded. Your draft is retained; close More and retry Send."),
             .attachment_add, .attachment_remove => {
                 app.view.workflowNotice("Host accepted metadata command; provider delivery remains unavailable.");
