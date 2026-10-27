@@ -355,7 +355,7 @@ test "schema five adds empty titles without changing existing messages or revisi
     try f.store.close();
     var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
     f.store = try storage.Store.open(std.testing.io, try f.path(&directory));
-    try std.testing.expectEqual(@as(i64, 7), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 8), try f.store.scalar("PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM threads WHERE id='h' AND title='' AND revision=1"));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM messages WHERE id='m'"));
 }
@@ -1832,7 +1832,7 @@ test "attachment schema v6 migration preserves prior data and reopens with durab
     const path = try f.path(&path_buffer);
     try f.store.close();
     f.store = try storage.Store.open(std.testing.io, path);
-    try std.testing.expectEqual(@as(i64, 7), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 8), try f.store.scalar("PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM messages WHERE id='m'"));
     try f.store.exec("INSERT INTO attachments VALUES('a',1,'h','fixture.txt','text/plain',3,'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad','file',X'616263'); INSERT INTO attachment_refs VALUES('m','a',0)");
     try f.store.close();

@@ -10,7 +10,7 @@ extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, Closed };
 pub const application_id = 0x53504334;
-pub const schema_version = 7;
+pub const schema_version = 8;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
 
 pub const Statement = struct {
@@ -142,6 +142,12 @@ pub const Store = struct {
             try result.exec(attachment_schema);
             try result.exec("UPDATE meta SET schema_version=7 WHERE singleton=1; PRAGMA user_version=7; COMMIT");
         } else if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN('attachments','attachment_refs')") != 2) return error.Corrupt;
+        if (fresh or version < 8) {
+            try result.exec("BEGIN IMMEDIATE");
+            errdefer result.exec("ROLLBACK") catch {};
+            try result.exec(question_schema);
+            try result.exec("UPDATE meta SET schema_version=8 WHERE singleton=1; PRAGMA user_version=8; COMMIT");
+        } else if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='questions'") != 1) return error.Corrupt;
         // Staging budgets exclude sent history; lookup by attachment must not
         // scan all message refs for every historical row in the thread.
         try result.exec("CREATE INDEX IF NOT EXISTS attachment_refs_by_attachment ON attachment_refs(attachment_id)");
@@ -390,7 +396,7 @@ pub const Store = struct {
     pub fn recoverClaims(self: *Store) Error!void {
         if (!self.in_transaction) return error.Conflict;
         const affected = try self.prepare(
-            "SELECT 'effect',id,revision FROM effects WHERE state='in_flight' UNION ALL SELECT 'approval',id,revision FROM approvals WHERE live_epoch IS NOT NULL UNION ALL SELECT 'run',id,revision FROM runs WHERE state IN('queued','starting','streaming','awaiting_approval','cancel_requested') OR (EXISTS(SELECT 1 FROM effects e WHERE e.run_id=runs.id AND e.state='in_flight') AND state NOT IN('completed','cancelled','failed')) UNION ALL SELECT 'tool',t.id,t.revision FROM tools t JOIN runs r ON r.id=t.run_id WHERE t.outcome='pending' AND r.state IN('queued','starting','streaming','awaiting_approval','cancel_requested','unknown','interrupted')",
+            "SELECT 'effect',id,revision FROM effects WHERE state='in_flight' UNION ALL SELECT 'approval',id,revision FROM approvals WHERE live_epoch IS NOT NULL UNION ALL SELECT 'run',id,revision FROM runs WHERE state IN('queued','starting','streaming','awaiting_approval','awaiting_question','cancel_requested') OR (EXISTS(SELECT 1 FROM effects e WHERE e.run_id=runs.id AND e.state='in_flight') AND state NOT IN('completed','cancelled','failed')) UNION ALL SELECT 'tool',t.id,t.revision FROM tools t JOIN runs r ON r.id=t.run_id WHERE t.outcome='pending' AND r.state IN('queued','starting','streaming','awaiting_approval','awaiting_question','cancel_requested','unknown','interrupted')",
             &.{},
         );
         defer affected.deinit();
@@ -409,7 +415,7 @@ pub const Store = struct {
             index = std.math.add(u32, index, 1) catch return error.Limit;
         }
         try self.exec("UPDATE runs SET state='unknown',revision=revision+1 WHERE EXISTS(SELECT 1 FROM effects e WHERE e.run_id=runs.id AND e.state='in_flight') AND state NOT IN('completed','cancelled','failed')");
-        try self.exec("UPDATE runs SET state='interrupted',revision=revision+1 WHERE state IN('queued','starting','streaming','awaiting_approval','cancel_requested')");
+        try self.exec("UPDATE runs SET state='interrupted',revision=revision+1 WHERE state IN('queued','starting','streaming','awaiting_approval','awaiting_question','cancel_requested')");
         try self.exec("UPDATE tools SET outcome='unknown',revision=revision+1 WHERE outcome='pending' AND EXISTS(SELECT 1 FROM runs r WHERE r.id=tools.run_id AND r.state IN('unknown','interrupted'))");
         try self.exec("UPDATE effects SET state='unknown',outcome='crash_after_claim',revision=revision+1 WHERE state='in_flight'");
         try self.exec("UPDATE approvals SET state=CASE WHEN state='pending' THEN 'invalidated' ELSE state END,live_epoch=NULL,revision=revision+1 WHERE live_epoch IS NOT NULL");
@@ -439,8 +445,8 @@ const schema =
     \\CREATE TABLE workspaces(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,project_id TEXT NOT NULL REFERENCES projects(id),binding BLOB NOT NULL);
     \\CREATE TABLE sessions(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,workspace_id TEXT NOT NULL REFERENCES workspaces(id),selection BLOB NOT NULL,instance_id TEXT,upstream_session TEXT,cursor BLOB,continuity TEXT NOT NULL DEFAULT 'unknown');
     \\CREATE TABLE threads(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,project_id TEXT NOT NULL REFERENCES projects(id),workspace_id TEXT NOT NULL REFERENCES workspaces(id),session_id TEXT REFERENCES sessions(id),next_ordinal INTEGER NOT NULL DEFAULT 0);
-    \\CREATE TABLE runs(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,thread_id TEXT NOT NULL REFERENCES threads(id),session_id TEXT NOT NULL REFERENCES sessions(id),state TEXT NOT NULL CHECK(state IN('queued','starting','streaming','awaiting_approval','cancel_requested','completed','cancelled','failed','interrupted','unknown')),requested BLOB NOT NULL,effective BLOB,upstream_turn TEXT,cancel_cause TEXT,unresolved_tools INTEGER NOT NULL DEFAULT 0);
-    \\CREATE UNIQUE INDEX one_active_run ON runs(thread_id) WHERE state IN('queued','starting','streaming','awaiting_approval','cancel_requested');
+    \\CREATE TABLE runs(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,thread_id TEXT NOT NULL REFERENCES threads(id),session_id TEXT NOT NULL REFERENCES sessions(id),state TEXT NOT NULL CHECK(state IN('queued','starting','streaming','awaiting_approval','awaiting_question','cancel_requested','completed','cancelled','failed','interrupted','unknown')),requested BLOB NOT NULL,effective BLOB,upstream_turn TEXT,cancel_cause TEXT,unresolved_tools INTEGER NOT NULL DEFAULT 0);
+    \\CREATE UNIQUE INDEX one_active_run ON runs(thread_id) WHERE state IN('queued','starting','streaming','awaiting_approval','awaiting_question','cancel_requested');
     \\CREATE TABLE messages(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,thread_id TEXT NOT NULL REFERENCES threads(id),run_id TEXT NOT NULL REFERENCES runs(id),ordinal INTEGER NOT NULL,role TEXT NOT NULL CHECK(role IN('user','assistant','tool')),incomplete INTEGER NOT NULL,UNIQUE(thread_id,ordinal));
     \\CREATE TABLE blocks(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,message_id TEXT NOT NULL REFERENCES messages(id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL,committed_bytes INTEGER NOT NULL DEFAULT 0 CHECK(committed_bytes>=0),tool_id TEXT,UNIQUE(message_id,ordinal));
     \\CREATE TABLE chunks(block_id TEXT NOT NULL REFERENCES blocks(id),byte_offset INTEGER NOT NULL CHECK(byte_offset>=0),bytes BLOB NOT NULL,PRIMARY KEY(block_id,byte_offset));
@@ -477,4 +483,9 @@ const attachment_schema =
     \\CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY,revision INTEGER NOT NULL CHECK(revision>0),thread_id TEXT NOT NULL REFERENCES threads(id),name TEXT NOT NULL,media_type TEXT NOT NULL,byte_length INTEGER NOT NULL CHECK(byte_length BETWEEN 0 AND 262144),digest TEXT NOT NULL CHECK(length(digest)=64),kind TEXT NOT NULL CHECK(kind IN('file','image')),content BLOB NOT NULL);
     \\CREATE TABLE IF NOT EXISTS attachment_refs(message_id TEXT NOT NULL REFERENCES messages(id),attachment_id TEXT NOT NULL REFERENCES attachments(id),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(message_id,attachment_id),UNIQUE(message_id,ordinal));
     \\CREATE INDEX IF NOT EXISTS attachments_by_thread ON attachments(thread_id,id);
+;
+
+const question_schema =
+    \\CREATE TABLE IF NOT EXISTS questions(id TEXT PRIMARY KEY,revision INTEGER NOT NULL CHECK(revision>0),run_id TEXT NOT NULL REFERENCES runs(id),session_id TEXT NOT NULL REFERENCES sessions(id),question BLOB NOT NULL CHECK(length(question)<=16384),expires_at INTEGER,state TEXT NOT NULL CHECK(state IN('pending','resolved','invalidated')),answer BLOB,live_epoch TEXT,reply_effect TEXT UNIQUE);
+    \\CREATE INDEX IF NOT EXISTS questions_by_run ON questions(run_id,id);
 ;

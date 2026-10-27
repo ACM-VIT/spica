@@ -91,9 +91,8 @@ pub const Payload = union(enum) {
     followup_edit: struct { content: []const u8, attachments: []const adapter.Attachment = &.{} },
     followup_cancel: struct { reason: []const u8 },
     followup_order: struct { followups: []const FollowupId },
-    /// Provider questions are separate from permission approvals. Durable
-    /// pending-question storage is a later schema handoff; this command shape
-    /// is still shared by domain and provider fixtures.
+    /// Provider questions are separate from permission approvals and have
+    /// durable pending state keyed by question identity and revision.
     question_answer: struct { question: QuestionId, answer: adapter.QuestionAnswer },
     attachment_add: adapter.Attachment,
     attachment_remove: AttachmentId,
@@ -173,10 +172,11 @@ pub const Receipt = struct {
     commit_sequence: u64,
     effect_ids: []const adapter.EffectId = &.{},
 };
-pub const RunState = enum { queued, starting, streaming, awaiting_approval, cancel_requested, completed, cancelled, failed, interrupted, unknown };
+pub const RunState = enum { queued, starting, streaming, awaiting_approval, awaiting_question, cancel_requested, completed, cancelled, failed, interrupted, unknown };
 pub const EffectState = enum { planned, in_flight, withdrawn, confirmed, failed, unknown };
 pub const EffectKind = enum { create_session, start, approval_reply, cancel, inspect, attach, message };
 pub const ApprovalState = enum { pending, resolved, invalidated };
+pub const QuestionState = enum { pending, resolved, invalidated };
 pub const ToolOutcome = enum { pending, succeeded, failed, unknown };
 pub const Direction = enum { older, newer };
 pub const Page = struct {
@@ -202,6 +202,7 @@ pub const Query = union(enum) {
     effects: struct { run: adapter.RunId, page: Page = .{} },
     tools: struct { run: adapter.RunId, page: Page = .{} },
     approvals: struct { run: adapter.RunId, page: Page = .{} },
+    questions: struct { run: adapter.RunId, page: Page = .{} },
     capabilities: void,
     task_list: struct { parent: adapter.RunId, page: Page = .{} },
     task_wait: adapter.RunId,
@@ -275,6 +276,7 @@ pub const Row = union(enum) {
     effect: struct { id: adapter.EffectId, revision: Revision, run: adapter.RunId, kind: EffectKind, state: EffectState, outcome: []const u8 },
     tool: struct { id: adapter.ToolCallId, revision: Revision, run: adapter.RunId, name: []const u8, action_digest: []const u8, outcome: ToolOutcome, result_block: ?adapter.BlockId },
     approval: struct { id: adapter.ApprovalId, revision: Revision, run: adapter.RunId, state: ApprovalState, evidence: adapter.ApprovalEvidence, live: bool },
+    question: struct { id: QuestionId, revision: Revision, run: adapter.RunId, state: QuestionState, question: adapter.Question, live: bool },
     capabilities: adapter.Discovery,
     model: adapter.Model,
     runtime_status: RuntimeStatus,

@@ -408,6 +408,10 @@ pub const App = struct {
                     error.AttachmentDeliveryUnavailable => "Remove local files before queueing; this provider cannot receive them.",
                     error.KeepOrClearCurrentDraftBeforeEditing => "Keep or clear the current composer draft before editing a follow-up.",
                     error.FollowupAlreadyDispatched => "This follow-up has already left the queue and cannot be changed.",
+                    error.QuestionCapabilityUnavailable => "The selected provider does not support structured questions.",
+                    error.QuestionNotLive => "This provider question is no longer pending.",
+                    error.QuestionAnswerEmpty => "Choose an option or enter a written answer.",
+                    error.QuestionAnswerTooLarge => "Write a shorter answer (up to 4096 bytes).",
                     else => "The action is unavailable in the current chat state. Your draft is retained.",
                 });
             } else self.view.workflowNotice("No connected Host; draft retained.");
@@ -671,6 +675,13 @@ pub const App = struct {
             self.snapshot.followup_revisions[i] = item.revision;
         }
         if (self.conversation) |conversation| self.snapshot.followup_capability = @tagName(conversation.followup_capability);
+        if (self.conversation) |conversation| self.snapshot.question_capability = @tagName(conversation.question_capability);
+        self.snapshot.question_pending = self.view.question_pending;
+        self.snapshot.question_id = if (self.view.question_pending) self.view.question_id.slice() else "";
+        self.snapshot.question_revision = if (self.view.question_pending) self.view.question_revision else 0;
+        self.snapshot.question_prompt = if (self.view.question_pending) self.view.question_prompt[0..self.view.question_prompt_len] else "";
+        self.snapshot.question_choice_count = if (self.view.question_pending) self.view.question_choice_count else 0;
+        self.snapshot.question_selected = if (self.view.question_pending) self.view.question_selected else 0;
         self.snapshot.workflow_target = setupTarget("workflow.open", "button", self.view.workflow_button, self.view.custom_root == null and !self.view.setup_open and !self.view.workspace_open);
         self.snapshot.workflow_target.key = "F10";
         observeWorkflowTargets(&self.view, &self.snapshot.workflow_targets);
@@ -952,6 +963,10 @@ const Conversation = struct {
     approval_revision: u64 = 0,
     approval_digest: Id = .{},
     approval_live: bool = false,
+    question: Id = .{},
+    question_revision: u64 = 0,
+    question_live: bool = false,
+    question_capability: contract.Status = .unknown,
     subscription: ?types.SubscriptionId = null,
     subscribe_ticket: ?types.Ticket = null,
     query: ?struct { ticket: types.Ticket, kind: QueryKind, search_revision: u64 } = null,
@@ -1538,7 +1553,7 @@ const Conversation = struct {
 
     fn cardRunStatus(state: types.RunState) Coding.RunStatus {
         return switch (state) {
-            .queued, .starting, .streaming, .cancel_requested => .running,
+            .queued, .starting, .streaming, .awaiting_question, .cancel_requested => .running,
             .awaiting_approval => .approval,
             .failed => .failed,
             .interrupted => .interrupted,
@@ -1758,8 +1773,8 @@ const Conversation = struct {
         }
     }
 
-    const QueryKind = enum { send_receipt, capabilities, projects, workspaces, inspection_workspace, threads, cards, thread_search, thread, models, runtime_status, startup_status, runs, effects, approvals, tasks, messages, blocks, content };
-    const CommandKind = enum { prompt_cleanup, followup_enqueue, followup_edit, followup_cancel, followup_order, attachment_add, attachment_remove, project, workspace, thread, title, selection, send, cancel, approval, configure, login, refresh_models };
+    const QueryKind = enum { send_receipt, capabilities, projects, workspaces, inspection_workspace, threads, cards, thread_search, thread, models, runtime_status, startup_status, runs, effects, approvals, questions, tasks, messages, blocks, content };
+    const CommandKind = enum { prompt_cleanup, followup_enqueue, followup_edit, followup_cancel, followup_order, attachment_add, attachment_remove, question, project, workspace, thread, title, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
     fn create(allocator: std.mem.Allocator, io: std.Io, host: *domain.Host, file: std.Io.File, wake: *Wake, workspace_root: []const u8) !*Conversation {
@@ -2047,6 +2062,26 @@ const Conversation = struct {
                 self.workflow_pending.order_count = view.followup_count;
                 for (0..view.followup_count) |i| self.workflow_pending.order[i] = .{ .value = self.workflow_pending.order_ids[i].slice() };
                 try self.submit(.followup_order, .{ .run = .{ .value = self.run.slice() } }, .{ .revision = self.run_revision }, .{ .followup_order = .{ .followups = self.workflow_pending.order[0..view.followup_count] } }, view.revision);
+            },
+            .question_choice => |index| {
+                if (!self.question_live or !view.question_pending or index >= view.question_choice_count) return error.QuestionNotLive;
+                const bit: u16 = @as(u16, 1) << @intCast(index);
+                if (view.question_allow_multiple) view.question_selected ^= bit else view.question_selected = bit;
+            },
+            .question_submit => {
+                if (!self.question_live or !view.question_pending) return error.QuestionNotLive;
+                if (self.question_capability != .supported) return error.QuestionCapabilityUnavailable;
+                const answer_text = view.workflow_path[0..view.workflow_path_len];
+                if (view.question_selected == 0 and answer_text.len == 0 and !view.question_allow_freeform) return error.QuestionAnswerEmpty;
+                if (answer_text.len > (contract.Limits{}).question_answer_bytes) return error.QuestionAnswerTooLarge;
+                var choice_ids: [16][]const u8 = undefined;
+                var count: usize = 0;
+                for (view.question_choices[0..view.question_choice_count], 0..) |choice, index| if (view.question_selected & (@as(u16, 1) << @intCast(index)) != 0) {
+                    choice_ids[count] = choice.id.slice();
+                    count += 1;
+                };
+                try self.submit(.question, .{ .question = .{ .value = self.question.slice() } }, .{ .revision = self.question_revision }, .{ .question_answer = .{ .question = .{ .value = self.question.slice() }, .answer = .{ .choice_ids = choice_ids[0..count], .text = answer_text } } }, view.revision);
+                view.workflowNotice("Answer accepted by Host; waiting for provider acknowledgement.");
             },
         }
     }
@@ -2389,7 +2424,7 @@ const Conversation = struct {
         self.command = null;
         if (pending.kind == .send) self.unknown_send = null;
         const workflow_command = switch (pending.kind) {
-            .followup_enqueue, .followup_edit, .followup_cancel, .followup_order, .attachment_add, .attachment_remove => true,
+            .followup_enqueue, .followup_edit, .followup_cancel, .followup_order, .attachment_add, .attachment_remove, .question => true,
             else => false,
         };
         if (workflow_command and (!self.workflow_pending.thread.eql(self.thread.slice()) or !self.workflow_pending.run.eql(self.run.slice()))) return error.StaleWorkflowReceipt;
@@ -2399,6 +2434,7 @@ const Conversation = struct {
                 app.view.workflowNotice(switch (pending.kind) {
                     .attachment_add => "Attachments are unavailable. File kept locally; nothing sent.",
                     .attachment_remove => "Local file removed. Provider attachment removal is unavailable.",
+                    .question => "Provider rejected the answer; the question remains pending.",
                     else => "Follow-up refused by the provider. Your draft is retained.",
                 });
             }
@@ -2477,6 +2513,15 @@ const Conversation = struct {
                 }
                 @memcpy(app.view.followups[0..app.view.followup_count], reordered[0..app.view.followup_count]);
                 app.view.workflowNotice("Host accepted follow-up order.");
+                self.refresh = true;
+            },
+            .question => {
+                app.view.question_pending = false;
+                self.question_live = false;
+                app.view.question_selected = 0;
+                app.view.question_answer_len = 0;
+                app.view.workflow_path_len = 0;
+                app.view.workflowNotice("Answer delivered; the provider may continue this run.");
                 self.refresh = true;
             },
             .project => {
@@ -2569,8 +2614,9 @@ const Conversation = struct {
                 self.capability_runtime = .{};
                 for (value.items) |row| {
                     self.followup_capability = row.capabilities.capabilities[@intFromEnum(contract.Capability.followup_queue)].status;
+                    self.question_capability = row.capabilities.capabilities[@intFromEnum(contract.Capability.question)].status;
                     self.capability_runtime = try Id.init(row.capabilities.runtime_kind);
-                    if (self.followup_capability != .supported and app.view.workflow_feedback_len == 0) app.view.workflowNotice("This provider does not support follow-ups. Questions and attachments are also unavailable.");
+                    if (self.followup_capability != .supported and self.question_capability != .supported and app.view.workflow_feedback_len == 0) app.view.workflowNotice("This provider does not support follow-ups or structured questions.");
                 }
                 try self.askRuns();
             },
@@ -2879,12 +2925,47 @@ const Conversation = struct {
                 } else try self.ask(.approvals, .{ .approvals = .{ .run = .{ .value = self.run.slice() }, .page = page } });
             },
             .approvals => {
+                self.approval_live = false;
                 for (value.items) |row| if (row.approval.state == .pending and row.approval.live) {
                     self.approval = try Id.init(row.approval.id.value);
                     self.approval_revision = row.approval.revision;
                     self.approval_digest = try Id.init(row.approval.evidence.action_digest);
                     self.approval_live = true;
                 };
+                app.view.task_count = 0;
+                try self.ask(.questions, .{ .questions = .{ .run = .{ .value = self.run.slice() }, .page = page } });
+            },
+            .questions => {
+                self.question_live = false;
+                app.view.question_pending = false;
+                app.view.question_choice_count = 0;
+                for (value.items) |row| if (row.question.state == .pending and row.question.live) {
+                    const q = row.question.question;
+                    if (q.prompt.len > app.view.question_prompt.len) continue;
+                    self.question = try Id.init(row.question.id.value);
+                    self.question_revision = row.question.revision;
+                    self.question_live = true;
+                    app.view.question_pending = true;
+                    app.view.question_id = self.question;
+                    app.view.question_revision = self.question_revision;
+                    app.view.question_prompt_len = q.prompt.len;
+                    @memcpy(app.view.question_prompt[0..q.prompt.len], q.prompt);
+                    app.view.question_allow_multiple = q.allow_multiple;
+                    app.view.question_allow_freeform = q.allow_freeform;
+                    app.view.question_selected = 0;
+                    app.view.question_answer_len = 0;
+                    app.view.workflow_path_len = 0;
+                    app.view.question_choice_count = @min(q.choices.len, app.view.question_choices.len);
+                    for (q.choices[0..app.view.question_choice_count], 0..) |choice, i| {
+                        app.view.question_choices[i].id = try Id.init(choice.id);
+                        app.view.question_choices[i].len = @min(choice.label.len, app.view.question_choices[i].label.len);
+                        @memcpy(app.view.question_choices[i].label[0..app.view.question_choices[i].len], choice.label[0..app.view.question_choices[i].len]);
+                    }
+                };
+                if (value.next_cursor) |cursor| {
+                    try self.ask(.questions, .{ .questions = .{ .run = .{ .value = self.run.slice() }, .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = cursor } } });
+                    return;
+                }
                 app.view.task_count = 0;
                 try self.ask(.tasks, .{ .task_list = .{ .parent = .{ .value = self.run.slice() }, .page = .{ .limit = 16, .max_bytes = 64 * 1024 } } });
             },

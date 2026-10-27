@@ -143,6 +143,18 @@ pub const View = struct {
     workflow_targets: hit_targets.SemanticTargets(64, 96, 16) = .{},
     workflow_keyboard: usize = 0,
     workflow_page: usize = 0,
+    question_pending: bool = false,
+    question_id: transcript.Id = .{},
+    question_revision: u64 = 0,
+    question_prompt: [1024]u8 = undefined,
+    question_prompt_len: usize = 0,
+    question_allow_multiple: bool = false,
+    question_allow_freeform: bool = false,
+    question_selected: u16 = 0,
+    question_answer: [4096]u8 = undefined,
+    question_answer_len: usize = 0,
+    question_choices: [16]struct { id: transcript.Id = .{}, label: [160]u8 = undefined, len: usize = 0 } = @splat(.{}),
+    question_choice_count: usize = 0,
     followups: [8]Followup = @splat(.{}),
     followup_count: usize = 0,
     followup_editing: ?transcript.Id = null,
@@ -471,7 +483,7 @@ pub const View = struct {
         run_status: RunStatus = .idle,
     };
 
-    pub const WorkflowAction = union(enum) { cleanup_prompt, add, remove: usize, enqueue, edit: usize, cancel: usize, up: usize, down: usize };
+    pub const WorkflowAction = union(enum) { cleanup_prompt, add, remove: usize, enqueue, edit: usize, cancel: usize, up: usize, down: usize, question_choice: usize, question_submit };
     pub const Followup = struct {
         id: transcript.Id = .{},
         revision: u64 = 0,
@@ -497,6 +509,13 @@ pub const View = struct {
         self.followup_editing = null;
         self.workflow_uncertain = false;
         self.workflow_action = null;
+        self.question_pending = false;
+        self.question_id = .{};
+        self.question_revision = 0;
+        self.question_prompt_len = 0;
+        self.question_choice_count = 0;
+        self.question_selected = 0;
+        self.question_answer_len = 0;
     }
 
     fn workflowInsert(self: *View, bytes: []const u8) !void {
@@ -516,6 +535,11 @@ pub const View = struct {
         } else if (std.mem.eql(u8, id, "attachment.path")) {
             self.workflow_path_focus = true;
             self.workflow_path_select_all = true;
+        } else if (std.mem.eql(u8, id, "question.answer")) {
+            self.workflow_path_focus = true;
+            self.workflow_path_select_all = true;
+        } else if (std.mem.eql(u8, id, "question.submit")) {
+            self.workflow_action = .question_submit;
         } else if (std.mem.eql(u8, id, "workflow.previous")) {
             self.workflow_page -|= 1;
         } else if (std.mem.eql(u8, id, "workflow.next")) {
@@ -535,6 +559,9 @@ pub const View = struct {
                 inline for (.{ "edit", "cancel", "up", "down" }) |kind| {
                     if (std.mem.eql(u8, id, try std.fmt.bufPrint(&buffer, "followup." ++ kind ++ ".{d}", .{i}))) self.workflow_action = @unionInit(WorkflowAction, kind, i);
                 }
+            }
+            for (0..self.question_choice_count) |i| {
+                if (std.mem.eql(u8, id, std.fmt.bufPrint(&buffer, "question.choice.{d}", .{i}) catch "")) self.workflow_action = .{ .question_choice = i };
             }
         }
     }
@@ -2181,7 +2208,27 @@ pub const View = struct {
         try widgets.panel(renderer, box, 8, self.design.colors.surface);
         try self.labels.drawFitted(renderer, text, "Follow-ups, questions & attachments", box.x + 12, box.y + 10, box.w - 100, 16, foreground);
         try self.workflowControl(renderer, text, "workflow.close", "Close · Esc", .{ .x = box.x + box.w - 92, .y = box.y + 5, .w = 84, .h = 28 }, true, foreground);
-        try self.labels.drawFitted(renderer, text, "Questions are unavailable in this version. No answers will be sent.", box.x + 12, box.y + 38, box.w - 24, 12, muted);
+        if (self.question_pending) {
+            try self.labels.drawFitted(renderer, text, "Provider question · answer is sent to the active run", box.x + 12, box.y + 38, box.w - 24, 12, foreground);
+            try self.labels.drawFitted(renderer, text, self.question_prompt[0..self.question_prompt_len], box.x + 12, box.y + 56, box.w - 24, 13, foreground);
+            var choice_y = box.y + 78;
+            var id_buffer: [64]u8 = undefined;
+            for (self.question_choices[0..self.question_choice_count], 0..) |choice, index| {
+                const selected = self.question_selected & (@as(u16, 1) << @intCast(index)) != 0;
+                try self.workflowControl(renderer, text, try std.fmt.bufPrint(&id_buffer, "question.choice.{d}", .{index}), choice.label[0..choice.len], .{ .x = box.x + 12, .y = choice_y, .w = @min(box.w - 24, 420), .h = 26 }, !self.workflow_busy, if (selected) foreground else muted);
+                choice_y += 30;
+            }
+            if (self.question_allow_freeform) {
+                const answer_rect = c.SDL_FRect{ .x = box.x + 12, .y = choice_y, .w = @max(80, box.w - 104), .h = 28 };
+                try self.workflowControl(renderer, text, "question.answer", if (self.workflow_path_len == 0) "Optional written answer…" else self.workflow_path[0..self.workflow_path_len], answer_rect, true, foreground);
+                try self.workflowControl(renderer, text, "question.submit", "Answer", .{ .x = box.x + box.w - 84, .y = choice_y, .w = 72, .h = 28 }, !self.workflow_busy, foreground);
+            } else {
+                try self.workflowControl(renderer, text, "question.submit", "Answer", .{ .x = box.x + 12, .y = choice_y, .w = 92, .h = 28 }, !self.workflow_busy and self.question_selected != 0, foreground);
+            }
+            if (self.workflow_feedback_len != 0) try self.labels.drawFitted(renderer, text, self.workflow_feedback[0..self.workflow_feedback_len], box.x + 12, box.y + box.h - 28, box.w - 24, 12, foreground);
+            return;
+        }
+        try self.labels.drawFitted(renderer, text, "Questions appear here when the provider needs a bounded answer.", box.x + 12, box.y + 38, box.w - 24, 12, muted);
         try self.labels.drawFitted(renderer, text, "Files stay in this draft. Delivery is unavailable; remove them before Send.", box.x + 12, box.y + 58, box.w - 24, 12, muted);
         const path_rect = c.SDL_FRect{ .x = box.x + 12, .y = box.y + 82, .w = @max(60, box.w - 104), .h = 28 };
         try self.workflowControl(renderer, text, "attachment.path", if (self.workflow_path_len == 0) "Absolute file path…" else self.workflow_path[0..self.workflow_path_len], path_rect, true, foreground);

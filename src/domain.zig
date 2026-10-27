@@ -122,10 +122,10 @@ pub const Owner = struct {
             .run => |v| .{ "SELECT revision FROM runs WHERE id=?", v.value },
             .approval => |v| .{ "SELECT revision FROM approvals WHERE id=?", v.value },
             .effect => |v| .{ "SELECT revision FROM effects WHERE id=?", v.value },
-            // Questions and attachment metadata have no durable tables in the
-            // current schema; their public command shapes remain provider-
-            // neutral until the owning migration lands.
-            .followup, .question, .attachment => return null,
+            .question => |v| .{ "SELECT revision FROM questions WHERE id=?", v.value },
+            // Follow-up and attachment commands target effects/threads and
+            // carry their own bounded revision checks in reduce.
+            .followup, .attachment => return null,
         };
         const statement = try self.database.prepare(sql, &.{.{ .text = key }});
         defer statement.deinit();
@@ -309,7 +309,7 @@ pub const Owner = struct {
                 // process in this Host. It must not prevent account setup for
                 // other chats. Live adapters and accepted dispatches still do.
                 if (self.liveRuntimeCount() != 0) return .busy;
-                if (try db.scalar("SELECT EXISTS(SELECT 1 FROM runs WHERE state IN('queued','starting','streaming','awaiting_approval','cancel_requested')) OR EXISTS(SELECT 1 FROM effects WHERE state='in_flight')") != 0) return .busy;
+                if (try db.scalar("SELECT EXISTS(SELECT 1 FROM runs WHERE state IN('queued','starting','streaming','awaiting_approval','awaiting_question','cancel_requested')) OR EXISTS(SELECT 1 FROM effects WHERE state='in_flight')") != 0) return .busy;
                 // The command record commits explicit intent before Host performs
                 // any configuration, provider discovery or login side effect.
                 return null;
@@ -467,7 +467,44 @@ pub const Owner = struct {
                 aggregate = .{ .run = e.target.run };
                 revision_value = e.expected_revision.revision + 1;
             },
-            .question_answer => return .capability_unavailable,
+            .question_answer => |p| {
+                if (e.target != .question or e.expected_revision != .revision) return .question_invalid;
+                const statement = try db.prepare("SELECT run_id,session_id,question,state,live_epoch,expires_at FROM questions WHERE id=?", &.{.{ .text = e.target.question.value }});
+                defer statement.deinit();
+                if (!try statement.step()) return .not_found;
+                if (!std.mem.eql(u8, try statement.bytes(3), "pending") or statement.isNull(4) or !std.mem.eql(u8, try statement.bytes(4), self.epoch)) return .question_invalid;
+                if (!statement.isNull(5) and (self.utc_ms == null or self.utc_ms.? >= @as(u64, @intCast(statement.integer(5))))) return .question_expired;
+                if (self.factory) |runtime| {
+                    const requested = try self.field(allocator, "SELECT requested FROM runs WHERE id=?", &.{.{ .text = try statement.bytes(0) }}) orelse return error.Corrupt;
+                    const selection = try t.decode(a.Selection, requested, allocator);
+                    if (runtime.discover(selection).capabilities[@intFromEnum(a.Capability.question)].status != .supported) return .capability_unavailable;
+                }
+                try a.validateQuestionAnswer(p.answer, .{});
+                const pending_question = try t.decode(a.Question, try statement.bytes(2), allocator);
+                if (!pending_question.allow_freeform and p.answer.text.len != 0) return .question_invalid;
+                if (!pending_question.allow_multiple and p.answer.choice_ids.len > 1) return .question_invalid;
+                if (!pending_question.allow_freeform and pending_question.choices.len != 0 and p.answer.choice_ids.len == 0) return .question_invalid;
+                for (p.answer.choice_ids) |choice_id| {
+                    var found = false;
+                    for (pending_question.choices) |choice| {
+                        if (std.mem.eql(u8, choice.id, choice_id)) found = true;
+                    }
+                    if (!found) return .question_invalid;
+                }
+                const run = try allocator.dupe(u8, try statement.bytes(0));
+                const session = try allocator.dupe(u8, try statement.bytes(1));
+                const question = try allocator.dupe(u8, e.target.question.value);
+                const effect_id = try self.id(allocator);
+                const request: a.Request = .{ .answer_question = .{ .correlation = .{ .effect = .{ .value = effect_id }, .session = .{ .value = session }, .run = .{ .value = run }, .question = e.target.question }, .question = e.target.question, .answer = p.answer } };
+                if (a.frameBytes(request) > start_frame_limit) return .admission_limit;
+                try self.plan(allocator, effect_id, run, session, .message, request, null, null, e.command_id);
+                try db.execute("UPDATE questions SET state='resolved',answer=?,reply_effect=?,revision=revision+1 WHERE id=? AND state='pending'", &.{ .{ .blob = try encoded(allocator, p.answer) }, .{ .text = effect_id }, .{ .text = question } });
+                try db.execute("UPDATE runs SET state='streaming',revision=revision+1 WHERE id=? AND state='awaiting_question'", &.{.{ .text = run }});
+                r.entity_ids = .{ .run = .{ .value = run }, .question = e.target.question };
+                r.effect_ids = try allocator.dupe(a.EffectId, &.{.{ .value = effect_id }});
+                aggregate = .{ .question = e.target.question };
+                revision_value = e.expected_revision.revision + 1;
+            },
             .prompt_discard => |p| {
                 if (e.target != .absent or e.expected_revision != .absent) return .invalid_command;
                 if (p.id) |upload| {
@@ -561,8 +598,8 @@ pub const Owner = struct {
                     for ([_]a.Capability{ .create, .start, .stream }) |capability|
                         if (discovery.capabilities[@intFromEnum(capability)].status != .supported) return .capability_unavailable;
                 } else if (!std.mem.eql(u8, p.selection.runtime_kind, "fake") or !std.mem.eql(u8, p.selection.required_runtime_version, "1") or p.selection.capability_revision != 1) return .capability_unavailable;
-                if (self.factory != null and (self.liveRuntimeCount() >= 3 or try db.scalar("SELECT count(*) FROM runs WHERE state IN('queued','starting','streaming','awaiting_approval','cancel_requested')") >= 3)) return .admission_limit;
-                if (try self.field(allocator, "SELECT id FROM runs WHERE thread_id=? AND (state IN('queued','starting','streaming','awaiting_approval','cancel_requested','unknown','interrupted') OR EXISTS(SELECT 1 FROM effects WHERE run_id=runs.id AND state IN('unknown','in_flight')))", &.{.{ .text = thread }}) != null) return .unresolved_effects;
+                if (self.factory != null and (self.liveRuntimeCount() >= 3 or try db.scalar("SELECT count(*) FROM runs WHERE state IN('queued','starting','streaming','awaiting_approval','awaiting_question','cancel_requested')") >= 3)) return .admission_limit;
+                if (try self.field(allocator, "SELECT id FROM runs WHERE thread_id=? AND (state IN('queued','starting','streaming','awaiting_approval','awaiting_question','cancel_requested','unknown','interrupted') OR EXISTS(SELECT 1 FROM effects WHERE run_id=runs.id AND state IN('unknown','in_flight')))", &.{.{ .text = thread }}) != null) return .unresolved_effects;
                 const run = try self.id(allocator);
                 var session = try self.id(allocator);
                 var resumed: ?a.Session = null;
@@ -827,7 +864,7 @@ pub const Owner = struct {
         // Their dependent start makes them ordinary Send work: recovery must
         // not claim the attach and revive that interrupted/unknown turn. Repeat
         // one_effect's partial-index predicate for a bounded compatibility lookup.
-        const statement = try self.database.prepare("SELECT e.id,e.request FROM effects e JOIN runs r ON r.id=e.run_id WHERE e.state='planned' AND ((e.read_only=1 AND NOT EXISTS(SELECT 1 FROM effects continuation WHERE continuation.run_id=e.run_id AND continuation.kind IN('create_session','start','cancel') AND continuation.kind='start' AND continuation.depends_on=e.id)) OR r.state IN('queued','starting','streaming','awaiting_approval') OR (e.kind='cancel' AND r.state='cancel_requested')) AND (e.depends_on IS NULL OR EXISTS(SELECT 1 FROM effects d WHERE d.id=e.depends_on AND d.state='confirmed')) ORDER BY e.rowid LIMIT 1", &.{});
+        const statement = try self.database.prepare("SELECT e.id,e.request FROM effects e JOIN runs r ON r.id=e.run_id WHERE e.state='planned' AND ((e.read_only=1 AND NOT EXISTS(SELECT 1 FROM effects continuation WHERE continuation.run_id=e.run_id AND continuation.kind IN('create_session','start','cancel') AND continuation.kind='start' AND continuation.depends_on=e.id)) OR r.state IN('queued','starting','streaming','awaiting_approval','awaiting_question') OR (e.kind='cancel' AND r.state='cancel_requested')) AND (e.depends_on IS NULL OR EXISTS(SELECT 1 FROM effects d WHERE d.id=e.depends_on AND d.state='confirmed')) ORDER BY e.rowid LIMIT 1", &.{});
         const result: ?Claimed = blk: {
             defer statement.deinit();
             if (!try statement.step()) break :blk null;
@@ -885,6 +922,14 @@ pub const Owner = struct {
             .unknown => "unknown",
         };
         try db.execute("UPDATE effects SET state=?,outcome=?,evidence=?,revision=revision+1 WHERE id=?", &.{ .{ .text = state }, .{ .blob = receipt.detail }, .{ .blob = evidence }, .{ .text = effect.value } });
+        if (std.mem.eql(u8, kind, "message") and receipt.outcome == .rejected) {
+            const request_bytes = try self.field(allocator, "SELECT request FROM effects WHERE id=?", &.{.{ .text = effect.value }}) orelse return error.Corrupt;
+            const request = try t.decode(a.Request, request_bytes, allocator);
+            if (request == .answer_question) {
+                try db.execute("UPDATE questions SET state='pending',answer=NULL,reply_effect=NULL,revision=revision+1 WHERE id=? AND state='resolved' AND reply_effect=?", &.{ .{ .text = request.answer_question.question.value }, .{ .text = effect.value } });
+                try db.execute("UPDATE runs SET state='awaiting_question',revision=revision+1 WHERE id=? AND state='streaming'", &.{.{ .text = run }});
+            }
+        }
         try self.event(allocator, sequence, 0, .{ .effect = effect }, @intCast(s.integer(3) + 1), "EffectDelivery", null, effect, delivery_proof);
         if (receipt.session) |live| {
             if (!std.mem.eql(u8, live.id.value, session)) return error.Conflict;
@@ -1065,9 +1110,21 @@ pub const Owner = struct {
                 try self.event(allocator, sequence, index, .{ .approval = approval_id }, 1, "ApprovalPending", null, observation.correlation.effect, "");
                 index += 1;
             },
-            // Pending structured questions need their own durable projection;
-            // approvals are permission-only and cannot be reused for this.
-            .question => return error.CapabilityUnavailable,
+            .question => |question| {
+                if (terminal or std.mem.eql(u8, current_state, "cancel_requested") or !a.equal(question.correlation, observation.correlation)) return error.Conflict;
+                const question_id = question.correlation.question orelse return error.Conflict;
+                try a.validateQuestion(question, .{});
+                const existing = try self.field(allocator, "SELECT state FROM questions WHERE id=?", &.{.{ .text = question_id.value }});
+                if (existing != null) return error.Conflict;
+                const expires = if (question.expires_at) |value| blk: {
+                    if (value > std.math.maxInt(i64)) return error.Limit;
+                    break :blk V{ .integer = @intCast(value) };
+                } else V.null;
+                try db.execute("INSERT INTO questions(id,revision,run_id,session_id,question,expires_at,state,live_epoch) VALUES(?,1,?,?,?,?, 'pending',?)", &.{ .{ .text = question_id.value }, .{ .text = run.value }, .{ .text = session.value }, .{ .blob = try encoded(allocator, question) }, expires, .{ .text = self.epoch } });
+                next_state = "awaiting_question";
+                try self.event(allocator, sequence, index, .{ .question = question_id }, 1, "QuestionPending", null, observation.correlation.effect, "");
+                index += 1;
+            },
             .completed => {
                 const pending = try self.field(allocator, "SELECT id FROM tools WHERE run_id=? AND outcome IN('pending','unknown') LIMIT 1", &.{.{ .text = run.value }});
                 if (!terminal) next_state = if (pending == null) "completed" else "unknown";
@@ -1748,7 +1805,7 @@ pub const Host = struct {
             }
             // Process ownership ends at a terminal/ambiguous boundary, while
             // durable unknown claims remain for explicit reconciliation.
-            const done = try self.database.prepare("SELECT 1 FROM sessions s WHERE s.id=? AND NOT EXISTS(SELECT 1 FROM runs active WHERE active.session_id=s.id AND active.state IN('queued','starting','streaming','awaiting_approval','cancel_requested')) AND NOT EXISTS(SELECT 1 FROM effects pending WHERE pending.session_id=s.id AND pending.state IN('planned','in_flight')) AND EXISTS(SELECT 1 FROM runs terminal WHERE terminal.session_id=s.id AND (terminal.state IN('unknown','interrupted','failed') OR terminal.state IN('completed','cancelled')))", &.{.{ .text = entry.session.value }});
+            const done = try self.database.prepare("SELECT 1 FROM sessions s WHERE s.id=? AND NOT EXISTS(SELECT 1 FROM runs active WHERE active.session_id=s.id AND active.state IN('queued','starting','streaming','awaiting_approval','awaiting_question','cancel_requested')) AND NOT EXISTS(SELECT 1 FROM effects pending WHERE pending.session_id=s.id AND pending.state IN('planned','in_flight')) AND EXISTS(SELECT 1 FROM runs terminal WHERE terminal.session_id=s.id AND (terminal.state IN('unknown','interrupted','failed') OR terminal.state IN('completed','cancelled')))", &.{.{ .text = entry.session.value }});
             const release = blk: {
                 defer done.deinit();
                 break :blk try done.step();
@@ -1896,7 +1953,7 @@ pub const Host = struct {
             const session: a.RuntimeSessionId = .{ .value = try allocator.dupe(u8, try metadata.bytes(0)) };
             const selection = try t.decode(a.Selection, try metadata.bytes(1), allocator);
             const binding = try t.decode(t.WorkspaceBinding, try metadata.bytes(2), allocator);
-            if (effect.request == .open or effect.request == .start or effect.request == .message) {
+            if (effect.request == .open or effect.request == .start or effect.request == .message or effect.request == .answer_question) {
                 if (!(workspace_binding.verify(allocator, self.io, binding) catch false)) {
                     try owner.delivered(allocator, effect.id, .{ .outcome = .rejected, .detail = "Workspace identity changed before dispatch" });
                     return;
@@ -2009,6 +2066,7 @@ pub const Host = struct {
             .tools => |v| v.page,
             .approvals => |v| v.page,
             .task_list => |v| v.page,
+            .questions => |v| v.page,
             .thread, .capabilities, .runtime_status, .task_wait, .command_receipt => .{},
         };
         if (page.limit == 0 or page.limit > self.options.limits.page_rows or page.max_bytes == 0 or page.max_bytes > self.options.limits.page_bytes) return error.InvalidQuery;
@@ -2035,6 +2093,7 @@ pub const Host = struct {
             .effects => |*v| v.page = .{},
             .tools => |*v| v.page = .{},
             .approvals => |*v| v.page = .{},
+            .questions => |*v| v.page = .{},
             .task_list => |*v| v.page = .{},
             else => {},
         }
@@ -2182,6 +2241,11 @@ pub const Host = struct {
                 values[0] = .{ .text = v.run.value };
                 n = 1;
             },
+            .questions => |v| {
+                sql = "SELECT rowid,id,revision,run_id,state,question,expires_at,live_epoch FROM questions WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                values[0] = .{ .text = v.run.value };
+                n = 1;
+            },
             .content => |v| {
                 if (v.start_byte > v.end_byte or v.end_byte > std.math.maxInt(i64) or v.end_byte - v.start_byte > page.max_bytes) return error.InvalidQuery;
                 const s = try reader.prepare("SELECT revision,committed_bytes FROM blocks WHERE id=?", &.{.{ .text = v.block.value }});
@@ -2277,6 +2341,7 @@ pub const Host = struct {
                     .revision = try number(s, 11),
                 } },
                 .approvals => .{ .approval = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .run = .{ .value = try text(allocator, s, 3) }, .state = try enumeration(t.ApprovalState, s, 4), .evidence = .{ .correlation = .{ .session = .{ .value = try text(allocator, s, 5) }, .run = .{ .value = try text(allocator, s, 3) }, .tool = .{ .value = try text(allocator, s, 6) }, .approval = .{ .value = try text(allocator, s, 1) }, .upstream_request = try text(allocator, s, 8) }, .workspace = .{ .value = try text(allocator, s, 7) }, .action_digest = try text(allocator, s, 9), .scope = try text(allocator, s, 10), .expires_at = if (s.isNull(11)) null else try number(s, 11) }, .live = !s.isNull(12) and std.mem.eql(u8, try s.bytes(12), &self.epoch) } },
+                .questions => .{ .question = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .run = .{ .value = try text(allocator, s, 3) }, .state = try enumeration(t.QuestionState, s, 4), .question = try t.decode(a.Question, try s.bytes(5), allocator), .live = !s.isNull(7) and std.mem.eql(u8, try s.bytes(7), &self.epoch) } },
                 else => unreachable,
             };
             const row_bytes = (try t.encode(row, &encode_buffer)).len;
@@ -2350,7 +2415,8 @@ pub const Host = struct {
             .tool => |v| .{ "SELECT r.thread_id,r.id FROM tools t JOIN runs r ON r.id=t.run_id WHERE t.id=?", v.value },
             .approval => |v| .{ "SELECT r.thread_id,r.id FROM approvals a JOIN runs r ON r.id=a.run_id WHERE a.id=?", v.value },
             .effect => |v| .{ "SELECT r.thread_id,r.id FROM effects e JOIN runs r ON r.id=e.run_id WHERE e.id=?", v.value },
-            .followup, .question, .attachment => return error.NotFound,
+            .followup, .attachment => return error.NotFound,
+            .question => |v| .{ "SELECT run_id,id FROM questions WHERE id=?", v.value },
             .session => |v| .{ "SELECT thread_id,id FROM runs WHERE session_id=?", v.value },
             else => return false,
         };
@@ -2374,6 +2440,51 @@ test "provider start preflight admits the complete UTF8 composer capacity" {
     }
     try std.testing.expect(!startPreflight(65537).fits());
     try std.testing.expect(!startPreflight(std.math.maxInt(usize)).fits());
+}
+
+test "structured question is durable, answerable and dispatchable" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var database = try store.Store.open(std.testing.io, path_buffer[0..path_len]);
+    defer database.close() catch {};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: Owner = .{ .database = &database, .io = std.testing.io, .epoch = "question-fixture", .utc_ms = 1000 };
+    const project = (try owner.command(allocator, .{ .command_id = .{ .value = "question-project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "Question fixture" } } })).entity_ids.project.?;
+    const workspace = (try owner.command(allocator, .{ .command_id = .{ .value = "question-workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = try workspace_binding.capture(allocator, std.testing.io, path_buffer[0..path_len]) } } })).entity_ids.workspace.?;
+    const thread = (try owner.command(allocator, .{ .command_id = .{ .value = "question-thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+    const sent = try owner.command(allocator, .{ .command_id = .{ .value = "question-send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "configure it", .selection = a.fakeSelection(workspace) } } });
+    const open = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, open.id, .{ .outcome = .acknowledged, .session = .{ .id = sent.entity_ids.session.?, .instance = .{ .value = "question-instance" }, .upstream = .{ .value = "question-session" } } });
+    const start = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, start.id, .{ .outcome = .acknowledged });
+    var correlation = start.request.start.correlation;
+    correlation.question = .{ .value = "question-1" };
+    const question: a.Question = .{ .id = correlation.question.?, .correlation = correlation, .prompt = "Which mode?", .choices = &.{ .{ .id = "safe", .label = "Safe" }, .{ .id = "fast", .label = "Fast" } } };
+    try owner.observe(allocator, .{ .correlation = correlation, .upstream_event = "question", .body = .{ .question = question } });
+    try std.testing.expectEqual(@as(i64, 1), try database.scalar("SELECT count(*) FROM questions WHERE state='pending'"));
+    {
+        const run_state = try database.prepare("SELECT state FROM runs WHERE id=?", &.{.{ .text = sent.entity_ids.run.?.value }});
+        defer run_state.deinit();
+        try std.testing.expect(try run_state.step());
+        try std.testing.expectEqualStrings("awaiting_question", try run_state.bytes(0));
+    }
+    const answered = try owner.command(allocator, .{ .command_id = .{ .value = "question-answer" }, .target = .{ .question = question.id }, .expected_revision = .{ .revision = 1 }, .payload = .{ .question_answer = .{ .question = question.id, .answer = .{ .choice_ids = &.{"safe"} } } } });
+    try std.testing.expectEqual(.accepted, answered.outcome);
+    const reply = (try owner.claimNext(allocator)).?;
+    try std.testing.expect(reply.request == .answer_question);
+    try std.testing.expectEqualStrings("question-1", reply.request.answer_question.question.value);
+    try owner.delivered(allocator, reply.id, .{ .outcome = .acknowledged });
+    try std.testing.expectEqual(@as(i64, 1), try database.scalar("SELECT count(*) FROM questions WHERE state='resolved'"));
+    {
+        const run_state = try database.prepare("SELECT state FROM runs WHERE id=?", &.{.{ .text = sent.entity_ids.run.?.value }});
+        defer run_state.deinit();
+        try std.testing.expect(try run_state.step());
+        try std.testing.expectEqualStrings("streaming", try run_state.bytes(0));
+    }
 }
 
 test "session-only open rejection closes starting claim and preserves indexed run diagnostics on reopen" {
