@@ -2089,6 +2089,14 @@ const Conversation = struct {
                 .failure => |value| {
                     if (self.query) |pending| if (pending.ticket.value == value.ticket.value) {
                         self.query = null;
+                        if (pending.kind == .threads or pending.kind == .cards) {
+                            app.view.thread_search_busy = false;
+                            app.view.search_more_available = false;
+                            if (staleThreadPage(pending.kind, pending.search_revision, app.view.thread_search_revision)) {
+                                self.thread_search_started = true;
+                                self.thread_search_active = false;
+                            }
+                        }
                         if (pending.kind == .effects) {
                             self.notice(&app.view, "Provider effect diagnostic is unavailable. Inspect the run before retrying Send.");
                             try self.ask(.approvals, .{ .approvals = .{ .run = .{ .value = self.run.slice() }, .page = page } });
