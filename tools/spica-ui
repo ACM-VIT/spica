@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -102,16 +103,25 @@ def redact(value: Any, key: str = "") -> Any:
 
 
 def run_command(argv: Iterable[os.PathLike[str] | str], *, timeout: float = 30,
-                check: bool = True, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                check: bool = True, env: dict[str, str] | None = None,
+                private: bool = False) -> subprocess.CompletedProcess[str]:
+    command = [str(value) for value in argv]
+    if command and command[0] == "vd":
+        # The installed launcher may be a symlink. Its pointer helper lives
+        # beside the real script; invoking that script preserves resource lookup.
+        installed = shutil.which("vd")
+        if installed:
+            command[0] = str(Path(installed).resolve())
     try:
-        result = subprocess.run([str(value) for value in argv], cwd=ROOT, env=env,
+        result = subprocess.run(command, cwd=ROOT, env=env,
                                 text=True, capture_output=True, timeout=timeout)
     except FileNotFoundError as error:
         raise DriverError(f"required command unavailable: {error.filename}", EX_UNAVAILABLE) from error
     except subprocess.TimeoutExpired as error:
-        raise DriverError(f"command timed out: {shlex.join(map(str, argv))}", EX_TIMEOUT) from error
+        description = "private text delivery" if private else shlex.join(command)
+        raise DriverError(f"command timed out: {description}", EX_TIMEOUT) from error
     if check and result.returncode:
-        detail = result.stderr.strip() or result.stdout.strip()
+        detail = "private text delivery failed; content omitted" if private else (result.stderr.strip() or result.stdout.strip())
         raise DriverError(f"command failed ({result.returncode}): {detail}", EX_PROCESS)
     return result
 
@@ -237,7 +247,7 @@ def wait_snapshot(session: Session, predicate: Any, timeout: float, label: str) 
     raise DriverError(f"timed out waiting for {label}", EX_TIMEOUT)
 
 
-def window_rect(session: Session) -> dict[str, Any]:
+def window_node(session: Session) -> dict[str, Any]:
     socket = session.sway_socket
     if not socket:
         raise DriverError("private desktop has no compositor socket", EX_STALE)
@@ -255,7 +265,11 @@ def window_rect(session: Session) -> dict[str, Any]:
     node = walk(tree)
     if not node or not node.get("rect"):
         raise DriverError("painted window disappeared from compositor tree", EX_STALE)
-    return node["rect"]
+    return node
+
+
+def window_rect(session: Session) -> dict[str, Any]:
+    return window_node(session)["rect"]
 
 
 def focus(session: Session) -> None:
@@ -339,6 +353,9 @@ def launch(args: argparse.Namespace) -> int:
     state.mkdir()
     workspace = output / "workspace"
     workspace.mkdir()
+    # Prevent Git discovery from inheriting the developer checkout surrounding
+    # .artifacts. Even empty-workspace scenarios own a distinct unborn repo.
+    run_command(["git", "-C", workspace, "init", "--quiet"])
     if args.scenario == "workspace-diff":
         prepare_workspace_fixture(workspace)
     private_path = run_command(["vd", "start", "--width", str(args.width), "--height", str(args.height)]).stdout.strip()
@@ -403,6 +420,21 @@ def attach(args: argparse.Namespace) -> int:
     manifest.update({"session_nonce": secrets.token_hex(16), "window": str(args.window),
                      "observations": str(observations), "launch": {"attached": True}, "actions": []})
     session = Session(output, manifest)
+    node = window_node(session)
+    pid = node.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        raise DriverError("private window has no native process identity", EX_STALE)
+    try:
+        binary = Path(f"/proc/{pid}/exe").resolve(strict=True)
+        arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        marker = arguments.index(b"--automation-live")
+        exported = Path(os.fsdecode(arguments[marker + 1])).resolve()
+    except (OSError, ValueError, IndexError) as error:
+        raise DriverError("window process does not expose the requested observation export", EX_STALE) from error
+    if exported != observations:
+        raise DriverError("observation export belongs to a different process", EX_STALE)
+    manifest.update({"launch": {"attached": True, "pid": pid}, "binary": str(binary),
+                     "binary_sha256": sha256(binary), "provider": "attached; not inferred"})
     session.save()
     session.snapshot(args.timeout)
     atomic_json(output / "manifest.json", redact(manifest))
@@ -476,8 +508,16 @@ def perform_input(session: Session, operation: str, identifier: str, timeout: fl
         # previous action left keyboard focus in a menu or the sidebar.
         run_command(["vd", "click", str(session.vd_session), session.window, str(x), str(y)])
         digest = hashlib.sha256(content.encode()).hexdigest()
-        run_command(["vd", "text", str(session.vd_session), session.window, content])
-        detail = {"target": identifier, "input_origin": "ordinary vd text", "source": source,
+        if len(content.encode()) > 512:
+            # vd text intentionally delays between characters and times out on
+            # large drafts. Paste through the private compositor's clipboard.
+            run_command(["vd", "run", str(session.vd_session), "--", "wl-copy", "--", content], private=True)
+            run_command(key_argv(session, "ctrl+v"))
+            origin = "ordinary private clipboard paste"
+        else:
+            run_command(["vd", "text", str(session.vd_session), session.window, content], private=True)
+            origin = "ordinary vd text"
+        detail = {"target": identifier, "input_origin": origin, "source": source,
                   "bytes": len(content.encode()), "sha256": digest}
     else:
         raise DriverError(f"unknown input operation: {operation}", EX_USAGE)
@@ -705,6 +745,15 @@ def assert_oversized_refusal(before: dict[str, Any], current: dict[str, Any], si
         raise DriverError("oversized refusal did not preserve the draft and command/run identity", EX_ASSERTION)
 
 
+def assert_empty_send_disabled(current: dict[str, Any]) -> None:
+    target = next((item for item in target_groups(current) if item.get("id") == "command.send"), None)
+    # send_ready describes Host/selection readiness. Empty drafts disable the
+    # painted target separately and show composer guidance instead of a reason.
+    if (current.get("draft") != "" or not target or target.get("enabled")
+            or current.get("pending_command") or current.get("send_command_id") or current.get("run_id")):
+        raise DriverError("empty composer did not retain disabled Send without command/run admission", EX_ASSERTION)
+
+
 def capability_refusal(session: Session, timeout: float, identifiers: tuple[str, ...]) -> None:
     before = composer_ready(session, timeout)
     for identifier in identifiers:
@@ -753,9 +802,10 @@ def scenario(args: argparse.Namespace) -> int:
     try:
         if args.name == "disabled-send":
             current = composer_ready(session, args.timeout)
-            target = next((item for item in target_groups(current) if item.get("id") == "command.send"), None)
-            if not target or target.get("enabled") or not current.get("send_disabled_reason"):
-                raise DriverError("empty composer did not expose a disabled Send target", EX_ASSERTION)
+            assert_empty_send_disabled(current)
+            perform_input(session, "click", "composer.input", args.timeout)
+            perform_key(session, "Return", args.timeout)
+            assert_empty_send_disabled(session.snapshot(args.timeout))
             session.data["expected_outcome"] = "send_disabled"
         elif args.name in {"rejected-send", "oversized-send"}:
             before = composer_ready(session, args.timeout)

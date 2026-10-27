@@ -47,6 +47,32 @@ class SpicaUiOfflineTests(unittest.TestCase):
         self.assertIn("scenario", result.stdout)
         self.assertIn("ordinary private-desktop", result.stdout)
 
+    def test_vd_symlink_resolves_to_packaged_resource_directory(self):
+        module = load_cli()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "scripts" / "vd.py"
+            script.parent.mkdir()
+            script.touch()
+            launcher = root / "vd"
+            launcher.symlink_to(script)
+            with patch.object(module.shutil, "which", return_value=str(launcher)), \
+                    patch.object(module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+                module.run_command(["vd", "preflight"])
+            self.assertEqual(run.call_args.args[0], [str(script), "preflight"])
+
+    def test_text_delivery_failures_do_not_echo_private_arguments(self):
+        module = load_cli()
+        content = "private fixture prompt"
+        with patch.object(module.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, content, content)):
+            with self.assertRaises(module.DriverError) as failure:
+                module.run_command(["wl-copy", content], private=True)
+            self.assertNotIn(content, str(failure.exception))
+        with patch.object(module.subprocess, "run", side_effect=subprocess.TimeoutExpired(["wl-copy", content], 1)):
+            with self.assertRaises(module.DriverError) as failure:
+                module.run_command(["wl-copy", content], private=True)
+            self.assertNotIn(content, str(failure.exception))
+
     def test_launch_dry_run_does_not_require_binary_or_vd(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self.run_cli("launch", "--private", "--provider", "fake",
@@ -129,6 +155,17 @@ class SpicaUiOfflineTests(unittest.TestCase):
                         {"send_frame_bytes": 4000}, {"pending_command": True}):
             with self.assertRaises(module.DriverError):
                 module.assert_oversized_refusal(before, {**current, **changed}, 6000)
+
+    def test_empty_send_is_disabled_without_creating_command_or_run(self):
+        module = load_cli()
+        current = {"draft": "", "send_ready": True, "send_disabled_reason": None,
+                   "targets": [{"id": "command.send", "enabled": False}]}
+        module.assert_empty_send_disabled(current)
+        for changed in ({"draft": "unexpected"}, {"pending_command": True},
+                        {"send_command_id": "unexpected"}, {"run_id": "unexpected"},
+                        {"targets": [{"id": "command.send", "enabled": True}]}):
+            with self.assertRaises(module.DriverError):
+                module.assert_empty_send_disabled({**current, **changed})
 
     def test_capability_refusal_delivers_no_input_or_host_command(self):
         module = load_cli()

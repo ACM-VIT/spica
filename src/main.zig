@@ -21,14 +21,16 @@ const NativeProvider = struct {
     codex_environment: []const [:0]const u8 = &.{},
 
     fn init(self: *NativeProvider, a: std.mem.Allocator, io: std.Io, options: options_module.Options) !void {
+        if (options.workspace) |path| {
+            const directory = try std.Io.Dir.cwd().openDir(io, path, .{});
+            defer directory.close(io);
+            self.workspace_root = try directory.realPathFileAlloc(io, ".", a);
+        }
         if (options.provider == .fake) {
             self.factory = .{ .configs = &.{}, .codex_environment = self.codex_environment };
             return;
         }
-        const workspace_dir = try std.Io.Dir.cwd().openDir(io, options.workspace.?, .{});
-        defer workspace_dir.close(io);
-        const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, options.workspace.?, a);
-        self.workspace_root = workspace;
+        const workspace = self.workspace_root.?;
         self.configs[0] = try accountConfig(a, io, self.codex_environment, .{ .runtime_kind = @tagName(options.provider), .required_runtime_version = if (options.provider == .codex) "0.163.0" else "2.1.4", .model_provider = options.model_provider.?, .model_id = options.model orelse "", .effort = options.effort orelse "", .account_ref = options.runtime_account_directory.?, .workspace = .{ .value = workspace } }, options.runtime_executable);
         self.selection = self.configs[0].selection;
         var count: usize = 1;
@@ -164,7 +166,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         errdefer spool.close(threaded.io());
         // Derived content is descriptor-owned and disappears even after a crash.
         try dir.deleteFile(threaded.io(), ".ui-projection");
-        try app.connect(threaded.io(), host.?, spool, &wake, if (provider.selection) |selection| selection.workspace.value else workspace_buffer[0..workspace_length]);
+        try app.connect(threaded.io(), host.?, spool, &wake, provider.workspace_root orelse workspace_buffer[0..workspace_length]);
         if (!options.provider_explicit) {
             const setup_defaults = try @import("startup.zig").defaults(arena.allocator(), threaded.io(), workspace_buffer[0..workspace_length], init.environ.getPosix("PATH"), init.environ.getPosix("HOME"), init.environ.getPosix("CODEX_HOME"));
             try app.configureStartup(setup_defaults);
