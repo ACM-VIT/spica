@@ -30,6 +30,72 @@ const Fixture = struct {
 
 const white = c.SDL_Color{ .r = 255, .g = 255, .b = 255, .a = 255 };
 
+test "visible controls render without changing original UTF8 byte positions" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    // NUL remains outside the native text contract; layout controls stay tabs
+    // or hard breaks. Every other C0/C1 scalar must have a visible, selectable
+    // cell even when the font has no glyph for the original scalar.
+    for (1..0xa0) |scalar| {
+        if ((scalar >= 0x20 and scalar < 0x7f) or scalar == '\t' or scalar == '\n' or scalar == '\r') continue;
+        var source: [4]u8 = @splat(0);
+        const length = try std.unicode.utf8Encode(@intCast(scalar), &source);
+        const original = source;
+        const layout = c.spica_text_layout_create(f.engine, &source, length, 200, 16, false) orelse return error.Layout;
+        defer c.spica_text_layout_release(layout);
+        try std.testing.expectEqualSlices(u8, &original, &source);
+        var start: c.SDL_FRect = undefined;
+        var end: c.SDL_FRect = undefined;
+        try std.testing.expect(c.spica_text_layout_caret(layout, 0, &start));
+        try std.testing.expect(c.spica_text_layout_caret(layout, length, &end));
+        try std.testing.expect(end.x > start.x + 1);
+        try std.testing.expectEqual(@as(usize, 0), c.spica_text_layout_hit_test(layout, start.x, start.y + 1));
+        try std.testing.expectEqual(@as(usize, length), c.spica_text_layout_hit_test(layout, end.x, end.y + 1));
+        var selection: c.SDL_FRect = undefined;
+        try std.testing.expectEqual(@as(usize, 1), c.spica_text_layout_selection_rects(layout, 0, length, &selection, 1));
+        try std.testing.expectApproxEqAbs(end.x - start.x, selection.w, 1.0 / 64.0);
+        if (length == 2) {
+            var inside: c.SDL_FRect = undefined;
+            try std.testing.expect(c.spica_text_layout_caret(layout, 1, &inside));
+            try std.testing.expectEqual(start.x, inside.x);
+            try std.testing.expectEqual(@as(usize, 1), c.spica_text_layout_selection_rects(layout, 1, 2, &selection, 1));
+            try std.testing.expectApproxEqAbs(end.x - start.x, selection.w, 1.0 / 64.0);
+        }
+        try f.clear();
+        try std.testing.expect(c.spica_text_layout_draw(f.engine, layout, 5, 4, white));
+    }
+}
+
+test "visible controls retain adjacent graphemes tabs and CRLF geometry" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const source = "a\u{301}\u{80}\u{301}€\tq\r\n";
+    // A control has grapheme boundaries on both sides, including before a
+    // combining mark. Display substitution must not attach that mark to it.
+    const control = c.SpicaTextSpan{ .byte_start = 3, .byte_end = 5, .style = 0 };
+    const layout = c.spica_text_layout_create_spans(f.engine, source, source.len, 200, 16, false, &control, 1) orelse return error.Layout;
+    defer c.spica_text_layout_release(layout);
+    try std.testing.expectEqual(@as(usize, 2), c.spica_text_layout_line_count(layout));
+    var start: c.SDL_FRect = undefined;
+    var end: c.SDL_FRect = undefined;
+    try std.testing.expect(c.spica_text_layout_caret(layout, 3, &start));
+    try std.testing.expect(c.spica_text_layout_caret(layout, 5, &end));
+    try std.testing.expect(end.x > start.x + 1);
+    try std.testing.expectEqual(@as(usize, 5), c.spica_text_layout_hit_test(layout, end.x, end.y + 1));
+    var selection: c.SDL_FRect = undefined;
+    try std.testing.expectEqual(@as(usize, 1), c.spica_text_layout_selection_rects(layout, 3, 5, &selection, 1));
+    try std.testing.expectApproxEqAbs(end.x - start.x, selection.w, 1.0 / 64.0);
+    try std.testing.expect(c.spica_text_layout_caret(layout, 10, &start));
+    try std.testing.expect(c.spica_text_layout_caret(layout, 11, &end));
+    try std.testing.expect(end.x > start.x);
+    var last: c.SpicaTextLine = undefined;
+    try std.testing.expect(c.spica_text_layout_line(layout, 1, &last));
+    try std.testing.expectEqual(source.len, last.byte_start);
+    try std.testing.expectEqual(source.len, last.byte_end);
+    try f.clear();
+    try std.testing.expect(c.spica_text_layout_draw(f.engine, layout, 5, 4, white));
+}
+
 test "wrapped composer carets stay at grapheme boundaries and retain trailing blank line" {
     const f = try Fixture.init();
     defer f.deinit();

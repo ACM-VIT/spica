@@ -128,6 +128,7 @@ struct SpicaText {
     unsigned visual_rank[CHAR_LIMIT];
     hb_script_t scripts[CHAR_LIMIT];
     uint16_t char_faces[CHAR_LIMIT], styles[CHAR_LIMIT];
+    bool controls[CHAR_LIMIT];
     char breaks[CHAR_LIMIT], graphemes[CHAR_LIMIT];
     float advances[CHAR_LIMIT];
     Run runs[CHAR_LIMIT];
@@ -480,6 +481,9 @@ static bool ignorable(uint32_t c) {
            (c >= 0xfe00 && c <= 0xfe0f) || (c >= 0xe0100 && c <= 0xe01ef) ||
            (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069) || c == 0x061c ||
            c == 0x200e || c == 0x200f || c == 0xad;
+}
+static bool visible_control(uint32_t c) {
+    return (c < 0x20 && c != '\t' && c != '\n' && c != '\r') || (c >= 0x7f && c <= 0x9f);
 }
 static bool covers(Face *f, const FriBidiChar *chars, unsigned count, unsigned style) {
     if (!face_style(f, available_style(f, style)))
@@ -875,7 +879,7 @@ static unsigned make_runs(SpicaText *t, unsigned start, unsigned end) {
         unsigned j = i + 1;
         while (j < end && t->char_faces[j] == t->char_faces[i] && t->styles[j] == t->styles[i] &&
                t->scripts[j] == t->scripts[i] && t->levels[j] == t->levels[i] &&
-               t->chars[j] != '\t' && t->chars[i] != '\t')
+               t->controls[j] == t->controls[i] && t->chars[j] != '\t' && t->chars[i] != '\t')
             ++j;
         t->runs[count++] = (Run){.start = i,
                                  .end = j,
@@ -1072,6 +1076,16 @@ SpicaTextLayout *spica_text_layout_create_spans(SpicaText *t, const char *utf8, 
     if (!decode(t, utf8, length, &n))
         return NULL;
     set_graphemebreaks_utf32(t->chars, n, NULL, t->graphemes);
+    /* Controls have no font glyph. Substitute only in reusable display scratch;
+     * offsets and grapheme boundaries still describe the original UTF-8.
+     * Isolate these runs so a following combining mark cannot absorb a control
+     * into its replacement glyph's HarfBuzz cluster. Tabs and line separators,
+     * bidi formatting and joiners retain their existing layout semantics. */
+    for (unsigned i = 0; i < n; ++i) {
+        t->controls[i] = visible_control(t->chars[i]);
+        if (t->controls[i])
+            t->chars[i] = 0xfffd;
+    }
     set_linebreaks_utf32(t->chars, n, NULL, t->breaks);
     size_t previous = 0;
     for (size_t s = 0; s < span_count; ++s) {
