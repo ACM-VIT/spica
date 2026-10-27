@@ -25,6 +25,22 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// Infer the small provider intersection supported by the native attachment
+/// contract.  Unknown extensions are refused instead of being labelled as a
+/// generic binary blob that both providers reject later.
+pub fn mediaTypeForPath(path: []const u8) ?struct { media_type: []const u8, kind: contract.AttachmentKind } {
+    const extension = std.fs.path.extension(path);
+    if (extension.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(extension, ".png")) return .{ .media_type = "image/png", .kind = .image };
+    if (std.ascii.eqlIgnoreCase(extension, ".jpg") or std.ascii.eqlIgnoreCase(extension, ".jpeg")) return .{ .media_type = "image/jpeg", .kind = .image };
+    if (std.ascii.eqlIgnoreCase(extension, ".gif")) return .{ .media_type = "image/gif", .kind = .image };
+    if (std.ascii.eqlIgnoreCase(extension, ".webp")) return .{ .media_type = "image/webp", .kind = .image };
+    if (std.ascii.eqlIgnoreCase(extension, ".pdf")) return .{ .media_type = "application/pdf", .kind = .file };
+    const text_extensions = [_][]const u8{ ".txt", ".md", ".markdown", ".json", ".jsonl", ".xml", ".html", ".css", ".csv", ".yaml", ".yml", ".toml", ".zig", ".c", ".h", ".cpp", ".hpp", ".py", ".js", ".ts", ".tsx", ".rs", ".go", ".java", ".sh" };
+    for (text_extensions) |text_extension| if (std.ascii.eqlIgnoreCase(extension, text_extension)) return .{ .media_type = "text/plain", .kind = .file };
+    return null;
+}
+
 const Slot = struct {
     used: bool = false,
     id: [max_id_bytes]u8 = undefined,
@@ -205,6 +221,15 @@ test "attachment store owns bounded content and reuses removed slots" {
     try std.testing.expectEqual(@as(usize, 0), store.content_bytes);
     const second = try store.add(attachment);
     try std.testing.expectEqual(first, second);
+}
+
+test "attachment media type inference stays within provider intersection" {
+    try std.testing.expectEqualStrings("image/png", mediaTypeForPath("/tmp/diagram.PNG").?.media_type);
+    try std.testing.expectEqual(contract.AttachmentKind.image, mediaTypeForPath("/tmp/diagram.PNG").?.kind);
+    try std.testing.expectEqualStrings("application/pdf", mediaTypeForPath("/tmp/report.pdf").?.media_type);
+    try std.testing.expectEqualStrings("text/plain", mediaTypeForPath("/tmp/source.zig").?.media_type);
+    try std.testing.expect(mediaTypeForPath("/tmp/archive.zip") == null);
+    try std.testing.expect(mediaTypeForPath("/tmp/no-extension") == null);
 }
 
 test "attachment store refuses invalid, duplicate, metadata and aggregate limits" {

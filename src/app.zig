@@ -1891,9 +1891,11 @@ const Conversation = struct {
             self.notice(&app.view, if (self.attachment_loading) "A file is still being read. Wait for attachment admission before sending." else "This draft edits a follow-up. Save it or stop editing in More (F10).");
             return;
         }
-        if (app.view.attachments.count != 0) {
+        if (app.view.attachments.count != 0 and
+            (!std.mem.eql(u8, selection.runtime_kind, "codex") and !std.mem.eql(u8, selection.runtime_kind, "opencode")))
+        {
             app.view.send_diagnostic.stage = .disabled;
-            self.notice(&app.view, "Attachments are local only. Remove them in More (F10) before sending; this Host cannot deliver them.");
+            self.notice(&app.view, "The selected provider cannot receive attachments. Choose Codex or OpenCode, or remove the files.");
             return;
         }
         if (self.promptDisabledReason(prompt.len)) |reason| {
@@ -1907,7 +1909,13 @@ const Conversation = struct {
             return;
         }
         app.view.send_diagnostic.begin(&id, prompt.len, preflight.frame_bytes);
-        self.submitIdentified(.send, target, revision, .{ .thread_send = .{ .text = prompt, .selection = selection } }, draft_revision, id) catch |err| {
+        var attachment_ids: [attachment_text.max_count]contract.AttachmentId = undefined;
+        var attachment_count: usize = 0;
+        for (0..attachment_text.max_count) |index| if (app.view.attachments.get(index)) |attachment| {
+            attachment_ids[attachment_count] = attachment.metadata.id;
+            attachment_count += 1;
+        };
+        self.submitIdentified(.send, target, revision, .{ .thread_send = .{ .text = prompt, .selection = selection, .attachments = attachment_ids[0..attachment_count] } }, draft_revision, id) catch |err| {
             app.view.send_diagnostic.stage = .admission_failed;
             @import("ui/coding.zig").SendDiagnostic.bounded(&app.view.send_diagnostic.rejection, &app.view.send_diagnostic.rejection_len, @errorName(err));
             app.view.notice = std.fmt.bufPrint(&self.notice_storage, "Send was not queued: {s}. Draft retained; retry after the current action finishes.", .{@errorName(err)}) catch @errorName(err);
@@ -1951,9 +1959,10 @@ const Conversation = struct {
         const index = try view.attachments.add(.{ .metadata = .{
             .id = .{ .value = &id },
             .name = std.fs.path.basename(loader.path[0..loader.path_len]),
-            .media_type = "application/octet-stream",
+            .media_type = (attachment_text.mediaTypeForPath(loader.path[0..loader.path_len]) orelse return error.InvalidAttachment).media_type,
             .byte_length = bytes.len,
             .digest = &hex,
+            .kind = (attachment_text.mediaTypeForPath(loader.path[0..loader.path_len]) orelse return error.InvalidAttachment).kind,
         }, .content = bytes });
         self.workflow_pending = .{ .thread = self.thread, .run = self.run, .attachment_index = index };
         view.workflowNotice("File copied locally; checking Host attachment admission…");
@@ -2335,7 +2344,7 @@ const Conversation = struct {
         }
         const selection_reason = self.selectionDisabledReason(&app.view);
         const preflight_reason = self.sendPreflight(&app.view);
-        app.view.send_disabled_reason = if (self.attachment_loading) "Reading attachment… Wait for admission before sending." else if (app.view.attachments.count != 0) "Attachments are local only. Remove them in More (F10) before sending." else if (app.view.followup_editing != null) "Editing a follow-up. Use More (F10) to save it to the current run." else if (preflight_reason) |reason| reason else if (selection_reason) |reason| reason else if (self.thread.len == 0)
+        app.view.send_disabled_reason = if (self.attachment_loading) "Reading attachment… Wait for admission before sending." else if (app.view.followup_editing != null) "Editing a follow-up. Use More (F10) to save it to the current run." else if (preflight_reason) |reason| reason else if (selection_reason) |reason| reason else if (self.thread.len == 0)
             "Opening conversation…"
         else if (!terminal)
             "Wait for this run to finish, or cancel it."
@@ -3816,7 +3825,7 @@ test "workflow receipts preserve newer draft and rejected attachment ownership" 
     try conversation.receipt(&app, .{ .value = 2 }, .{ .command_id = .{ .value = &id }, .outcome = .rejected, .reason = .capability_unavailable, .commit_sequence = 2 });
     try std.testing.expectEqual(@as(usize, 1), app.view.attachments.count);
     try std.testing.expectEqualStrings("capability_unavailable", app.view.workflow_error);
-    try conversation.sendIdentified(&app, .absent, .absent, app.view.editor.textBytes(), usability_selection, app.view.revision, id);
+    try conversation.sendIdentified(&app, .absent, .absent, app.view.editor.textBytes(), contract.fakeSelection(.{ .value = "workspace" }), app.view.revision, id);
     try std.testing.expect(conversation.command == null);
     try std.testing.expectEqualStrings("queued newer", app.view.editor.textBytes());
 }
