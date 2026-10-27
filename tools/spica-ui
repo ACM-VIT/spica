@@ -347,7 +347,8 @@ def key_argv(session: Session, value: str) -> list[str]:
 
 
 def record_manifest(output: Path, *, scenario: str, binary: Path | None,
-                    build_command: list[str] | None, private: dict[str, Any] | None = None) -> dict[str, Any]:
+                    build_command: list[str] | None, private: dict[str, Any] | None = None,
+                    provider: str = "unknown") -> dict[str, Any]:
     revision = run_command(["git", "rev-parse", "HEAD"]).stdout.strip()
     status = run_command(["git", "status", "--porcelain"], check=True).stdout
     result: dict[str, Any] = {
@@ -356,7 +357,7 @@ def record_manifest(output: Path, *, scenario: str, binary: Path | None,
         "binary_sha256": sha256(binary) if binary and binary.is_file() else None,
         "build_mode": "explicit build" if build_command else "prebuilt; no build requested",
         "build_command": build_command, "input_method": "ordinary vd compositor input",
-        "provider": "fake", "private_desktop": private, "passed": False,
+        "provider": provider, "private_desktop": private, "passed": False,
         "limitations": ["No physical input-to-photon or provider-inference claim.",
                         "Snapshots are bounded read-only observations; content is not copied into routine receipts.",
                         "Process-tree memory/performance are outside this workflow driver."],
@@ -364,16 +365,25 @@ def record_manifest(output: Path, *, scenario: str, binary: Path | None,
     return result
 
 
+def offline_provider_argv(provider: str, output: Path) -> list[str]:
+    if provider == "fake":
+        return ["--provider", "fake"]
+    if provider == "codex-fixture":
+        return ["--provider", "codex", "--runtime-executable", str(ROOT / "build/codex_workflow_fixture.py"),
+                "--runtime-account-directory", str(output / "codex-fixture-account"),
+                "--model-provider", "openai", "--model", "offline-workflow", "--effort", "low"]
+    raise DriverError("only offline fake and codex-fixture providers are allowed", EX_PROVIDER)
+
+
 def launch(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
-    if args.provider != "fake":
-        raise DriverError("only the explicit offline fake provider is allowed", EX_PROVIDER)
+    provider_argv = offline_provider_argv(args.provider, output)
     if args.dry_run:
         binary = Path(args.binary).resolve() if args.binary else ROOT / "zig-out/bin/spica"
         plan = {"command": "launch", "private": args.private, "provider": args.provider,
                 "output": str(output), "binary": str(binary), "build": bool(args.build),
                 "state_directory": str(output / "state"), "workspace": str(output / "workspace"),
-                "argv": [str(binary), "--provider", "fake", "--state-directory", str(output / "state"), "--workspace", str(output / "workspace"),
+                "argv": [str(binary), *provider_argv, "--state-directory", str(output / "state"), "--workspace", str(output / "workspace"),
                          "--automation-live", str(output / "live.json"), "--automation-output", str(output / "final.json"),
                          "--automation-session", "<fresh 32-digit process nonce>"]}
         print(json.dumps(plan, indent=2))
@@ -403,12 +413,17 @@ def launch(args: argparse.Namespace) -> int:
     run_command(["git", "-C", workspace, "init", "--quiet"])
     if args.scenario == "workspace-diff":
         prepare_workspace_fixture(workspace)
+    if args.provider == "codex-fixture":
+        account = output / "codex-fixture-account"
+        account.mkdir()
+        atomic_json(account / "workflow-profile.json", {"format": "spica-offline-codex-workflow-v1",
+                    "workspace": str(workspace), "mode": "fail" if args.scenario == "codex-error" else "complete"})
     private_path = run_command(["vd", "start", "--width", str(args.width), "--height", str(args.height)]).stdout.strip()
     private_dir = Path(private_path)
     try:
         process_nonce = secrets.token_hex(16)
         private_record = json.loads((private_dir / "session.json").read_text(encoding="utf-8"))
-        argv = [str(binary), "--provider", "fake", "--state-directory", str(state), "--workspace", str(workspace),
+        argv = [str(binary), *provider_argv, "--state-directory", str(state), "--workspace", str(workspace),
                 "--automation-live", str(output / "live.json"), "--automation-output", str(output / "final.json"),
                 "--automation-session", process_nonce,
                 "--quit-after-ms", str(args.quit_after_ms)]
@@ -425,7 +440,11 @@ def launch(args: argparse.Namespace) -> int:
         if window is None:
             raise DriverError("native window did not appear", EX_PROCESS)
         manifest = record_manifest(output, scenario=args.scenario, binary=binary,
-                                   build_command=build_command, private={"session": private_path, **private_record})
+                                   build_command=build_command, private={"session": private_path, **private_record},
+                                   provider=args.provider)
+        if args.provider == "codex-fixture":
+            manifest["fixture_sha256"] = sha256(ROOT / "build/codex_workflow_fixture.py")
+            manifest["limitations"].append("Production Codex adapter with an offline app-server fixture; no installed Codex compatibility or live context acceptance claim.")
         manifest.update({"session_nonce": secrets.token_hex(16), "window": window,
                          "observations": str(output / "live.json"), "launch": launch_info, "workspace": str(workspace),
                          "actions": []})
@@ -699,10 +718,10 @@ def prepare_workspace_fixture(workspace: Path) -> None:
 def composer_ready(session: Session, timeout: float) -> dict[str, Any]:
     return wait_snapshot(session, lambda value: value.get("connected") and value.get("thread_id")
                          and any(item.get("id") == "composer.input" and item.get("enabled")
-                                 for item in target_groups(value)), timeout, "fake composer input")
+                                 for item in target_groups(value)), timeout, "composer input")
 
 
-def send_turn(session: Session, prompt: str, timeout: float) -> dict[str, Any]:
+def send_turn(session: Session, prompt: str, timeout: float, *, terminal: str = "completed") -> dict[str, Any]:
     before = composer_ready(session, timeout)
     old_command, old_run = before.get("send_command_id"), before.get("run_id")
     perform_input(session, "text", "composer.input", timeout, prompt)
@@ -726,14 +745,14 @@ def send_turn(session: Session, prompt: str, timeout: float) -> dict[str, Any]:
         nonlocal approval_sent
         if value.get("thread_id") != thread or value.get("run_id") != run:
             raise DriverError("Send changed the captured thread/run", EX_STALE)
-        if value.get("run_status") in {"failed", "unknown", "interrupted", "cancelled"}:
-            raise DriverError("correlated fake run failed: " + value["run_status"], EX_PROVIDER)
+        if value.get("run_status") in {"failed", "unknown", "interrupted", "cancelled"} and value.get("run_status") != terminal:
+            raise DriverError("correlated run failed: " + value["run_status"], EX_PROVIDER)
         if value.get("run_status") == "awaiting_approval" and not approval_sent:
             perform_input(session, "click", "approval.allow", timeout)
             approval_sent = True
-        return value.get("run_status") == "completed"
+        return value.get("run_status") == terminal
 
-    current = wait_snapshot(session, completed, timeout, "correlated completed fake run")
+    current = wait_snapshot(session, completed, timeout, "correlated " + terminal + " run")
     turn = {key: current.get(key) for key in ("thread_id", "run_id", "send_command_id",
             "send_run_id", "send_session_id", "send_receipt", "selected_runtime", "selected_model", "selected_effort")}
     session.data.setdefault("turns", []).append(turn)
@@ -851,7 +870,8 @@ def restart_app(session: Session, args: argparse.Namespace) -> dict[str, Any]:
     restarted_output.mkdir(exist_ok=False)
     live = restarted_output / "live.json"
     process_nonce = secrets.token_hex(16)
-    argv = [session.data["binary"], "--provider", "fake", "--workspace", session.data["workspace"],
+    argv = [session.data["binary"], *offline_provider_argv(session.data.get("provider", "fake"), session.output),
+            "--workspace", session.data["workspace"],
             "--state-directory", str(session.output / "state"), "--automation-live", str(live),
             "--automation-output", str(restarted_output / "final.json"),
             "--automation-session", process_nonce,
@@ -1103,22 +1123,116 @@ def scenario_attachment_refusal(session: Session, args: argparse.Namespace) -> N
     session.data["expected_outcome"] = "attachment_refusal_retained_utf8_local_state_blocked_send_switch_remove_oversized_refused"
 
 
+def fixture_events(session: Session) -> list[dict[str, Any]]:
+    path = session.output / "codex-fixture-account/workflow-events.jsonl"
+    with path.open("rb") as source:
+        data = source.read(128 * 1024 + 1)
+    if len(data) > 128 * 1024:
+        raise DriverError("offline protocol event log exceeded its bound", EX_ASSERTION)
+    return [json.loads(line) for line in data.splitlines()]
+
+
+def assert_codex_fixture_trace(events: list[dict[str, Any]], prompts: list[str]) -> None:
+    starts = [event for event in events if event.get("method") == "thread/start"]
+    turns = [event for event in events if event.get("method") == "turn/start"]
+    if not prompts or len(starts) != 1 or not starts[0].get("thread_id") or len(turns) != len(prompts):
+        raise DriverError("Codex fixture created a fresh session or missed/duplicated a turn", EX_ASSERTION)
+    for index, (turn, prompt) in enumerate(zip(turns, prompts)):
+        data = prompt.encode("utf-8")
+        if (not turn.get("turn_id") or turn.get("thread_id") != starts[0].get("thread_id") or turn.get("prior_turns") != index
+                or turn.get("prompt_bytes") != len(data)
+                or turn.get("prompt_sha256") != hashlib.sha256(data).hexdigest()):
+            raise DriverError("Codex upstream session context or exact prompt bytes changed", EX_ASSERTION)
+    if len({turn.get("turn_id") for turn in turns}) != len(turns):
+        raise DriverError("Codex fixture reused an upstream turn identity", EX_ASSERTION)
+
+
+def scenario_codex_session(session: Session, args: argparse.Namespace) -> None:
+    prompts = ["first offline Codex turn café 世界", "second offline Codex turn with retained context",
+               "third offline Codex turn after restart"]
+    turns = [send_turn(session, prompt, args.timeout) for prompt in prompts[:2]]
+    capture(session, "codex-second-turn.png")
+    before_restart = len(fixture_events(session))
+    restart_app(session, args)
+    turns.append(send_turn(session, prompts[2], args.timeout))
+    events = fixture_events(session)
+    assert_codex_fixture_trace(events, prompts)
+    if (not any(event.get("method") == "thread/resume" for event in events[before_restart:])
+            or not turns[0].get("send_session_id")
+            or len({turn.get("send_session_id") for turn in turns}) != 1
+            or len({turn.get("run_id") for turn in turns}) != 3
+            or len({turn.get("send_command_id") for turn in turns}) != 3
+            or len({turn.get("thread_id") for turn in turns}) != 1
+            or not any("prior turns 2" in value for value in turns[-1].get("transcript", []))):
+        raise DriverError("GUI and offline Codex session/restart evidence do not agree", EX_ASSERTION)
+    session.journal("scenario.codex-session", turns[0], turns[-1], input_origin="ordinary GUI Send before and after restart",
+                    outcome="same_upstream_session_three_distinct_turns_exact_prompt_digests",
+                    upstream_turns=[event for event in events if event.get("method") == "turn/start"])
+    session.data["expected_outcome"] = "codex_adapter_three_turns_same_session_reopened_with_upstream_context"
+
+
+def scenario_codex_error(session: Session, args: argparse.Namespace) -> None:
+    failed = send_turn(session, "offline synthetic provider error", args.timeout, terminal="failed")
+    current = wait_snapshot(session, lambda value: value.get("run_id") == failed.get("run_id")
+                            and value.get("send_stage") == "provider_failed"
+                            and "Offline Codex fixture quota exhausted (synthetic)." in value.get("send_provider_diagnostic", ""),
+                            args.timeout, "accepted Send with retained specific provider failure")
+    if current.get("send_receipt") != "accepted" or current.get("draft"):
+        raise DriverError("provider failure was confused with local admission refusal", EX_ASSERTION)
+    assert_codex_fixture_trace(fixture_events(session), ["offline synthetic provider error"])
+    capture(session, "codex-failure-banner.png")
+    perform_key(session, "ctrl+shift+c", args.timeout)
+    copied = read_private_clipboard(session)
+    report = json.loads(copied)
+    if (report.get("run_id") != current.get("run_id") or report.get("command_id") != current.get("send_command_id")
+            or report.get("receipt") != "accepted" or report.get("run_state") != "failed"
+            or "Offline Codex fixture quota exhausted (synthetic)." not in report.get("provider_diagnostic", "")
+            or "offline synthetic provider error" in copied):
+        raise DriverError("copied provider diagnostic lost correlation or included the prompt", EX_ASSERTION)
+    atomic_json(session.output / "provider-diagnostic.json", report)
+    session.journal("scenario.codex-error", failed, current, input_origin="ordinary GUI Send to offline Codex fixture",
+                    receipt_outcome="accepted", run_state="failed", outcome="specific_synthetic_provider_error_preserved_and_copyable")
+    session.data["limitations"].append("Screenshot review found the failure banner renders clipped serialized JSON; readable native failure text remains an open UI fix.")
+    session.data["expected_outcome"] = "codex_send_accepted_specific_provider_failure_retained_and_copyable"
+
+
+def read_private_clipboard(session: Session) -> str:
+    # vd run returns process metadata on stdout; the command's stdout goes to
+    # its explicitly selected log. Never interpret that launch receipt as data.
+    path = session.output / "provider-diagnostic-clipboard.json"
+    if path.exists():
+        raise DriverError("clipboard capture already exists", EX_STALE)
+    run_command(["vd", "run", str(session.vd_session), "--log", str(path), "--", "wl-paste", "--no-newline"], private=True)
+    with path.open("rb") as source:
+        data = source.read(16 * 1024 + 1)
+    if len(data) > 16 * 1024:
+        raise DriverError("copied Send diagnostic exceeds the capture bound", EX_ASSERTION)
+    return data.decode("utf-8")
+
+
 def scenario(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
-    if args.provider != "fake":
-        raise DriverError("scenarios only support the explicit offline fake provider", EX_PROVIDER)
+    expected_provider = "codex-fixture" if args.name in {"codex-session", "codex-error"} else "fake"
+    args.provider = args.provider or expected_provider
+    if args.provider != expected_provider:
+        raise DriverError(f"{args.name} requires the offline {expected_provider} provider", EX_PROVIDER)
     if args.name in {"rejected-send", "oversized-send"} and not 4097 <= args.rejected_bytes <= 64 * 1024:
         raise DriverError("--rejected-bytes must be between 4097 and 65536", EX_USAGE)
     if args.dry_run:
-        print(json.dumps({"command": "scenario", "scenario": args.name, "provider": "fake",
-                          "output": str(output), "steps": scenario_steps(args.name)}, indent=2))
+        print(json.dumps({"command": "scenario", "scenario": args.name,
+                          "output": str(output), "steps": scenario_steps(args.name),
+                          "provider": args.provider}, indent=2))
         return 0
     launch_args = argparse.Namespace(**vars(args))
     launch_args.scenario, launch_args.private = args.name, True
     launch(launch_args)
     session = Session.load(output)
     try:
-        if args.name == "disabled-send":
+        if args.name == "codex-session":
+            scenario_codex_session(session, args)
+        elif args.name == "codex-error":
+            scenario_codex_error(session, args)
+        elif args.name == "disabled-send":
             current = composer_ready(session, args.timeout)
             assert_empty_send_disabled(current)
             perform_input(session, "click", "composer.input", args.timeout)
@@ -1192,7 +1306,9 @@ def scenario(args: argparse.Namespace) -> int:
 
 
 def scenario_steps(name: str) -> list[str]:
-    return {"disabled-send": ["launch fake", "snapshot empty composer", "assert command.send disabled"],
+    return {"codex-session": ["launch production Codex adapter with isolated offline app-server fixture", "Send two turns", "restart native app on same private desktop", "Send third turn", "assert one upstream session, distinct commands/runs/turns, exact UTF-8 prompt digests and resumed prior context"],
+            "codex-error": ["launch production Codex adapter with isolated failing offline fixture", "Send a prompt", "assert accepted command then failed run with retained specific synthetic provider diagnostic", "copy diagnostic with Ctrl+Shift+C and verify correlation without prompt content", "capture failure banner for visual review"],
+            "disabled-send": ["launch fake", "snapshot empty composer", "assert command.send disabled"],
             "rejected-send": ["launch fake", "type oversized prompt through vd", "assert disabled Send and retained draft", "press Return", "assert no command or run"],
             "oversized-send": ["launch fake", "type oversized prompt through vd", "assert disabled Send and retained draft", "press Return", "assert no command or run"],
             "send-restart": ["launch fake", "type prompt and Send", "correlate command and new run", "allow fake approval", "close app while retaining private desktop", "relaunch and assert same completed thread/run"],
@@ -1214,12 +1330,14 @@ def receipt(args: argparse.Namespace, session: Session | None = None) -> int:
         session = get_session(args)
     manifest = redact(session.data)
     receipt_data = {"version": 1, "status": "passed" if manifest.get("passed") else "incomplete",
+                    "provider": manifest.get("provider"), "fixture_sha256": manifest.get("fixture_sha256"),
                     "scenario": manifest.get("scenario"), "revision": manifest.get("revision"),
                     "source_sha256": manifest.get("source_sha256"), "binary_sha256": manifest.get("binary_sha256"),
                     "input_method": manifest.get("input_method"), "expected_outcome": manifest.get("expected_outcome"),
                     "actions": len(manifest.get("actions", [])),
                     "evidence": {"manifest": str(session.output / "session.json"),
                                  "actions": str(session.output / "actions.json"),
+                                 "offline_protocol_events": str(session.output / "codex-fixture-account/workflow-events.jsonl") if manifest.get("provider") == "codex-fixture" else None,
                                  "screenshots": [str(path) for path in session.output.glob("*.png")]},
                     "limitations": manifest.get("limitations", [])}
     atomic_json(session.output / "receipt.json", receipt_data)
@@ -1241,9 +1359,9 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--dry-run", action="store_true", help="print the bounded plan without desktop/build/input")
     commands = root.add_subparsers(dest="command", required=True)
 
-    item = commands.add_parser("launch", help="launch an explicit fake provider on a private desktop")
+    item = commands.add_parser("launch", help="launch an offline provider on a private desktop")
     item.add_argument("--private", action="store_true", help="required acknowledgement of private vd desktop")
-    item.add_argument("--provider", choices=("fake",), default="fake")
+    item.add_argument("--provider", choices=("fake", "codex-fixture"), default="fake")
     item.add_argument("--binary", type=Path)
     item.add_argument("--build", action="store_true", help="explicitly build before launch")
     item.add_argument("--optimize", choices=("Debug", "ReleaseSafe"), default="ReleaseSafe")
@@ -1298,10 +1416,11 @@ def parser() -> argparse.ArgumentParser:
     item = commands.add_parser("stop", help="close the app through ordinary Ctrl+Q and clean its vd session")
     add_common(item)
 
-    item = commands.add_parser("scenario", help="run a bounded offline fake GUI scenario")
+    item = commands.add_parser("scenario", help="run a bounded offline GUI scenario")
     item.add_argument("name", choices=("send-restart", "disabled-send", "rejected-send", "oversized-send", "second-turn",
-                                             "workspace-diff", "capability-refusal", "followup-refusal", "question-refusal", "attachment-refusal"))
-    item.add_argument("--provider", choices=("fake",), default="fake")
+                                             "workspace-diff", "capability-refusal", "followup-refusal", "question-refusal", "attachment-refusal",
+                                             "codex-session", "codex-error"))
+    item.add_argument("--provider", choices=("fake", "codex-fixture"), help="offline fixture; inferred from scenario")
     item.add_argument("--prompt", default="offline GUI send")
     item.add_argument("--rejected-bytes", type=int, default=6000)
     item.add_argument("--binary", type=Path)

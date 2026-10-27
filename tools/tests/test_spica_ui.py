@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -156,11 +157,49 @@ class SpicaUiOfflineTests(unittest.TestCase):
     def test_new_scenarios_have_offline_plans(self):
         with tempfile.TemporaryDirectory() as directory:
             for name in ("second-turn", "oversized-send", "workspace-diff", "capability-refusal",
-                         "followup-refusal", "question-refusal", "attachment-refusal"):
+                         "followup-refusal", "question-refusal", "attachment-refusal", "codex-session", "codex-error"):
                 result = self.run_cli("scenario", name, "--output", directory, "--dry-run")
                 self.assertEqual(result.returncode, 0, (name, result.stderr))
                 self.assertTrue(json.loads(result.stdout)["steps"])
             self.assertFalse((Path(directory) / "session.json").exists())
+
+    def test_codex_fixture_dry_run_pins_only_the_repo_fixture_and_disposable_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_cli("launch", "--provider", "codex-fixture", "--private", "--output", directory, "--dry-run")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            argv = json.loads(result.stdout)["argv"]
+            self.assertEqual(argv[argv.index("--runtime-executable") + 1], str(ROOT / "build/codex_workflow_fixture.py"))
+            self.assertEqual(argv[argv.index("--runtime-account-directory") + 1], str(Path(directory) / "codex-fixture-account"))
+            self.assertFalse((Path(directory) / "codex-fixture-account").exists())
+            mismatch = self.run_cli("scenario", "codex-session", "--provider", "fake", "--dry-run")
+            self.assertEqual(mismatch.returncode, 15)
+
+    def test_codex_fixture_trace_rejects_fresh_sessions_missing_turns_and_changed_prompt_bytes(self):
+        module = load_cli()
+        prompt = "café 世界"
+        start = {"method": "thread/start", "thread_id": "session"}
+        turn = {"method": "turn/start", "thread_id": "session", "turn_id": "turn", "prior_turns": 0,
+                "prompt_bytes": len(prompt.encode()), "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()}
+        module.assert_codex_fixture_trace([start, turn], [prompt])
+        for events in ([start, start, turn], [start], [start, turn, turn],
+                       [start, {**turn, "prior_turns": 1}], [start, {**turn, "thread_id": "other"}],
+                       [start, {**turn, "turn_id": ""}], [start, {**turn, "prompt_bytes": 2}],
+                       [start, {**turn, "prompt_sha256": "wrong"}]):
+            with self.assertRaises(module.DriverError):
+                module.assert_codex_fixture_trace(events, [prompt])
+
+    def test_private_clipboard_reads_command_log_instead_of_vd_launch_receipt(self):
+        module = load_cli()
+        with tempfile.TemporaryDirectory() as directory:
+            session = module.Session(Path(directory), {"private_desktop": {"session": "/private-desktop"}})
+            payload = '{"provider_diagnostic":"synthetic café 世界"}'
+            def run(argv, **kwargs):
+                Path(argv[argv.index("--log") + 1]).write_text(payload)
+                return subprocess.CompletedProcess(argv, 0, '{"pid":42,"log":"fixture"}', "")
+            with patch.object(module, "run_command", side_effect=run):
+                self.assertEqual(module.read_private_clipboard(session), payload)
+                with self.assertRaises(module.DriverError):
+                    module.read_private_clipboard(session)
 
     def test_wait_requires_exact_identity_even_in_dry_run(self):
         for args in (("--receipt", "accepted"), ("--run", "run", "--receipt", "rejected")):

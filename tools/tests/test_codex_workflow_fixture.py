@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Exercise the offline server in separate processes with disposable state."""
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+FIXTURE = ROOT / "build/codex_workflow_fixture.py"
+
+
+class CodexWorkflowFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.account = self.root / "account"
+        self.workspace = self.root / "workspace"
+        self.account.mkdir()
+        self.workspace.mkdir()
+        self.profile()
+
+    def profile(self, mode="complete"):
+        (self.account / "workflow-profile.json").write_text(json.dumps({
+            "format": "spica-offline-codex-workflow-v1", "mode": mode, "workspace": str(self.workspace)}))
+
+    def run_server(self, requests, *, cwd=None, account=None):
+        return subprocess.run([str(FIXTURE), "app-server", "--stdio"],
+            input="".join(json.dumps(value) + "\n" for value in requests),
+            text=True, capture_output=True, timeout=5, cwd=cwd or self.workspace,
+            env={"PATH": "/usr/bin:/bin", "CODEX_HOME": str(account or self.account)})
+
+    def selection(self, thread=None):
+        return dict(model="offline-workflow", modelProvider="openai", cwd=str(self.workspace),
+                    config=dict(model_reasoning_effort="low"), **({"threadId": thread} if thread else {}))
+
+    def create(self):
+        result = self.run_server([dict(id=1, method="initialize"), dict(id=2, method="account/read"),
+            dict(id=3, method="model/list"), dict(id=4, method="thread/start", params=self.selection())])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertIn("0.163.0", output[0]["result"]["userAgent"])
+        self.assertEqual(output[1]["result"]["account"]["type"], "chatgpt")
+        self.assertEqual(output[2]["result"]["data"][0]["model"], "offline-workflow")
+        return output[3]["result"]["thread"]["id"]
+
+    def turn(self, thread, prompt):
+        return self.run_server([dict(id=1, method="thread/resume", params=self.selection(thread)),
+            dict(id=2, method="turn/start", params=dict(threadId=thread, model="offline-workflow", effort="low",
+                cwd=str(self.workspace), input=[dict(type="text", text=prompt)]))])
+
+    def test_resumes_persisted_session_and_checks_exact_escaped_utf8_bytes(self):
+        thread = self.create()
+        prompts = ["界🙂 café", '\n"\\' * 21845 + "x"]
+        for index, prompt in enumerate(prompts):
+            result = self.turn(thread, prompt)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = [json.loads(line) for line in result.stdout.splitlines()]
+            self.assertEqual(output[-1]["params"]["turn"]["status"], "completed")
+            self.assertIn(f"prior turns {index}", output[-2]["params"]["delta"])
+        events = [json.loads(line) for line in (self.account / "workflow-events.jsonl").read_text().splitlines()]
+        turns = [event for event in events if event["method"] == "turn/start"]
+        self.assertEqual([turn["prior_turns"] for turn in turns], [0, 1])
+        self.assertNotEqual(turns[0]["pid"], turns[1]["pid"])
+        self.assertNotEqual(turns[0]["turn_id"], turns[1]["turn_id"])
+        self.assertEqual(turns[1]["prompt_bytes"], 65536)
+        for event, prompt in zip(turns, prompts):
+            self.assertEqual(event["prompt_sha256"], hashlib.sha256(prompt.encode()).hexdigest())
+        self.assertNotIn(prompts[0], (self.account / "workflow-state.json").read_text())
+        self.assertNotIn(prompts[0], (self.account / "workflow-events.jsonl").read_text())
+
+    def test_synthetic_failure_is_a_terminal_provider_notification(self):
+        self.profile("fail")
+        result = self.turn(self.create(), "failure")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = [json.loads(line) for line in result.stdout.splitlines()]
+        failed = output[-1]["params"]["turn"]
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("(synthetic)", failed["error"]["message"])
+        self.assertEqual(failed["error"]["codexErrorInfo"], "usageLimitExceeded")
+        self.assertFalse(any(value.get("method") == "item/agentMessage/delta" for value in output))
+
+    def test_requires_explicit_profile_and_bound_workspace(self):
+        for change in ("workspace", "profile"):
+            result = self.run_server([], cwd=self.root) if change == "workspace" else self.run_server([], account=self.workspace)
+            self.assertEqual(result.returncode, 1)
+            self.assertFalse(result.stdout)
+        self.assertFalse((self.workspace / "workflow-state.json").exists())
+
+    def test_unknown_resume_and_oversized_prompt_are_refused(self):
+        unknown = self.turn("unowned", "prompt")
+        self.assertEqual(unknown.returncode, 1)
+        self.assertNotIn("prompt", unknown.stderr)
+        thread = self.create()
+        oversized = self.turn(thread, "x" * 65537)
+        self.assertEqual(oversized.returncode, 1)
+        self.assertEqual(json.loads((self.account / "workflow-state.json").read_text())[thread], [])
+
+
+if __name__ == "__main__":
+    unittest.main()
