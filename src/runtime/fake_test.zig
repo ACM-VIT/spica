@@ -251,19 +251,21 @@ test "structured provider question answers are distinct from permission replies"
         .{ .barrier = "answer-question" },
         .{ .expect = .{ .request = answer, .receipt = ack } },
     };
-    var runtime = try f.Runtime(4, 4).init(workflowConfig(), &script);
+    var runtime = try f.Runtime(8, 8).init(workflowConfig(), &script);
     try runtime.pump();
     const observed = runtime.poll().?;
     try t.expectEqual(.question, std.meta.activeTag(observed.body));
     try t.expect(c.equal(question, observed.body.question));
     try runtime.release("answer-question");
-    _ = try runtime.answerQuestion(answer.answer_question);
-    try t.expectEqual(@as(u64, 1), runtime.counters.Q);
     const permission: c.Request = .{ .respond_approval = .{ .correlation = corr, .decision = .allow, .action_digest = "digest" } };
     try t.expectError(error.UnexpectedRequest, runtime.dispatch(permission));
+    try t.expectEqual(@as(u64, 0), runtime.counters.A);
+    try t.expectEqual(@as(u64, 0), runtime.counters.Q);
+    _ = try runtime.answerQuestion(answer.answer_question);
+    try t.expectEqual(@as(u64, 1), runtime.counters.Q);
 
     const expired = workflowConfig();
-    var expired_runtime = try f.Runtime(4, 4).init(expired, &script);
+    var expired_runtime = try f.Runtime(8, 8).init(expired, &script);
     try expired_runtime.pump();
     _ = expired_runtime.poll();
     try expired_runtime.advance(100);

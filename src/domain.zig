@@ -119,7 +119,7 @@ pub const Owner = struct {
     fn plan(self: *Owner, allocator: std.mem.Allocator, effect: []const u8, run: []const u8, session: []const u8, kind: t.EffectKind, request: a.Request, dependency: ?[]const u8, approval: ?[]const u8, causation: t.CommandId) !void {
         const bytes = try encoded(allocator, request);
         const digest = t.digest(bytes);
-        try self.database.execute("INSERT INTO effects(id,revision,run_id,session_id,kind,read_only,request,digest,state,depends_on,approval_id,command_id) VALUES(?,1,?,?,?,?,?,?,'planned',?,?,?)", &.{ .{ .text = effect }, .{ .text = run }, .{ .text = session }, .{ .text = @tagName(kind) }, .{ .integer = @intFromBool(kind == .inspect or kind == .attach) }, .{ .blob = bytes }, .{ .blob = &digest }, if (dependency) |v| .{ .text = v } else .null, if (approval) |v| .{ .text = v } else .null, .{ .text = causation.value } });
+        try self.database.execute("INSERT INTO effects(id,revision,run_id,session_id,kind,read_only,request,digest,state,depends_on,approval_id,command_id) VALUES(?,1,?,?,?,?,?,?,'planned',?,?,?)", &.{ .{ .text = effect }, .{ .text = run }, .{ .text = session }, .{ .text = @tagName(kind) }, .{ .integer = @intFromBool(request == .inspect or request == .attach) }, .{ .blob = bytes }, .{ .blob = &digest }, if (dependency) |v| .{ .text = v } else .null, if (approval) |v| .{ .text = v } else .null, .{ .text = causation.value } });
     }
 
     /// Lookup precedes validation. Rejections are durable and byte-exact retries
@@ -622,7 +622,11 @@ pub const Owner = struct {
     pub fn claimNext(self: *Owner, allocator: std.mem.Allocator) !?Claimed {
         try self.database.begin();
         errdefer self.database.rollback() catch {};
-        const statement = try self.database.prepare("SELECT e.id,e.request FROM effects e JOIN runs r ON r.id=e.run_id WHERE e.state='planned' AND (e.read_only=1 OR r.state IN('queued','starting','streaming','awaiting_approval') OR (e.kind='cancel' AND r.state='cancel_requested')) AND (e.depends_on IS NULL OR EXISTS(SELECT 1 FROM effects d WHERE d.id=e.depends_on AND d.state='confirmed')) ORDER BY e.rowid LIMIT 1", &.{});
+        // Old journals classified continuation opens as read-only attaches.
+        // Their dependent start makes them ordinary Send work: recovery must
+        // not claim the attach and revive that interrupted/unknown turn. Repeat
+        // one_effect's partial-index predicate for a bounded compatibility lookup.
+        const statement = try self.database.prepare("SELECT e.id,e.request FROM effects e JOIN runs r ON r.id=e.run_id WHERE e.state='planned' AND ((e.read_only=1 AND NOT EXISTS(SELECT 1 FROM effects continuation WHERE continuation.run_id=e.run_id AND continuation.kind IN('create_session','start','cancel') AND continuation.kind='start' AND continuation.depends_on=e.id)) OR r.state IN('queued','starting','streaming','awaiting_approval') OR (e.kind='cancel' AND r.state='cancel_requested')) AND (e.depends_on IS NULL OR EXISTS(SELECT 1 FROM effects d WHERE d.id=e.depends_on AND d.state='confirmed')) ORDER BY e.rowid LIMIT 1", &.{});
         const result: ?Claimed = blk: {
             defer statement.deinit();
             if (!try statement.step()) break :blk null;
@@ -651,7 +655,10 @@ pub const Owner = struct {
         const kind = try allocator.dupe(u8, try s.bytes(2));
         try self.guardRunRevisions(run);
         const sequence = try db.nextSequence();
-        const missing_session = std.mem.eql(u8, kind, "create_session") and receipt.outcome == .acknowledged and receipt.session == null;
+        const opening_session = std.mem.eql(u8, kind, "create_session") or std.mem.eql(u8, kind, "attach");
+        const missing_session = opening_session and receipt.outcome == .acknowledged and receipt.session == null;
+        // An accepted resume RPC is not evidence that the old context exists.
+        // Hold its dependent start until the adapter publishes that session.
         const pending_session = missing_session and self.factory != null;
         const state = if (pending_session) "in_flight" else if (missing_session) "unknown" else switch (receipt.outcome) {
             .acknowledged => "confirmed",
@@ -662,9 +669,10 @@ pub const Owner = struct {
         try self.event(allocator, sequence, 0, .{ .effect = effect }, @intCast(s.integer(3) + 1), "EffectDelivery", null, effect, "");
         if (receipt.session) |live| {
             if (!std.mem.eql(u8, live.id.value, session)) return error.Conflict;
-            const revision_statement = try db.prepare("SELECT revision FROM sessions WHERE id=?", &.{.{ .text = session }});
+            const revision_statement = try db.prepare("SELECT revision,upstream_session FROM sessions WHERE id=?", &.{.{ .text = session }});
             defer revision_statement.deinit();
             if (!try revision_statement.step() or revision_statement.integer(0) == std.math.maxInt(i64)) return error.Limit;
+            if (!revision_statement.isNull(1) and !std.mem.eql(u8, try revision_statement.bytes(1), live.upstream.value)) return error.Conflict;
             try db.execute("UPDATE sessions SET instance_id=?,upstream_session=?,continuity=?,revision=revision+1 WHERE id=?", &.{ .{ .text = live.instance.value }, .{ .text = live.upstream.value }, .{ .text = @tagName(receipt.continuity) }, .{ .text = session } });
             try self.event(allocator, sequence, 1, .{ .session = .{ .value = session } }, @intCast(revision_statement.integer(0) + 1), "SessionEvidence", null, effect, "");
         }
@@ -674,11 +682,13 @@ pub const Owner = struct {
         if (!try revision_statement.step()) return error.Corrupt;
         const current = try revision_statement.bytes(1);
         // Delivery after terminal evidence never revives the lifecycle.
-        if (!(std.mem.eql(u8, current, "completed") or std.mem.eql(u8, current, "cancelled") or std.mem.eql(u8, current, "failed"))) {
+        if (!(std.mem.eql(u8, current, "completed") or std.mem.eql(u8, current, "cancelled") or std.mem.eql(u8, current, "failed") or std.mem.eql(u8, current, "unknown") or std.mem.eql(u8, current, "interrupted"))) {
             const applied_state = if (std.mem.eql(u8, current, "cancel_requested") and std.mem.eql(u8, kind, "create_session")) current else next_state;
             try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = applied_state }, .{ .text = run } });
             try self.event(allocator, sequence, 2, .{ .run = .{ .value = run } }, @intCast(revision_statement.integer(0) + 1), "RunDelivery", null, effect, "");
         }
+        if (opening_session and receipt.outcome == .rejected)
+            try db.execute("UPDATE effects SET state='withdrawn',revision=revision+1 WHERE run_id=? AND state='planned'", &.{.{ .text = run }});
         try self.finalizeMessages(run);
         try db.publishChanges(sequence, null);
         try db.commit();
@@ -713,6 +723,13 @@ pub const Owner = struct {
         }
         if (self.factory != null) {
             observation.correlation.run = run;
+            // Resume adapters can publish only the session identity while the
+            // open RPC is pending. Bind its success/failure to this run's live
+            // open claim, never an earlier turn's confirmed attach.
+            if (observation.correlation.effect == null and (observation.body == .session or observation.body == .failure)) {
+                if (try self.field(allocator, "SELECT id FROM effects WHERE session_id=? AND run_id=? AND state='in_flight' AND kind IN('create_session','attach') ORDER BY rowid DESC LIMIT 1", &.{ .{ .text = session.value }, .{ .text = run.value } })) |pending|
+                    observation.correlation.effect = .{ .value = pending };
+            }
             if (observation.correlation.upstream_tool) |upstream| {
                 observation.correlation.upstream_tool = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ run.value, upstream });
                 if (observation.correlation.tool) |tool| observation.correlation.tool = .{ .value = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ run.value, tool.value }) };
@@ -858,11 +875,13 @@ pub const Owner = struct {
             },
             .session => |live| {
                 if (self.factory == null or terminal or !std.mem.eql(u8, live.id.value, session.value)) return error.Conflict;
-                const effect_id: a.EffectId = if (observation.correlation.effect) |effect| effect else a.EffectId{ .value = try self.field(allocator, "SELECT id FROM effects WHERE session_id=? AND kind='attach' AND state='confirmed' ORDER BY rowid DESC LIMIT 1", &.{.{ .text = session.value }}) orelse return error.Conflict };
+                const effect_id: a.EffectId = if (observation.correlation.effect) |effect| effect else a.EffectId{ .value = try self.field(allocator, "SELECT id FROM effects WHERE session_id=? AND run_id=? AND kind='attach' AND state='confirmed' ORDER BY rowid DESC LIMIT 1", &.{ .{ .text = session.value }, .{ .text = run.value } }) orelse return error.Conflict };
                 const pending = try db.prepare("SELECT revision FROM effects WHERE id=? AND session_id=? AND kind IN('create_session','attach') AND state IN('in_flight','confirmed')", &.{ .{ .text = effect_id.value }, .{ .text = session.value } });
                 defer pending.deinit();
                 if (!try pending.step()) return error.Conflict;
-                try db.execute("UPDATE sessions SET instance_id=?,upstream_session=?,revision=revision+1 WHERE id=? AND (upstream_session IS NULL OR upstream_session=?)", &.{ .{ .text = live.instance.value }, .{ .text = live.upstream.value }, .{ .text = session.value }, .{ .text = live.upstream.value } });
+                const upstream = try self.field(allocator, "SELECT upstream_session FROM sessions WHERE id=?", &.{.{ .text = session.value }});
+                if (upstream) |previous| if (!std.mem.eql(u8, previous, live.upstream.value)) return error.Conflict;
+                try db.execute("UPDATE sessions SET instance_id=?,upstream_session=?,revision=revision+1 WHERE id=?", &.{ .{ .text = live.instance.value }, .{ .text = live.upstream.value }, .{ .text = session.value } });
                 try db.execute("UPDATE effects SET state='confirmed',revision=revision+1 WHERE id=?", &.{.{ .text = effect_id.value }});
                 try self.event(allocator, sequence, index, .{ .effect = effect_id }, @intCast(pending.integer(0) + 1), "SessionOpened", null, effect_id, "");
                 index += 1;
@@ -1374,7 +1393,6 @@ pub const Host = struct {
                     break;
                 }
                 owner.observe(allocator, observation) catch |err| {
-                    std.debug.print("observation fault {s} event {s}\\n", .{ @errorName(err), observation.upstream_event });
                     try runtimeFault(owner, allocator, entry.session, @errorName(err));
                 };
             }
@@ -1396,11 +1414,6 @@ pub const Host = struct {
                 break :blk try done.step();
             };
             if (release) {
-                const states = try self.database.prepare("SELECT group_concat(state, ',') FROM runs WHERE session_id=?", &.{.{ .text = entry.session.value }});
-                defer states.deinit();
-                _ = try states.step();
-                std.debug.print(" session states {s}\\n", .{try states.bytes(0)});
-                std.debug.print("releasing runtime {s}\\n", .{entry.session.value});
                 registry.release(&self.mcp.?, entry_index);
             }
         }
@@ -1568,7 +1581,6 @@ pub const Host = struct {
                 };
                 try owner.delivered(allocator, effect.id, try entry.adapter.dispatch(allocator, effect.request));
             } else {
-                std.debug.print("missing live runtime for {s} request {s}\\n", .{ session.value, @tagName(effect.request) });
                 try owner.delivered(allocator, effect.id, .{ .outcome = .unknown, .detail = "No live instance for durable session; explicit reconciliation required" });
             }
             return;
@@ -2033,8 +2045,16 @@ test "session-only open rejection closes starting claim and preserves indexed ru
     failure.correlation.run = .{ .value = "another-run" };
     try std.testing.expectError(error.Conflict, owner.observe(allocator, failure));
     try std.testing.expectEqual(@as(i64, 1), try database.scalar("SELECT count(*) FROM observations WHERE evidence IS NOT NULL"));
-    const second = try owner.command(allocator, .{ .command_id = .{ .value = "second-send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "second run", .selection = a.fakeSelection(workspace) } } });
+    // No upstream session was ever published. Continuing this transcript must
+    // not silently create a new provider context and omit its first prompt.
+    const retry = try owner.command(allocator, .{ .command_id = .{ .value = "second-send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "second run", .selection = a.fakeSelection(workspace) } } });
+    try std.testing.expectEqual(.rejected, retry.outcome);
+    try std.testing.expectEqual(t.Reason.session_unavailable, retry.reason.?);
+    try std.testing.expect((try owner.claimNext(allocator)) == null);
+    const second_thread = (try owner.command(allocator, .{ .command_id = .{ .value = "second-thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+    const second = try owner.command(allocator, .{ .command_id = .{ .value = "new-thread-send" }, .target = .{ .thread = second_thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "second run", .selection = a.fakeSelection(workspace) } } });
     try std.testing.expectEqual(.accepted, second.outcome);
+    try std.testing.expect(!a.equal(sent.entity_ids.session.?, second.entity_ids.session.?));
     const second_open = (try owner.claimNext(allocator)).?;
     try owner.delivered(allocator, second_open.id, .{ .outcome = .acknowledged });
     failure.correlation.run = second.entity_ids.run;
@@ -2054,27 +2074,31 @@ test "session-only open rejection closes starting claim and preserves indexed ru
     database_live = false;
     const host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path });
     defer host.destroy();
-    const ticket = try host.query(.{ .runs = .{ .thread = thread } });
     const backing = try allocator.alloc(u8, 262144);
-    for (0..2000) |_| {
-        var output: [1]t.Output = undefined;
-        const drained = host.drain(&output, backing);
-        if (drained.output_count == 0) {
-            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-            continue;
+    for ([_]t.ThreadId{ thread, second_thread }, 0..) |query_thread, index| {
+        const ticket = try host.query(.{ .runs = .{ .thread = query_thread } });
+        var received = false;
+        for (0..2000) |_| {
+            var output: [1]t.Output = undefined;
+            const drained = host.drain(&output, backing);
+            if (drained.output_count == 0) {
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+                continue;
+            }
+            try std.testing.expect(output[0] == .query_page);
+            try std.testing.expectEqual(ticket, output[0].query_page.ticket);
+            try std.testing.expectEqual(@as(usize, 1), output[0].query_page.page.items.len);
+            const row = output[0].query_page.page.items[0].run;
+            try std.testing.expectEqual(if (index == 0) t.RunState.failed else t.RunState.unknown, row.state);
+            const expected = if (index == 0) "dynamic tool name rejected" else "second run only";
+            const unrelated = if (index == 0) "second run only" else "dynamic tool name rejected";
+            try std.testing.expect(std.mem.indexOf(u8, row.diagnostic, expected) != null);
+            try std.testing.expect(std.mem.indexOf(u8, row.diagnostic, unrelated) == null);
+            received = true;
+            break;
         }
-        try std.testing.expect(output[0] == .query_page);
-        try std.testing.expectEqual(ticket, output[0].query_page.ticket);
-        try std.testing.expectEqual(@as(usize, 2), output[0].query_page.page.items.len);
-        const row = output[0].query_page.page.items[0].run;
-        try std.testing.expectEqual(t.RunState.failed, row.state);
-        try std.testing.expect(std.mem.indexOf(u8, row.diagnostic, "dynamic tool name rejected") != null);
-        try std.testing.expect(std.mem.indexOf(u8, row.diagnostic, "second run only") == null);
-        const second_row = output[0].query_page.page.items[1].run;
-        try std.testing.expect(std.mem.indexOf(u8, second_row.diagnostic, "second run only") != null);
-        return;
+        try std.testing.expect(received);
     }
-    return error.HostQueryTimeout;
 }
 
 test "fake send admission matches the shared start-frame preflight at UTF-8 boundaries" {
@@ -2136,7 +2160,13 @@ test "thread cards read bounded UTF8 first-prompt previews and latest status aft
     const prompt = [_]u8{'a'} ** 159 ++ "🎉\n" ++ [_]u8{'z'} ** 2400;
     const sent = try owner.command(allocator, .{ .command_id = .{ .value = "send-first" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = prompt, .selection = a.fakeSelection(workspace) } } });
     try std.testing.expectEqual(.accepted, sent.outcome);
-    try database.execute("UPDATE runs SET state='completed' WHERE id=?", &.{.{ .text = sent.entity_ids.run.?.value }});
+    // Establish actual session evidence and resolve both effects before the
+    // next turn. Merely changing the run state cannot establish continuity.
+    const open = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, open.id, .{ .outcome = .acknowledged, .session = .{ .id = sent.entity_ids.session.?, .instance = .{ .value = "card-instance" }, .upstream = .{ .value = "card-session" } } });
+    const start = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, start.id, .{ .outcome = .acknowledged });
+    try owner.observe(allocator, .{ .correlation = start.request.start.correlation, .upstream_event = "card-completed", .body = .completed });
     const second = try owner.command(allocator, .{ .command_id = .{ .value = "send-again" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "A later prompt must not replace the title", .selection = a.fakeSelection(workspace) } } });
     try std.testing.expectEqual(.accepted, second.outcome);
     _ = try owner.command(allocator, .{ .command_id = .{ .value = "empty-thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } });

@@ -472,14 +472,40 @@ test "public Host consumer streams approves cancels pages and reopens durable st
     try std.testing.expectEqual(t.ToolOutcome.succeeded, tools.items[0].tool.outcome);
     const blocks = try consumer.query(.{ .blocks = .{ .message = sent.entity_ids.assistant_message.? } });
     try std.testing.expectEqual(@as(usize, 2), blocks.items.len);
-    const second = try consumer.command(.{ .command_id = .{ .value = "host-send-2" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "cancel me", .selection = selection } } });
+    // Reopen a completed conversation, then exercise a second approval on the
+    // same durable session. Fake process-local counters cannot supply identity.
+    consumer.host.destroy();
+    live = false;
+    consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .wake = Consumer.wake, .wake_context = &consumer });
+    live = true;
+    const second = try consumer.command(.{ .command_id = .{ .value = "host-send-2" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "deny this turn", .selection = selection } } });
+    try std.testing.expectEqualStrings(sent.entity_ids.session.?.value, second.entity_ids.session.?.value);
+    const next_approvals = try consumer.query(.{ .approvals = .{ .run = second.entity_ids.run.? } });
+    try std.testing.expectEqual(@as(usize, 1), next_approvals.items.len);
+    const next_approval = next_approvals.items[0].approval;
+    try std.testing.expect(next_approval.live);
+    try std.testing.expect(!t.adapter.equal(approval.id, next_approval.id));
+    try std.testing.expect(!t.adapter.equal(approval.evidence.correlation.upstream_request, next_approval.evidence.correlation.upstream_request));
+    const old = (try consumer.query(.{ .approvals = .{ .run = run } })).items[0].approval;
+    _ = try consumer.host.submit(.{ .command_id = .{ .value = "host-stale-allow" }, .target = .{ .approval = old.id }, .expected_revision = .{ .revision = old.revision }, .payload = .{ .approval_respond = .{ .decision = .allow, .action_digest = old.evidence.action_digest } } });
+    const refused = try consumer.next();
+    try std.testing.expect(refused == .command_receipt);
+    try std.testing.expectEqual(t.Reason.approval_invalid, refused.command_receipt.receipt.reason.?);
+    _ = try consumer.command(.{ .command_id = .{ .value = "host-deny-2" }, .target = .{ .approval = next_approval.id }, .expected_revision = .{ .revision = next_approval.revision }, .payload = .{ .approval_respond = .{ .decision = .deny, .action_digest = next_approval.evidence.action_digest } } });
+    const second_tools = try consumer.query(.{ .tools = .{ .run = second.entity_ids.run.? } });
+    try std.testing.expectEqual(@as(usize, 1), second_tools.items.len);
+    try std.testing.expectEqual(t.ToolOutcome.failed, second_tools.items[0].tool.outcome);
+    const second_runs = try consumer.query(.{ .runs = .{ .thread = thread } });
+    try std.testing.expectEqual(t.RunState.completed, second_runs.items[1].run.state);
+    const third = try consumer.command(.{ .command_id = .{ .value = "host-send-3" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 3 }, .payload = .{ .thread_send = .{ .text = "cancel me", .selection = selection } } });
+    try std.testing.expectEqualStrings(sent.entity_ids.session.?.value, third.entity_ids.session.?.value);
     const active = try consumer.query(.{ .runs = .{ .thread = thread } });
-    const active_run = active.items[1].run;
-    _ = try consumer.command(.{ .command_id = .{ .value = "host-cancel" }, .target = .{ .run = second.entity_ids.run.? }, .expected_revision = .{ .revision = active_run.revision }, .payload = .{ .run_cancel = .{ .reason = "consumer cancel" } } });
+    const active_run = active.items[2].run;
+    _ = try consumer.command(.{ .command_id = .{ .value = "host-cancel" }, .target = .{ .run = third.entity_ids.run.? }, .expected_revision = .{ .revision = active_run.revision }, .payload = .{ .run_cancel = .{ .reason = "consumer cancel" } } });
     const cancelled = try consumer.query(.{ .runs = .{ .thread = thread } });
-    try std.testing.expectEqual(t.RunState.cancelled, cancelled.items[1].run.state);
+    try std.testing.expectEqual(t.RunState.cancelled, cancelled.items[2].run.state);
     const cancelled_messages = try consumer.query(.{ .messages = .{ .thread = thread } });
-    try std.testing.expect(!cancelled_messages.items[3].message.incomplete);
+    try std.testing.expect(!cancelled_messages.items[5].message.incomplete);
     consumer.host.destroy();
     live = false;
     consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .wake = Consumer.wake, .wake_context = &consumer });
@@ -487,12 +513,14 @@ test "public Host consumer streams approves cancels pages and reopens durable st
     const replay = try consumer.command(send);
     try std.testing.expectEqualStrings(run.value, replay.entity_ids.run.?.value);
     const retained = try consumer.query(.{ .runs = .{ .thread = thread } });
-    try std.testing.expectEqual(@as(usize, 2), retained.items.len);
+    try std.testing.expectEqual(@as(usize, 3), retained.items.len);
     try std.testing.expectEqual(t.RunState.completed, retained.items[0].run.state);
-    try std.testing.expectEqual(t.RunState.cancelled, retained.items[1].run.state);
+    try std.testing.expectEqual(t.RunState.completed, retained.items[1].run.state);
+    try std.testing.expectEqual(t.RunState.cancelled, retained.items[2].run.state);
     const retained_messages = try consumer.query(.{ .messages = .{ .thread = thread } });
     try std.testing.expect(!retained_messages.items[1].message.incomplete);
     try std.testing.expect(!retained_messages.items[3].message.incomplete);
+    try std.testing.expect(!retained_messages.items[5].message.incomplete);
 }
 
 test "Host subscriptions retain delivery under small drain and unsubscribe generation checks" {
@@ -898,4 +926,179 @@ test "indexed distant history pages retain boundaries cursors and exact source r
     const query_peak = heap_peak - heap_before;
     std.debug.print("incremental blob 16MiB/4KiB query SQLite peak delta={d} bytes\n", .{query_peak});
     try std.testing.expect(query_peak < 4 * 1024 * 1024);
+}
+
+fn completeInitialTurn(owner: *domain.Owner, allocator: std.mem.Allocator, conversation: Conversation) !t.Receipt {
+    const sent = try owner.command(allocator, conversation.send("initial-turn", "retain this context", 1));
+    try std.testing.expectEqual(.accepted, sent.outcome);
+    const open = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, open.id, .{ .outcome = .acknowledged, .session = .{ .id = sent.entity_ids.session.?, .instance = .{ .value = "initial-process" }, .upstream = .{ .value = "retained-context" } } });
+    const start = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, start.id, .{ .outcome = .acknowledged });
+    try owner.observe(allocator, .{ .correlation = start.request.start.correlation, .upstream_event = "initial-completed", .body = .completed });
+    return sent;
+}
+
+test "queued and claimed continuation opens stay dormant after recovery including old read-only journals" {
+    for (0..3) |scenario| {
+        var f = try Fixture.init();
+        defer f.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "before", .utc_ms = 1 };
+        const conversation = try Conversation.create(&owner, allocator);
+        const first = try completeInitialTurn(&owner, allocator, conversation);
+        const command = conversation.send("second-turn", "never replay this prompt", 2);
+        const second = try owner.command(allocator, command);
+        try std.testing.expectEqual(.accepted, second.outcome);
+        try std.testing.expectEqualStrings(first.entity_ids.session.?.value, second.entity_ids.session.?.value);
+        // SQLite needs the exact partial-index predicate; kind='start' alone
+        // otherwise scans all historical effects for every compatibility probe.
+        const plan = try f.store.prepare("EXPLAIN QUERY PLAN SELECT 1 FROM effects continuation WHERE continuation.run_id=? AND continuation.kind IN('create_session','start','cancel') AND continuation.kind='start' AND continuation.depends_on=?", &.{ .{ .text = second.entity_ids.run.?.value }, .{ .text = second.effect_ids[0].value } });
+        {
+            defer plan.deinit();
+            try std.testing.expect(try plan.step());
+            try std.testing.expect(std.mem.indexOf(u8, try plan.bytes(3), "SEARCH continuation USING INDEX one_effect") != null);
+        }
+        try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='attach' AND read_only=1"));
+        // Simulate the prior durable classification, not application input.
+        if (scenario != 0) try f.store.exec("UPDATE effects SET read_only=1 WHERE kind='attach'");
+        if (scenario == 2) {
+            const attach = (try owner.claimNext(allocator)).?;
+            try std.testing.expectEqualStrings("retained-context", attach.request.open.existing.session.upstream.value);
+        }
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try allocator.dupe(u8, try f.path(&path_buffer));
+        try f.store.close();
+        f.store = try storage.Store.open(std.testing.io, path);
+        owner.epoch = "after";
+        try owner.recover();
+        try std.testing.expect((try owner.claimNext(allocator)) == null);
+        const state = try f.store.prepare("SELECT state FROM runs WHERE id=?", &.{.{ .text = second.entity_ids.run.?.value }});
+        {
+            defer state.deinit();
+            try std.testing.expect(try state.step());
+            try std.testing.expectEqualStrings(if (scenario == 2) "unknown" else "interrupted", try state.bytes(0));
+        }
+        const replay = try owner.command(allocator, command);
+        try std.testing.expectEqual(second.commit_sequence, replay.commit_sequence);
+        try std.testing.expectEqualStrings(second.entity_ids.run.?.value, replay.entity_ids.run.?.value);
+        const refused = try owner.command(allocator, conversation.send("new-attempt", "still unresolved", 3));
+        try std.testing.expectEqual(t.Reason.unresolved_effects, refused.reason.?);
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='create_session'"));
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='start' AND state='planned'"));
+    }
+}
+
+test "failed resume permits only an explicit retry of the same context and waits for session evidence" {
+    for ([_]bool{ false, true }) |synchronous_rejection| {
+        var f = try Fixture.init();
+        defer f.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "resume", .utc_ms = 1 };
+        owner.factory = @import("fake_factory.zig").factory(&owner);
+        const conversation = try Conversation.create(&owner, allocator);
+        const first = try completeInitialTurn(&owner, allocator, conversation);
+        const second = try owner.command(allocator, conversation.send("second-turn", "resume existing", 2));
+        try std.testing.expectEqual(.accepted, second.outcome);
+        const attach = (try owner.claimNext(allocator)).?;
+        try std.testing.expect(attach.request.open == .existing);
+        // A transport acknowledgement cannot release the prompt before resume has
+        // actually succeeded, and a replacement context is never accepted.
+        try owner.delivered(allocator, attach.id, .{ .outcome = .acknowledged });
+        try std.testing.expect((try owner.claimNext(allocator)) == null);
+        var replacement: t.adapter.Observation = .{ .correlation = .{ .session = second.entity_ids.session.? }, .upstream_event = "wrong-resume", .body = .{ .session = .{ .id = second.entity_ids.session.?, .instance = .{ .value = "replacement-process" }, .upstream = .{ .value = "contextless-replacement" } } } };
+        try std.testing.expectError(error.Conflict, owner.observe(allocator, replacement));
+        try std.testing.expectError(error.Conflict, owner.delivered(allocator, attach.id, .{ .outcome = .acknowledged, .session = replacement.body.session }));
+        if (synchronous_rejection) {
+            try owner.delivered(allocator, attach.id, .{ .outcome = .rejected, .detail = "retained context temporarily unavailable" });
+        } else {
+            try owner.observe(allocator, .{ .correlation = .{ .session = second.entity_ids.session.? }, .upstream_event = "resume-failed", .body = .{ .failure = .{ .code = "session_resume_failed", .detail = "retained context temporarily unavailable" } } });
+        }
+        try std.testing.expect((try owner.claimNext(allocator)) == null);
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='start' AND state='withdrawn'"));
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try allocator.dupe(u8, try f.path(&path_buffer));
+        try f.store.close();
+        f.store = try storage.Store.open(std.testing.io, path);
+        owner.epoch = "retry-after-restart";
+        try owner.recover();
+        try std.testing.expect((try owner.claimNext(allocator)) == null);
+        const third_command = conversation.send("explicit-retry", "retry same context", 3);
+        const third = try owner.command(allocator, third_command);
+        try std.testing.expectEqual(.accepted, third.outcome);
+        try std.testing.expectEqualStrings(first.entity_ids.session.?.value, third.entity_ids.session.?.value);
+        const retry = (try owner.claimNext(allocator)).?;
+        try std.testing.expect(retry.request.open == .existing);
+        try std.testing.expectEqualStrings("retained-context", retry.request.open.existing.session.upstream.value);
+        try owner.delivered(allocator, retry.id, .{ .outcome = .acknowledged });
+        try std.testing.expect((try owner.claimNext(allocator)) == null);
+        replacement.correlation = .{ .session = third.entity_ids.session.? };
+        replacement.upstream_event = "same-context-resumed";
+        replacement.body.session.upstream.value = "retained-context";
+        try owner.observe(allocator, replacement);
+        const start = (try owner.claimNext(allocator)).?;
+        try std.testing.expect(start.request == .start);
+        try std.testing.expectEqualStrings(third.entity_ids.run.?.value, start.request.start.correlation.run.?.value);
+        try std.testing.expectEqualStrings("retry same context", start.request.start.prompt);
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM sessions"));
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='create_session'"));
+        try std.testing.expectEqual(@as(i64, 6), try f.store.scalar("SELECT count(*) FROM messages"));
+    }
+}
+
+test "late resume delivery cannot revive ambiguous work or release its dependent prompt" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "late-resume", .utc_ms = 1 };
+    const conversation = try Conversation.create(&owner, allocator);
+    _ = try completeInitialTurn(&owner, allocator, conversation);
+    const second = try owner.command(allocator, conversation.send("second-turn", "do not replay", 2));
+    const attach = (try owner.claimNext(allocator)).?;
+    try owner.observe(allocator, .{ .correlation = .{ .session = second.entity_ids.session.?, .run = second.entity_ids.run.? }, .upstream_event = "lost-resume", .body = .{ .ambiguous = .{ .reason = "resume outcome unknown" } } });
+    try owner.delivered(allocator, attach.id, .{ .outcome = .acknowledged, .session = attach.request.open.existing.session, .continuity = .proven });
+    try std.testing.expect((try owner.claimNext(allocator)) == null);
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='unknown'"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='start' AND state='planned'"));
+}
+
+test "rejected initial open withdraws dependent work and requires an explicit new thread" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "initial-rejection", .utc_ms = 1 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const command = conversation.send("initial-turn", "unpublished context", 1);
+    const first = try owner.command(allocator, command);
+    const open = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, open.id, .{ .outcome = .rejected, .detail = "definitive initial open rejection" });
+    try std.testing.expect((try owner.claimNext(allocator)) == null);
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM effects WHERE state IN('planned','in_flight','unknown')"));
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try allocator.dupe(u8, try f.path(&path_buffer));
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, path);
+    owner.epoch = "initial-rejection-reopened";
+    try owner.recover();
+    try std.testing.expect((try owner.claimNext(allocator)) == null);
+    const replay = try owner.command(allocator, command);
+    try std.testing.expectEqual(first.commit_sequence, replay.commit_sequence);
+    try std.testing.expectEqualStrings(first.entity_ids.run.?.value, replay.entity_ids.run.?.value);
+    const refused = try owner.command(allocator, conversation.send("second-turn", "must not lose first prompt", 2));
+    try std.testing.expectEqual(t.Reason.session_unavailable, refused.reason.?);
+    const thread = (try owner.command(allocator, .{ .command_id = .{ .value = "new-thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = conversation.project, .workspace = conversation.workspace } } })).entity_ids.thread.?;
+    var fresh = conversation;
+    fresh.thread = thread;
+    const second = try owner.command(allocator, fresh.send("new-context", "explicit fresh conversation", 1));
+    try std.testing.expectEqual(.accepted, second.outcome);
+    try std.testing.expect(!t.adapter.equal(first.entity_ids.session.?, second.entity_ids.session.?));
+    try std.testing.expect((try owner.claimNext(allocator)).?.request.open == .create);
 }

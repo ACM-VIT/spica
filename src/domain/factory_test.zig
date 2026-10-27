@@ -398,7 +398,12 @@ test "Host cancellation before readiness never opens and partial create stays un
     factory.fail_create = true;
     consumer.host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = root, .factory = factory.handle(), .selection = sampleSelection(""), .wake = Consumer.wake, .wake_context = &consumer });
     live = true;
-    const failed = try consumer.command(.{ .command_id = .{ .value = "partial-create-send" }, .target = .{ .thread = parent.entity_ids.thread.? }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "partial failure", .selection = sampleSelection(workspace.value) } } });
+    const retry = try consumer.command(.{ .command_id = .{ .value = "cancelled-thread-retry" }, .target = .{ .thread = parent.entity_ids.thread.? }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "cannot resume an unopened session", .selection = sampleSelection(workspace.value) } } });
+    try std.testing.expectEqual(.rejected, retry.outcome);
+    try std.testing.expectEqual(t.Reason.session_unavailable, retry.reason.?);
+    try std.testing.expectEqual(@as(u32, 1), factory.creates.load(.acquire));
+    const new_thread = (try consumer.command(.{ .command_id = .{ .value = "partial-create-thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+    const failed = try consumer.command(.{ .command_id = .{ .value = "partial-create-send" }, .target = .{ .thread = new_thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "partial failure", .selection = sampleSelection(workspace.value) } } });
     try std.testing.expectEqual(.accepted, failed.outcome);
     const effects = try consumer.query(.{ .effects = .{ .run = failed.entity_ids.run.? } });
     try std.testing.expectEqual(.unknown, effects.items[0].effect.state);
