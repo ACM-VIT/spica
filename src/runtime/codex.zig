@@ -200,9 +200,11 @@ pub fn RuntimeFor(comptime T: type) type {
                             items[item_count] = .{ .type = "text", .text = writer.buffered() };
                         } else {
                             const encoded_len = std.base64.standard.Encoder.calcSize(attachment.content.len);
-                            const encoded = try self.turn_state.allocator().alloc(u8, encoded_len);
-                            _ = std.base64.standard.Encoder.encode(encoded, attachment.content);
-                            const url = try std.fmt.allocPrint(self.turn_state.allocator(), "data:{s};base64,{s}", .{ attachment.metadata.media_type, encoded });
+                            const mime = attachment.metadata.media_type;
+                            const prefix_len = "data:".len + mime.len + ";base64,".len;
+                            const url = try self.turn_state.allocator().alloc(u8, prefix_len + encoded_len);
+                            _ = try std.fmt.bufPrint(url[0..prefix_len], "data:{s};base64,", .{mime});
+                            _ = std.base64.standard.Encoder.encode(url[prefix_len..], attachment.content);
                             items[item_count] = .{ .type = "image", .url = url };
                         }
                         item_count += 1;

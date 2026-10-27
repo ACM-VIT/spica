@@ -6,6 +6,7 @@ executes tools, accesses the network or invokes an installed provider.
 """
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import json
@@ -18,9 +19,44 @@ import uuid
 FORMAT = "spica-offline-codex-workflow-v1"
 MODEL = "offline-workflow"
 ERROR = "Offline Codex fixture quota exhausted (synthetic)."
-MAX_FRAME = 512 * 1024
+MAX_FRAME = 6 * (64 * 1024 + 256 * 1024 + 4096) + 16 * 1024
 MAX_LOG = 128 * 1024
 CANCEL_MODES = {"cancel-open", "cancel-start", "cancel-refuse", "cancel-hang"}
+
+
+def validate_turn_inputs(inputs):
+    if not isinstance(inputs, list) or not 1 <= len(inputs) <= 9:
+        raise ValueError("bounded turn inputs required")
+    prompt = b""
+    attachments = []
+    total = 0
+    for index, part in enumerate(inputs):
+        if not isinstance(part, dict):
+            raise ValueError("input object required")
+        if part.get("type") == "text" and set(part) == {"type", "text"}:
+            value = part["text"]
+            if index == 0:
+                prompt = value.encode("utf-8")
+                if len(prompt) > 64 * 1024:
+                    raise ValueError("fixture prompt bound exceeded")
+                continue
+            if not value.startswith("[Attached text file ") or "]\n" not in value:
+                raise ValueError("attached text wrapper required")
+            content = value.split("]\n", 1)[1].encode("utf-8")
+            kind = "text"
+        elif part.get("type") == "image" and set(part) == {"type", "url"}:
+            header, encoded = part["url"].split(",", 1)
+            if header not in {"data:" + mime + ";base64" for mime in {"image/png", "image/jpeg", "image/gif", "image/webp"}}:
+                raise ValueError("image data URL required")
+            content = base64.b64decode(encoded, validate=True)
+            kind = "image"
+        else:
+            raise ValueError("native Codex input required")
+        total += len(content)
+        attachments.append(dict(type=kind, byte_length=len(content), sha256=hashlib.sha256(content).hexdigest()))
+    if len(attachments) > 8 or total > 256 * 1024 or (not prompt and not attachments):
+        raise ValueError("fixture attachment bound exceeded")
+    return prompt, attachments
 
 
 def read_json(path: Path, limit: int):
@@ -130,21 +166,18 @@ class Fixture:
                 raise ValueError("unexpected Start in cancellation fixture")
             thread = params.get("threadId")
             inputs = params.get("input")
-            if (thread != self.opened or not isinstance(inputs, list) or len(inputs) != 1
-                    or inputs[0].get("type") != "text" or not isinstance(inputs[0].get("text"), str)
+            if (thread != self.opened or not isinstance(inputs, list) or not 1 <= len(inputs) <= 9
                     or params.get("model") != MODEL or params.get("effort") != "low"
                     or params.get("cwd") != str(Path.cwd().resolve())):
                 raise ValueError("exact bound fixture turn required")
-            prompt = inputs[0]["text"].encode("utf-8")
-            if not 0 < len(prompt) <= 64 * 1024:
-                raise ValueError("fixture prompt bound exceeded")
+            prompt, attachments = validate_turn_inputs(inputs)
             state = self.state()
             prior = len(state[thread])
             if prior >= 16:
                 raise ValueError("fixture turn bound exceeded")
             turn = thread + "-turn-" + str(prior + 1)
             details = dict(thread_id=thread, turn_id=turn, prior_turns=prior,
-                           prompt_bytes=len(prompt), prompt_sha256=hashlib.sha256(prompt).hexdigest())
+                           prompt_bytes=len(prompt), prompt_sha256=hashlib.sha256(prompt).hexdigest(), attachments=attachments)
             state[thread].append(details)
             self.save(state)
             self.record(method, **details)

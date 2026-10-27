@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the offline OpenCode ACP fixture without network or installed auth."""
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -173,6 +174,39 @@ class OpenCodeWorkflowFixtureTests(unittest.TestCase):
                                      "--provider", "fake", "--output", self.temporary.name, "--dry-run"],
                                     text=True, capture_output=True, cwd=ROOT)
         self.assertEqual(no_network.returncode, 15)
+
+
+    def test_attachment_acp_native_image_resource_and_maximum_escaping(self):
+        session = self.create()
+        cases = [("image/png", b"\xff" * (256 * 1024)), ("text/plain", b"\x01" * (256 * 1024)),
+                 ("application/pdf", b"%PDF-1.7\x00\xff")]
+        for mime, content in cases:
+            if mime.startswith("image/"):
+                part = {"type": "image", "mimeType": mime, "data": base64.b64encode(content).decode()}
+            else:
+                resource = {"uri": "spica-attachment:sha256:" + hashlib.sha256(content).hexdigest(), "mimeType": mime}
+                resource["text" if mime == "text/plain" else "blob"] = content.decode() if mime == "text/plain" else base64.b64encode(content).decode()
+                part = {"type": "resource", "resource": resource}
+            turn = self.prompt(3, session, "\x01" * (64 * 1024))
+            turn["params"]["prompt"].append(part)
+            result = self.run_server([self.resume(session, 1), turn])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            events = [json.loads(line) for line in (self.account / "workflow-events.jsonl").read_text().splitlines()]
+            accepted = [event for event in events if event["method"] == "session/prompt"][-1]
+            self.assertEqual(accepted["attachments"][0]["sha256"], hashlib.sha256(content).hexdigest())
+            self.assertEqual(accepted["attachments"][0]["byte_length"], len(content))
+            self.assertEqual(accepted["prompt_bytes"], 64 * 1024)
+
+    def test_rejects_invented_file_shape_bad_base64_digest_and_count(self):
+        session = self.create()
+        for parts in ([{"type": "file", "mime": "image/png", "filename": "a.png", "url": "data:image/png;base64,/w=="}],
+                      [{"type": "image", "mimeType": "image/png", "data": "%%%"}],
+                      [{"type": "resource", "resource": {"uri": "spica-attachment:sha256:wrong", "mimeType": "text/plain", "text": "x"}}],
+                      [{"type": "text", "text": "p"}] * 10):
+            turn = self.prompt(3, session, "p")
+            turn["params"]["prompt"] = parts
+            result = self.run_server([self.resume(session, 1), turn])
+            self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

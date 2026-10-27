@@ -71,7 +71,11 @@ pub fn RuntimeFor(comptime Transport: type) type {
         config: Config,
         storage: [32768]u8 = undefined,
         retained: std.heap.FixedBufferAllocator = undefined,
-        turn_storage: [16384]u8 = undefined,
+        // At most ceil(256KiB/3)*4 base64 bytes + 8 resource URIs,
+        // correlation and tool state. JSON is allocated separately by prompt_wire;
+        // raw text bodies are borrowed until synchronous serialization completes.
+        // No second base64 copy/data URL is retained. Ordinary frames stay 64KiB.
+        turn_storage: [512 * 1024]u8 = undefined,
         turn: std.heap.FixedBufferAllocator = undefined,
         selection: c.Selection = undefined,
         session: ?c.Session = null,
@@ -93,6 +97,8 @@ pub fn RuntimeFor(comptime Transport: type) type {
         sequence: u64 = 0,
         load_supported: bool = false,
         resume_supported: bool = false,
+        image_supported: bool = false,
+        embedded_supported: bool = false,
         runtime_version: []const u8 = "unnegotiated",
         effective: bool = false,
         selection_pending: bool = false,
@@ -141,6 +147,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
             for (&caps) |*cap| cap.* = .{ .status = .unsupported, .evidence = "OpenCode 2.1.4 ACP; no invented parity" };
             if (self.phase != .cold and self.phase != .initializing and self.phase != .failed and self.phase != .stopped) {
                 for ([_]c.Capability{ .create, .start, .stream, .tools, .approval, .cancel, .selection, .workspace }) |cap| caps[@intFromEnum(cap)].status = .supported;
+                if (self.image_supported or self.embedded_supported) caps[@intFromEnum(c.Capability.attachment)] = .{ .status = .supported, .evidence = "ACP image/resource serializers tested against offline consumer; content kinds require negotiated promptCapabilities" };
                 if (self.resume_supported) caps[@intFromEnum(c.Capability.attach)].status = .supported;
             }
             // ACP MCP registration is not itself an implemented app MCP bridge.
@@ -237,6 +244,13 @@ pub fn RuntimeFor(comptime Transport: type) type {
         pub fn dispatch(self: *Self, allocator: std.mem.Allocator, request: c.Request) !c.Receipt {
             if (request == .start) {
                 try prompt_wire.validate(request.start);
+                for (request.start.attachments) |attachment| {
+                    const m = attachment.metadata;
+                    if (!@import("../domain/attachments.zig").supported(m.media_type, m.kind, .opencode) or
+                        (m.kind == .image and !self.image_supported) or
+                        (m.kind == .file and !self.embedded_supported)) return error.AttachmentUnsupported;
+                }
+                if (c.frameBytes(request) > (c.Limits{}).frame_bytes + (c.Limits{}).attachment_packet_bytes) return error.FrameTooLarge;
             } else if (c.frameBytes(request) > 65536) return error.FrameTooLarge;
             switch (request) {
                 .open => |open| {
@@ -268,7 +282,41 @@ pub fn RuntimeFor(comptime Transport: type) type {
                     self.turn.reset();
                     self.tool_authorities = null;
                     self.correlation = try clone(self.turn.allocator(), r.correlation);
-                    try self.rpc("session/prompt", .{ .sessionId = self.session.?.upstream.value, .prompt = .{.{ .type = "text", .text = r.prompt }} });
+                    // ACP v1 ContentBlock (pinned effect-acp schema): images carry
+                    // base64 data/mimeType; embedded resources carry text or blob.
+                    // Encode inactive fields by omission, never invented file URLs.
+                    const Resource = struct { uri: []const u8, mimeType: []const u8, text: ?[]const u8 = null, blob: ?[]const u8 = null };
+                    const Part = struct { type: []const u8, text: ?[]const u8 = null, data: ?[]const u8 = null, mimeType: ?[]const u8 = null, resource: ?Resource = null };
+                    var parts: [9]Part = undefined;
+                    var part_count: usize = 0;
+                    if (r.prompt.len != 0) {
+                        parts[part_count] = .{ .type = "text", .text = r.prompt };
+                        part_count += 1;
+                    }
+                    for (r.attachments) |attachment| {
+                        const m = attachment.metadata;
+                        if (m.kind == .image) {
+                            const encoded = try self.turn.allocator().alloc(u8, std.base64.standard.Encoder.calcSize(attachment.content.len));
+                            _ = std.base64.standard.Encoder.encode(encoded, attachment.content);
+                            parts[part_count] = .{ .type = "image", .mimeType = m.media_type, .data = encoded };
+                        } else {
+                            // Digest-only URI cannot contain path escapes or refer to
+                            // local/provider files. Resource body is self-contained.
+                            const uri = try std.fmt.allocPrint(self.turn.allocator(), "spica-attachment:sha256:{s}", .{m.digest});
+                            var resource: Resource = .{ .uri = uri, .mimeType = m.media_type };
+                            if (eq(m.media_type, "text/plain")) {
+                                resource.text = attachment.content;
+                            } else {
+                                const encoded = try self.turn.allocator().alloc(u8, std.base64.standard.Encoder.calcSize(attachment.content.len));
+                                _ = std.base64.standard.Encoder.encode(encoded, attachment.content);
+                                resource.blob = encoded;
+                            }
+                            parts[part_count] = .{ .type = "resource", .resource = resource };
+                        }
+                        part_count += 1;
+                    }
+                    if (part_count == 0) return error.InvalidPrompt;
+                    try self.rpc("session/prompt", .{ .sessionId = self.session.?.upstream.value, .prompt = parts[0..part_count] });
                     self.prompt_id = self.pending_id;
                     self.offset = 0;
                     self.cancel_requested = false;
@@ -432,6 +480,9 @@ pub fn RuntimeFor(comptime Transport: type) type {
                         const caps = field(result, "agentCapabilities");
                         const load = field(caps, "loadSession");
                         self.load_supported = load == .bool and load.bool;
+                        const prompt_caps = field(caps, "promptCapabilities");
+                        self.image_supported = field(prompt_caps, "image") == .bool and field(prompt_caps, "image").bool;
+                        self.embedded_supported = field(prompt_caps, "embeddedContext") == .bool and field(prompt_caps, "embeddedContext").bool;
                         self.resume_supported = field(field(caps, "sessionCapabilities"), "resume") == .object;
                         self.phase = .idle;
                     },

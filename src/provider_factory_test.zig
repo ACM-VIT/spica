@@ -790,3 +790,109 @@ test "OpenCode rejected or mismatched first middle last row retains exact good r
         }
     }
 }
+
+fn attachmentFixtureBytes(a: std.mem.Allocator, content: []const u8, id: []const u8, image: bool) !c.Attachment {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &hash, .{});
+    return .{ .metadata = .{ .id = .{ .value = id }, .name = "fixture", .media_type = if (image) "image/png" else "text/plain", .kind = if (image) .image else .file, .byte_length = content.len, .digest = try a.dupe(u8, &std.fmt.bytesToHex(hash, .lower)) }, .content = content };
+}
+
+fn pumpAttachmentFixture(instance: @import("runtime/adapter.zig").Adapter, a: std.mem.Allocator, comptime kind: c.RuntimeKind, comptime until: enum { ready, opened, completed }) !void {
+    const Runtime = if (kind == .codex) @import("runtime/codex.zig").Runtime else @import("runtime/opencode.zig").Runtime;
+    const runtime: *Runtime = @ptrCast(@alignCast(instance.context));
+    const wire = if (kind == .codex) runtime.wire else &runtime.transport;
+    const platform = @import("runtime/transport.zig").c;
+    const deadline = platform.spica_monotonic_ms() + 5000;
+    while (platform.spica_monotonic_ms() < deadline) {
+        try instance.pump();
+        if (until == .ready and instance.ready() and instance.accountStatus().readiness != .unavailable) {
+            if (kind == .opencode) return;
+            if (runtime.pending == null) return;
+        }
+        while (try instance.poll(a)) |event| {
+            if (until == .opened and event.body == .selection) return;
+            if (until == .completed and event.body == .completed) return;
+            if (event.body == .failure) return error.FixtureFailed;
+        }
+        if (wire.exited) return error.FixtureExited;
+        _ = platform.spica_process_poll(&wire.process, -1, @intFromBool(wire.prompt_input != null or wire.input_len != 0), 10);
+    }
+    return error.FixtureTimeout;
+}
+
+fn nativeAttachmentConsumer(comptime kind: c.RuntimeKind) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    try temporary.dir.createDirPath(io, "account");
+    try temporary.dir.createDirPath(io, "workspace");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, "workspace", a);
+    const account = try temporary.dir.realPathFileAlloc(io, "account", a);
+    const profile = try std.json.Stringify.valueAlloc(a, .{
+        .format = if (kind == .codex) "spica-offline-codex-workflow-v1" else "spica-offline-opencode-workflow-v1",
+        .mode = "complete",
+        .workspace = root,
+        .runtime_version = "2.1.4",
+        .protocol_version = 1,
+        .model_provider = "opencode",
+        .model = "big-pickle",
+        .effort = "default",
+    }, .{});
+    try temporary.dir.writeFile(io, .{ .sub_path = "account/workflow-profile.json", .data = profile });
+    const executable = try std.Io.Dir.cwd().realPathFileAlloc(io, if (kind == .codex) "build/codex_workflow_fixture.py" else "build/opencode_workflow_fixture.py", a);
+    const chosen: c.Selection = .{ .runtime_kind = @tagName(kind), .required_runtime_version = if (kind == .codex) "0.163.0" else "2.1.4", .model_provider = if (kind == .codex) "openai" else "opencode", .model_id = if (kind == .codex) "offline-workflow" else "big-pickle", .effort = if (kind == .codex) "low" else "default", .account_ref = account, .workspace = .{ .value = "workspace" } };
+    const environment = try @import("runtime/environment.zig").build(a, kind, account, &.{});
+    var config: native.NativeFactory = .{ .configs = &.{.{ .selection = chosen, .executable = executable, .environment = environment }} };
+    const factory = config.asFactory();
+    try std.testing.expectEqual(.supported, factory.discover(chosen).capabilities[@intFromEnum(c.Capability.attachment)].status);
+    try std.testing.expectEqual(.unsupported, factory.discover(chosen).capabilities[@intFromEnum(c.Capability.followup_queue)].status);
+    const instance = try factory.create(std.testing.allocator, chosen, root, .{ .value = "attachment-session" }, null);
+    defer factory.destroy(std.testing.allocator, instance);
+    defer instance.shutdown();
+    try pumpAttachmentFixture(instance, a, kind, .ready);
+    _ = try instance.dispatch(a, .{ .open = .{ .create = .{ .session = .{ .value = "attachment-session" }, .effect = .{ .value = "open" }, .selection = chosen } } });
+    try pumpAttachmentFixture(instance, a, kind, .opened);
+    for (0..3) |scenario| {
+        const bytes = try a.alloc(u8, 256 * 1024);
+        @memset(bytes, if (scenario == 0) 0xff else 1);
+        var attached: [8]c.Attachment = undefined;
+        const count: usize = if (scenario == 2) 8 else 1;
+        for (attached[0..count], 0..) |*item, index| {
+            const id_value = try std.fmt.allocPrint(a, "a-{d}-{d}", .{ scenario, index });
+            item.* = try attachmentFixtureBytes(a, bytes[index * (bytes.len / count) .. (index + 1) * (bytes.len / count)], id_value, scenario == 0 or (scenario == 2 and index % 2 == 0));
+        }
+        // Invalid UTF8 text is refused before provider state changes; the same
+        // session then accepts the valid maximal packet through the real process.
+        var invalid = try attachmentFixtureBytes(a, "\xff", "invalid", false);
+        const correlation: c.Correlation = .{ .session = .{ .value = "attachment-session" }, .run = .{ .value = "run" }, .effect = .{ .value = "start" } };
+        try std.testing.expectError(error.InvalidAttachment, instance.dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = "p", .attachments = (&invalid)[0..1] } }));
+        _ = try instance.dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = "\x01" ** 65536, .attachments = attached[0..count] } });
+        try pumpAttachmentFixture(instance, a, kind, .completed);
+    }
+    const log = try temporary.dir.readFileAlloc(io, "account/workflow-events.jsonl", a, .limited(256 * 1024));
+    var lines = std.mem.tokenizeScalar(u8, log, '\n');
+    var turns: usize = 0;
+    while (lines.next()) |line| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, line, .{});
+        const object = parsed.value.object;
+        if (!std.mem.eql(u8, object.get("method").?.string, if (kind == .codex) "turn/start" else "session/prompt")) continue;
+        try std.testing.expectEqual(@as(i64, 65536), object.get("prompt_bytes").?.integer);
+        const accepted = object.get("attachments").?.array.items;
+        try std.testing.expectEqual(@as(usize, if (turns == 2) 8 else 1), accepted.len);
+        var total: i64 = 0;
+        for (accepted) |item| total += item.object.get("byte_length").?.integer;
+        try std.testing.expectEqual(@as(i64, 256 * 1024), total);
+        turns += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), turns);
+}
+
+test "Codex production factory attachment wire is accepted by strict offline consumer at maximum inputs" {
+    try nativeAttachmentConsumer(.codex);
+}
+test "OpenCode production factory attachment wire is accepted by strict ACP consumer at maximum inputs" {
+    try nativeAttachmentConsumer(.opencode);
+}

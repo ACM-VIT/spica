@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the offline server in separate processes with disposable state."""
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -153,6 +154,34 @@ class CodexWorkflowFixtureTests(unittest.TestCase):
             dict(id=3, method="turn/interrupt", params=dict(threadId=thread, turnId="wrong-turn"))])
         self.assertEqual(result.returncode, 1)
         self.assertFalse(any(json.loads(line).get("id") == 3 for line in result.stdout.splitlines()))
+
+
+    def test_attachment_native_inputs_maximum_escaping_and_binary_roundtrip(self):
+        session = self.create()
+        prompt = "\x01" * (64 * 1024)
+        for index, image in enumerate((True, False)):
+            content = b"\xff" * (256 * 1024) if image else b"\x01" * (256 * 1024)
+            part = ({"type": "image", "url": "data:image/png;base64," + base64.b64encode(content).decode()}
+                    if image else {"type": "text", "text": "[Attached text file fixture]\n" + content.decode()})
+            turn = dict(id=3, method="turn/start", params=dict(threadId=session, input=[{"type": "text", "text": prompt}, part],
+                        model="offline-workflow", effort="low", cwd=str(self.workspace)))
+            result = self.run_server([dict(id=1, method="thread/resume", params=self.selection(session)), turn])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            events = [json.loads(line) for line in (self.account / "workflow-events.jsonl").read_text().splitlines()]
+            accepted = [event for event in events if event["method"] == "turn/start"][-1]
+            self.assertEqual(accepted["attachments"][0]["sha256"], hashlib.sha256(content).hexdigest())
+            self.assertEqual(accepted["attachments"][0]["byte_length"], len(content))
+            self.assertEqual(accepted["prompt_bytes"], len(prompt))
+
+    def test_rejects_non_native_image_and_attachment_count_overflow(self):
+        session = self.create()
+        for parts in ([{"type": "image", "url": "data:image/png;base64,%%%"}],
+                      [{"type": "text", "text": "p"}] * 10,
+                      [{"type": "file", "url": "file:///private"}]):
+            turn = dict(id=3, method="turn/start", params=dict(threadId=session, input=parts,
+                        model="offline-workflow", effort="low", cwd=str(self.workspace)))
+            result = self.run_server([dict(id=1, method="thread/resume", params=self.selection(session)), turn])
+            self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

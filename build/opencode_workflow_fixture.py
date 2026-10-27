@@ -8,6 +8,7 @@ history, and stores prompt bytes only as lengths and SHA-256 digests.
 """
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import json
@@ -23,12 +24,58 @@ MODEL_PROVIDER = "opencode"
 MODEL = "big-pickle"
 EFFORT = "default"
 FAILURE = "Offline synthetic OpenCode provider failure (synthetic)."
-MAX_FRAME = 512 * 1024
+MAX_FRAME = 6 * (64 * 1024 + 256 * 1024 + 4096) + 16 * 1024
 MAX_PROFILE = 8192
 MAX_STATE = 128 * 1024
 MAX_LOG = 256 * 1024
 MAX_SESSIONS = 8
 MAX_TURNS = 16
+
+
+def validate_prompt_parts(parts):
+    """Pinned effect-acp v1 ContentBlock consumer, deliberately strict fields.
+
+    See packages/effect-acp/src/_generated/schema-v1.gen.ts ContentBlock and
+    TextResourceContents/BlobResourceContents in the local T3 source reference.
+    This validates offline wire acceptance, never model vision/PDF capability.
+    """
+    if not isinstance(parts, list) or not 1 <= len(parts) <= 9:
+        raise ValueError("bounded ACP content array required")
+    prompt = b""
+    attachments = []
+    total = 0
+    for index, part in enumerate(parts):
+        if not isinstance(part, dict):
+            raise ValueError("ACP content object required")
+        kind = part.get("type")
+        if kind == "text" and index == 0 and set(part) == {"type", "text"}:
+            prompt = part["text"].encode("utf-8")
+            if len(prompt) > 64 * 1024:
+                raise ValueError("fixture prompt bound exceeded")
+            continue
+        if kind == "image" and set(part) == {"type", "data", "mimeType"}:
+            mime = part["mimeType"]
+            if mime not in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+                raise ValueError("unsupported image MIME")
+            content = base64.b64decode(part["data"], validate=True)
+        elif kind == "resource" and set(part) == {"type", "resource"}:
+            resource = part["resource"]
+            mime = resource.get("mimeType")
+            if set(resource) == {"uri", "mimeType", "text"} and mime == "text/plain":
+                content = resource["text"].encode("utf-8")
+            elif set(resource) == {"uri", "mimeType", "blob"} and mime == "application/pdf":
+                content = base64.b64decode(resource["blob"], validate=True)
+            else:
+                raise ValueError("unsupported embedded resource")
+            if resource["uri"] != "spica-attachment:sha256:" + hashlib.sha256(content).hexdigest():
+                raise ValueError("resource identity mismatch")
+        else:
+            raise ValueError("protocol-native ACP content required")
+        total += len(content)
+        attachments.append(dict(type=kind, mime_type=mime, byte_length=len(content), sha256=hashlib.sha256(content).hexdigest()))
+    if len(attachments) > 8 or total > 256 * 1024 or (not prompt and not attachments):
+        raise ValueError("fixture attachment bound exceeded")
+    return prompt, attachments
 
 
 def read_json(path: Path, limit: int):
@@ -154,7 +201,8 @@ class Fixture:
             self.record(method)
             self.reply(request, {"protocolVersion": PROTOCOL,
                                  "agentInfo": {"name": "spica-offline-opencode", "version": VERSION},
-                                 "agentCapabilities": {"sessionCapabilities": {"resume": {}}}})
+                                 "agentCapabilities": {"sessionCapabilities": {"resume": {}},
+                                                       "promptCapabilities": {"image": True, "embeddedContext": True}}})
             return
         if method in {"session/new", "session/resume"}:
             self.session(request, method, params)
@@ -211,19 +259,15 @@ class Fixture:
         if params.get("sessionId") != self.opened:
             raise ValueError("wrong fixture session id")
         prompts = params.get("prompt")
-        if (not isinstance(prompts, list) or len(prompts) != 1 or not isinstance(prompts[0], dict)
-                or prompts[0].get("type") != "text" or not isinstance(prompts[0].get("text"), str)):
-            raise ValueError("exact text prompt required")
-        prompt = prompts[0]["text"].encode("utf-8")
-        if not 0 < len(prompt) <= 64 * 1024:
-            raise ValueError("fixture prompt bound exceeded")
+        prompt, attachments = validate_prompt_parts(prompts)
         state = self.state()
         if self.opened not in state or len(state[self.opened]) >= MAX_TURNS:
             raise ValueError("fixture turn bound exceeded")
         prior = len(state[self.opened])
         turn = f"{self.opened}-turn-{prior + 1}"
         details = {"session_id": self.opened, "turn_id": turn, "prior_turns": prior,
-                   "prompt_bytes": len(prompt), "prompt_sha256": hashlib.sha256(prompt).hexdigest()}
+                   "prompt_bytes": len(prompt), "prompt_sha256": hashlib.sha256(prompt).hexdigest(),
+                   "attachments": attachments}
         state[self.opened].append(details)
         self.save(state)
         self.record("session/prompt", **details)

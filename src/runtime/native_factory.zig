@@ -65,6 +65,7 @@ pub const NativeFactory = struct {
             for ([_]c.Capability{ .create, .start, .stream, .tools, .approval, .cancel, .selection, .workspace }) |cap| {
                 caps[@intFromEnum(cap)] = .{ .status = .supported, .evidence = "Compiled adapter protocol support; installed version and effective selection require instance handshake" };
             }
+            caps[@intFromEnum(c.Capability.attachment)] = .{ .status = .supported, .evidence = "Bounded native text/image serialization accepted by offline consumer fixtures; OpenCode instance requires promptCapabilities" };
             if (std.mem.eql(u8, selection.runtime_kind, "codex")) caps[@intFromEnum(c.Capability.attach)] = .{ .status = .supported, .evidence = "Codex thread/resume protocol; instance handshake required" };
             if (std.mem.eql(u8, selection.runtime_kind, "opencode") and self.opencode_resume_supported) caps[@intFromEnum(c.Capability.attach)] = .{ .status = .supported, .evidence = "OpenCode session/resume negotiated during catalog refresh; instance handshake required" };
             caps[@intFromEnum(c.Capability.coordinator_bridge)] = .{ .status = .unknown, .evidence = "Host endpoint and actual provider tool callback require consumer verification" };
