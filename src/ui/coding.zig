@@ -11,6 +11,7 @@ const Color = @import("color.zig").Color;
 const transcript = @import("transcript.zig");
 const presentation = @import("../content/presentation.zig");
 const contract = @import("../contract.zig");
+const attachment_text = @import("../text/attachments.zig");
 const script_api = @import("../script.zig");
 
 // Visual reference: T3 Code eb1510d (MIT), apps/marketing/src/assets/app-desktop.webp;
@@ -122,6 +123,28 @@ pub const View = struct {
     task_count: usize = 0,
     tasks_enabled: bool = false,
     task_cancel: ?TaskCancel = null,
+    attachments: attachment_text.Store,
+    workflow_open: bool = false,
+    workflow_path_focus: bool = false,
+    workflow_path: [1024]u8 = undefined,
+    workflow_path_len: usize = 0,
+    workflow_path_select_all: bool = false,
+    workflow_action: ?WorkflowAction = null,
+    workflow_busy: bool = false,
+    workflow_run: transcript.Id = .{},
+    workflow_active: bool = false,
+    workflow_uncertain: bool = false,
+    workflow_feedback: [512]u8 = undefined,
+    workflow_feedback_len: usize = 0,
+    workflow_error: []const u8 = "",
+    workflow_bounds: c.SDL_FRect = zero_rect,
+    workflow_button: c.SDL_FRect = zero_rect,
+    workflow_targets: hit_targets.SemanticTargets(64, 96, 16) = .{},
+    workflow_keyboard: usize = 0,
+    workflow_page: usize = 0,
+    followups: [8]Followup = @splat(.{}),
+    followup_count: usize = 0,
+    followup_editing: ?transcript.Id = null,
     can_send: bool = false,
     send_disabled_reason: ?[]const u8 = null,
     can_cancel: bool = false,
@@ -438,9 +461,82 @@ pub const View = struct {
         run_status: RunStatus = .idle,
     };
 
+    pub const WorkflowAction = union(enum) { add, remove: usize, enqueue, edit: usize, cancel: usize, up: usize, down: usize };
+    pub const Followup = struct {
+        id: transcript.Id = .{},
+        revision: u64 = 0,
+        state: enum { planned, in_flight, withdrawn, confirmed, failed, unknown } = .planned,
+        content: []u8 = &.{},
+        len: usize = 0,
+    };
+
+    pub fn workflowNotice(self: *View, message: []const u8) void {
+        const clipped = @import("../text/utf8.zig").prefix(message, self.workflow_feedback.len);
+        @memcpy(self.workflow_feedback[0..clipped.len], clipped);
+        self.workflow_feedback_len = clipped.len;
+    }
+
+    pub fn scopeWorkflow(self: *View, run: transcript.Id) void {
+        if (self.workflow_run.eql(run.slice())) return;
+        self.workflow_run = run;
+        for (self.followups[0..self.followup_count]) |*item| {
+            self.allocator.free(item.content);
+            item.* = .{};
+        }
+        self.followup_count = 0;
+        self.followup_editing = null;
+        self.workflow_uncertain = false;
+        self.workflow_action = null;
+    }
+
+    fn workflowInsert(self: *View, bytes: []const u8) !void {
+        if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.InvalidUtf8;
+        const start = if (self.workflow_path_select_all) 0 else self.workflow_path_len;
+        if (start + bytes.len > self.workflow_path.len) return error.TextTooLarge;
+        @memcpy(self.workflow_path[start..][0..bytes.len], bytes);
+        self.workflow_path_len = start + bytes.len;
+        self.workflow_path_select_all = false;
+    }
+
+    fn workflowActivate(self: *View, id: []const u8) !void {
+        if (std.mem.eql(u8, id, "workflow.close")) {
+            self.workflow_open = false;
+            self.workflow_path_focus = false;
+            self.focused = true;
+        } else if (std.mem.eql(u8, id, "attachment.path")) {
+            self.workflow_path_focus = true;
+            self.workflow_path_select_all = true;
+        } else if (std.mem.eql(u8, id, "workflow.previous")) {
+            self.workflow_page -|= 1;
+        } else if (std.mem.eql(u8, id, "workflow.next")) {
+            self.workflow_page = @min(7, self.workflow_page + 1);
+        } else if (std.mem.eql(u8, id, "followup.stop_edit")) {
+            self.followup_editing = null;
+            self.workflowNotice("Editing stopped. Composer retained as a new draft.");
+        } else if (!self.workflow_busy) {
+            if (std.mem.eql(u8, id, "attachment.add")) self.workflow_action = .add;
+            if (std.mem.eql(u8, id, "followup.enqueue")) self.workflow_action = .enqueue;
+            var buffer: [64]u8 = undefined;
+            for (0..attachment_text.max_count) |i| if (std.mem.eql(u8, id, try std.fmt.bufPrint(&buffer, "attachment.remove.{d}", .{i}))) {
+                self.workflow_action = .{ .remove = i };
+            };
+            for (0..self.followup_count) |i| {
+                inline for (.{ "edit", "cancel", "up", "down" }) |kind| {
+                    if (std.mem.eql(u8, id, try std.fmt.bufPrint(&buffer, "followup." ++ kind ++ ".{d}", .{i}))) self.workflow_action = @unionInit(WorkflowAction, kind, i);
+                }
+            }
+        }
+    }
+
     const Retained = struct {
         id: transcript.Id = .{},
         editor: ?Composer = null,
+        attachments: ?attachment_text.Store = null,
+        workflow_run: transcript.Id = .{},
+        workflow_uncertain: bool = false,
+        followups: [8]Followup = @splat(.{}),
+        followup_count: usize = 0,
+        followup_editing: ?transcript.Id = null,
         revision: u64 = 0,
         scroll: f32 = 0,
         follow: bool = true,
@@ -469,9 +565,19 @@ pub const View = struct {
             self.retained[index] = .{};
         } else {
             self.retained_clock += 1;
-            self.retained[index] = .{ .id = self.active_thread, .editor = self.editor, .revision = self.revision, .scroll = self.editor_view.scroll, .follow = self.follow_latest, .position = self.history_position, .selection = self.selected, .used = self.retained_clock };
+            self.retained[index] = .{ .id = self.active_thread, .editor = self.editor, .revision = self.revision, .scroll = self.editor_view.scroll, .follow = self.follow_latest, .position = self.history_position, .selection = self.selected, .used = self.retained_clock, .attachments = self.attachments, .workflow_run = self.workflow_run, .workflow_uncertain = self.workflow_uncertain, .followups = self.followups, .followup_count = self.followup_count, .followup_editing = self.followup_editing };
         }
         self.editor = next.editor.?;
+        self.attachments = next.attachments orelse attachment_text.Store.init(self.allocator);
+        self.workflow_path_len = 0;
+        self.workflow_feedback_len = 0;
+        self.workflow_error = "";
+        self.workflow_run = next.workflow_run;
+        self.workflow_uncertain = next.workflow_uncertain;
+        self.followups = next.followups;
+        self.followup_count = next.followup_count;
+        self.followup_editing = next.followup_editing;
+        self.workflow_page = 0;
         self.selected = next.selection;
         self.revision = next.revision;
         self.editor_view.deinit();
@@ -518,11 +624,17 @@ pub const View = struct {
     pub fn init(allocator: std.mem.Allocator) !View {
         var editor = try Composer.init(allocator);
         errdefer editor.deinit();
-        return .{ .allocator = allocator, .editor = editor, .scratch = try allocator.alloc(u8, 64 * 1024 + 1) };
+        return .{ .allocator = allocator, .editor = editor, .scratch = try allocator.alloc(u8, 64 * 1024 + 1), .attachments = attachment_text.Store.init(allocator) };
     }
 
     pub fn deinit(self: *View) void {
-        for (&self.retained) |*slot| if (slot.editor) |*editor| editor.deinit();
+        for (&self.retained) |*slot| {
+            if (slot.editor) |*editor| editor.deinit();
+            if (slot.attachments) |*attachments| attachments.deinit();
+            for (slot.followups[0..slot.followup_count]) |item| self.allocator.free(item.content);
+        }
+        self.attachments.deinit();
+        for (self.followups[0..self.followup_count]) |item| self.allocator.free(item.content);
         for (&self.rich_tiles) |*tile| tile.deinit();
         self.custom_tile.deinit();
         if (self.preedit_layout) |layout| c.spica_text_layout_release(layout);
@@ -908,6 +1020,22 @@ pub const View = struct {
                 if (self.custom_root == null) {
                     const x = event.button.x;
                     const y = event.button.y;
+                    if (widgets.contains(self.workflow_button, x, y) and !self.setup_open and !self.workspace_open) {
+                        self.workflow_open = !self.workflow_open;
+                        self.workflow_path_focus = false;
+                        self.workflow_keyboard = 0;
+                        try self.focus(window, true);
+                        return true;
+                    }
+                    if (self.workflow_open) {
+                        for (self.workflow_targets.slice(), 0..) |target, i| if (target.enabled and widgets.contains(target.bounds, x, y)) {
+                            self.workflow_keyboard = i;
+                            try self.workflowActivate(target.id[0..target.id_len]);
+                            try self.focus(window, true);
+                            break;
+                        };
+                        return true;
+                    }
                     if (self.workspace_open) {
                         if (widgets.contains(self.workspace_close_bounds, x, y)) {
                             self.workspace_open = false;
@@ -1118,6 +1246,7 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_MOUSE_WHEEL => {
+                if (self.workflow_open and self.custom_root == null) return true;
                 const wheel_direction: f32 = if (event.wheel.direction == c.SDL_MOUSEWHEEL_FLIPPED) -1 else 1;
                 if (self.custom_root == null and (self.setup_open or self.effort_open)) return true;
                 if (self.custom_root == null and self.workspace_open) {
@@ -1157,7 +1286,7 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_TEXT_EDITING => {
-                if (self.custom_root == null and (self.setup_open or self.picker_open or self.effort_open or self.search_focused)) return true;
+                if (self.custom_root == null and (self.workflow_open or self.setup_open or self.picker_open or self.effort_open or self.search_focused)) return true;
                 if (!self.hasComposer() or !self.focused or !self.window_active) return false;
                 const bytes = std.mem.span(event.edit.text);
                 self.preedit_changed = true;
@@ -1171,6 +1300,10 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_TEXT_INPUT => {
+                if (self.workflow_open and self.custom_root == null) {
+                    if (self.workflow_path_focus and self.window_active) try self.workflowInsert(std.mem.span(event.text.text));
+                    return true;
+                }
                 if (self.custom_root == null and (self.picker_open or self.effort_open)) return true;
                 if (self.setup_open and self.custom_root == null) {
                     try self.setupInsert(std.mem.span(event.text.text));
@@ -1194,6 +1327,52 @@ pub const View = struct {
                 const mods = event.key.mod;
                 const ctrl = mods & c.SDL_KMOD_CTRL != 0;
                 const shift = mods & c.SDL_KMOD_SHIFT != 0;
+                if (key == c.SDLK_F10 and self.custom_root == null and !self.setup_open and !self.workspace_open) {
+                    self.workflow_open = !self.workflow_open;
+                    self.workflow_path_focus = false;
+                    self.workflow_keyboard = 0;
+                    self.picker_open = false;
+                    self.effort_open = false;
+                    self.scope_open = false;
+                    self.search_focused = false;
+                    try self.focus(window, true);
+                    return true;
+                }
+                if (self.workflow_open and self.custom_root == null) {
+                    if (!self.window_active) return false;
+                    if (key == c.SDLK_F6 or key == c.SDLK_F7 or key == c.SDLK_F8) {
+                        self.request(if (key == c.SDLK_F6) .cancel else if (key == c.SDLK_F7) .allow else .deny);
+                        return true;
+                    }
+                    if (key == c.SDLK_ESCAPE) {
+                        self.workflow_open = false;
+                        self.workflow_path_focus = false;
+                        try self.focus(window, true);
+                    } else if (key == c.SDLK_TAB) {
+                        self.workflow_path_focus = false;
+                        const count = self.workflow_targets.slice().len;
+                        if (count != 0) self.workflow_keyboard = (self.workflow_keyboard + (if (shift) count - 1 else 1)) % count;
+                    } else if (self.workflow_path_focus) {
+                        if (ctrl and key == c.SDLK_A) self.workflow_path_select_all = true;
+                        if (ctrl and key == c.SDLK_V) {
+                            const value = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+                            defer c.SDL_free(value);
+                            try self.workflowInsert(std.mem.span(value));
+                        }
+                        if (key == c.SDLK_BACKSPACE or key == c.SDLK_DELETE) {
+                            if (self.workflow_path_select_all) self.workflow_path_len = 0 else if (key == c.SDLK_BACKSPACE and self.workflow_path_len != 0) {
+                                self.workflow_path_len -= 1;
+                                while (self.workflow_path_len != 0 and self.workflow_path[self.workflow_path_len] & 0xc0 == 0x80) self.workflow_path_len -= 1;
+                            }
+                            self.workflow_path_select_all = false;
+                        }
+                        if (key == c.SDLK_RETURN and !self.workflow_busy) self.workflow_action = .add;
+                    } else if (key == c.SDLK_RETURN or key == c.SDLK_SPACE) {
+                        const targets = self.workflow_targets.slice();
+                        if (self.workflow_keyboard < targets.len and targets[self.workflow_keyboard].enabled) try self.workflowActivate(targets[self.workflow_keyboard].id[0..targets[self.workflow_keyboard].id_len]);
+                    }
+                    return true;
+                }
                 if (self.setup_open and self.custom_root == null) {
                     const alt = mods & c.SDL_KMOD_ALT != 0;
                     if (key == c.SDLK_ESCAPE) self.setup_open = false;
@@ -1818,7 +1997,9 @@ pub const View = struct {
         const primary: usize = if (self.can_cancel) 1 else 0;
         self.controls[primary] = .{ .x = panel.x + panel.w - 44, .y = y - 2, .w = 32, .h = 32 };
         const model_x = panel.x + 10;
-        const available = @max(0, self.controls[primary].x - model_x - gap * 2);
+        self.workflow_button = .{ .x = self.controls[primary].x - 110, .y = y, .w = 104, .h = 28 };
+        try self.labels.drawFitted(renderer, text, "More · F10", self.workflow_button.x + 4, y + 6, 98, 13, foreground);
+        const available = @max(0, self.workflow_button.x - model_x - gap * 2);
         const label = if (self.selected) |*selected| (if (selected.runtime_kind.eql("fake")) "Demo · synthetic" else selected.model_id.slice()) else "Choose model";
         const effort = if (self.selected) |*selected| selected.effort.slice() else "Effort";
         const prefix = @import("../text/utf8.zig").prefix;
@@ -1855,6 +2036,62 @@ pub const View = struct {
         }
         const guidance = self.send_disabled_reason orelse if (self.can_cancel) "Working · Stop cancels the current run" else if (self.selected == null) "Choose a model, or open Connection to refresh models" else if (!self.can_send) self.status else if (self.editor.len == 0) "Write a message · Enter sends · Shift+Enter adds a line" else "Enter to send · Shift+Enter for a new line";
         try self.labels.drawFitted(renderer, text, guidance, panel.x + 2, panel.y + panel.h - 16, panel.w - 4, 11, muted);
+    }
+
+    fn workflowControl(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, id: []const u8, label: []const u8, rect: c.SDL_FRect, enabled: bool, color: Color) !void {
+        const index = self.workflow_targets.slice().len;
+        try self.workflow_targets.add(id, if (std.mem.eql(u8, id, "attachment.path")) "textbox" else "button", rect, enabled);
+        try widgets.panel(renderer, rect, 4, if (index == self.workflow_keyboard) self.design.colors.selection else self.design.colors.raised);
+        try self.labels.drawFitted(renderer, text, label, rect.x + 5, rect.y + 6, rect.w - 10, 12, if (enabled) color else self.design.colors.muted);
+    }
+
+    fn drawWorkflow(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
+        self.workflow_targets.clear();
+        const box = c.SDL_FRect{ .x = bounds.transcript.x, .y = bounds.header.y + bounds.header.height + 4, .w = bounds.transcript.width, .h = bounds.composer.y + bounds.composer.height - bounds.header.y - bounds.header.height - 4 };
+        self.workflow_bounds = box;
+        var clip = widgets.Clip.push(renderer, box);
+        defer clip.restore(renderer);
+        try widgets.panel(renderer, box, 8, self.design.colors.surface);
+        try self.labels.drawFitted(renderer, text, "Follow-ups, questions & attachments", box.x + 12, box.y + 10, box.w - 100, 16, foreground);
+        try self.workflowControl(renderer, text, "workflow.close", "Close · Esc", .{ .x = box.x + box.w - 92, .y = box.y + 5, .w = 84, .h = 28 }, true, foreground);
+        try self.labels.drawFitted(renderer, text, "Questions are unavailable in this version. No answers will be sent.", box.x + 12, box.y + 38, box.w - 24, 12, muted);
+        try self.labels.drawFitted(renderer, text, "Files stay in this draft. Delivery is unavailable; remove them before Send.", box.x + 12, box.y + 58, box.w - 24, 12, muted);
+        const path_rect = c.SDL_FRect{ .x = box.x + 12, .y = box.y + 82, .w = @max(60, box.w - 104), .h = 28 };
+        try self.workflowControl(renderer, text, "attachment.path", if (self.workflow_path_len == 0) "Absolute file path…" else self.workflow_path[0..self.workflow_path_len], path_rect, true, foreground);
+        try self.workflowControl(renderer, text, "attachment.add", "Add", .{ .x = box.x + box.w - 84, .y = path_rect.y, .w = 72, .h = 28 }, !self.workflow_busy, foreground);
+        var buffer: [512]u8 = undefined;
+        var id_buffer: [64]u8 = undefined;
+        // Page one attachment and one follow-up together. Every bounded slot
+        // remains reachable on a 720x480 window, without offscreen hit targets.
+        const pages = @max(@max(self.attachments.count, self.followup_count), 1);
+        self.workflow_page = @min(self.workflow_page, pages - 1);
+        const y = box.y + 118;
+        var ordinal: usize = 0;
+        for (0..attachment_text.max_count) |i| if (self.attachments.get(i)) |file| {
+            defer ordinal += 1;
+            if (ordinal != self.workflow_page) continue;
+            const label = try std.fmt.bufPrint(&buffer, "{s} · {d} bytes · local only", .{ file.metadata.name, file.content.len });
+            try self.labels.drawFitted(renderer, text, label, box.x + 12, y + 6, box.w - 106, 12, foreground);
+            try self.workflowControl(renderer, text, try std.fmt.bufPrint(&id_buffer, "attachment.remove.{d}", .{i}), "Remove", .{ .x = box.x + box.w - 84, .y = y, .w = 72, .h = 28 }, !self.workflow_busy, foreground);
+        };
+        if (self.attachments.count == 0) try self.labels.drawFitted(renderer, text, "No local attachments · 8 files / 256 KiB maximum", box.x + 12, y + 6, box.w - 24, 12, muted);
+        try self.workflowControl(renderer, text, "followup.enqueue", if (self.followup_editing != null) "Save draft edit" else "Queue composer draft", .{ .x = box.x + 12, .y = y + 34, .w = 174, .h = 28 }, !self.workflow_busy and !self.workflow_uncertain and self.workflow_active, foreground);
+        if (self.followup_editing != null) try self.workflowControl(renderer, text, "followup.stop_edit", "Stop editing", .{ .x = box.x + 194, .y = y + 34, .w = 104, .h = 28 }, !self.workflow_busy, foreground);
+        try self.labels.drawFitted(renderer, text, if (self.workflow_active) "Provider support is checked. Your draft stays here if refused." else "Follow-ups require a current live run. F6 stops; F7/F8 approve/deny.", box.x + 12, y + 68, box.w - 24, 12, muted);
+        if (self.workflow_page < self.followup_count) {
+            const i = self.workflow_page;
+            const item = &self.followups[i];
+            const label = try std.fmt.bufPrint(&buffer, "{s}: {s}", .{ @tagName(item.state), @import("../text/utf8.zig").prefix(item.content[0..item.len], 160) });
+            try self.labels.drawFitted(renderer, text, label, box.x + 12, y + 90, box.w - 24, 12, foreground);
+            inline for (.{ "edit", "cancel", "up", "down" }, 0..) |kind, k| {
+                try self.workflowControl(renderer, text, try std.fmt.bufPrint(&id_buffer, "followup." ++ kind ++ ".{d}", .{i}), kind, .{ .x = box.x + 12 + k * 74, .y = y + 109, .w = 68, .h = 26 }, !self.workflow_busy and !self.workflow_uncertain and item.state == .planned and self.workflow_active, foreground);
+            }
+        }
+        if (pages > 1) {
+            try self.workflowControl(renderer, text, "workflow.previous", "Previous", .{ .x = box.x + box.w - 190, .y = box.y + box.h - 60, .w = 82, .h = 26 }, self.workflow_page > 0, foreground);
+            try self.workflowControl(renderer, text, "workflow.next", "Next", .{ .x = box.x + box.w - 100, .y = box.y + box.h - 60, .w = 82, .h = 26 }, self.workflow_page + 1 < pages, foreground);
+        }
+        if (self.workflow_feedback_len != 0) try self.labels.drawFitted(renderer, text, self.workflow_feedback[0..self.workflow_feedback_len], box.x + 12, box.y + box.h - 28, box.w - 24, 12, foreground);
     }
 
     fn drawEffort(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, foreground: Color, muted: Color) !void {
@@ -2230,6 +2467,7 @@ pub const View = struct {
             try self.labels.drawFitted(renderer, text, notice, bounds.transcript.x, bounds.transcript.y + task_height, bounds.transcript.width - hint_width, 12, muted);
             if (hint_width != 0) try self.labels.drawFitted(renderer, text, "Ctrl+Shift+C: Send diagnostics", bounds.transcript.x + bounds.transcript.width - hint_width + 12, bounds.transcript.y + task_height, hint_width - 12, 11, muted);
         }
+        if (self.custom_root == null and self.workflow_open) try self.drawWorkflow(renderer, text, bounds, foreground, muted);
         if (self.custom_root == null and self.picker_open) try self.drawPicker(renderer, text, bounds, foreground, muted);
         if (self.custom_root == null and self.effort_open) try self.drawEffort(renderer, text, foreground, muted);
         if (self.custom_root == null and self.setup_open) try self.drawSetup(renderer, text, bounds, foreground, muted);
@@ -3475,4 +3713,81 @@ test "existing Codex is an explicit owned choice preserving saved custom paths a
     view.setup_runtime = .opencode;
     view.useExistingCodex();
     try std.testing.expect(view.setup_action == null);
+}
+
+test "workflow attachments and follow-up edits retain thread identity and release owned copies" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.selectThread(try transcript.Id.init("first"));
+    try view.insert("draft café", .paste);
+    view.scopeWorkflow(try transcript.Id.init("run-one"));
+    _ = try view.attachments.add(.{ .metadata = .{ .id = .{ .value = "file" }, .name = "notes", .media_type = "text/plain", .byte_length = 5, .digest = "digest" }, .content = "hello" });
+    view.followups[0] = .{ .id = try transcript.Id.init("followup"), .revision = 7, .len = 6, .content = try std.testing.allocator.dupe(u8, "queued") };
+    view.followup_count = 1;
+    view.followup_editing = view.followups[0].id;
+    try view.selectThread(try transcript.Id.init("second"));
+    try std.testing.expectEqual(@as(usize, 0), view.attachments.count);
+    try std.testing.expectEqual(@as(usize, 0), view.followup_count);
+    try std.testing.expect(view.followup_editing == null);
+    try view.selectThread(try transcript.Id.init("first"));
+    try std.testing.expectEqualStrings("hello", view.attachments.get(0).?.content);
+    try std.testing.expectEqualStrings("draft café", view.editor.textBytes());
+    try std.testing.expectEqual(@as(u64, 7), view.followups[0].revision);
+    try std.testing.expectEqualStrings("run-one", view.workflow_run.slice());
+    view.scopeWorkflow(try transcript.Id.init("run-two"));
+    try std.testing.expectEqual(@as(usize, 0), view.followup_count);
+    try std.testing.expect(view.followup_editing == null);
+    try std.testing.expectEqualStrings("draft café", view.editor.textBytes());
+    try std.testing.expectEqual(@as(usize, 1), view.attachments.count);
+}
+
+test "workflow path editing rejects overflow transactionally and never edits the composer" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.insert("composer", .typing);
+    try view.workflowInsert("/tmp/café");
+    try std.testing.expectError(error.TextTooLarge, view.workflowInsert("x" ** 1024));
+    try std.testing.expectEqualStrings("/tmp/café", view.workflow_path[0..view.workflow_path_len]);
+    try std.testing.expectEqualStrings("composer", view.editor.textBytes());
+    view.followup_editing = try transcript.Id.init("old");
+    try view.workflowActivate("followup.stop_edit");
+    try std.testing.expect(view.followup_editing == null);
+    try std.testing.expectEqualStrings("composer", view.editor.textBytes());
+}
+
+test "workflow paging keeps every bounded action inside minimum native geometry" {
+    const surface = c.SDL_CreateSurface(720, 480, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(text);
+    var layout = try Layout.init(std.testing.allocator, 720, 480);
+    defer layout.deinit();
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.workflow_active = true;
+    view.workflow_open = true;
+    for (0..8) |i| {
+        var buffer: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&buffer, "file-{d}", .{i});
+        _ = try view.attachments.add(.{ .metadata = .{ .id = .{ .value = id }, .name = id, .media_type = "text/plain", .byte_length = 1, .digest = "digest" }, .content = "x" });
+        view.followups[i] = .{ .id = try transcript.Id.init(id), .revision = 1, .content = try std.testing.allocator.dupe(u8, "queued"), .len = 6 };
+        view.followup_count += 1;
+    }
+    for (0..8) |page| {
+        view.workflow_page = page;
+        try view.drawWorkflow(renderer, text, layout.coding(720), view.design.colors.foreground, view.design.colors.muted);
+        var remove: [32]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&remove, "attachment.remove.{d}", .{page});
+        var found = false;
+        for (view.workflow_targets.slice()) |target| {
+            const b = target.bounds;
+            try std.testing.expect(b.x >= view.workflow_bounds.x and b.y >= view.workflow_bounds.y);
+            try std.testing.expect(b.x + b.w <= view.workflow_bounds.x + view.workflow_bounds.w);
+            try std.testing.expect(b.y + b.h <= view.workflow_bounds.y + view.workflow_bounds.h);
+            if (std.mem.eql(u8, target.id[0..target.id_len], expected)) found = true;
+        }
+        try std.testing.expect(found);
+    }
 }

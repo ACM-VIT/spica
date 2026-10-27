@@ -258,11 +258,11 @@ class Session:
 def target_groups(snapshot: dict[str, Any]) -> Iterable[dict[str, Any]]:
     for name in ("targets", "thread_targets", "sidebar_targets", "scope_targets",
                  "effort_targets", "navigation_targets", "task_targets", "setup_targets", "setup_provider_targets",
-                 "setup_field_targets"):
+                 "setup_field_targets", "workflow_targets"):
         for target in snapshot.get(name, []) or []:
             if isinstance(target, dict):
                 yield target
-    for name in ("setup_advanced_target", "setup_existing_target", "setup_login_target"):
+    for name in ("setup_advanced_target", "setup_existing_target", "setup_login_target", "workflow_target"):
         target = snapshot.get(name)
         if isinstance(target, dict):
             yield target

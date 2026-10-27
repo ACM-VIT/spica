@@ -184,6 +184,17 @@ class SpicaUiOfflineTests(unittest.TestCase):
         target = {"id": "workspace.file.0", "enabled": True, "pointer_bounds": [10, 20, 30, 40]}
         self.assertEqual(module.find_target({"navigation_targets": [target]}, "workspace.file.0"), target)
 
+    def test_workflow_targets_preserve_painted_bounds_and_disabled_state(self):
+        module = load_cli()
+        opener = {"id": "workflow.open", "enabled": True, "pointer_bounds": [10, 20, 30, 40]}
+        remove = {"id": "attachment.remove.0", "enabled": False, "pointer_bounds": None}
+        snapshot = {"workflow_target": opener, "workflow_targets": [remove]}
+        self.assertEqual(module.find_target(snapshot, "workflow.open"), opener)
+        with self.assertRaises(module.DriverError) as failure:
+            module.find_target(snapshot, "attachment.remove.0")
+        self.assertEqual(failure.exception.code, module.EX_TARGET)
+        self.assertIn("disabled", str(failure.exception))
+
     def test_workspace_diff_requires_fresh_result_in_the_same_checkout_and_thread(self):
         module = load_cli()
         before = {"workspace_root": "/fixture", "workspace_revision": 2, "project_id": "p", "thread_id": "t"}

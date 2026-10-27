@@ -13,6 +13,7 @@ const presentation = @import("content/presentation.zig");
 const Id = @import("ui/transcript.zig").Id;
 const script = @import("script.zig");
 const design = @import("ui/design.zig");
+const attachment_text = @import("text/attachments.zig");
 const inspection = @import("domain/inspection.zig");
 
 /// Only a payload-free wake crosses worker threads. Registered after SDL init;
@@ -36,6 +37,16 @@ pub const Wake = struct {
 fn setupTarget(id: []const u8, role: []const u8, bounds: c.SDL_FRect, open: bool) automation.Target {
     const enabled = open and bounds.w > 0 and bounds.h > 0;
     return .{ .id = id, .role = role, .key = "", .enabled = enabled, .pointer_bounds = if (enabled) .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } else null };
+}
+
+/// Observations borrow stable copied ledger bytes through the next paint.
+/// Iteration must borrow entries, never a temporary by-value loop capture.
+fn observeWorkflowTargets(view: *const Coding, output: *[64]automation.Target) void {
+    output.* = @splat(.{ .enabled = false });
+    if (view.custom_root != null or !view.workflow_open) return;
+    for (view.workflow_targets.slice(), 0..) |*target, i| {
+        output[i] = setupTarget(target.id[0..target.id_len], target.role[0..target.role_len], target.bounds, target.enabled);
+    }
 }
 
 /// Extend explicit live observations within the native consumer; the retained
@@ -358,6 +369,22 @@ pub const App = struct {
             },
             else => return err,
         };
+        if (self.view.workflow_action) |action| {
+            self.view.workflow_action = null;
+            if (self.conversation) |conversation| conversation.workflow(self, action) catch |err| {
+                self.view.workflow_error = @errorName(err);
+                self.view.workflowNotice(switch (err) {
+                    error.FollowupCapabilityUnavailable => "The selected provider does not support follow-ups. Your draft is retained.",
+                    error.NoLiveRun => "Follow-ups need a live run in this chat. Your draft is retained.",
+                    error.AbsoluteFilePathRequired => "Enter an absolute file path before adding a file.",
+                    error.FollowupDraftSize => "Write a shorter follow-up (up to 4096 bytes). Your draft is retained.",
+                    error.AttachmentDeliveryUnavailable => "Remove local files before queueing; this provider cannot receive them.",
+                    error.KeepOrClearCurrentDraftBeforeEditing => "Keep or clear the current composer draft before editing a follow-up.",
+                    error.FollowupAlreadyDispatched => "This follow-up has already left the queue and cannot be changed.",
+                    else => "The action is unavailable in the current chat state. Your draft is retained.",
+                });
+            } else self.view.workflowNotice("No connected Host; draft retained.");
+        }
         if (self.view.navigation) |navigation| {
             self.view.navigation = null;
             if (self.conversation) |conversation| conversation.navigateWorkspace(self, navigation) catch |err| {
@@ -463,10 +490,11 @@ pub const App = struct {
         }
         self.snapshot.caret = self.view.editor.caret;
         self.snapshot.anchor = self.view.editor.anchor;
-        self.snapshot.editor_focused = self.view.focused and !self.view.search_focused and !self.view.setup_open and !self.view.workspace_open and !self.view.picker_open and !self.view.effort_open;
+        self.snapshot.editor_focused = self.view.focused and !self.view.workflow_open and !self.view.search_focused and !self.view.setup_open and !self.view.workspace_open and !self.view.picker_open and !self.view.effort_open;
         self.snapshot.preedit_bytes = self.view.preedit_len;
         self.snapshot.draft_revision = self.view.revision;
         const editor_bounds = self.view.editor_view.bounds;
+        self.snapshot.targets[1].enabled = editor_bounds.w > 0 and editor_bounds.h > 0;
         self.snapshot.targets[1].pointer_bounds = .{ @intFromFloat(editor_bounds.x), @intFromFloat(editor_bounds.y), @intFromFloat(editor_bounds.w), @intFromFloat(editor_bounds.h) };
         self.snapshot.connected = self.view.connected;
         self.snapshot.run_status = self.view.status;
@@ -577,6 +605,36 @@ pub const App = struct {
         self.snapshot.send_session_id = self.view.send_diagnostic.session_id[0..self.view.send_diagnostic.session_id_len];
         self.snapshot.send_rejection = self.view.send_diagnostic.rejection[0..self.view.send_diagnostic.rejection_len];
         self.snapshot.send_provider_diagnostic = self.view.send_diagnostic.provider[0..self.view.send_diagnostic.provider_len];
+        self.snapshot.workflow_open = self.view.workflow_open;
+        self.snapshot.workflow_busy = self.view.workflow_busy;
+        self.snapshot.workflow_path_focused = self.view.workflow_open and self.view.workflow_path_focus;
+        self.snapshot.workflow_path = self.view.workflow_path[0..self.view.workflow_path_len];
+        self.snapshot.workflow_feedback = self.view.workflow_feedback[0..self.view.workflow_feedback_len];
+        self.snapshot.workflow_error = self.view.workflow_error;
+        self.snapshot.workflow_run_id = self.view.workflow_run.slice();
+        self.snapshot.attachment_count = self.view.attachments.count;
+        self.snapshot.attachment_bytes = self.view.attachments.content_bytes;
+        self.snapshot.attachment_names = @splat("");
+        for (0..attachment_text.max_count) |i| if (self.view.attachments.get(i)) |file| {
+            self.snapshot.attachment_names[i] = file.metadata.name;
+        };
+        self.snapshot.followup_ids = @splat("");
+        self.snapshot.followup_states = @splat("");
+        self.snapshot.followup_revisions = @splat(0);
+        for (self.view.followups[0..self.view.followup_count], 0..) |*item, i| {
+            self.snapshot.followup_ids[i] = item.id.slice();
+            self.snapshot.followup_states[i] = @tagName(item.state);
+            self.snapshot.followup_revisions[i] = item.revision;
+        }
+        if (self.conversation) |conversation| self.snapshot.followup_capability = @tagName(conversation.followup_capability);
+        self.snapshot.workflow_target = setupTarget("workflow.open", "button", self.view.workflow_button, self.view.custom_root == null and !self.view.setup_open and !self.view.workspace_open);
+        self.snapshot.workflow_target.key = "F10";
+        observeWorkflowTargets(&self.view, &self.snapshot.workflow_targets);
+        if (self.view.workflow_open and self.view.custom_root == null) {
+            for (self.snapshot.targets[1..]) |*target| target.enabled = false;
+            for (&self.snapshot.thread_targets) |*target| target.enabled = false;
+            for (&self.snapshot.sidebar_targets) |*target| target.enabled = false;
+        }
         self.snapshot.picker_open = self.view.picker_open;
         self.snapshot.setup_open = self.view.setup_open;
         self.snapshot.setup_runtime = @tagName(self.view.setup_runtime);
@@ -807,6 +865,9 @@ const Conversation = struct {
     worker: *presentation.Worker,
     wake: *Wake,
     workspace_root: []u8,
+    attachment_loader: ?*attachment_text.Loader = null,
+    attachment_loading: bool = false,
+    attachment_thread: Id = .{},
     inspection_worker: ?*inspection.Worker = null,
     inspection_binding_storage: [6][4096]u8 = undefined,
     inspection_binding_lengths: [6]usize = @splat(0),
@@ -897,6 +958,19 @@ const Conversation = struct {
     diagnostic_storage: [1024]u8 = undefined,
     diagnostic_len: usize = 0,
     preflight_storage: [192]u8 = undefined,
+    followup_capability: contract.Status = .unknown,
+    capability_runtime: Id = .{},
+    workflow_pending: struct {
+        thread: Id = .{},
+        run: Id = .{},
+        id: Id = .{},
+        content: [4096]u8 = undefined,
+        len: usize = 0,
+        attachment_index: usize = 0,
+        order: [8]contract.FollowupId = undefined,
+        order_ids: [8]Id = undefined,
+        order_count: usize = 0,
+    } = .{},
 
     const InspectionRequest = struct {
         revision: u64,
@@ -1615,8 +1689,8 @@ const Conversation = struct {
         }
     }
 
-    const QueryKind = enum { projects, workspaces, inspection_workspace, threads, cards, thread, models, runtime_status, startup_status, runs, effects, approvals, tasks, messages, blocks, content };
-    const CommandKind = enum { project, workspace, thread, selection, send, cancel, approval, configure, login, refresh_models };
+    const QueryKind = enum { capabilities, projects, workspaces, inspection_workspace, threads, cards, thread, models, runtime_status, startup_status, runs, effects, approvals, tasks, messages, blocks, content };
+    const CommandKind = enum { followup_enqueue, followup_edit, followup_cancel, followup_order, attachment_add, attachment_remove, project, workspace, thread, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
     fn create(allocator: std.mem.Allocator, io: std.Io, host: *domain.Host, file: std.Io.File, wake: *Wake, workspace_root: []const u8) !*Conversation {
@@ -1628,12 +1702,15 @@ const Conversation = struct {
         const ticket = try host.query(.{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
         const worker = try presentation.Worker.create(allocator, io, file, .{ .context = wake, .notify = Wake.presentationNotify });
         errdefer worker.destroy();
+        const attachment_loader = try attachment_text.Loader.create(allocator, io, wake, Wake.presentationNotify);
+        errdefer attachment_loader.destroy();
         const inspection_worker = try inspection.Worker.create(allocator, io, .{ .context = wake, .notify = Wake.presentationNotify }, .{});
-        self.* = .{ .allocator = allocator, .io = io, .host = host, .worker = worker, .inspection_worker = inspection_worker, .wake = wake, .workspace_root = root, .query = .{ .ticket = ticket, .kind = .projects } };
+        self.* = .{ .allocator = allocator, .io = io, .host = host, .worker = worker, .attachment_loader = attachment_loader, .inspection_worker = inspection_worker, .wake = wake, .workspace_root = root, .query = .{ .ticket = ticket, .kind = .projects } };
         return self;
     }
 
     fn destroy(self: *Conversation) void {
+        if (self.attachment_loader) |loader| loader.destroy();
         if (self.inspection_worker) |worker| worker.destroy();
         self.worker.destroy();
         // Main owns Host and joins it separately before SDL destruction.
@@ -1674,6 +1751,16 @@ const Conversation = struct {
     fn sendIdentified(self: *Conversation, app: *App, target: types.Target, revision: types.Precondition, prompt: []const u8, selection: contract.Selection, draft_revision: u64, id: [32]u8) !void {
         if (self.command != null) return error.CommandPending;
         const preflight = domain.startPreflight(prompt.len);
+        if (self.attachment_loading or app.view.followup_editing != null) {
+            app.view.send_diagnostic.stage = .disabled;
+            self.notice(&app.view, if (self.attachment_loading) "A file is still being read. Wait for attachment admission before sending." else "This draft edits a follow-up. Save it or stop editing in More (F10).");
+            return;
+        }
+        if (app.view.attachments.count != 0) {
+            app.view.send_diagnostic.stage = .disabled;
+            self.notice(&app.view, "Attachments are local only. Remove them in More (F10) before sending; this Host cannot deliver them.");
+            return;
+        }
         if (self.promptDisabledReason(prompt.len)) |reason| {
             app.view.send_diagnostic = .{ .stage = .preflight_rejected, .prompt_bytes = prompt.len, .frame_bytes = preflight.frame_bytes };
             self.notice(&app.view, reason);
@@ -1692,6 +1779,128 @@ const Conversation = struct {
             return;
         };
         app.view.send_diagnostic.ticket = self.command.?.ticket.value;
+    }
+
+    fn pumpAttachment(self: *Conversation, app: *App) void {
+        if (!self.attachment_loading or self.command != null or self.query != null or self.refresh) return;
+        const loader = self.attachment_loader orelse return;
+        if (!loader.completed()) return;
+        defer loader.release();
+        self.attachment_loading = false;
+        app.dirty = true;
+        const view = &app.view;
+        if (!self.thread.eql(self.attachment_thread.slice())) {
+            view.workflowNotice("Selected chat changed while reading. File was not added.");
+            return;
+        }
+        self.admitAttachment(app, loader) catch |err| {
+            view.workflow_error = @errorName(err);
+            view.workflowNotice(switch (err) {
+                error.AttachmentLimit, error.StreamTooLong => "File is too large. Draft files are limited to 256 KiB total.",
+                error.FileNotFound => "File not found. Check the path and try again.",
+                error.RegularFileRequired => "Choose a regular file, rather than a folder or special file.",
+                error.AccessDenied => "Cannot read this file. Check its permissions.",
+                else => "Could not add the file. Your draft is retained; nothing was sent.",
+            });
+        };
+    }
+
+    fn admitAttachment(self: *Conversation, app: *App, loader: *attachment_text.Loader) !void {
+        if (loader.failure) |err| return err;
+        const view = &app.view;
+        const bytes = loader.bytes[0..loader.len];
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        const id = try self.commandId();
+        const index = try view.attachments.add(.{ .metadata = .{
+            .id = .{ .value = &id },
+            .name = std.fs.path.basename(loader.path[0..loader.path_len]),
+            .media_type = "application/octet-stream",
+            .byte_length = bytes.len,
+            .digest = &hex,
+        }, .content = bytes });
+        self.workflow_pending = .{ .thread = self.thread, .run = self.run, .attachment_index = index };
+        view.workflowNotice("File copied locally; checking Host attachment admission…");
+        try self.submit(.attachment_add, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .attachment_add = view.attachments.get(index).? }, view.revision);
+    }
+
+    fn workflow(self: *Conversation, app: *App, action: Coding.WorkflowAction) !void {
+        const view = &app.view;
+        if (self.command != null or self.query != null or self.refresh or self.attachment_loading) return error.ConversationUpdating;
+        if (!view.active_thread.eql(self.thread.slice()) or !view.workflow_run.eql(self.run.slice())) return error.StaleWorkflow;
+        self.workflow_pending = .{ .thread = self.thread, .run = self.run };
+        view.workflow_error = "";
+        switch (action) {
+            .add => {
+                const loader = self.attachment_loader orelse return error.AttachmentLoaderUnavailable;
+                try loader.request(view.workflow_path[0..view.workflow_path_len], attachment_text.max_bytes - view.attachments.content_bytes);
+                self.attachment_loading = true;
+                self.attachment_thread = self.thread;
+                view.workflowNotice("Reading the selected file…");
+            },
+            .remove => |index| {
+                const attachment = view.attachments.get(index) orelse return error.AttachmentNotFound;
+                self.workflow_pending.attachment_index = index;
+                // Removal is local draft editing. The public Host command still
+                // records/refuses removal of any provider-owned metadata.
+                try self.submit(.attachment_remove, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .attachment_remove = attachment.metadata.id }, view.revision);
+                view.attachments.removeAt(index);
+                view.workflowNotice("Local attachment removed; checking Host metadata removal…");
+            },
+            .enqueue => {
+                if (!view.workflow_active) return error.NoLiveRun;
+                if (view.workflow_uncertain) return error.FollowupOutcomeUnknown;
+                if (self.followup_capability != .supported or view.selected == null or !self.capability_runtime.eql(view.selected.?.runtime_kind.slice())) return error.FollowupCapabilityUnavailable;
+                const content = view.editor.textBytes();
+                if (content.len == 0 or content.len > self.workflow_pending.content.len) return error.FollowupDraftSize;
+                if (view.attachments.count != 0) return error.AttachmentDeliveryUnavailable;
+                @memcpy(self.workflow_pending.content[0..content.len], content);
+                self.workflow_pending.len = content.len;
+                const copy = self.workflow_pending.content[0..content.len];
+                if (view.followup_editing) |editing| {
+                    for (view.followups[0..view.followup_count]) |*item| if (item.id.eql(editing.slice())) {
+                        if (item.state != .planned) return error.FollowupAlreadyDispatched;
+                        self.workflow_pending.id = item.id;
+                        try self.submit(.followup_edit, .{ .effect = .{ .value = item.id.slice() } }, .{ .revision = item.revision }, .{ .followup_edit = .{ .content = copy } }, view.revision);
+                        return;
+                    };
+                    return error.FollowupNotFound;
+                }
+                if (view.followup_count == view.followups.len) return error.FollowupLimit;
+                try self.submit(.followup_enqueue, .{ .run = .{ .value = self.run.slice() } }, .{ .revision = self.run_revision }, .{ .followup_enqueue = .{ .content = copy } }, view.revision);
+            },
+            .edit => |index| {
+                if (index >= view.followup_count) return error.FollowupNotFound;
+                const item = &view.followups[index];
+                if (item.state != .planned) return error.FollowupAlreadyDispatched;
+                if (view.editor.len != 0) return error.KeepOrClearCurrentDraftBeforeEditing;
+                try view.insert(item.content[0..item.len], .paste);
+                view.followup_editing = item.id;
+                view.workflow_open = false;
+                view.focused = true;
+            },
+            .cancel => |index| {
+                if (index >= view.followup_count) return error.FollowupNotFound;
+                const item = &view.followups[index];
+                if (item.state != .planned) return error.FollowupAlreadyDispatched;
+                self.workflow_pending.id = item.id;
+                try self.submit(.followup_cancel, .{ .effect = .{ .value = item.id.slice() } }, .{ .revision = item.revision }, .{ .followup_cancel = .{ .reason = "Native follow-up cancellation" } }, view.revision);
+            },
+            .up, .down => |index| {
+                if (index >= view.followup_count) return error.FollowupNotFound;
+                const other = if (action == .up) index -| 1 else index + 1;
+                if (other == index or other >= view.followup_count) return error.FollowupOrderBoundary;
+                for (view.followups[0..view.followup_count], 0..) |item, i| {
+                    if (item.state != .planned) return error.FollowupAlreadyDispatched;
+                    const from = if (i == index) other else if (i == other) index else i;
+                    self.workflow_pending.order_ids[i] = view.followups[from].id;
+                }
+                self.workflow_pending.order_count = view.followup_count;
+                for (0..view.followup_count) |i| self.workflow_pending.order[i] = .{ .value = self.workflow_pending.order_ids[i].slice() };
+                try self.submit(.followup_order, .{ .run = .{ .value = self.run.slice() } }, .{ .revision = self.run_revision }, .{ .followup_order = .{ .followups = self.workflow_pending.order[0..view.followup_count] } }, view.revision);
+            },
+        }
     }
 
     fn act(self: *Conversation, app: *App, intent: @import("ui/coding.zig").Intent) !void {
@@ -1779,6 +1988,14 @@ const Conversation = struct {
                         }
                     };
                     if (self.command) |pending| if (pending.ticket.value == value.ticket.value) {
+                        switch (pending.kind) {
+                            .followup_enqueue, .followup_edit, .followup_cancel, .followup_order => {
+                                app.view.workflow_uncertain = true;
+                                app.view.workflowNotice("Follow-up outcome unknown. Draft retained; further follow-up mutations are blocked for this run.");
+                            },
+                            .attachment_add, .attachment_remove => app.view.workflowNotice("Host metadata outcome unknown. Local draft state retained; attachment delivery remains unavailable."),
+                            else => {},
+                        }
                         if (pending.kind == .send) {
                             app.view.send_diagnostic.stage = .outcome_unknown;
                             @import("ui/coding.zig").SendDiagnostic.bounded(&app.view.send_diagnostic.rejection, &app.view.send_diagnostic.rejection_len, @tagName(value.failure.reason));
@@ -1801,6 +2018,7 @@ const Conversation = struct {
         }
         if (drained.more_pending) Wake.notify(self.wake);
         self.pumpInspection(app);
+        self.pumpAttachment(app);
         const ready = self.worker.drain(&self.completion) catch |err| switch (err) {
             error.Busy => blk: {
                 Wake.notify(self.wake);
@@ -1950,7 +2168,7 @@ const Conversation = struct {
         }
         const selection_reason = self.selectionDisabledReason(&app.view);
         const preflight_reason = self.sendPreflight(&app.view);
-        app.view.send_disabled_reason = if (preflight_reason) |reason| reason else if (selection_reason) |reason| reason else if (self.thread.len == 0)
+        app.view.send_disabled_reason = if (self.attachment_loading) "Reading attachment… Wait for admission before sending." else if (app.view.attachments.count != 0) "Attachments are local only. Remove them in More (F10) before sending." else if (app.view.followup_editing != null) "Editing a follow-up. Use More (F10) to save it to the current run." else if (preflight_reason) |reason| reason else if (selection_reason) |reason| reason else if (self.thread.len == 0)
             "Opening conversation…"
         else if (!terminal)
             "Wait for this run to finish, or cancel it."
@@ -1970,11 +2188,13 @@ const Conversation = struct {
                 app.view.send_diagnostic.stage = .idle;
             }
         }
+        app.view.workflow_active = !terminal and self.run_state != .queued and self.run_state != .cancel_requested;
+        app.view.workflow_busy = !settled or self.attachment_loading;
         app.view.can_send = app.view.send_disabled_reason == null;
         app.view.can_cancel = self.run.len != 0 and !terminal and self.command == null;
         app.view.tasks_enabled = self.command == null and !self.refresh;
         app.view.can_approve = self.approval_live and self.command == null and !self.refresh;
-        app.view.navigation_enabled = (!self.normal_startup or self.runtime_configured) and self.command == null and self.query == null and !self.refresh and !self.source_pending and (self.worker_key == null or self.history_paused);
+        app.view.navigation_enabled = (!self.normal_startup or self.runtime_configured) and self.command == null and self.query == null and !self.refresh and !self.attachment_loading and !self.source_pending and (self.worker_key == null or self.history_paused);
         app.view.setup_busy = self.command != null or self.query != null or self.setup_login_after_configure != null;
         app.view.setup_login_pending = self.login_inflight;
         app.view.setup_feedback = app.view.notice;
@@ -1991,7 +2211,20 @@ const Conversation = struct {
         const pending = self.command orelse return error.UnexpectedCommandReceipt;
         if (pending.ticket.value != ticket.value or !std.mem.eql(u8, &pending.id, value.command_id.value)) return error.UnexpectedCommandReceipt;
         self.command = null;
+        const workflow_command = switch (pending.kind) {
+            .followup_enqueue, .followup_edit, .followup_cancel, .followup_order, .attachment_add, .attachment_remove => true,
+            else => false,
+        };
+        if (workflow_command and (!self.workflow_pending.thread.eql(self.thread.slice()) or !self.workflow_pending.run.eql(self.run.slice()))) return error.StaleWorkflowReceipt;
         if (value.outcome == .rejected) {
+            if (workflow_command) {
+                app.view.workflow_error = if (value.reason) |reason| @tagName(reason) else "rejected";
+                app.view.workflowNotice(switch (pending.kind) {
+                    .attachment_add => "Attachments are unavailable. File kept locally; nothing sent.",
+                    .attachment_remove => "Local file removed. Provider attachment removal is unavailable.",
+                    else => "Follow-up refused by the provider. Your draft is retained.",
+                });
+            }
             if (pending.kind == .send) {
                 app.view.send_diagnostic.setReceipt(.rejected, if (value.reason) |reason| @tagName(reason) else "command_rejected");
             }
@@ -2011,6 +2244,47 @@ const Conversation = struct {
             return;
         }
         switch (pending.kind) {
+            .attachment_add, .attachment_remove => {
+                app.view.workflowNotice("Host accepted metadata command; provider delivery remains unavailable.");
+                self.refresh = true;
+            },
+            .followup_enqueue, .followup_edit => {
+                const id = if (pending.kind == .followup_enqueue) try Id.init(value.entity_ids.followup.?.value) else self.workflow_pending.id;
+                var found: ?usize = null;
+                for (app.view.followups[0..app.view.followup_count], 0..) |item, i| if (item.id.eql(id.slice())) {
+                    found = i;
+                };
+                const index = found orelse app.view.followup_count;
+                if (index >= app.view.followups.len) return error.FollowupLimit;
+                const owned = try self.allocator.dupe(u8, self.workflow_pending.content[0..self.workflow_pending.len]);
+                const slot = &app.view.followups[index];
+                if (found != null) self.allocator.free(slot.content);
+                slot.* = .{ .id = id, .len = owned.len, .content = owned };
+                if (found == null) app.view.followup_count += 1;
+                app.view.followup_editing = null;
+                if (app.view.revision == pending.draft_revision) {
+                    try app.view.editor.setText("");
+                    app.view.revision += 1;
+                    app.view.editor_view.changed = true;
+                }
+                app.view.workflowNotice("Host accepted follow-up; effect status below tracks delivery.");
+                self.refresh = true;
+            },
+            .followup_cancel => {
+                app.view.workflowNotice("Host accepted follow-up withdrawal.");
+                self.refresh = true;
+            },
+            .followup_order => {
+                var reordered: [8]Coding.Followup = undefined;
+                for (0..self.workflow_pending.order_count) |i| {
+                    for (app.view.followups[0..app.view.followup_count]) |item| if (item.id.eql(self.workflow_pending.order_ids[i].slice())) {
+                        reordered[i] = item;
+                    };
+                }
+                @memcpy(app.view.followups[0..app.view.followup_count], reordered[0..app.view.followup_count]);
+                app.view.workflowNotice("Host accepted follow-up order.");
+                self.refresh = true;
+            },
             .project => {
                 self.project = try Id.init(value.entity_ids.project.?.value);
                 try addEntry(&app.view.projects, &app.view.project_count, self.project.slice(), "Coding project");
@@ -2084,6 +2358,16 @@ const Conversation = struct {
 
     fn consume(self: *Conversation, app: *App, kind: QueryKind, value: types.QueryPage) !void {
         switch (kind) {
+            .capabilities => {
+                self.followup_capability = .unknown;
+                self.capability_runtime = .{};
+                for (value.items) |row| {
+                    self.followup_capability = row.capabilities.capabilities[@intFromEnum(contract.Capability.followup_queue)].status;
+                    self.capability_runtime = try Id.init(row.capabilities.runtime_kind);
+                    if (self.followup_capability != .supported and app.view.workflow_feedback_len == 0) app.view.workflowNotice("This provider does not support follow-ups. Questions and attachments are also unavailable.");
+                }
+                try self.askRuns();
+            },
             .runtime_status, .startup_status => {
                 app.view.runtime_info_len = 0;
                 for (value.items) |row| {
@@ -2215,7 +2499,7 @@ const Conversation = struct {
                             if (std.mem.startsWith(u8, message, "Provider unavailable:")) app.view.notice = null;
                         }
                     }
-                    try self.askRuns();
+                    try self.ask(.capabilities, .{ .capabilities = {} });
                 }
             },
             .projects => {
@@ -2342,15 +2626,24 @@ const Conversation = struct {
                 } else {
                     self.approval_live = false;
                     if (self.run.len != 0) {
-                        if (self.diagnostic_len == 0 and (self.run_state == .failed or self.run_state == .unknown or self.run_state == .interrupted)) {
-                            try self.ask(.effects, .{ .effects = .{ .run = .{ .value = self.run.slice() }, .page = page } });
-                        } else try self.ask(.approvals, .{ .approvals = .{ .run = .{ .value = self.run.slice() }, .page = page } });
-                    } else try self.askHistory(app);
+                        try self.ask(.effects, .{ .effects = .{ .run = .{ .value = self.run.slice() }, .page = page } });
+                    } else {
+                        app.view.scopeWorkflow(.{});
+                        try self.askHistory(app);
+                    }
                 }
             },
             .effects => {
-                for (value.items) |row| self.recordEffect(&app.view, row.effect);
-                if (self.diagnostic_len == 0 and value.next_cursor != null) {
+                app.view.scopeWorkflow(self.run);
+                for (value.items) |row| {
+                    self.recordEffect(&app.view, row.effect);
+                    if (!self.run.eql(row.effect.run.value)) continue;
+                    for (app.view.followups[0..app.view.followup_count]) |*item| if (item.id.eql(row.effect.id.value)) {
+                        item.revision = row.effect.revision;
+                        item.state = @enumFromInt(@intFromEnum(row.effect.state));
+                    };
+                }
+                if (value.next_cursor != null) {
                     var bounds = page;
                     bounds.cursor = value.next_cursor;
                     bounds.snapshot = value.snapshot_id;
@@ -3175,4 +3468,89 @@ test "unresolved chats explain new-chat recovery and setup busy names the live r
     try conversation.receipt(&app, .{ .value = 1 }, .{ .command_id = .{ .value = &id }, .outcome = .rejected, .reason = .busy, .commit_sequence = 0 });
     try std.testing.expect(conversation.command == null and !conversation.catalog_refresh_inflight);
     try std.testing.expect(std.mem.indexOf(u8, app.view.notice.?, "Stop") != null);
+}
+
+test "workflow refuses unsupported and stale follow-ups without touching Host or draft" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    try app.view.insert("follow-up €", .paste);
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    conversation.thread = try Id.init("thread");
+    conversation.run = try Id.init("run");
+    app.view.active_thread = conversation.thread;
+    app.view.scopeWorkflow(conversation.run);
+    app.view.workflow_active = true;
+    app.view.selected = try Coding.Identity.from(contract.fakeSelection(.{ .value = "workspace" }));
+    conversation.capability_runtime = try Id.init("fake");
+    conversation.followup_capability = .unsupported;
+    try std.testing.expectError(error.FollowupCapabilityUnavailable, conversation.workflow(&app, .enqueue));
+    conversation.followup_capability = .supported;
+    app.view.scopeWorkflow(try Id.init("other-run"));
+    try std.testing.expectError(error.StaleWorkflow, conversation.workflow(&app, .enqueue));
+    try std.testing.expectEqualStrings("follow-up €", app.view.editor.textBytes());
+    try std.testing.expect(conversation.command == null);
+}
+
+test "workflow receipts preserve newer draft and rejected attachment ownership" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    conversation.thread = try Id.init("thread");
+    conversation.run = try Id.init("run");
+    app.view.active_thread = conversation.thread;
+    app.view.scopeWorkflow(conversation.run);
+    try app.view.insert("queued", .paste);
+    const revision = app.view.revision;
+    conversation.workflow_pending = .{ .thread = conversation.thread, .run = conversation.run, .len = 6 };
+    @memcpy(conversation.workflow_pending.content[0..6], "queued");
+    try app.view.insert(" newer", .typing);
+    const id = [_]u8{'f'} ** 32;
+    conversation.command = .{ .ticket = .{ .value = 1 }, .kind = .followup_enqueue, .draft_revision = revision, .id = id };
+    try conversation.receipt(&app, .{ .value = 1 }, .{ .command_id = .{ .value = &id }, .outcome = .accepted, .commit_sequence = 1, .entity_ids = .{ .followup = .{ .value = "effect" } } });
+    try std.testing.expectEqualStrings("queued newer", app.view.editor.textBytes());
+    try std.testing.expectEqualStrings("queued", app.view.followups[0].content[0..app.view.followups[0].len]);
+    _ = try app.view.attachments.add(.{ .metadata = .{ .id = .{ .value = "file" }, .name = "notes", .media_type = "text/plain", .byte_length = 5, .digest = "digest" }, .content = "hello" });
+    conversation.command = .{ .ticket = .{ .value = 2 }, .kind = .attachment_add, .draft_revision = revision, .id = id };
+    try conversation.receipt(&app, .{ .value = 2 }, .{ .command_id = .{ .value = &id }, .outcome = .rejected, .reason = .capability_unavailable, .commit_sequence = 2 });
+    try std.testing.expectEqual(@as(usize, 1), app.view.attachments.count);
+    try std.testing.expectEqualStrings("capability_unavailable", app.view.workflow_error);
+    try conversation.sendIdentified(&app, .absent, .absent, app.view.editor.textBytes(), usability_selection, app.view.revision, id);
+    try std.testing.expect(conversation.command == null);
+    try std.testing.expectEqualStrings("queued newer", app.view.editor.textBytes());
+}
+
+test "workflow observations borrow stable ledger identities after returning" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    view.workflow_open = true;
+    const rect = c.SDL_FRect{ .x = 1, .y = 2, .w = 30, .h = 20 };
+    try view.workflow_targets.add("attachment.path", "textbox", rect, true);
+    try view.workflow_targets.add("followup.enqueue", "button", rect, true);
+    var output: [64]automation.Target = undefined;
+    observeWorkflowTargets(&view, &output);
+    try std.testing.expectEqualStrings("attachment.path", output[0].id);
+    try std.testing.expectEqualStrings("followup.enqueue", output[1].id);
+    try std.testing.expectEqual(view.workflow_targets.items[0].id[0..].ptr, output[0].id.ptr);
+    try std.testing.expectEqual(view.workflow_targets.items[1].role[0..].ptr, output[1].role.ptr);
+    view.workflow_open = false;
+    observeWorkflowTargets(&view, &output);
+    try std.testing.expect(!output[0].enabled);
+}
+
+test "workflow file read and follow-up edit block delayed custom sends before Host admission" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    try app.view.insert("retained", .paste);
+    conversation.attachment_loading = true;
+    try conversation.sendIdentified(&app, .absent, .absent, "retained", usability_selection, app.view.revision, @splat('a'));
+    try std.testing.expect(conversation.command == null);
+    conversation.attachment_loading = false;
+    app.view.followup_editing = try Id.init("followup");
+    try conversation.sendIdentified(&app, .absent, .absent, "retained", usability_selection, app.view.revision, @splat('a'));
+    try std.testing.expect(conversation.command == null);
+    try std.testing.expectEqualStrings("retained", app.view.editor.textBytes());
 }
