@@ -194,6 +194,30 @@ class Fixture:
                 message = f"Offline Codex fixture: turn {prior + 1}; prior turns {prior}; prompt bytes {len(prompt)}. café 世界"
                 self.notify("item/agentMessage/delta", dict(threadId=thread, turnId=turn, itemId=turn + "-message", delta=message))
                 self.notify("turn/completed", dict(threadId=thread, turn=dict(id=turn, status="completed")))
+        elif method == "turn/steer":
+            if self.active is None:
+                raise ValueError("steer requires an active fixture turn")
+            thread = params.get("threadId")
+            turn = params.get("expectedTurnId")
+            inputs = params.get("input")
+            if (thread, turn) != self.active or not isinstance(inputs, list) or not 1 <= len(inputs) <= 9:
+                raise ValueError("exact active fixture turn required")
+            prompt, attachments = validate_turn_inputs(inputs)
+            state = self.state()
+            if thread not in state or not state[thread]:
+                raise ValueError("unknown fixture session")
+            details = dict(thread_id=thread, turn_id=turn, prior_turns=len(state[thread]),
+                           prompt_bytes=len(prompt), prompt_sha256=hashlib.sha256(prompt).hexdigest(),
+                           attachments=attachments, steering=True)
+            state[thread].append(details)
+            self.save(state)
+            self.record(method, **details)
+            self.reply(request, dict(turnId=turn))
+            message = f"Offline Codex fixture: steered turn; prompt bytes {len(prompt)}. café 世界"
+            self.notify("item/agentMessage/delta", dict(threadId=thread, turnId=turn,
+                        itemId=turn + "-steer-message", delta=message))
+            self.notify("turn/completed", dict(threadId=thread, turn=dict(id=turn, status="completed")))
+            self.active = None
         elif method == "turn/interrupt":
             target = (params.get("threadId"), params.get("turnId"))
             if self.active is None or target != self.active:

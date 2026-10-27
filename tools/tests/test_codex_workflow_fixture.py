@@ -183,6 +183,30 @@ class CodexWorkflowFixtureTests(unittest.TestCase):
             result = self.run_server([dict(id=1, method="thread/resume", params=self.selection(session)), turn])
             self.assertNotEqual(result.returncode, 0)
 
+    def test_steer_accepts_native_attachments_and_completes_active_turn(self):
+        self.profile("cancel-hang")
+        thread = self.create()
+        image = b"\x00\xfffixture-image"
+        steer = [{"type": "text", "text": "continue with image"},
+                 {"type": "image", "url": "data:image/png;base64," + base64.b64encode(image).decode()}]
+        result = self.run_server([
+            dict(id=1, method="thread/resume", params=self.selection(thread)),
+            dict(id=2, method="turn/start", params=dict(threadId=thread, model="offline-workflow", effort="low",
+                cwd=str(self.workspace), input=[dict(type="text", text="hold active turn")])),
+            dict(id=3, method="turn/steer", params=dict(threadId=thread,
+                expectedTurnId=thread + "-turn-1", input=steer)),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([value for value in output if value.get("id") == 3],
+                         [dict(id=3, result={"turnId": thread + "-turn-1"})])
+        self.assertEqual(output[-1]["params"]["turn"]["status"], "completed")
+        events = [json.loads(line) for line in (self.account / "workflow-events.jsonl").read_text().splitlines()]
+        steered = [event for event in events if event["method"] == "turn/steer"]
+        self.assertEqual(len(steered), 1)
+        self.assertTrue(steered[0]["steering"])
+        self.assertEqual(steered[0]["attachments"][0]["sha256"], hashlib.sha256(image).hexdigest())
+
 
 if __name__ == "__main__":
     unittest.main()

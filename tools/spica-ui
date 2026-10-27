@@ -450,7 +450,8 @@ def launch(args: argparse.Namespace) -> int:
         elif args.provider == "codex-fixture":
             profile = {"format": "spica-offline-codex-workflow-v1", "workspace": str(workspace),
                        "mode": {"codex-error": "fail", "codex-crash-open": "cancel-open",
-                                "codex-crash-recovery": "cancel-hang"}.get(args.scenario, "complete"),
+                                "codex-crash-recovery": "cancel-hang",
+                                "codex-followup-attachment": "cancel-hang"}.get(args.scenario, "complete"),
                        "gate_timeout_ms": 15000}
         else:
             profile = {"format": "spica-offline-opencode-workflow-v1", "workspace": str(workspace),
@@ -1132,6 +1133,53 @@ def scenario_attachment_delivery(session: Session, args: argparse.Namespace) -> 
                     outcome="attachment_delivered_to_codex_fixture")
     session.data["expected_outcome"] = "attachment_admitted_and_delivered_to_codex_fixture"
 
+
+def scenario_codex_followup_attachment(session: Session, args: argparse.Namespace) -> None:
+    """Queue a Codex follow-up with a durable image while the first turn streams."""
+    before = composer_ready(session, args.timeout)
+    initial = "hold Codex turn for follow-up attachment"
+    perform_input(session, "text", "composer.input", args.timeout, initial)
+    wait_snapshot(session, lambda value: value.get("draft") == initial and value.get("send_ready"),
+                  args.timeout, "initial Codex prompt")
+    perform_input(session, "click", "command.send", args.timeout)
+    active = wait_snapshot(session, lambda value: value.get("send_receipt") == "accepted"
+                           and value.get("send_run_id")
+                           and value.get("run_id") == value.get("send_run_id")
+                           and value.get("run_status") in {"starting", "streaming"},
+                           args.timeout, "active Codex turn")
+    draft = "follow-up image café 世界"
+    perform_input(session, "text", "composer.input", args.timeout, draft)
+    wait_snapshot(session, lambda value: value.get("draft") == draft, args.timeout, "follow-up draft")
+    perform_key(session, "F10", args.timeout)
+    wait_snapshot(session, lambda value: value.get("workflow_open"), args.timeout, "follow-up workflow panel")
+    image = attachment_fixture(session.output, "follow-up-世界.png", 96)
+    perform_input(session, "click", "attachment.path", args.timeout)
+    perform_input(session, "text", "attachment.path", args.timeout, str(image), str(image))
+    path_ready = wait_snapshot(session, lambda value: value.get("workflow_path") == str(image),
+                               args.timeout, "follow-up attachment path")
+    perform_input(session, "click", "attachment.add", args.timeout)
+    admitted = wait_snapshot(session, lambda value: value.get("attachment_count") == 1
+                             and not value.get("pending_command")
+                             and not value.get("workflow_error"), args.timeout,
+                             "follow-up attachment admission")
+    perform_input(session, "click", "followup.enqueue", args.timeout)
+    completed = wait_snapshot(session, lambda value: value.get("run_id") == active.get("run_id")
+                              and value.get("run_status") == "completed"
+                              and not value.get("pending_command"), args.timeout,
+                              "Codex follow-up completion")
+    events = fixture_events(session)
+    steers = [event for event in events if event.get("method") == "turn/steer"]
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+    if len(steers) != 1 or not steers[0].get("attachments") or steers[0]["attachments"][0].get("sha256") != digest:
+        raise DriverError("Codex fixture did not receive the follow-up attachment digest", EX_ASSERTION)
+    capture(session, "codex-followup-attachment.png")
+    session.journal("scenario.codex-followup-attachment", path_ready, completed,
+                    input_origin="ordinary vd prompt, F10 workflow and painted Queue target",
+                    command_state=state_receipt(admitted), receipt_outcome="accepted",
+                    run_state={"id": completed.get("run_id"), "status": completed.get("run_status")},
+                    outcome="Codex_followup_attachment_delivered_via_turn_steer")
+    session.data["expected_outcome"] = "codex_followup_attachment_delivered_via_turn_steer"
+
 def fixture_events(session: Session) -> list[dict[str, Any]]:
     provider = session.data.get("provider")
     if provider not in {"codex-fixture", "codex-orchestration-fixture", "opencode-fixture"}:
@@ -1714,7 +1762,7 @@ def read_private_clipboard(session: Session) -> str:
 def scenario(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
     expected_provider = ("codex-orchestration-fixture" if args.name == "codex-orchestration"
-                        else "codex-fixture" if args.name in {"codex-session", "codex-error", "codex-large-send", "codex-crash-open", "codex-crash-recovery", "attachment-delivery"}
+                        else "codex-fixture" if args.name in {"codex-session", "codex-error", "codex-large-send", "codex-crash-open", "codex-crash-recovery", "attachment-delivery", "codex-followup-attachment"}
                         else "opencode-fixture" if args.name in {"opencode-session", "opencode-error", "opencode-large-send"}
                         else "fake")
     args.provider = args.provider or expected_provider
@@ -1748,6 +1796,8 @@ def scenario(args: argparse.Namespace) -> int:
             scenario_codex_crash(session, args)
         elif args.name == "opencode-error":
             scenario_opencode_error(session, args)
+        elif args.name == "codex-followup-attachment":
+            scenario_codex_followup_attachment(session, args)
         elif args.name in {"large-send", "codex-large-send", "opencode-large-send"}:
             scenario_large_send(session, args)
         elif args.name == "composer-capacity":
@@ -1842,6 +1892,7 @@ def scenario_steps(name: str) -> list[str]:
             "followup-refusal": ["launch fake", "start an active fake run", "type a draft and open F10", "click Queue and assert FollowupCapabilityUnavailable with draft retained", "cancel the active run with F6"],
             "question-refusal": ["launch fake", "refuse unavailable question.answer", "assert no input or command/run change"],
             "attachment-delivery": ["launch the offline Codex fixture", "open F10 and add a UTF-8 text file through attachment.path/add", "assert Host metadata admission retains the local bytes and draft", "close the panel and Send the prompt with the admitted attachment", "assert one completed Codex turn contains the exact attachment digest"],
+            "codex-followup-attachment": ["launch the offline Codex fixture with a held active turn", "type a follow-up draft and add a PNG through the F10 workflow", "queue the follow-up through the painted target", "assert turn/steer carries the exact attachment digest and the run completes"],
             }.get(name, [])
 
 
@@ -1943,7 +1994,7 @@ def parser() -> argparse.ArgumentParser:
 
     item = commands.add_parser("scenario", help="run a bounded offline GUI scenario")
     item.add_argument("name", choices=("send-restart", "disabled-send", "large-send", "composer-capacity", "codex-large-send", "opencode-large-send", "codex-orchestration", "second-turn",
-                                             "workspace-diff", "capability-refusal", "followup-refusal", "question-refusal", "attachment-delivery",
+                                             "workspace-diff", "capability-refusal", "followup-refusal", "question-refusal", "attachment-delivery", "codex-followup-attachment",
                                              "codex-session", "codex-error", "codex-crash-open", "codex-crash-recovery", "opencode-session", "opencode-error", "thread-title", "history-deep", "history-wide"))
     item.add_argument("--provider", choices=("fake", "codex-fixture", "codex-orchestration-fixture", "opencode-fixture"), help="offline fixture; inferred from scenario")
     item.add_argument("--prompt", default="offline GUI send")
