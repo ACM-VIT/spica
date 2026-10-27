@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""Finite populated-history evaluation using public Host fixtures and private GUI input."""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+from pathlib import Path
+import secrets
+import shutil
+import subprocess
+import time
+
+import measure_process as measure
+
+ROOT = Path(__file__).resolve().parents[1]
+_loader = importlib.machinery.SourceFileLoader('spica_eval_starter', str(ROOT / 'tools/eval-starter'))
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+evaluation = importlib.util.module_from_spec(_spec)
+_loader.exec_module(evaluation)
+_run = evaluation.run
+DRAFT = 'Retained pressure draft café 世界'
+
+
+def run(*args, timeout=30):
+    # vd locates its pointer helper beside the actual script, not a symlinked
+    # launcher. Resolve that launcher just as the existing GUI driver does.
+    if args and args[0] == 'vd':
+        installed = shutil.which('vd')
+        if installed:
+            args = (str(Path(installed).resolve()), *args[1:])
+    return _run(*args, timeout=timeout)
+
+
+evaluation.run = run
+
+
+def validate_config(threads, turns, content, warmup, seconds, cycles, interval, action_hz):
+    if not 33 <= threads <= 256 or not 65 <= turns <= 4096 or not 96 <= content <= 65536:
+        raise ValueError('threads 33..256, turns 65..4096 and content bytes 96..65536 required')
+    count = threads * turns
+    if count > 16384 or count * content > 128 * 1024 * 1024:
+        raise ValueError('fixture exceeds existing total-turn/content bounds')
+    if not all(math.isfinite(v) and v > 0 for v in (warmup, seconds, interval, action_hz)):
+        raise ValueError('finite positive timing values required')
+    if not 1 <= cycles <= 10 or interval < .1 or action_hz > 5:
+        raise ValueError('cycles 1..10, interval >=0.1s and action Hz <=5 required')
+    duration = warmup + seconds * (1 + 4 * cycles)
+    if duration > 1800 or math.ceil(duration / interval) > 32768:
+        raise ValueError('evaluation exceeds 30-minute/32768-sample bound')
+
+
+def validate_fixture(manifest, state, workspace, threads, turns, content):
+    expected = dict(fixture='synthetic-large-history', state_path=str(state), workspace_path=str(workspace),
+                    generated_threads=threads, generated_turns=threads * turns,
+                    generated_runs=threads * turns, generated_messages=threads * turns * 2,
+                    completed_runs=threads * turns, cancelled_runs=0, prompt_bytes=threads * turns * content)
+    if any(manifest.get(key) != value for key, value in expected.items()):
+        raise RuntimeError('public Host fixture manifest disagrees with requested history')
+    if (not manifest.get('latest_thread_id') or not manifest.get('provenance', {}).get('git_initialized')
+            or manifest.get('provenance', {}).get('runtime') != 'domain.Host fake'):
+        raise RuntimeError('fixture lacks isolated Git workspace or public Host provenance')
+
+
+def snapshot_summary(snapshot, baseline=None):
+    if (snapshot.get('draft') != DRAFT or not snapshot.get('connected') or snapshot.get('pending_command')
+            or snapshot.get('notice') or snapshot.get('visible_rich_blocks', 9) > 8):
+        raise RuntimeError('history action lost draft, connection, bounded tiles or clean command state')
+    if baseline is not None:
+        for key in ('thread_id', 'run_id', 'session_id', 'send_command_id', 'send_run_id'):
+            if snapshot.get(key) != baseline.get(key):
+                raise RuntimeError('history action changed conversation/provider identity: ' + key)
+    ordinals = [ordinal for message, ordinal in zip(snapshot.get('transcript_message_ids', []),
+                                                   snapshot.get('transcript_ordinals', [])) if message]
+    if not ordinals or any(type(value) is not int or value < 0 for value in ordinals):
+        raise RuntimeError('history action has no valid visible durable message ordinals')
+    labels = [label for label in snapshot.get('thread_labels', []) if label]
+    if len(labels) > 32:
+        raise RuntimeError('resident thread-card bound exceeded')
+    return dict(thread_id=snapshot['thread_id'], run_id=snapshot.get('run_id'),
+                ordinals=ordinals, resident_cards=len(labels), query=snapshot.get('sidebar_search'),
+                more_available=snapshot.get('thread_more_available'), frame_id=snapshot.get('frame_id'))
+
+
+def resource_summary(samples):
+    report = measure.summarize(samples)
+    intervals = report['cpu_intervals']
+    report['complete_cpu_intervals'] = sum(row['complete'] for row in intervals)
+    report['incomplete_cpu_intervals'] = sum(not row['complete'] for row in intervals)
+    report['cpu_percent_of_one_core'] = measure.distribution([
+        row['covered_cpu_percent_of_one_core'] for row in intervals if row['complete']])
+    return report
+
+
+def validate_action_coverage(actions, phases):
+    navigation = {a.get('key') for a in actions if a.get('operation') == 'history_navigation'}
+    search = {a.get('query') for a in actions if a.get('operation') == 'sidebar_search' and not a.get('cleanup')}
+    if navigation != {'alt+Home', 'alt+Page_Down', 'alt+End', 'alt+Page_Up'} or len(search) != 4:
+        raise RuntimeError('phase durations did not exercise all history/search actions; increase --phase-seconds')
+    if any(p['delivered_actions'] == 0 for p in phases if p['name'].startswith(('navigation_', 'search_'))):
+        raise RuntimeError('active phase delivered no ordinary GUI input')
+
+
+class HistoryInput:
+    def __init__(self, session, window, socket, live, nonce, baseline, fixture, pump):
+        self.session, self.window, self.socket = session, window, socket
+        self.live, self.nonce, self.baseline, self.fixture, self.pump = live, nonce, baseline, fixture, pump
+
+    def observe(self, predicate, label):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            self.pump()
+            current = evaluation.read_export(self.live, deadline)
+            if current.get('process_nonce') != self.nonce:
+                raise RuntimeError('live observation belongs to another GUI process')
+            if predicate(current):
+                return current
+            time.sleep(.025)
+        raise RuntimeError('history input did not settle: ' + label)
+
+    def ipc(self, command):
+        result = json.loads(run('swaymsg', '--socket', self.socket, '--raw', command))
+        if not result or not all(item.get('success') for item in result):
+            raise RuntimeError('private compositor command refused')
+
+    def key(self, value):
+        self.ipc(f'[con_id={self.window}] focus')
+        run(*evaluation.key_command(self.session, self.window, value))
+
+    def click(self, name):
+        current = self.observe(lambda s: any(t.get('id') == name and t.get('enabled')
+                               for group in ('targets', 'sidebar_targets') for t in s.get(group, [])), name)
+        target = next(t for group in ('targets', 'sidebar_targets') for t in current.get(group, []) if t.get('id') == name)
+        bounds = target.get('pointer_bounds')
+        if not bounds or len(bounds) != 4 or min(bounds[2:]) <= 0:
+            raise RuntimeError('input target lacks painted bounds')
+        tree = json.loads(run('swaymsg', '--socket', self.socket, '--raw', '-t', 'get_tree'))
+        def find(node):
+            if str(node.get('id')) == self.window:
+                return node
+            for child in node.get('nodes', []) + node.get('floating_nodes', []):
+                found = find(child)
+                if found:
+                    return found
+            return None
+        window = find(tree)
+        if window is None:
+            raise RuntimeError('private GUI window disappeared')
+        x, y, width, height = bounds
+        rect = window['rect']
+        self.ipc(f'[con_id={self.window}] focus')
+        run('vd', 'click', self.session, self.window, str(int(rect['x'] + x + width / 2)), str(int(rect['y'] + y + height / 2)))
+
+    def navigate(self, index):
+        before = self.observe(lambda s: s.get('send_ready'), 'history navigation ready')
+        old = snapshot_summary(before, self.baseline)
+        key = ('alt+Home', 'alt+Page_Down', 'alt+End', 'alt+Page_Up')[index % 4]
+        self.key(key)
+        def settled(snapshot):
+            ordinals = [o for m, o in zip(snapshot.get('transcript_message_ids', []), snapshot.get('transcript_ordinals', [])) if m]
+            if not snapshot.get('send_ready') or not ordinals:
+                return False
+            if key == 'alt+Home':
+                return min(ordinals) == 0
+            if key == 'alt+End':
+                return max(ordinals) == self.fixture['generated_turns'] // self.fixture['generated_threads'] * 2 - 1
+            return ordinals != old['ordinals']
+        current = self.observe(settled, key)
+        return dict(operation='history_navigation', key=key, observed=snapshot_summary(current, self.baseline))
+
+    def search(self, index):
+        query = (f"thread={self.fixture['generated_threads'] - 1} turn=0", 'turn=0', 'no-synthetic-thread-match', '')[index % 4]
+        self.click('sidebar.search')
+        self.key('ctrl+a')
+        self.key('BackSpace')
+        if query:
+            run('vd', 'text', self.session, self.window, query)
+        def settled(snapshot):
+            if snapshot.get('sidebar_search') != query or not snapshot.get('send_ready'):
+                return False
+            count = sum(bool(label) for label in snapshot.get('thread_labels', []))
+            if index % 4 == 0:
+                return count == 1 and any(t.get('id') == self.fixture['latest_thread_id'] for t in snapshot.get('thread_targets', []))
+            if index % 4 == 2:
+                return count == 0 and not snapshot.get('thread_more_available')
+            return count == 32 and snapshot.get('thread_more_available')
+        current = self.observe(settled, 'durable search ' + query)
+        return dict(operation='sidebar_search', query=query, observed=snapshot_summary(current, self.baseline))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, required=True, help='Fresh ignored evidence directory')
+    parser.add_argument('--threads', type=int, default=40)
+    parser.add_argument('--turns', type=int, default=130)
+    parser.add_argument('--content-bytes', type=int, default=1024)
+    parser.add_argument('--optimize', choices=('Debug', 'ReleaseSafe'), default='ReleaseSafe')
+    parser.add_argument('--binary', type=Path, help='Prebuilt frozen app; requires both hashes and --fixture-sha256')
+    parser.add_argument('--binary-sha256')
+    parser.add_argument('--source-sha256')
+    parser.add_argument('--fixture-sha256')
+    parser.add_argument('--warmup', type=float, default=10)
+    parser.add_argument('--phase-seconds', type=float, default=15)
+    parser.add_argument('--cycles', type=int, default=3)
+    parser.add_argument('--interval', type=float, default=.25)
+    parser.add_argument('--action-hz', type=float, default=1)
+    args = parser.parse_args()
+    try:
+        validate_config(args.threads, args.turns, args.content_bytes, args.warmup, args.phase_seconds, args.cycles, args.interval, args.action_hz)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.binary and not all((args.binary_sha256, args.source_sha256, args.fixture_sha256)):
+        parser.error('prebuilt binary requires binary, source and fixture SHA256 values')
+    output = args.output.resolve()
+    if output.exists():
+        parser.error('output must be fresh')
+    output.mkdir(parents=True)
+    binary = args.binary.resolve() if args.binary else ROOT / 'zig-out/bin/spica'
+    fixture_binary = binary.parent / 'build-history-fixture'
+    source = evaluation.source_fingerprint()
+    manifest = dict(version=1, revision=run('git', 'rev-parse', 'HEAD'), status=run('git', 'status', '--porcelain'),
+                    source_sha256=source, passed=False, performance_accepted=False, commands=evaluation.COMMANDS,
+                    input_origin='ordinary private vd keyboard and pointer, public Host synthetic history',
+                    limitations=['Instrumented software timing, not physical input-to-photon latency.',
+                                 'Public Host fake fixture; no live provider or installed-provider compatibility claim.',
+                                 'Live snapshots and metrics add overhead. Harness acquisition cost is reported separately.',
+                                 'Tree RSS sums shared pages; PSS excludes VRAM and other system memory.',
+                                 'Observed samples cannot prove absolute process-tree peaks or short-lived child CPU tails.',
+                                 'No performance acceptance budget is selected by this runner. Low-N p99 remains weak.'])
+    session, samples, phases, actions = None, [], [], []
+    try:
+        if args.binary:
+            if evaluation.sha(binary) != args.binary_sha256 or source != args.source_sha256 or evaluation.sha(fixture_binary) != args.fixture_sha256:
+                raise RuntimeError('frozen binary, fixture or source fingerprint mismatch')
+            manifest['build_mode'] = 'externally frozen; see supplied binary provenance'
+        else:
+            with (output / 'build.log').open('w') as log:
+                for step in ([], ['build-history-fixture']):
+                    subprocess.run(['python3', 'build/driver.py', *step, '-Doptimize=' + args.optimize], cwd=ROOT,
+                                   stdout=log, stderr=subprocess.STDOUT, check=True, timeout=300)
+            manifest['build_mode'] = args.optimize
+        if source != evaluation.source_fingerprint():
+            raise RuntimeError('source changed during build')
+        manifest.update(binary=str(binary), binary_sha256=evaluation.sha(binary), fixture_binary=str(fixture_binary),
+                        fixture_sha256=evaluation.sha(fixture_binary))
+        state, workspace = output / 'conversation-state', output / 'workspace'
+        fixture = json.loads(run(str(fixture_binary), '--state', str(state), '--workspace', str(workspace),
+                                 '--threads', str(args.threads), '--turns', str(args.turns), '--content-bytes', str(args.content_bytes),
+                                 '--seed', '17', '--name', 'pressure café 世界', '--git-init', timeout=300))
+        validate_fixture(fixture, state, workspace, args.threads, args.turns, args.content_bytes)
+        manifest['fixture'] = fixture
+        session = run('vd', 'start', '--width', '1280', '--height', '800')
+        record = json.loads((Path(session) / 'session.json').read_text())
+        manifest['private_desktop'] = record
+        nonce = secrets.token_hex(16)
+        duration = args.warmup + args.phase_seconds * (1 + 4 * args.cycles)
+        launch = json.loads(run('vd', 'run', session, '--bg', '--log', str(output / 'app.log'), '--', str(binary),
+                               '--provider', 'fake', '--workspace', str(workspace), '--state-directory', str(state),
+                               '--automation-session', nonce, '--automation-live', str(output / 'live.json'),
+                               '--automation-output', str(output / 'automation.json'), '--metrics-output', str(output / 'native.json'),
+                               '--metrics-capacity', '65536', '--quit-after-ms', str(math.ceil((duration + 300) * 1000))))
+        manifest['launch'] = launch
+        root_identity = measure.identity(measure.stat(Path('/proc') / str(launch['pid']) / 'stat'))
+        manifest['root_identity'] = root_identity
+        windows = evaluation.wait_windows(session, True)
+        if 'Spica' not in windows:
+            raise RuntimeError('wrong private GUI window')
+        window = windows.splitlines()[0].split()[0]
+        current_phase, next_sample = None, 0
+        def pump():
+            nonlocal next_sample
+            if current_phase is None or time.monotonic() < next_sample:
+                return
+            if len(samples) >= 32768:
+                raise RuntimeError('resource sample bound exceeded')
+            row = measure.sample(launch['pid'], expected_root=root_identity)
+            row.update(phase=current_phase, scheduled_monotonic_seconds=next_sample,
+                       lateness_seconds=max(0, row['monotonic_seconds'] - next_sample))
+            if row['root_exited']:
+                raise RuntimeError('GUI process exited or changed during measurement')
+            next_sample += args.interval
+            now = time.monotonic()
+            row['missed_intervals'] = math.floor((now - next_sample) / args.interval) + 1 if now >= next_sample else 0
+            next_sample += row['missed_intervals'] * args.interval
+            samples.append(row)
+        gui = HistoryInput(session, window, record['environment']['SWAYSOCK'], output / 'live.json', nonce, None, fixture, pump)
+        gui.ipc(f'[con_id={window}] floating enable')
+        gui.ipc(f'[con_id={window}] resize set width 1100 px height 740 px')
+        gui.observe(lambda s: s.get('send_ready') and s.get('run_status') == 'completed', 'populated startup')
+        gui.click('composer.input')
+        run('vd', 'text', session, window, DRAFT)
+        baseline = gui.observe(lambda s: s.get('draft') == DRAFT and s.get('send_ready'), 'retained draft')
+        snapshot_summary(baseline)
+        gui.baseline = baseline
+        run('vd', 'shot', session, str(output / 'before.png'))
+        schedule = [('warmup', args.warmup), ('idle', args.phase_seconds)]
+        for cycle in range(1, args.cycles + 1):
+            schedule += [(f'navigation_{cycle}', args.phase_seconds), (f'settled_navigation_{cycle}', args.phase_seconds),
+                         (f'search_{cycle}', args.phase_seconds), (f'settled_search_{cycle}', args.phase_seconds)]
+        for name, seconds in schedule:
+            begin = time.monotonic()
+            current_phase, next_sample, next_action = name, begin, begin
+            delivered, skipped = 0, 0
+            active = name.startswith(('navigation_', 'search_'))
+            while time.monotonic() < begin + seconds:
+                pump()
+                if active and time.monotonic() >= next_action:
+                    action = dict(phase=name, sequence=delivered, due=next_action, begin=time.monotonic())
+                    action.update(gui.navigate(delivered) if name.startswith('navigation_') else gui.search(delivered))
+                    action['end'] = time.monotonic()
+                    actions.append(action)
+                    delivered += 1
+                    due_index = math.floor((time.monotonic() - begin) * args.action_hz) + 1
+                    skipped += max(0, due_index - round((next_action - begin) * args.action_hz) - 1)
+                    next_action = begin + due_index / args.action_hz
+                time.sleep(max(0, min(begin + seconds, next_sample, next_action if active else begin + seconds) - time.monotonic()))
+            if name.startswith('search_'):
+                cleanup_begin = time.monotonic()
+                cleanup = gui.search(3)
+                gui.click('composer.input')
+                actions.append(dict(phase=name, sequence=delivered, cleanup=True, begin=cleanup_begin,
+                                    end=time.monotonic(), **cleanup))
+            pump()
+            phases.append(dict(name=name, begin=begin, end=time.monotonic(), requested_seconds=seconds,
+                               demanded_action_hz=args.action_hz if active else 0, delivered_actions=delivered,
+                               missed_action_deadlines=skipped))
+        current_phase = None
+        final_live = gui.observe(lambda s: s.get('send_ready'), 'final settled history')
+        manifest['final_history'] = snapshot_summary(final_live, baseline)
+        run('vd', 'shot', session, str(output / 'after.png'))
+        gui.key('ctrl+q')
+        evaluation.wait_windows(session, False)
+        final = evaluation.read_export(output / 'automation.json', time.monotonic() + 10)
+        if final.get('running') or final.get('close_reason') != 'ctrl_q' or final.get('process_nonce') != nonce:
+            raise RuntimeError('owned GUI did not close through ordinary Ctrl+Q')
+        snapshot_summary(final, baseline)
+        native = evaluation.read_export(output / 'native.json', time.monotonic() + 10)
+        evaluation.validate_native(native)
+        if native['dropped']:
+            raise RuntimeError('native telemetry dropped observations')
+        manifest.update(frame_phases=[dict(phase=p['name'], **evaluation.frame_summary(native, p)) for p in phases],
+                        resource_phases=[dict(phase=p['name'], **resource_summary([s for s in samples if s['phase'] == p['name']])) for p in phases],
+                        cache_tails=[evaluation.cache_tail_summary(native, p) for p in phases if p['name'].startswith('settled')],
+                        renderer=native['renderer'], video=native['video'], final_cache=native['text_stats'],
+                        resource_coverage=measure.summarize(samples)['coverage'])
+        validate_action_coverage(actions, phases)
+        manifest['input_to_observed_settlement_seconds'] = [dict(
+            phase=p['name'], **measure.distribution([a['end'] - a['begin'] for a in actions
+                if a['phase'] == p['name'] and not a.get('cleanup')])) for p in phases
+            if p['name'].startswith(('navigation_', 'search_'))]
+        manifest['input_timing_scope'] = 'Full external command chain through observed settled GUI snapshot; includes driver IPC, scheduling and polling overhead, not physical input-to-photon.'
+        tails = [dict(phase=p['name'], **resource_summary([s for s in samples if s['phase'] == p['name']
+                 and s['monotonic_seconds'] >= max(p['begin'], p['end'] - 5)]))
+                 for p in phases if p['name'].startswith('settled_')]
+        manifest['settled_tails'] = tails
+        manifest['settled_growth'] = {}
+        for workload in ('navigation', 'search'):
+            rows = [row for row in tails if row['phase'].startswith('settled_' + workload + '_')]
+            manifest['settled_growth'][workload] = {metric: rows[-1][metric]['p50'] - rows[0][metric]['p50']
+                if len(rows) > 1 and rows[0][metric]['p50'] is not None and rows[-1][metric]['p50'] is not None else None
+                for metric in ('rss_bytes', 'pss_bytes')}
+        manifest['measurement_complete'] = all(p['coverage'] == 'complete_observed_samples'
+            and p['missing_intervals'] == 0 and p['incomplete_cpu_intervals'] == 0
+            for p in manifest['resource_phases'])
+        for field, path in (('binary_sha256', binary), ('fixture_sha256', fixture_binary)):
+            if manifest[field] != evaluation.sha(path):
+                raise RuntimeError('binary drift during evaluation')
+        if source != evaluation.source_fingerprint():
+            raise RuntimeError('source drift during evaluation')
+        manifest['passed'] = True  # Fixture/input/instrumentation gates; never a performance budget verdict.
+    except BaseException as error:
+        manifest['error'] = repr(error)
+        raise
+    finally:
+        try:
+            if session:
+                manifest['cleanup'] = run('vd', 'clean', session)
+                (output / 'compositor.log').write_text((Path(session) / 'compositor.log').read_text())
+        except BaseException as error:
+            manifest.update(passed=False, cleanup_error=repr(error))
+            raise
+        finally:
+            manifest['phases'] = phases
+            (output / 'samples.json').write_text(json.dumps(samples, indent=2) + '\n')
+            (output / 'actions.json').write_text(json.dumps(actions, indent=2) + '\n')
+            (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    print(output / 'manifest.json')
+
+
+if __name__ == '__main__':
+    main()
