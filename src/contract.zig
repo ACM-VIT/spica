@@ -243,6 +243,12 @@ pub const Observation = struct {
         usage: struct { input_tokens: u64, output_tokens: u64, cached_tokens: u64 },
         completed: void,
         cancelled: struct { tools_stopped: bool },
+        /// Definitive refusal of one message request, not failure of its run.
+        /// Requires explicit session/run/effect correlation to a dispatched
+        /// message. Acknowledged delivery alone does not preclude this outcome.
+        request_failed: struct { code: []const u8, detail: []const u8 },
+        /// Terminal provider/turn (including start/open) failure. Request-only
+        /// refusals must use request_failed, even when an effect ID is known.
         failure: struct { code: []const u8, detail: []const u8 },
         disconnect: struct { reason: []const u8, continuity: enum { unknown, lost } },
         ambiguous: struct { reason: []const u8 },

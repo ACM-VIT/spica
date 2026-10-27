@@ -749,9 +749,15 @@ pub const Owner = struct {
         const db = self.database;
         try db.begin();
         errdefer db.rollback() catch {};
-        const s = try db.prepare("SELECT run_id,session_id,kind,revision,state FROM effects WHERE id=?", &.{.{ .text = effect.value }});
+        const s = try db.prepare("SELECT run_id,session_id,kind,revision,state,evidence FROM effects WHERE id=?", &.{.{ .text = effect.value }});
         defer s.deinit();
-        if (!try s.step() or !std.mem.eql(u8, try s.bytes(4), "in_flight")) return error.Conflict;
+        if (!try s.step()) return error.Conflict;
+        const evidence = try encoded(allocator, receipt);
+        if (!s.isNull(5) and std.mem.eql(u8, try s.bytes(5), evidence)) {
+            try db.rollback();
+            return;
+        }
+        if (!std.mem.eql(u8, try s.bytes(4), "in_flight")) return error.Conflict;
         if (s.integer(3) == std.math.maxInt(i64)) return error.Limit;
         const run = try allocator.dupe(u8, try s.bytes(0));
         const session = try allocator.dupe(u8, try s.bytes(1));
@@ -768,7 +774,7 @@ pub const Owner = struct {
             .rejected => "failed",
             .unknown => "unknown",
         };
-        try db.execute("UPDATE effects SET state=?,outcome=?,evidence=?,revision=revision+1 WHERE id=?", &.{ .{ .text = state }, .{ .blob = receipt.detail }, .{ .blob = try encoded(allocator, receipt) }, .{ .text = effect.value } });
+        try db.execute("UPDATE effects SET state=?,outcome=?,evidence=?,revision=revision+1 WHERE id=?", &.{ .{ .text = state }, .{ .blob = receipt.detail }, .{ .blob = evidence }, .{ .text = effect.value } });
         try self.event(allocator, sequence, 0, .{ .effect = effect }, @intCast(s.integer(3) + 1), "EffectDelivery", null, effect, "");
         if (receipt.session) |live| {
             if (!std.mem.eql(u8, live.id.value, session)) return error.Conflict;
@@ -785,7 +791,10 @@ pub const Owner = struct {
         if (!try revision_statement.step()) return error.Corrupt;
         const current = try revision_statement.bytes(1);
         // Delivery after terminal evidence never revives the lifecycle.
-        if (!(std.mem.eql(u8, current, "completed") or std.mem.eql(u8, current, "cancelled") or std.mem.eql(u8, current, "failed") or std.mem.eql(u8, current, "unknown") or std.mem.eql(u8, current, "interrupted"))) {
+        // Message delivery resolves only that effect. It neither starts a new
+        // turn nor supplies evidence about the independent Start's lifecycle,
+        // tools or cancellation, including when delivery itself is uncertain.
+        if (!std.mem.eql(u8, kind, "message") and !(std.mem.eql(u8, current, "completed") or std.mem.eql(u8, current, "cancelled") or std.mem.eql(u8, current, "failed") or std.mem.eql(u8, current, "unknown") or std.mem.eql(u8, current, "interrupted"))) {
             const applied_state = if (std.mem.eql(u8, current, "cancel_requested") and std.mem.eql(u8, kind, "create_session")) current else next_state;
             try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = applied_state }, .{ .text = run } });
             try self.event(allocator, sequence, 2, .{ .run = .{ .value = run } }, @intCast(revision_statement.integer(0) + 1), "RunDelivery", null, effect, "");
@@ -801,6 +810,9 @@ pub const Owner = struct {
     /// transaction succeeds. Duplicate identity requires byte-equal evidence.
     pub fn observe(self: *Owner, allocator: std.mem.Allocator, input: a.Observation) !void {
         if (a.frameBytes(input) > 4096 or input.upstream_event.len == 0) return error.Limit;
+        // Never infer a request outcome's run from the newest turn in a
+        // session. Both identities must come from the dispatched request.
+        if (input.body == .request_failed and (input.correlation.run == null or input.correlation.effect == null)) return error.Conflict;
         var observation = input;
         const run = observation.correlation.run orelse if (self.factory != null) a.RunId{
             .value = try self.field(allocator, "SELECT id FROM runs WHERE session_id=? ORDER BY rowid DESC LIMIT 1", &.{.{ .text = observation.correlation.session.value }}) orelse return error.Conflict,
@@ -837,9 +849,6 @@ pub const Owner = struct {
                 observation.correlation.upstream_tool = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ run.value, upstream });
                 if (observation.correlation.tool) |tool| observation.correlation.tool = .{ .value = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ run.value, tool.value }) };
             }
-            if (observation.correlation.effect) |effect_id| {
-                if (try self.field(allocator, "SELECT id FROM effects WHERE id=? AND session_id=? AND run_id=?", &.{ .{ .text = effect_id.value }, .{ .text = session.value }, .{ .text = run.value } }) == null) return error.Conflict;
-            }
             if (observation.body == .approval) {
                 if (!a.equal(input.body.approval.correlation, input.correlation)) return error.Conflict;
                 observation.body.approval.correlation = observation.correlation;
@@ -864,6 +873,9 @@ pub const Owner = struct {
                 chunk.message = .{ .value = message };
                 chunk.block = .{ .value = block };
             }
+        }
+        if (observation.correlation.effect) |effect_id| {
+            if (try self.field(allocator, "SELECT id FROM effects WHERE id=? AND session_id=? AND run_id=?", &.{ .{ .text = effect_id.value }, .{ .text = session.value }, .{ .text = run.value } }) == null) return error.Conflict;
         }
         const state_statement = try db.prepare("SELECT state,revision FROM runs WHERE id=? AND session_id=?", &.{ .{ .text = run.value }, .{ .text = session.value } });
         defer state_statement.deinit();
@@ -953,6 +965,19 @@ pub const Owner = struct {
             .cancelled => |cancelled| if (!terminal) {
                 next_state = if (cancelled.tools_stopped) "cancelled" else "unknown";
             },
+            .request_failed => |failure| {
+                const effect_id = observation.correlation.effect.?;
+                const pending = try db.prepare("SELECT revision,request FROM effects WHERE id=? AND run_id=? AND session_id=? AND kind='message' AND state IN('in_flight','confirmed','unknown')", &.{ .{ .text = effect_id.value }, .{ .text = run.value }, .{ .text = session.value } });
+                defer pending.deinit();
+                if (!try pending.step()) return error.Conflict;
+                if (pending.integer(0) == std.math.maxInt(i64)) return error.Limit;
+                const request = try t.decode(a.Request, try pending.bytes(1), allocator);
+                if (request != .message or !a.equal(request.message.correlation.effect, observation.correlation.effect) or !a.equal(request.message.correlation.run, observation.correlation.run) or !a.equal(request.message.correlation.session, session)) return error.Conflict;
+                if (observation.correlation.followup != null and !a.equal(request.message.correlation.followup, observation.correlation.followup)) return error.Conflict;
+                try db.execute("UPDATE effects SET state='failed',outcome=?,evidence=?,revision=revision+1 WHERE id=?", &.{ .{ .blob = failure.detail }, .{ .blob = try encoded(allocator, observation.body) }, .{ .text = effect_id.value } });
+                try self.event(allocator, sequence, index, .{ .effect = effect_id }, @intCast(pending.integer(0) + 1), "RequestFailed", null, effect_id, "");
+                index += 1;
+            },
             .failure => |failure| if (!terminal) {
                 // A definitive rejection before session publication resolves the
                 // committed open claim; no dependent start may remain runnable.
@@ -1004,8 +1029,12 @@ pub const Owner = struct {
             try self.event(allocator, sequence, index, .{ .session = session }, @intCast(session_revision.integer(0) + 1), "CursorCommitted", null, observation.correlation.effect, "");
             index += 1;
         }
-        try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = next_state }, .{ .text = run.value } });
-        try self.event(allocator, sequence, index, .{ .run = run }, @intCast(state_statement.integer(1) + 1), "ObservationCommitted", null, observation.correlation.effect, "");
+        // Request diagnostics live on the effect, not the run's terminal
+        // diagnostic projection. Cursor/observation identity still commits.
+        if (observation.body != .request_failed) {
+            try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = next_state }, .{ .text = run.value } });
+            try self.event(allocator, sequence, index, .{ .run = run }, @intCast(state_statement.integer(1) + 1), "ObservationCommitted", null, observation.correlation.effect, "");
+        }
         try self.finalizeMessages(run.value);
         try db.publishChanges(sequence, null);
         try db.commit();
