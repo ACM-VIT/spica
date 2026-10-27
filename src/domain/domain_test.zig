@@ -255,7 +255,7 @@ test "real reducers accept arbitrary prompt dedup before revision and withdraw q
     const allocator = arena.allocator();
     var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "one", .utc_ms = 1000 };
     const conversation = try Conversation.create(&owner, allocator);
-    const command = conversation.send("send", "Any user text: 世界 é\x00\xf0\x9f", 1);
+    const command = conversation.send("send", "Any user text: 世界 é\x00😀", 1);
     const receipt = try owner.command(allocator, command);
     try std.testing.expectEqual(.accepted, receipt.outcome);
     try std.testing.expectEqual(@as(usize, 2), receipt.effect_ids.len);
@@ -1043,7 +1043,9 @@ test "failed resume permits only an explicit retry of the same context and waits
         const start = (try owner.claimNext(allocator)).?;
         try std.testing.expect(start.request == .start);
         try std.testing.expectEqualStrings(third.entity_ids.run.?.value, start.request.start.correlation.run.?.value);
-        try std.testing.expectEqualStrings("retry same context", start.request.start.prompt);
+        const prompt_ref = start.request.start.prompt_ref.?;
+        var prompt_buffer: [64 * 1024]u8 = undefined;
+        try std.testing.expectEqualStrings("retry same context", try @import("prompts.zig").readBlock(&f.store, prompt_ref.id, prompt_ref, &prompt_buffer));
         try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM sessions"));
         try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='create_session'"));
         try std.testing.expectEqual(@as(i64, 6), try f.store.scalar("SELECT count(*) FROM messages"));
@@ -1101,4 +1103,107 @@ test "rejected initial open withdraws dependent work and requires an explicit ne
     try std.testing.expectEqual(.accepted, second.outcome);
     try std.testing.expect(!t.adapter.equal(first.entity_ids.session.?, second.entity_ids.session.?));
     try std.testing.expect((try owner.claimNext(allocator)).?.request.open == .create);
+}
+
+test "staged Send has no effects before durable completion and verifies content on reopen" {
+    const prompts = @import("prompts.zig");
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "upload", .utc_ms = 1 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const text = ("a" ** 2047) ++ "€" ++ ("\x01" ** 63486);
+    const ref = prompts.reference("complete-send", text);
+    try prompts.begin(&f.store, ref);
+    try prompts.append(&f.store, ref, 0, text[0..2048]);
+    var buffer: [prompts.max_bytes]u8 = undefined;
+    try std.testing.expectError(error.PromptIncomplete, prompts.complete(&f.store, ref, &buffer));
+    try std.testing.expect((try owner.claimNext(allocator)) == null);
+    const selection = conversation.send("", "", 1).payload.thread_send.selection;
+    const incomplete: t.CommandEnvelope = .{ .command_id = .{ .value = "incomplete-command" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send_staged = .{ .prompt = ref, .selection = selection } } };
+    const refused = try owner.command(allocator, incomplete);
+    try std.testing.expectEqual(t.Reason.prompt_incomplete, refused.reason.?);
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM effects"));
+    // A definitive refusal releases only the matching reservation.
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM prompt_uploads"));
+    try prompts.begin(&f.store, ref);
+    try prompts.append(&f.store, ref, 0, text[0..2048]);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try f.path(&path_buffer);
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, path);
+    try owner.recover();
+    var offset: usize = 2048;
+    while (offset < text.len) : (offset += 2048) try prompts.append(&f.store, ref, offset, text[offset..@min(text.len, offset + 2048)]);
+    try prompts.complete(&f.store, ref, &buffer);
+    try std.testing.expect((try owner.claimNext(allocator)) == null);
+    const replay = try owner.command(allocator, incomplete);
+    try std.testing.expectEqual(refused.commit_sequence, replay.commit_sequence);
+    var complete = incomplete;
+    complete.command_id.value = "complete-command";
+    const receipt = try owner.command(allocator, complete);
+    try std.testing.expectEqual(.accepted, receipt.outcome);
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM prompt_uploads"));
+    const s = try f.store.prepare("SELECT request FROM effects WHERE kind='start'", &.{});
+    {
+        defer s.deinit();
+        try std.testing.expect(try s.step());
+        const bytes = try s.bytes(0);
+        try std.testing.expect(bytes.len < 2048);
+        const request = try t.decode(t.adapter.Request, bytes, allocator);
+        try std.testing.expectEqualStrings("", request.start.prompt);
+        const committed_ref = request.start.prompt_ref.?;
+        try std.testing.expectEqualStrings(text, try prompts.readBlock(&f.store, committed_ref.id, committed_ref, &buffer));
+        // Prefix-only title/history queries do not participate in Start loading.
+        try f.store.execute("DELETE FROM chunks WHERE block_id=? AND byte_offset=2048", &.{.{ .text = committed_ref.id }});
+        try std.testing.expectError(error.InvalidPrompt, prompts.readBlock(&f.store, committed_ref.id, committed_ref, &buffer));
+    }
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM commands WHERE command_id='complete-command' AND length(canonical)<2048"));
+}
+
+test "invalid UTF8 prompt is durably refused without provider effects" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "invalid", .utc_ms = 1 };
+    const conversation = try Conversation.create(&owner, arena.allocator());
+    const command = conversation.send("invalid", "\xf0\x9f", 1);
+    const receipt = try owner.command(arena.allocator(), command);
+    try std.testing.expectEqual(t.Reason.invalid_command, receipt.reason.?);
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM effects"));
+    try std.testing.expectEqual(receipt.commit_sequence, (try owner.command(arena.allocator(), command)).commit_sequence);
+}
+
+test "schema 4 inline Send retry retains original receipt before reserving prompt staging" {
+    const prompts = @import("prompts.zig");
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "upgrade", .utc_ms = 1 };
+    const conversation = try Conversation.create(&owner, allocator);
+    var command = conversation.send("prior-send", "retained café 世界", 1);
+    const original = try owner.command(allocator, command);
+    // Reconstruct only the older journal representation in this disposable
+    // fixture. Reopening performs the actual version 4 -> 5 store migration.
+    var buffer: [65536]u8 = undefined;
+    const canonical = try t.encode(command, &buffer);
+    try f.store.execute("UPDATE commands SET canonical=?,digest=? WHERE command_id='prior-send'", &.{ .{ .blob = canonical }, .{ .blob = &t.digest(canonical) } });
+    try f.store.exec("DROP TABLE prompt_chunks; DROP TABLE prompt_uploads; UPDATE meta SET schema_version=4; PRAGMA user_version=4");
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try f.path(&path_buffer);
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, path);
+    for ([_][]const u8{ "one", "two", "three", "four" }) |id| try prompts.begin(&f.store, prompts.reference(id, "x"));
+    const replay = try owner.command(allocator, command);
+    try std.testing.expectEqual(original.commit_sequence, replay.commit_sequence);
+    try std.testing.expectEqual(original.outcome, replay.outcome);
+    try std.testing.expectEqual(@as(i64, 4), try f.store.scalar("SELECT count(*) FROM prompt_uploads"));
+    try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM effects"));
+    command.payload.thread_send.text = "changed";
+    try std.testing.expectEqual(t.Reason.command_id_conflict, (try owner.command(allocator, command)).reason.?);
 }

@@ -17,6 +17,8 @@ const Factory = struct {
         pumps: std.atomic.Value(u32) = .init(0),
         opens: std.atomic.Value(u32) = .init(0),
         starts: std.atomic.Value(u32) = .init(0),
+        prompt_digest: [32]u8 = undefined,
+        prompt_length: usize = 0,
         tool_requested: std.atomic.Value(bool) = .init(false),
         tool_responded: std.atomic.Value(bool) = .init(false),
         tool_result: [65536]u8 = undefined,
@@ -58,8 +60,15 @@ const Factory = struct {
                     _ = self.opens.fetchAdd(1, .release);
                     return .{ .outcome = .acknowledged, .session = .{ .id = self.session, .instance = .{ .value = self.session.value }, .upstream = .{ .value = self.session.value } } };
                 },
-                .start => {
+                .start => |start| {
+                    if (start.prompt_ref != null) return error.UnmaterializedPrompt;
+                    self.prompt_digest = t.digest(start.prompt);
+                    self.prompt_length = start.prompt.len;
+                    self.owner.prompt_digest = self.prompt_digest;
+                    self.owner.prompt_length = self.prompt_length;
+                    _ = self.owner.start_calls.fetchAdd(1, .release);
                     _ = self.starts.fetchAdd(1, .release);
+                    return .{ .outcome = self.owner.start_outcome };
                 },
                 .cancel => {
                     _ = self.cancels.fetchAdd(1, .release);
@@ -97,6 +106,10 @@ const Factory = struct {
         const vtable: common.Adapter.VTable = .{ .discover = discover, .accountStatus = account, .resolveSelection = resolve, .dispatch = dispatch, .pump = pump, .poll = poll, .shutdown = shutdown, .ready = ready, .pollTool = pollTool, .respondTool = respondTool };
     };
     instances: [8]?*Instance = @splat(null),
+    start_outcome: @FieldType(c.Receipt, "outcome") = .acknowledged,
+    start_calls: std.atomic.Value(u32) = .init(0),
+    prompt_digest: [32]u8 = undefined,
+    prompt_length: usize = 0,
     creates: std.atomic.Value(u32) = .init(0),
     shutdowns: std.atomic.Value(u32) = .init(0),
     destroys: std.atomic.Value(u32) = .init(0),
@@ -457,4 +470,89 @@ test "real workspace Git capture rejects changed checkouts aliases and shared me
     try std.testing.expect(!try domain.workspace_binding.validOwnedPath(allocator, binding, "escape/write"));
     try gitFixture(allocator, root, &.{ "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "changed" });
     try std.testing.expect(!try domain.workspace_binding.verify(allocator, std.testing.io, binding));
+}
+
+test "Host large Send verifies exact bytes and never repeats definitive or unknown Start receipts" {
+    for ([_]@FieldType(c.Receipt, "outcome"){ .acknowledged, .rejected, .unknown }) |outcome| {
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try temporary.dir.realPath(std.testing.io, &directory);
+        const root = directory[0..n];
+        var consumer: Consumer = .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+        defer consumer.arena.deinit();
+        var factory: Factory = .{ .auto_ready = true, .start_outcome = outcome };
+        consumer.host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = root, .factory = factory.handle(), .selection = sampleSelection(""), .workspace_root = root, .wake = Consumer.wake, .wake_context = &consumer });
+        defer consumer.host.destroy();
+        const project = (try consumer.command(.{ .command_id = .{ .value = "project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "large Send" } } })).entity_ids.project.?;
+        const workspace = try consumer.register(project, root, "workspace");
+        const thread = (try consumer.command(.{ .command_id = .{ .value = "thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+        const text = "\x01" ** (64 * 1024);
+        const command: t.CommandEnvelope = .{ .command_id = .{ .value = "long-send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = text, .selection = sampleSelection(workspace.value) } } };
+        var too_small: [65536]u8 = undefined;
+        try std.testing.expectError(error.TooLarge, t.encode(command, &too_small));
+        const receipt = try consumer.command(command);
+        try std.testing.expectEqual(.accepted, receipt.outcome);
+        // Host handles queued queries after its bounded dispatch/pump slice.
+        _ = try consumer.query(.{ .runs = .{ .thread = thread } });
+        try std.testing.expectEqual(@as(u32, 1), factory.creates.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 1), factory.start_calls.load(.acquire));
+        try std.testing.expectEqual(text.len, factory.prompt_length);
+        try std.testing.expectEqualSlices(u8, &t.digest(text), &factory.prompt_digest);
+        const replay = try consumer.command(command);
+        try std.testing.expectEqual(receipt.commit_sequence, replay.commit_sequence);
+        const found = try consumer.query(.{ .command_receipt = .{ .value = "long-send" } });
+        try std.testing.expectEqual(receipt.commit_sequence, found.items[0].command_receipt.?.commit_sequence);
+        const absent = try consumer.query(.{ .command_receipt = .{ .value = "never-sent" } });
+        try std.testing.expect(absent.items[0].command_receipt == null);
+        try std.testing.expectEqual(@as(u32, 1), factory.start_calls.load(.acquire));
+        // Reopen never replays accepted work, even without a provider receipt.
+        consumer.host.destroy();
+        consumer.host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = root, .factory = factory.handle(), .selection = sampleSelection(""), .wake = Consumer.wake, .wake_context = &consumer });
+        const reopened = try consumer.command(command);
+        try std.testing.expectEqual(receipt.commit_sequence, reopened.commit_sequence);
+        try std.testing.expectEqual(@as(u32, 1), factory.creates.load(.acquire));
+    }
+}
+
+test "Host staging full refusal is durable and explicit cleanup releases only one orphan" {
+    const prompts = @import("prompts.zig");
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &directory);
+    const root = directory[0..n];
+    // Separate stopped-app state fixture; no GUI mutation or private state.
+    var db = try domain.store.Store.open(std.testing.io, root);
+    for ([_][]const u8{ "orphan-1", "orphan-2", "orphan-3", "orphan-4" }) |id| try prompts.begin(&db, prompts.reference(id, "a" ** 65536));
+    try db.close();
+    var consumer: Consumer = .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer consumer.arena.deinit();
+    consumer.host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = root, .wake = Consumer.wake, .wake_context = &consumer });
+    var live = true;
+    defer if (live) consumer.host.destroy();
+    const project = (try consumer.command(.{ .command_id = .{ .value = "project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "full staging" } } })).entity_ids.project.?;
+    const workspace = try consumer.register(project, root, "workspace");
+    const thread = (try consumer.command(.{ .command_id = .{ .value = "thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+    var command: t.CommandEnvelope = .{ .command_id = .{ .value = "send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "a" ** 65536, .selection = c.fakeSelection(workspace) } } };
+    const refused = try consumer.command(command);
+    try std.testing.expectEqual(t.Reason.prompt_staging_full, refused.reason.?);
+    try std.testing.expectEqual(@as(usize, 0), (try consumer.query(.{ .runs = .{ .thread = thread } })).items.len);
+    _ = try consumer.command(.{ .command_id = .{ .value = "cleanup" }, .target = .absent, .expected_revision = .absent, .payload = .{ .prompt_discard = .{} } });
+    try std.testing.expectEqual(refused.commit_sequence, (try consumer.command(command)).commit_sequence);
+    command.command_id.value = "new-send";
+    try std.testing.expectEqual(.accepted, (try consumer.command(command)).outcome);
+    consumer.host.destroy();
+    live = false;
+    db = try domain.store.Store.open(std.testing.io, root);
+    defer db.close() catch {};
+    try std.testing.expectEqual(@as(i64, 3), try db.scalar("SELECT count(*) FROM prompt_uploads"));
+    try std.testing.expectEqual(@as(i64, 0), try db.scalar("SELECT count(*) FROM prompt_uploads WHERE id='orphan-1'"));
+    // Conflicting cleanup references and lengths cannot erase other uploads.
+    var conflict = prompts.reference("orphan-2", "a" ** 65536);
+    conflict.sha256[0] ^= 1;
+    try prompts.discardMatching(&db, conflict);
+    conflict.byte_length = std.math.maxInt(usize);
+    try prompts.discardMatching(&db, conflict);
+    try std.testing.expectEqual(@as(i64, 3), try db.scalar("SELECT count(*) FROM prompt_uploads"));
 }

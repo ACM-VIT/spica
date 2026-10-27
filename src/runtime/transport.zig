@@ -16,6 +16,9 @@ pub const Transport = struct {
     input: []u8,
     output: []u8,
     input_len: usize = 0,
+    // One materialized Start packet, separate from ordinary frame/queue budgets.
+    prompt_input: ?[]u8 = null,
+    prompt_offset: usize = 0,
     output_len: usize = 0,
     exited: bool = false,
     status: c_int = 0,
@@ -54,9 +57,30 @@ pub const Transport = struct {
         self.input[self.input_len] = '\n';
         self.input_len += 1;
     }
+    pub fn sendPrompt(self: *Transport, line: []const u8) !void {
+        if (self.exited) return error.ProcessExited;
+        if (line.len > @import("prompt.zig").json_bytes) return error.FrameTooLarge;
+        if (std.mem.indexOfScalar(u8, line, '\n') != null) return error.InvalidFrame;
+        if (self.prompt_input != null or self.input_len != 0) return error.QueueFull;
+        const owned = try self.allocator.alloc(u8, line.len + 1);
+        @memcpy(owned[0..line.len], line);
+        owned[line.len] = '\n';
+        self.prompt_input = owned;
+        self.prompt_offset = 0;
+    }
     pub fn pump(self: *Transport) !void {
         if (self.exited) return;
-        if (self.input_len > 0) {
+        if (self.prompt_input) |bytes| {
+            const n = c.spica_process_write(self.process.input, bytes[self.prompt_offset..].ptr, bytes.len - self.prompt_offset);
+            if (n == -1) return error.TransportWrite;
+            if (n > 0) self.prompt_offset += @intCast(n);
+            if (self.prompt_offset == bytes.len) {
+                self.allocator.free(bytes);
+                self.prompt_input = null;
+                self.prompt_offset = 0;
+            }
+        }
+        if (self.prompt_input == null and self.input_len > 0) {
             const n = c.spica_process_write(self.process.input, self.input.ptr, self.input_len);
             if (n == -1) return error.TransportWrite;
             if (n > 0) {
@@ -107,6 +131,7 @@ pub const Transport = struct {
             }
         }
         c.spica_process_dispose(&self.process);
+        if (self.prompt_input) |bytes| self.allocator.free(bytes);
         self.allocator.free(self.input);
         self.allocator.free(self.output);
     }
@@ -133,4 +158,47 @@ test "real process framing and ownership" {
         _ = c.spica_process_poll(&transport.process, -1, 0, 10);
     }
     return error.TestTimeout;
+}
+
+test "dedicated Start transport drains partial writes and keeps ordinary budgets" {
+    const allocator = std.testing.allocator;
+    var transport = try Transport.init(allocator, .{ .argv = &.{ "/usr/bin/python3", "-c", "import sys,json; x=json.loads(sys.stdin.readline()); print(json.dumps({'length':len(x['text']),'same':all(ord(c)==1 for c in x['text'])}),flush=True); print(sys.stdin.readline().strip(),flush=True)" }, .cwd = "/tmp", .environment = &.{} });
+    defer transport.deinit();
+    const bytes = try @import("prompt.zig").encode(allocator, .{ .text = "\x01" ** (64 * 1024) });
+    defer allocator.free(bytes);
+    try std.testing.expect(bytes.len > Transport.frame_bytes);
+    try std.testing.expectError(error.FrameTooLarge, transport.send(bytes));
+    try transport.sendPrompt(bytes);
+    try std.testing.expectError(error.QueueFull, transport.sendPrompt(bytes));
+    // Ordinary traffic queued afterward must remain after the complete Start.
+    try transport.send("{\"after\":true}");
+    var seen: usize = 0;
+    for (0..300) |_| {
+        try transport.pump();
+        while (try transport.poll(allocator)) |line| {
+            defer allocator.free(line);
+            if (seen == 0) {
+                try std.testing.expectEqualStrings("{\"length\": 65536, \"same\": true}", line);
+            } else try std.testing.expectEqualStrings("{\"after\":true}", line);
+            seen += 1;
+        }
+        if (seen == 2) break;
+        _ = c.spica_process_poll(&transport.process, -1, @intFromBool(transport.prompt_input != null or transport.input_len != 0), 10);
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+    try std.testing.expect(transport.prompt_input == null);
+    try std.testing.expectEqual(@as(usize, 0), transport.input_len);
+}
+
+fn promptAdmissionFailure(allocator: std.mem.Allocator) !void {
+    var transport: Transport = .{ .allocator = allocator, .input = &.{}, .output = &.{} };
+    defer if (transport.prompt_input) |bytes| allocator.free(bytes);
+    transport.sendPrompt("{\"text\":\"bounded\"}") catch |err| {
+        try std.testing.expect(transport.prompt_input == null);
+        try std.testing.expectEqual(@as(usize, 0), transport.prompt_offset);
+        return err;
+    };
+}
+test "dedicated Start admission allocation failure retains no partial packet" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, promptAdmissionFailure, .{});
 }

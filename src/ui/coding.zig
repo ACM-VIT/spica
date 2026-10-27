@@ -461,7 +461,7 @@ pub const View = struct {
         run_status: RunStatus = .idle,
     };
 
-    pub const WorkflowAction = union(enum) { add, remove: usize, enqueue, edit: usize, cancel: usize, up: usize, down: usize };
+    pub const WorkflowAction = union(enum) { cleanup_prompt, add, remove: usize, enqueue, edit: usize, cancel: usize, up: usize, down: usize };
     pub const Followup = struct {
         id: transcript.Id = .{},
         revision: u64 = 0,
@@ -515,6 +515,7 @@ pub const View = struct {
             self.workflowNotice("Editing stopped. Composer retained as a new draft.");
         } else if (!self.workflow_busy) {
             if (std.mem.eql(u8, id, "attachment.add")) self.workflow_action = .add;
+            if (std.mem.eql(u8, id, "prompt.cleanup")) self.workflow_action = .cleanup_prompt;
             if (std.mem.eql(u8, id, "followup.enqueue")) self.workflow_action = .enqueue;
             var buffer: [64]u8 = undefined;
             for (0..attachment_text.max_count) |i| if (std.mem.eql(u8, id, try std.fmt.bufPrint(&buffer, "attachment.remove.{d}", .{i}))) {
@@ -2086,6 +2087,9 @@ pub const View = struct {
             inline for (.{ "edit", "cancel", "up", "down" }, 0..) |kind, k| {
                 try self.workflowControl(renderer, text, try std.fmt.bufPrint(&id_buffer, "followup." ++ kind ++ ".{d}", .{i}), kind, .{ .x = box.x + 12 + k * 74, .y = y + 109, .w = 68, .h = 26 }, !self.workflow_busy and !self.workflow_uncertain and item.state == .planned and self.workflow_active, foreground);
             }
+        }
+        if (self.send_diagnostic.stage == .rejected and std.mem.eql(u8, self.send_diagnostic.rejection[0..self.send_diagnostic.rejection_len], "prompt_staging_full")) {
+            try self.workflowControl(renderer, text, "prompt.cleanup", "Discard unfinished upload", .{ .x = box.x + 12, .y = box.y + box.h - 60, .w = @min(202, box.w - 214), .h = 26 }, !self.workflow_busy, foreground);
         }
         if (pages > 1) {
             try self.workflowControl(renderer, text, "workflow.previous", "Previous", .{ .x = box.x + box.w - 190, .y = box.y + box.h - 60, .w = 82, .h = 26 }, self.workflow_page > 0, foreground);

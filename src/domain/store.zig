@@ -10,7 +10,7 @@ extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, Closed };
 pub const application_id = 0x53504334;
-pub const schema_version = 4;
+pub const schema_version = 5;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
 
 pub const Statement = struct {
@@ -121,6 +121,12 @@ pub const Store = struct {
             errdefer result.exec("ROLLBACK") catch {};
             try result.exec("CREATE TABLE IF NOT EXISTS runtime_preferences(singleton INTEGER PRIMARY KEY CHECK(singleton=1),active_runtime_kind TEXT NOT NULL REFERENCES runtime_configurations(runtime_kind)); INSERT OR IGNORE INTO runtime_preferences SELECT 1,runtime_kind FROM runtime_configurations ORDER BY runtime_kind DESC LIMIT 1; UPDATE meta SET schema_version=4 WHERE singleton=1; PRAGMA user_version=4; COMMIT");
         } else if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='runtime_preferences'") != 1) return error.Corrupt;
+        if (fresh or version < 5) {
+            try result.exec("BEGIN IMMEDIATE");
+            errdefer result.exec("ROLLBACK") catch {};
+            try result.exec(prompt_schema);
+            try result.exec("UPDATE meta SET schema_version=5 WHERE singleton=1; PRAGMA user_version=5; COMMIT");
+        } else if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN('prompt_uploads','prompt_chunks')") != 2) return error.Corrupt;
         try result.exec("CREATE TABLE IF NOT EXISTS thread_selections(thread_id TEXT PRIMARY KEY REFERENCES threads(id),selection BLOB NOT NULL CHECK(length(selection)<=16384))");
         // The implicit rowid suffix supports latest selection/status lookups
         // without scanning completed runs from other threads.
@@ -442,4 +448,9 @@ const task_schema =
     \\CREATE UNIQUE INDEX one_effect ON effects(run_id,kind) WHERE kind IN('create_session','start','cancel');
     \\CREATE UNIQUE INDEX one_reconcile_call ON effects(command_id,kind) WHERE kind IN('inspect','attach');
     \\CREATE INDEX pending_effect ON effects(state,id);
+;
+
+const prompt_schema =
+    \\CREATE TABLE IF NOT EXISTS prompt_uploads(id TEXT PRIMARY KEY CHECK(length(id) BETWEEN 1 AND 128),byte_length INTEGER NOT NULL CHECK(byte_length BETWEEN 1 AND 65536),digest BLOB NOT NULL CHECK(length(digest)=32),received INTEGER NOT NULL CHECK(received BETWEEN 0 AND byte_length),complete INTEGER NOT NULL CHECK(complete IN(0,1)));
+    \\CREATE TABLE IF NOT EXISTS prompt_chunks(upload_id TEXT NOT NULL REFERENCES prompt_uploads(id) ON DELETE CASCADE,byte_offset INTEGER NOT NULL CHECK(byte_offset BETWEEN 0 AND 65535),bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 2048),PRIMARY KEY(upload_id,byte_offset));
 ;

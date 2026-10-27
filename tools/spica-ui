@@ -900,13 +900,11 @@ def restart_app(session: Session, args: argparse.Namespace) -> dict[str, Any]:
     raise DriverError("restarted native window did not appear", EX_PROCESS)
 
 
-def assert_oversized_refusal(before: dict[str, Any], current: dict[str, Any], size: int) -> None:
-    target = next((item for item in target_groups(current) if item.get("id") == "command.send"), None)
-    if (current.get("draft") != "x" * size or not target or target.get("enabled")
-            or current.get("send_frame_bytes", 0) <= 4096 or not current.get("send_disabled_reason")
-            or current.get("pending_command") or current.get("run_id") != before.get("run_id")
-            or current.get("send_command_id") != before.get("send_command_id")):
-        raise DriverError("oversized refusal did not preserve the draft and command/run identity", EX_ASSERTION)
+def assert_composer_capacity(before: dict[str, Any], current: dict[str, Any], draft: str) -> None:
+    if (current.get("draft") != draft or current.get("draft_revision") != before.get("draft_revision")
+            or current.get("notice") != "TextTooLarge"):
+        raise DriverError("over-capacity paste did not preserve the original draft revision", EX_ASSERTION)
+    assert_no_new_provider_work(before, current, "over-capacity paste")
 
 
 def assert_empty_send_disabled(current: dict[str, Any]) -> None:
@@ -1171,6 +1169,34 @@ def scenario_codex_session(session: Session, args: argparse.Namespace) -> None:
     session.data["expected_outcome"] = "codex_adapter_three_turns_same_session_reopened_with_upstream_context"
 
 
+def full_size_prompts() -> list[str]:
+    return ["x" * 65536, "🙂" * 16384, '\n"\\\t' * 16384, "x" * 2047 + "€" + "\x01" * 63486]
+
+
+def scenario_large_send(session: Session, args: argparse.Namespace) -> None:
+    prompts = full_size_prompts() if args.provider == "codex-fixture" else full_size_prompts()[:1]
+    for prompt in prompts:
+        current = send_turn(session, prompt, args.timeout)
+        if current.get("send_prompt_bytes") != 65536 or current.get("draft"):
+            raise DriverError("full-size Send did not report exact bytes and clear its admitted draft", EX_ASSERTION)
+    if args.provider == "codex-fixture":
+        assert_codex_fixture_trace(fixture_events(session), prompts)
+    session.data["expected_outcome"] = "full_64KiB_send_completed_exact_prompt_bytes"
+
+
+def scenario_composer_capacity(session: Session, args: argparse.Namespace) -> None:
+    draft = "retained draft café 世界"
+    composer_ready(session, args.timeout)
+    perform_input(session, "text", "composer.input", args.timeout, draft)
+    before = wait_snapshot(session, lambda value: value.get("draft") == draft, args.timeout, "retained capacity-test draft")
+    perform_key(session, "ctrl+a", args.timeout)
+    perform_input(session, "text", "composer.input", args.timeout, "x" * 65537)
+    current = wait_snapshot(session, lambda value: value.get("notice") == "TextTooLarge", args.timeout, "over-capacity paste refusal")
+    assert_composer_capacity(before, current, draft)
+    session.journal("scenario.composer-capacity", before, current, outcome="65537_byte_paste_refused_original_draft_retained")
+    session.data["expected_outcome"] = "over_capacity_paste_refused_no_send_original_draft_retained"
+
+
 def scenario_codex_error(session: Session, args: argparse.Namespace) -> None:
     failed = send_turn(session, "offline synthetic provider error", args.timeout, terminal="failed")
     current = wait_snapshot(session, lambda value: value.get("run_id") == failed.get("run_id")
@@ -1212,12 +1238,10 @@ def read_private_clipboard(session: Session) -> str:
 
 def scenario(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
-    expected_provider = "codex-fixture" if args.name in {"codex-session", "codex-error"} else "fake"
+    expected_provider = "codex-fixture" if args.name in {"codex-session", "codex-error", "codex-large-send"} else "fake"
     args.provider = args.provider or expected_provider
     if args.provider != expected_provider:
         raise DriverError(f"{args.name} requires the offline {expected_provider} provider", EX_PROVIDER)
-    if args.name in {"rejected-send", "oversized-send"} and not 4097 <= args.rejected_bytes <= 64 * 1024:
-        raise DriverError("--rejected-bytes must be between 4097 and 65536", EX_USAGE)
     if args.dry_run:
         print(json.dumps({"command": "scenario", "scenario": args.name,
                           "output": str(output), "steps": scenario_steps(args.name),
@@ -1232,6 +1256,10 @@ def scenario(args: argparse.Namespace) -> int:
             scenario_codex_session(session, args)
         elif args.name == "codex-error":
             scenario_codex_error(session, args)
+        elif args.name in {"large-send", "codex-large-send"}:
+            scenario_large_send(session, args)
+        elif args.name == "composer-capacity":
+            scenario_composer_capacity(session, args)
         elif args.name == "disabled-send":
             current = composer_ready(session, args.timeout)
             assert_empty_send_disabled(current)
@@ -1239,17 +1267,6 @@ def scenario(args: argparse.Namespace) -> int:
             perform_key(session, "Return", args.timeout)
             assert_empty_send_disabled(session.snapshot(args.timeout))
             session.data["expected_outcome"] = "send_disabled"
-        elif args.name in {"rejected-send", "oversized-send"}:
-            before = composer_ready(session, args.timeout)
-            perform_input(session, "text", "composer.input", args.timeout, "x" * args.rejected_bytes)
-            current = wait_snapshot(session, lambda value: value.get("send_stage") == "preflight_rejected",
-                                    args.timeout, "visible oversized Send refusal")
-            assert_oversized_refusal(before, current, args.rejected_bytes)
-            perform_key(session, "Return", args.timeout)
-            current = session.snapshot(args.timeout)
-            assert_oversized_refusal(before, current, args.rejected_bytes)
-            session.data["expected_outcome"] = "oversized_send_refused_draft_retained_no_command"
-            session.journal("scenario.oversized-send", before, current, outcome="preflight_rejected")
         elif args.name in {"send-restart", "second-turn"}:
             first = send_turn(session, args.prompt, args.timeout)
             capture(session, "before-restart.png")
@@ -1309,8 +1326,9 @@ def scenario_steps(name: str) -> list[str]:
     return {"codex-session": ["launch production Codex adapter with isolated offline app-server fixture", "Send two turns", "restart native app on same private desktop", "Send third turn", "assert one upstream session, distinct commands/runs/turns, exact UTF-8 prompt digests and resumed prior context"],
             "codex-error": ["launch production Codex adapter with isolated failing offline fixture", "Send a prompt", "assert accepted command then failed run with retained specific synthetic provider diagnostic", "copy diagnostic with Ctrl+Shift+C and verify correlation without prompt content", "capture failure banner for visual review"],
             "disabled-send": ["launch fake", "snapshot empty composer", "assert command.send disabled"],
-            "rejected-send": ["launch fake", "type oversized prompt through vd", "assert disabled Send and retained draft", "press Return", "assert no command or run"],
-            "oversized-send": ["launch fake", "type oversized prompt through vd", "assert disabled Send and retained draft", "press Return", "assert no command or run"],
+            "large-send": ["launch fake", "paste and Send all 65536 composer bytes", "assert accepted command, correlated completed run and empty draft"],
+            "codex-large-send": ["launch production Codex adapter with offline fixture", "Send exact 65536-byte ASCII, emoji, escaped JSON and split-codepoint prompts", "assert four completed turns and matching upstream prompt digests"],
+            "composer-capacity": ["launch fake", "type a retained draft", "select all and paste 65537 bytes", "assert whole paste refused and original draft revision retained without Send"],
             "send-restart": ["launch fake", "type prompt and Send", "correlate command and new run", "allow fake approval", "close app while retaining private desktop", "relaunch and assert same completed thread/run"],
             "second-turn": ["run send-restart", "send second prompt in reopened thread", "assert distinct command/run and same thread", "record fake-only context limitation"],
             "workspace-diff": ["create disposable committed Git fixture before launch", "launch fake in fixture checkout", "open workspace.changes", "select workspace.file.0", "assert captured checkout revision and diff bytes", "capture rendered diff"],
@@ -1417,12 +1435,11 @@ def parser() -> argparse.ArgumentParser:
     add_common(item)
 
     item = commands.add_parser("scenario", help="run a bounded offline GUI scenario")
-    item.add_argument("name", choices=("send-restart", "disabled-send", "rejected-send", "oversized-send", "second-turn",
+    item.add_argument("name", choices=("send-restart", "disabled-send", "large-send", "composer-capacity", "codex-large-send", "second-turn",
                                              "workspace-diff", "capability-refusal", "followup-refusal", "question-refusal", "attachment-refusal",
                                              "codex-session", "codex-error"))
     item.add_argument("--provider", choices=("fake", "codex-fixture"), help="offline fixture; inferred from scenario")
     item.add_argument("--prompt", default="offline GUI send")
-    item.add_argument("--rejected-bytes", type=int, default=6000)
     item.add_argument("--binary", type=Path)
     item.add_argument("--build", action="store_true")
     item.add_argument("--optimize", choices=("Debug", "ReleaseSafe"), default="ReleaseSafe")

@@ -70,11 +70,16 @@ pub const WorkspaceBinding = struct {
     base_revision: []const u8,
     non_git: bool = false,
 };
+pub const PromptRef = adapter.PromptRef;
+
 pub const Payload = union(enum) {
     project_create: struct { display_name: []const u8 },
     workspace_register: struct { project: ProjectId, binding: WorkspaceBinding },
     thread_create: struct { project: ProjectId, workspace: adapter.WorkspaceId },
     thread_send: struct { text: []const u8, selection: adapter.Selection },
+    thread_send_staged: struct { prompt: PromptRef, selection: adapter.Selection },
+    /// Explicitly discard one bounded orphan upload. Never affects a sent prompt.
+    prompt_discard: struct { id: ?[]const u8 = null },
     thread_select: struct { selection: adapter.Selection },
     /// A queued follow-up is represented by a planned provider message effect.
     /// The effect remains nondispatchable until its dependency chain permits it.
@@ -136,6 +141,9 @@ pub const Reason = enum {
     question_expired,
     attachment_limit,
     attachment_unsupported,
+    prompt_incomplete,
+    prompt_invalid,
+    prompt_staging_full,
 };
 pub const EntityIds = struct {
     project: ?ProjectId = null,
@@ -176,6 +184,7 @@ pub const Page = struct {
 pub const Query = union(enum) {
     // Provider effects require explicit commands; these queries are cache-only.
     projects: Page,
+    command_receipt: CommandId,
     models: struct { workspace: adapter.WorkspaceId, page: Page = .{} },
     runtime_status: void,
     workspaces: struct { project: ProjectId, page: Page = .{} },
@@ -215,6 +224,7 @@ pub const RuntimeStatus = struct {
     supported_login_modes: []const []const u8 = &.{},
 };
 pub const Row = union(enum) {
+    command_receipt: ?Receipt,
     project: struct { id: ProjectId, revision: Revision, display_name: []const u8 },
     workspace: struct { id: adapter.WorkspaceId, revision: Revision, project: ProjectId, binding: WorkspaceBinding },
     thread: struct {

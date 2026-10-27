@@ -2,6 +2,7 @@
 const std = @import("std");
 pub const types = @import("domain/types.zig");
 pub const store = @import("domain/store.zig");
+const prompts = @import("domain/prompts.zig");
 const t = types;
 const a = t.adapter;
 const V = store.Value;
@@ -12,24 +13,19 @@ const Mcp = @import("orchestration_mcp.zig").Server;
 pub const coordinator_tools = @import("orchestration_tools.zig");
 pub const workspace_binding = @import("domain/workspace.zig");
 
-/// The provider start request has a smaller accounted wire budget than the
-/// retained editor. Host admission reuses this calculation.
+/// Prompt admission is independent of the ordinary provider frame budget.
 pub const start_frame_limit = (a.Limits{}).frame_bytes;
+pub const max_prompt_bytes = prompts.max_bytes;
 const generated_id_bytes = 32;
-
 pub const StartPreflight = struct {
     prompt_bytes: usize,
+    /// Accounted materialized request bytes; it is not an ordinary queue frame.
     frame_bytes: usize,
     max_prompt_bytes: usize,
-
     pub fn fits(self: StartPreflight) bool {
-        return self.frame_bytes <= start_frame_limit;
+        return self.prompt_bytes <= self.max_prompt_bytes;
     }
 };
-
-/// Account the fixed header and generated 32-byte IDs used by Host's
-/// `Request.start`, without reading or retaining prompt contents. Host still
-/// rechecks the concrete request after generating its real IDs.
 pub fn startPreflight(prompt_bytes: usize) StartPreflight {
     const id = [_]u8{'0'} ** generated_id_bytes;
     const request: a.Request = .{ .start = .{ .correlation = .{
@@ -37,8 +33,7 @@ pub fn startPreflight(prompt_bytes: usize) StartPreflight {
         .run = .{ .value = &id },
         .session = .{ .value = &id },
     }, .prompt = "" } };
-    const overhead = a.frameBytes(request);
-    return .{ .prompt_bytes = prompt_bytes, .frame_bytes = overhead +| prompt_bytes, .max_prompt_bytes = start_frame_limit -| overhead };
+    return .{ .prompt_bytes = prompt_bytes, .frame_bytes = a.frameBytes(request) +| prompt_bytes, .max_prompt_bytes = max_prompt_bytes };
 }
 
 // Every nested lookup is a point/range lookup on an existing primary/unique
@@ -122,9 +117,66 @@ pub const Owner = struct {
         try self.database.execute("INSERT INTO effects(id,revision,run_id,session_id,kind,read_only,request,digest,state,depends_on,approval_id,command_id) VALUES(?,1,?,?,?,?,?,?,'planned',?,?,?)", &.{ .{ .text = effect }, .{ .text = run }, .{ .text = session }, .{ .text = @tagName(kind) }, .{ .integer = @intFromBool(request == .inspect or request == .attach) }, .{ .blob = bytes }, .{ .blob = &digest }, if (dependency) |v| .{ .text = v } else .null, if (approval) |v| .{ .text = v } else .null, .{ .text = causation.value } });
     }
 
+    fn commandReplay(self: *Owner, allocator: std.mem.Allocator, e: t.CommandEnvelope) !?t.Receipt {
+        const canonical = try encoded(allocator, e);
+        const output = try allocator.alloc(u8, 65536);
+        const bytes = self.database.lookupCommand(e.command_id.value, canonical, output) catch |err| switch (err) {
+            error.Conflict => {
+                const stored = try self.database.prepare("SELECT canonical,receipt FROM commands WHERE command_id=?", &.{.{ .text = e.command_id.value }});
+                defer stored.deinit();
+                if (!try stored.step()) return error.Corrupt;
+                const original = try t.decode(t.Receipt, try stored.bytes(1), allocator);
+                const conflict: t.Receipt = .{ .command_id = e.command_id, .outcome = .rejected, .reason = .command_id_conflict, .commit_sequence = original.commit_sequence };
+                // Schema 4 journaled the inline Send envelope. Recognize its
+                // exact semantic retry before reserving any new prompt bytes.
+                if (e.payload == .thread_send_staged) {
+                    var previous = t.decode(t.CommandEnvelope, try stored.bytes(0), allocator) catch |parse_error| {
+                        if (parse_error == error.OutOfMemory) return parse_error;
+                        return conflict;
+                    };
+                    if (previous.payload == .thread_send) {
+                        const p = previous.payload.thread_send;
+                        previous.payload = .{ .thread_send_staged = .{ .prompt = prompts.reference(previous.command_id.value, p.text), .selection = p.selection } };
+                        if (a.equal(previous, e)) return original;
+                    }
+                }
+                return conflict;
+            },
+            else => return err,
+        };
+        return if (bytes) |value| try t.decode(t.Receipt, value, allocator) else null;
+    }
+    pub fn stagePrompt(self: *Owner, ref: t.PromptRef, bytes: []const u8) !void {
+        try prompts.begin(self.database, ref);
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const end = @min(bytes.len, offset + prompts.chunk_bytes);
+            try prompts.append(self.database, ref, offset, bytes[offset..end]);
+            offset = end;
+        }
+        var buffer: [prompts.max_bytes]u8 = undefined;
+        try prompts.complete(self.database, ref, &buffer);
+    }
+
     /// Lookup precedes validation. Rejections are durable and byte-exact retries
     /// return their original receipt even after aggregate revisions have changed.
     pub fn command(self: *Owner, allocator: std.mem.Allocator, envelope: t.CommandEnvelope) !t.Receipt {
+        if (envelope.payload == .thread_send) {
+            const p = envelope.payload.thread_send;
+            if (p.text.len != 0 and p.text.len <= max_prompt_bytes and std.unicode.utf8ValidateSlice(p.text)) {
+                const ref = prompts.reference(envelope.command_id.value, p.text);
+                var compact = envelope;
+                compact.payload = .{ .thread_send_staged = .{ .prompt = ref, .selection = p.selection } };
+                // Receipt lookup must precede staging: a retry after consumption
+                // must work even when all upload reservations are in use.
+                if (try self.commandReplay(allocator, compact)) |receipt| return receipt;
+                try self.stagePrompt(ref, p.text);
+                return self.command(allocator, compact);
+            }
+        }
+        return self.commandCanonical(allocator, envelope, null);
+    }
+    fn commandCanonical(self: *Owner, allocator: std.mem.Allocator, envelope: t.CommandEnvelope, refusal: ?t.Reason) !t.Receipt {
         const canonical = try encoded(allocator, envelope);
         const output = try allocator.alloc(u8, 65536);
         try self.database.begin();
@@ -145,7 +197,7 @@ pub const Owner = struct {
         const sequence = try self.database.nextSequence();
         const current = try self.revision(envelope.target);
         var receipt: t.Receipt = .{ .command_id = envelope.command_id, .outcome = .rejected, .commit_sequence = sequence, .current_revision = current };
-        var reason: ?t.Reason = if (envelope.contract_version != 1) .unsupported_version else null;
+        var reason: ?t.Reason = if (envelope.contract_version != 1) .unsupported_version else refusal;
         if (reason == null) switch (envelope.expected_revision) {
             .absent => if (current != null) {
                 reason = .revision_conflict;
@@ -171,6 +223,9 @@ pub const Owner = struct {
             receipt.committed_revisions = try self.database.committedRevisions(allocator);
             try self.database.publishChanges(sequence, envelope.command_id);
         }
+        // A definitive receipt releases its upload. Unknown storage/transport
+        // failures keep the reservation for an exact retry or explicit discard.
+        if (envelope.payload == .thread_send_staged) try prompts.discardMatching(self.database, envelope.payload.thread_send_staged.prompt);
         const bytes = try encoded(allocator, receipt);
         try self.database.recordCommand(envelope.command_id.value, canonical, bytes, sequence);
         try self.database.commit();
@@ -196,6 +251,9 @@ pub const Owner = struct {
         try self.database.execute("UPDATE messages SET incomplete=0,revision=revision+1 WHERE run_id=? AND incomplete=1 AND EXISTS(SELECT 1 FROM runs WHERE id=? AND state IN('completed','cancelled','failed'))", &.{ .{ .text = run }, .{ .text = run } });
     }
     fn reduce(self: *Owner, allocator: std.mem.Allocator, e: t.CommandEnvelope, r: *t.Receipt) anyerror!?t.Reason {
+        return self.reduceWithPrompt(allocator, e, r, null);
+    }
+    fn reduceWithPrompt(self: *Owner, allocator: std.mem.Allocator, e: t.CommandEnvelope, r: *t.Receipt, staged_ref: ?t.PromptRef) anyerror!?t.Reason {
         const db = self.database;
         const seq = r.commit_sequence;
         var aggregate: t.AggregateRef = undefined;
@@ -353,8 +411,32 @@ pub const Owner = struct {
                 revision_value = e.expected_revision.revision + 1;
             },
             .question_answer, .attachment_add, .attachment_remove => return .capability_unavailable,
+            .prompt_discard => |p| {
+                if (e.target != .absent or e.expected_revision != .absent) return .invalid_command;
+                if (p.id) |upload| {
+                    if (upload.len == 0 or upload.len > 128) return .invalid_command;
+                    try prompts.discard(db, upload);
+                } else prompts.discardOldest(db) catch |err| return switch (err) {
+                    error.Busy => .busy,
+                    error.NotFound => .not_found,
+                    else => .prompt_invalid,
+                };
+                return null;
+            },
+            .thread_send_staged => |p| {
+                if (e.target != .thread or e.expected_revision != .revision or !prompts.validForDomain(p.prompt)) return .invalid_command;
+                var prompt_buffer: [prompts.max_bytes]u8 = undefined;
+                const prompt = prompts.read(db, p.prompt, &prompt_buffer) catch |err| return switch (err) {
+                    error.PromptIncomplete => .prompt_incomplete,
+                    error.PromptConflict, error.InvalidPrompt => .prompt_invalid,
+                    else => .admission_limit,
+                };
+                const result = try self.reduceWithPrompt(allocator, .{ .command_id = e.command_id, .target = e.target, .expected_revision = e.expected_revision, .payload = .{ .thread_send = .{ .text = prompt, .selection = p.selection } } }, r, p.prompt);
+                return result;
+            },
             .thread_send => |p| {
-                if (e.target != .thread or e.expected_revision != .revision or p.text.len == 0) return .invalid_command;
+                if (e.target != .thread or e.expected_revision != .revision or p.text.len == 0 or !std.unicode.utf8ValidateSlice(p.text)) return .invalid_command;
+                if (p.text.len > max_prompt_bytes) return .admission_limit;
                 const thread = e.target.thread.value;
                 const workspace = try self.field(allocator, "SELECT workspace_id FROM threads WHERE id=?", &.{.{ .text = thread }}) orelse return .not_found;
                 if (!std.mem.eql(u8, workspace, p.selection.workspace.value)) return .workspace_mismatch;
@@ -404,7 +486,11 @@ pub const Owner = struct {
                 const assistant_block = try self.id(allocator);
                 const open = try self.id(allocator);
                 const start = try self.id(allocator);
-                const request: a.Request = .{ .start = .{ .correlation = .{ .effect = .{ .value = start }, .run = .{ .value = run }, .session = .{ .value = session } }, .prompt = p.text } };
+                // Reference the canonical user block. This is the only durable copy;
+                // command/effect journals never JSON-escape the large text.
+                var prompt_ref = staged_ref orelse prompts.reference(user_block, p.text);
+                prompt_ref.id = user_block;
+                const request: a.Request = .{ .start = .{ .correlation = .{ .effect = .{ .value = start }, .run = .{ .value = run }, .session = .{ .value = session } }, .prompt_ref = prompt_ref } };
                 if (a.frameBytes(request) > start_frame_limit) return .admission_limit;
                 const selection = try encoded(allocator, p.selection);
                 try db.execute("INSERT INTO thread_selections VALUES(?,?) ON CONFLICT(thread_id) DO UPDATE SET selection=excluded.selection", &.{ .{ .text = thread }, .{ .blob = selection } });
@@ -529,7 +615,7 @@ pub const Owner = struct {
             .attachment_remove => "AttachmentRejected",
             else => @tagName(e.payload),
         };
-        try self.event(allocator, seq, if (e.payload == .thread_send) 1 else 0, aggregate, revision_value, event_kind, e.command_id, null, "");
+        try self.event(allocator, seq, if (e.payload == .thread_send or e.payload == .thread_send_staged) 1 else 0, aggregate, revision_value, event_kind, e.command_id, null, "");
         return null;
     }
     fn taskCommand(self: *Owner, allocator: std.mem.Allocator, e: t.CommandEnvelope, r: *t.Receipt) anyerror!?t.Reason {
@@ -1076,7 +1162,7 @@ pub const Host = struct {
         workspace_root: ?[]const u8 = null,
     };
     const Request = union(enum) { command: t.CommandEnvelope, query: t.Query, subscribe: t.Subscribe, unsubscribe: t.SubscriptionId };
-    const Frame = struct { ticket: t.Ticket = .{ .value = 0 }, len: usize = 0, bytes: [65536]u8 = undefined };
+    const Frame = struct { prompt_bytes: usize = 0, ticket: t.Ticket = .{ .value = 0 }, len: usize = 0, bytes: [65536]u8 = undefined };
     const Result = struct { len: usize = 0, bytes: [262144]u8 = undefined };
     const Snapshot = struct { generation: u64 = 0, database: ?*store.c.sqlite3 = null, position: t.EventPosition = .{}, deadline: u64 = 0 };
     const Subscription = struct { generation: u64 = 0, active: bool = false, scope: t.Scope = .all, after: t.EventPosition = .{}, max_bytes: usize = 65536, arena: std.heap.ArenaAllocator };
@@ -1094,6 +1180,8 @@ pub const Host = struct {
     closed: bool = false,
     next_ticket: u64 = 1,
     requests: [8]Frame = undefined,
+    prompt_inbox: [prompts.max_bytes]u8 = undefined,
+    prompt_pending: bool = false,
     request_head: usize = 0,
     request_count: usize = 0,
     results: [8]Result = undefined,
@@ -1187,7 +1275,20 @@ pub const Host = struct {
         return selection;
     }
     pub fn submit(self: *Host, command: t.CommandEnvelope) t.AdmissionError!t.Ticket {
-        return self.admit(.{ .command = command });
+        if (command.payload != .thread_send) return self.admit(.{ .command = command });
+        const p = command.payload.thread_send;
+        if (p.text.len == 0 or p.text.len > max_prompt_bytes or !std.unicode.utf8ValidateSlice(p.text)) return error.TooLarge;
+        var compact = command;
+        compact.payload = .{ .thread_send_staged = .{ .prompt = prompts.reference(command.command_id.value, p.text), .selection = p.selection } };
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.prompt_pending) return error.Busy;
+        const ticket = try self.admitLocked(.{ .command = compact });
+        const frame = &self.requests[(self.request_head + self.request_count - 1) % 8];
+        frame.prompt_bytes = p.text.len;
+        @memcpy(self.prompt_inbox[0..p.text.len], p.text);
+        self.prompt_pending = true;
+        return ticket;
     }
     pub fn query(self: *Host, request: t.Query) t.AdmissionError!t.Ticket {
         return self.admit(.{ .query = request });
@@ -1201,11 +1302,15 @@ pub const Host = struct {
     fn admit(self: *Host, request: Request) t.AdmissionError!t.Ticket {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        return self.admitLocked(request);
+    }
+    fn admitLocked(self: *Host, request: Request) t.AdmissionError!t.Ticket {
         if (self.closed) return error.Closed;
         if (self.request_count == self.options.limits.request_slots or self.next_ticket == std.math.maxInt(u64)) return error.Full;
         const frame = &self.requests[(self.request_head + self.request_count) % 8];
         const bytes = t.encode(request, frame.bytes[0..self.options.limits.command_bytes]) catch return error.TooLarge;
         frame.len = bytes.len;
+        frame.prompt_bytes = 0;
         frame.ticket = .{ .value = self.next_ticket };
         self.next_ticket += 1;
         self.request_count += 1;
@@ -1267,6 +1372,7 @@ pub const Host = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         var operation_memory: [2 * 1024 * 1024]u8 = undefined;
+        var prompt_transfer: [prompts.max_bytes]u8 = undefined;
         while (true) {
             self.mutex.lockUncancelable(self.io);
             while (!self.closed and self.request_count == 0 and self.options.factory == null and !self.setup_active) self.changed.waitUncancelable(self.io, &self.mutex);
@@ -1276,6 +1382,10 @@ pub const Host = struct {
             }
             const frame: ?Frame = if (self.request_count != 0) blk: {
                 const value = self.requests[self.request_head];
+                if (value.prompt_bytes != 0) {
+                    @memcpy(prompt_transfer[0..value.prompt_bytes], self.prompt_inbox[0..value.prompt_bytes]);
+                    self.prompt_pending = false;
+                }
                 self.request_head = (self.request_head + 1) % 8;
                 self.request_count -= 1;
                 break :blk value;
@@ -1294,7 +1404,7 @@ pub const Host = struct {
                     self.fail(input.ticket, .admission_limit);
                     continue;
                 };
-                self.handle(&owner, allocator, input.ticket, request) catch |err| {
+                self.handle(&owner, allocator, input.ticket, request, prompt_transfer[0..input.prompt_bytes]) catch |err| {
                     self.database.rollback() catch {};
                     self.fail(input.ticket, switch (err) {
                         error.CursorInvalid => .cursor_invalid,
@@ -1470,14 +1580,24 @@ pub const Host = struct {
     fn fail(self: *Host, ticket: t.Ticket, reason: @FieldType(t.Failure, "reason")) void {
         self.publish(.{ .failure = .{ .ticket = ticket, .failure = .{ .reason = reason, .refresh_required = reason == .cursor_invalid } } }) catch {};
     }
-    fn handle(self: *Host, owner: *Owner, allocator: std.mem.Allocator, ticket: t.Ticket, request: Request) !void {
+    fn handle(self: *Host, owner: *Owner, allocator: std.mem.Allocator, ticket: t.Ticket, request: Request, prompt: []const u8) !void {
         switch (request) {
             .command => |command| {
                 const used = try self.database.scalar("PRAGMA page_count");
                 const page_size = try self.database.scalar("PRAGMA page_size");
                 if (@as(u64, @intCast(used)) *| @as(u64, @intCast(page_size)) >= self.options.limits.durable_bytes) return error.Limit;
                 const before_sequence: u64 = @intCast(try self.database.scalar("SELECT next_sequence FROM meta WHERE singleton=1"));
-                const receipt = try owner.command(allocator, command);
+                const receipt = blk: {
+                    if (prompt.len != 0) {
+                        if (try owner.commandReplay(allocator, command)) |previous| break :blk previous;
+                        owner.stagePrompt(command.payload.thread_send_staged.prompt, prompt) catch |err| switch (err) {
+                            error.PromptStagingFull => break :blk try owner.commandCanonical(allocator, command, .prompt_staging_full),
+                            error.PromptConflict, error.InvalidPrompt, error.PromptIncomplete => break :blk try owner.commandCanonical(allocator, command, .prompt_invalid),
+                            else => return err,
+                        };
+                    }
+                    break :blk try owner.command(allocator, command);
+                };
                 if (receipt.outcome == .accepted and receipt.commit_sequence >= before_sequence) {
                     const action: ?a.RuntimeAction = switch (command.payload) {
                         .runtime_configure => |v| .{ .configure = v },
@@ -1579,7 +1699,16 @@ pub const Host = struct {
                     };
                     return;
                 };
-                try owner.delivered(allocator, effect.id, try entry.adapter.dispatch(allocator, effect.request));
+                var request = effect.request;
+                var prompt_buffer: [prompts.max_bytes]u8 = undefined;
+                if (request == .start) if (request.start.prompt_ref) |ref| {
+                    request.start.prompt = prompts.readBlock(&self.database, ref.id, ref, &prompt_buffer) catch |err| {
+                        try owner.delivered(allocator, effect.id, .{ .outcome = .rejected, .detail = @errorName(err) });
+                        return;
+                    };
+                    request.start.prompt_ref = null;
+                };
+                try owner.delivered(allocator, effect.id, try entry.adapter.dispatch(allocator, request));
             } else {
                 try owner.delivered(allocator, effect.id, .{ .outcome = .unknown, .detail = "No live instance for durable session; explicit reconciliation required" });
             }
@@ -1648,7 +1777,7 @@ pub const Host = struct {
             .tools => |v| v.page,
             .approvals => |v| v.page,
             .task_list => |v| v.page,
-            .thread, .capabilities, .runtime_status, .task_wait => .{},
+            .thread, .capabilities, .runtime_status, .task_wait, .command_receipt => .{},
         };
         if (page.limit == 0 or page.limit > self.options.limits.page_rows or page.max_bytes == 0 or page.max_bytes > self.options.limits.page_bytes) return error.InvalidQuery;
         const snapshot = try self.snapshotFor(page);
@@ -1687,6 +1816,13 @@ pub const Host = struct {
         var values: [5]V = undefined;
         var n: usize = 0;
         switch (q) {
+            .command_receipt => |id_value| {
+                const statement = try reader.prepare("SELECT receipt FROM commands WHERE command_id=?", &.{.{ .text = id_value.value }});
+                defer statement.deinit();
+                rows[0] = .{ .command_receipt = if (try statement.step()) try t.decode(t.Receipt, try statement.bytes(0), allocator) else null };
+                result.items = rows[0..1];
+                return result;
+            },
             .runtime_status => {
                 const borrowed = self.restore_status orelse if (self.options.setup_factory) |setup| setup.runtimeStatus() else a.RuntimeStatus{};
                 if (borrowed.configurations.len > 2) return error.ConfigurationLimit;
@@ -1988,28 +2124,13 @@ test {
     _ = @import("domain/factory_test.zig");
 }
 
-test "provider start preflight shares Host accounting at exact ASCII and UTF-8 boundaries" {
-    const empty = startPreflight(0);
-    try std.testing.expectEqual(@as(usize, 304), empty.frame_bytes);
-    try std.testing.expectEqual(@as(usize, 3792), empty.max_prompt_bytes);
-    try std.testing.expect(startPreflight(3792).fits());
-    try std.testing.expectEqual(@as(usize, 4096), startPreflight(3792).frame_bytes);
-    try std.testing.expect(!startPreflight(3793).fits());
-    try std.testing.expectEqual(@as(usize, 4097), startPreflight(3793).frame_bytes);
-
-    const euro_at_edge = ("x" ** 3789) ++ "€";
-    const euro_over = ("x" ** 3790) ++ "€";
-    try std.testing.expectEqual(@as(usize, 3792), euro_at_edge.len);
-    try std.testing.expect(startPreflight(euro_at_edge.len).fits());
-    try std.testing.expectEqual(@as(usize, 3793), euro_over.len);
-    try std.testing.expect(!startPreflight(euro_over.len).fits());
-
-    const emoji_at_edge = ("x" ** 3788) ++ "😀";
-    const emoji_over = ("x" ** 3789) ++ "😀";
-    try std.testing.expectEqual(@as(usize, 3792), emoji_at_edge.len);
-    try std.testing.expect(startPreflight(emoji_at_edge.len).fits());
-    try std.testing.expectEqual(@as(usize, 3793), emoji_over.len);
-    try std.testing.expect(!startPreflight(emoji_over.len).fits());
+test "provider start preflight admits the complete UTF8 composer capacity" {
+    try std.testing.expectEqual(@as(usize, 65536), startPreflight(0).max_prompt_bytes);
+    for ([_][]const u8{ "x" ** 65536, ("x" ** 65533) ++ "€", ("x" ** 65532) ++ "😀", "\x01" ** 65536 }) |prompt| {
+        try std.testing.expect(startPreflight(prompt.len).fits());
+    }
+    try std.testing.expect(!startPreflight(65537).fits());
+    try std.testing.expect(!startPreflight(std.math.maxInt(usize)).fits());
 }
 
 test "session-only open rejection closes starting claim and preserves indexed run diagnostics on reopen" {
@@ -2115,27 +2236,32 @@ test "fake send admission matches the shared start-frame preflight at UTF-8 boun
     var owner: Owner = .{ .database = &database, .io = std.testing.io, .epoch = "send-frame-boundary", .utc_ms = 1 };
     const project = (try owner.command(allocator, .{ .command_id = .{ .value = "project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "Frame boundary fixture" } } })).entity_ids.project.?;
     const workspace = (try owner.command(allocator, .{ .command_id = .{ .value = "workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = try workspace_binding.capture(allocator, std.testing.io, path) } } })).entity_ids.workspace.?;
-    const prompts = [_][]const u8{ "x" ** 3792, "x" ** 3793, ("x" ** 3789) ++ "€", ("x" ** 3790) ++ "€", ("x" ** 3788) ++ "😀", ("x" ** 3789) ++ "😀" };
-    for (prompts, 0..) |prompt, index| {
+    const prompt_cases = [_][]const u8{ "x" ** 65536, "x" ** 65537, ("x" ** 65533) ++ "€", ("x" ** 65534) ++ "€", ("x" ** 65532) ++ "😀", ("x" ** 65533) ++ "😀" };
+    for (prompt_cases, 0..) |prompt, index| {
         const thread_command = try std.fmt.allocPrint(allocator, "thread-{d}", .{index});
         const thread = (try owner.command(allocator, .{ .command_id = .{ .value = thread_command }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
         const before = try database.scalar("SELECT count(*) FROM effects");
         const command: t.CommandEnvelope = .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "send-{d}", .{index}) }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = prompt, .selection = a.fakeSelection(workspace) } } };
-        const receipt = try owner.command(allocator, command);
+        var proposed = command;
+        if (index % 2 != 0) proposed.payload = .{ .thread_send_staged = .{ .prompt = prompts.reference(command.command_id.value, prompt), .selection = a.fakeSelection(workspace) } };
+        const receipt = try owner.command(allocator, proposed);
         if (index % 2 == 0) {
             try std.testing.expectEqual(.accepted, receipt.outcome);
             const stored = (try owner.field(allocator, "SELECT request FROM effects WHERE run_id=? AND kind='start'", &.{.{ .text = receipt.entity_ids.run.?.value }})).?;
             const request = try t.decode(a.Request, stored, allocator);
-            try std.testing.expectEqual(@as(usize, 4096), a.frameBytes(request));
-            try std.testing.expectEqual(startPreflight(prompt.len).frame_bytes, a.frameBytes(request));
+            try std.testing.expect(a.frameBytes(request) <= start_frame_limit);
+            try std.testing.expectEqualStrings("", request.start.prompt);
+            const ref = request.start.prompt_ref.?;
+            var materialized: [prompts.max_bytes]u8 = undefined;
+            try std.testing.expectEqualStrings(prompt, try prompts.readBlock(&database, ref.id, ref, &materialized));
             try std.testing.expectEqual(before + 2, try database.scalar("SELECT count(*) FROM effects"));
         } else {
             try std.testing.expectEqual(.rejected, receipt.outcome);
-            try std.testing.expectEqual(t.Reason.admission_limit, receipt.reason.?);
+            try std.testing.expectEqual(t.Reason.invalid_command, receipt.reason.?);
             try std.testing.expectEqual(before, try database.scalar("SELECT count(*) FROM effects"));
         }
         // Even rejected oversized Sends retain their original durable receipt.
-        const replay = try owner.command(allocator, command);
+        const replay = try owner.command(allocator, proposed);
         try std.testing.expectEqual(receipt.commit_sequence, replay.commit_sequence);
         try std.testing.expectEqual(receipt.outcome, replay.outcome);
     }

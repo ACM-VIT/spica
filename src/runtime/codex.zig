@@ -4,6 +4,7 @@ const c = @import("../contract.zig");
 const adapter = @import("adapter.zig");
 const transport = @import("transport.zig");
 const Value = std.json.Value;
+const prompt_wire = @import("prompt.zig");
 const RpcDiagnostic = @import("catalog.zig").RpcDiagnostic;
 fn field(v: Value, key: []const u8) Value {
     return if (v == .object) v.object.get(key) orelse .null else .null;
@@ -97,10 +98,13 @@ pub fn RuntimeFor(comptime T: type) type {
                 .start => "turn/start",
                 .cancel => "turn/interrupt",
             };
-            const bytes = try std.json.Stringify.valueAlloc(self.allocator, .{ .id = self.next_id, .method = method, .params = params }, .{});
+            const packet = .{ .id = self.next_id, .method = method, .params = params };
+            const bytes = if (kind == .start) try prompt_wire.encode(self.allocator, packet) else try std.json.Stringify.valueAlloc(self.allocator, packet, .{});
             defer self.allocator.free(bytes);
             const owned = try adapter.clone(if (kind == .start or kind == .cancel) self.turn_state.allocator() else self.state.allocator(), correlation);
-            try self.wire.send(bytes);
+            if (kind == .start and @hasDecl(T, "sendPrompt")) {
+                try self.wire.sendPrompt(bytes);
+            } else try self.wire.send(bytes);
             self.pending = .{ .id = self.next_id, .kind = kind, .correlation = owned };
             self.next_id += 1;
         }
@@ -154,6 +158,7 @@ pub fn RuntimeFor(comptime T: type) type {
                     try self.restore(p.session);
                 },
                 .start => |p| {
+                    try prompt_wire.validate(p);
                     if (!self.session_ready) return error.SessionUnavailable;
                     if (p.correlation.run == null or p.correlation.effect == null or self.session == null or !eq(p.correlation.session.value, self.session.?.id.value) or self.turn.len != 0) return error.InvalidCorrelation;
                     // Queued observations own their bytes. Reclaim only completed

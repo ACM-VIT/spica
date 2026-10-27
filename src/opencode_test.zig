@@ -2,7 +2,7 @@ const std = @import("std");
 const c = @import("contract.zig");
 const opencode = @import("runtime/opencode.zig");
 const Mock = struct {
-    sent: [65536]u8 = undefined,
+    sent: [@import("runtime/prompt.zig").json_bytes]u8 = undefined,
     len: usize = 0,
     exited: bool = false,
     polls: usize = 0,
@@ -599,4 +599,26 @@ test "ACP failure preserves provider error data in bounded diagnostic" {
     try std.testing.expect(failed.body.failure.detail.len <= 2048);
     try std.testing.expect(std.mem.indexOf(u8, failed.body.failure.detail, "provider.free-limit") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed.body.failure.detail, "429") != null);
+}
+
+test "ACP Start serializes exact full composer prompts including sixfold escaping" {
+    for ([_][]const u8{ "a" ** 65536, "😀" ** 16384, "\x01" ** 65536, "\n\"\\\t" ** 16384 }) |prompt| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var runtime: Runtime = undefined;
+        try ready(&runtime, a);
+        defer runtime.shutdown();
+        const before = runtime.transport.len;
+        try std.testing.expectError(error.InvalidPrompt, runtime.dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = "a" ** 65537 } }));
+        try std.testing.expectError(error.InvalidPrompt, runtime.dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = "\xf0\x9f" } }));
+        try std.testing.expectEqual(before, runtime.transport.len);
+        _ = try runtime.dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = prompt } });
+        const line = runtime.transport.sent[0..runtime.transport.len];
+        try std.testing.expect(line.len <= @import("runtime/prompt.zig").json_bytes);
+        if (prompt[0] == 1) try std.testing.expect(line.len > 6 * prompt.len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, line, .{});
+        try std.testing.expectEqualStrings("session/prompt", parsed.value.object.get("method").?.string);
+        try std.testing.expectEqualStrings(prompt, parsed.value.object.get("params").?.object.get("prompt").?.array.items[0].object.get("text").?.string);
+    }
 }

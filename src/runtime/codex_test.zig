@@ -572,3 +572,31 @@ test "Codex adapter reuses cached ChatGPT and API-key auth without sending login
         for (wire.lines.items) |line| try std.testing.expect(std.mem.indexOf(u8, line, "login/start") == null);
     }
 }
+
+test "Codex Start serializes exact full composer prompts including sixfold escaping" {
+    for ([_][]const u8{ "a" ** 65536, "😀" ** 16384, "\x01" ** 65536, "\n\"\\\t" ** 16384 }) |prompt| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var wire: Mock = .{ .allocator = a };
+        var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "long-prompt" });
+        defer runtime.deinit();
+        try initializeFixture(&runtime, &wire, a);
+        _ = try runtime.dispatch(a, .{ .open = .{ .create = .{ .effect = .{ .value = "open" }, .session = .{ .value = "session" }, .selection = selection } } });
+        try wire.input.append(a, "{\"id\":3,\"result\":{\"thread\":{\"id\":\"upstream\"},\"model\":\"gpt-6.1-sol\",\"modelProvider\":\"openai\",\"cwd\":\"/tmp/project\",\"reasoningEffort\":\"medium\"}}");
+        try runtime.pump();
+        const correlation: c.Correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "run" }, .effect = .{ .value = "start" } };
+        const before = wire.lines.items.len;
+        try std.testing.expectError(error.InvalidPrompt, runtime.dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = "a" ** 65537 } }));
+        try std.testing.expectError(error.InvalidPrompt, runtime.dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = "\xf0\x9f" } }));
+        try std.testing.expectEqual(before, wire.lines.items.len);
+        _ = try runtime.dispatch(a, .{ .start = .{ .correlation = correlation, .prompt = prompt } });
+        const line = wire.lines.items[wire.lines.items.len - 1];
+        try std.testing.expect(line.len <= @import("prompt.zig").json_bytes);
+        if (prompt[0] == 1) try std.testing.expect(line.len > 6 * prompt.len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, line, .{});
+        const params = parsed.value.object.get("params").?.object;
+        try std.testing.expectEqualStrings("turn/start", parsed.value.object.get("method").?.string);
+        try std.testing.expectEqualStrings(prompt, params.get("input").?.array.items[0].object.get("text").?.string);
+    }
+}

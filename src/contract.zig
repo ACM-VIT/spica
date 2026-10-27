@@ -18,6 +18,7 @@ pub const ToolCallId = Id("tool_call");
 pub const FollowupId = Id("followup");
 pub const QuestionId = Id("question");
 pub const AttachmentId = Id("attachment");
+pub const PromptRef = struct { id: []const u8, byte_length: usize, sha256: [32]u8 };
 pub const UpstreamSession = struct { value: []const u8 };
 pub const UpstreamTurn = struct { value: []const u8 };
 pub const UpstreamCursor = struct { value: []const u8 };
@@ -189,7 +190,7 @@ pub const Open = union(enum) {
 };
 pub const Request = union(enum) {
     open: Open,
-    start: struct { correlation: Correlation, prompt: []const u8, attachments: []const Attachment = &.{} },
+    start: struct { correlation: Correlation, prompt: []const u8 = "", prompt_ref: ?PromptRef = null, attachments: []const Attachment = &.{} },
     respond_approval: struct { correlation: Correlation, decision: enum { allow, deny }, action_digest: []const u8 },
     cancel: struct { correlation: Correlation, reason: []const u8 },
     message: struct {
@@ -291,6 +292,11 @@ pub fn equal(a: anytype, b: @TypeOf(a)) bool {
         .pointer => |pointer| if (pointer.child == u8) std.mem.eql(u8, a, b) else blk: {
             if (a.len != b.len) break :blk false;
             for (a, b) |left, right| if (!equal(left, right)) break :blk false;
+            break :blk true;
+        },
+        .array => |array| blk: {
+            for (a, b) |left, right| if (!equal(left, right)) break :blk false;
+            _ = array;
             break :blk true;
         },
         else => a == b,

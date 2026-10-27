@@ -2,6 +2,7 @@
 const std = @import("std");
 const c = @import("../contract.zig");
 const Value = std.json.Value;
+const prompt_wire = @import("prompt.zig");
 const common = @import("adapter.zig");
 pub const Runtime = RuntimeFor(@import("transport.zig").Transport);
 
@@ -213,7 +214,14 @@ pub fn RuntimeFor(comptime Transport: type) type {
         }
         fn rpc(self: *Self, method: []const u8, params: anytype) !void {
             const id = self.request_id + 1;
-            try self.send(.{ .jsonrpc = "2.0", .id = id, .method = method, .params = params });
+            const packet = .{ .jsonrpc = "2.0", .id = id, .method = method, .params = params };
+            if (eq(method, "session/prompt")) {
+                const bytes = try prompt_wire.encode(self.allocator, packet);
+                defer self.allocator.free(bytes);
+                if (@hasDecl(Transport, "sendPrompt")) {
+                    try self.transport.sendPrompt(bytes);
+                } else try self.transport.send(bytes);
+            } else try self.send(packet);
             self.request_id = id;
             self.pending_id = id;
         }
@@ -227,7 +235,9 @@ pub fn RuntimeFor(comptime Transport: type) type {
             }
         }
         pub fn dispatch(self: *Self, allocator: std.mem.Allocator, request: c.Request) !c.Receipt {
-            if (c.frameBytes(request) > 65536) return error.FrameTooLarge;
+            if (request == .start) {
+                try prompt_wire.validate(request.start);
+            } else if (c.frameBytes(request) > 65536) return error.FrameTooLarge;
             switch (request) {
                 .open => |open| {
                     if (self.phase != .idle) return error.NotReady;

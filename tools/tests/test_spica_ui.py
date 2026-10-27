@@ -137,12 +137,10 @@ class SpicaUiOfflineTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, (command, result.stderr))
             self.assertFalse((Path(directory) / "session.json").exists())
 
-    def test_rejected_scenario_bounds_fixture_size(self):
-        with tempfile.TemporaryDirectory() as directory:
-            result = self.run_cli("scenario", "rejected-send", "--output", directory,
-                                  "--rejected-bytes", "4096", "--dry-run")
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("between 4097 and 65536", result.stderr)
+    def test_full_size_scenario_covers_exact_utf8_bytes_and_sixfold_json_escaping(self):
+        prompts = load_cli().full_size_prompts()
+        self.assertEqual([len(value.encode()) for value in prompts], [65536] * 4)
+        self.assertGreater(len(json.dumps(prompts[-1])), 6 * 63486)
 
     def test_redaction_does_not_leak_account_material(self):
         module = load_cli()
@@ -156,7 +154,7 @@ class SpicaUiOfflineTests(unittest.TestCase):
 
     def test_new_scenarios_have_offline_plans(self):
         with tempfile.TemporaryDirectory() as directory:
-            for name in ("second-turn", "oversized-send", "workspace-diff", "capability-refusal",
+            for name in ("second-turn", "large-send", "codex-large-send", "composer-capacity", "workspace-diff", "capability-refusal",
                          "followup-refusal", "question-refusal", "attachment-refusal", "codex-session", "codex-error"):
                 result = self.run_cli("scenario", name, "--output", directory, "--dry-run")
                 self.assertEqual(result.returncode, 0, (name, result.stderr))
@@ -246,17 +244,15 @@ class SpicaUiOfflineTests(unittest.TestCase):
             with self.assertRaises(module.DriverError):
                 module.assert_workspace_diff(before, {**current, **changed}, "/fixture")
 
-    def test_oversized_refusal_requires_preserved_draft_and_no_command(self):
+    def test_over_capacity_paste_requires_original_draft_revision_and_no_command(self):
         module = load_cli()
-        before = {"run_id": "", "send_command_id": ""}
-        current = {**before, "draft": "x" * 6000, "send_frame_bytes": 6200,
-                   "send_disabled_reason": "Shorten the message", "pending_command": False,
-                   "targets": [{"id": "command.send", "enabled": False}]}
-        module.assert_oversized_refusal(before, current, 6000)
+        before = {"run_id": "", "send_command_id": "", "draft_revision": 2}
+        current = {**before, "draft": "retained", "notice": "TextTooLarge"}
+        module.assert_composer_capacity(before, current, "retained")
         for changed in ({"draft": ""}, {"send_command_id": "unexpected"}, {"run_id": "unexpected"},
-                        {"send_frame_bytes": 4000}, {"pending_command": True}):
+                        {"draft_revision": 3}, {"notice": ""}, {"pending_command": True}):
             with self.assertRaises(module.DriverError):
-                module.assert_oversized_refusal(before, {**current, **changed}, 6000)
+                module.assert_composer_capacity(before, {**current, **changed}, "retained")
 
     def test_empty_send_is_disabled_without_creating_command_or_run(self):
         module = load_cli()

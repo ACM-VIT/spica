@@ -859,6 +859,7 @@ const LuaBridge = struct {
 /// One query, one mutation, one parse and one visible-tile request at a time.
 /// Every borrowed output is consumed/copied before drain storage is reused.
 const Conversation = struct {
+    const PendingCommand = struct { ticket: types.Ticket, kind: CommandKind, draft_revision: u64, id: [32]u8 };
     allocator: std.mem.Allocator,
     io: std.Io,
     host: *domain.Host,
@@ -902,7 +903,9 @@ const Conversation = struct {
     subscription: ?types.SubscriptionId = null,
     subscribe_ticket: ?types.Ticket = null,
     query: ?struct { ticket: types.Ticket, kind: QueryKind } = null,
-    command: ?struct { ticket: types.Ticket, kind: CommandKind, draft_revision: u64, id: [32]u8 } = null,
+    command: ?PendingCommand = null,
+    unknown_send: ?PendingCommand = null,
+    receipt_lookup_attempted: bool = false,
     refresh: bool = false,
     generation: u64 = 0,
     messages: [8]Id = undefined,
@@ -1117,12 +1120,7 @@ const Conversation = struct {
     fn promptDisabledReason(self: *Conversation, prompt_bytes: usize) ?[]const u8 {
         const preflight = domain.startPreflight(prompt_bytes);
         if (preflight.fits()) return null;
-        return std.fmt.bufPrint(&self.preflight_storage, "Shorten this message: {d} UTF-8 bytes exceeds the {d}-byte prompt limit ({d}/{d} accounted frame bytes).", .{
-            preflight.prompt_bytes,
-            preflight.max_prompt_bytes,
-            preflight.frame_bytes,
-            domain.start_frame_limit,
-        }) catch "Send disabled: prompt exceeds the provider start-frame budget. Shorten the message.";
+        return std.fmt.bufPrint(&self.preflight_storage, "Shorten this message: {d} UTF-8 bytes exceeds the {d}-byte durable prompt limit. Your draft is retained.", .{ preflight.prompt_bytes, preflight.max_prompt_bytes }) catch "Message exceeds the 64 KiB prompt limit. Your draft is retained.";
     }
 
     fn setupConfiguration(view: *const Coding) contract.RuntimeSetup {
@@ -1279,7 +1277,10 @@ const Conversation = struct {
             .revision_conflict => "Conversation changed. Wait for refresh, then retry your action.",
             .busy => "Provider or conversation is busy. Wait for the current action to finish.",
             .unresolved_effects => "Previous work has an unresolved outcome. Inspect its status before retrying.",
-            .admission_limit => "Send limit reached. Draft retained. Wait for other runs or shorten this message.",
+            .admission_limit => "Send storage or run limit reached. Draft retained. Wait for other runs, then retry.",
+            .prompt_incomplete => "Prompt upload is incomplete. Your draft is retained; retry Send.",
+            .prompt_invalid => "Prompt upload failed verification. Your draft is retained; send again.",
+            .prompt_staging_full => "Prompt staging is full. Open More (F10) → Discard unfinished upload, then retry Send. Draft retained.",
             else => @tagName(reason),
         };
     }
@@ -1689,8 +1690,8 @@ const Conversation = struct {
         }
     }
 
-    const QueryKind = enum { capabilities, projects, workspaces, inspection_workspace, threads, cards, thread, models, runtime_status, startup_status, runs, effects, approvals, tasks, messages, blocks, content };
-    const CommandKind = enum { followup_enqueue, followup_edit, followup_cancel, followup_order, attachment_add, attachment_remove, project, workspace, thread, selection, send, cancel, approval, configure, login, refresh_models };
+    const QueryKind = enum { send_receipt, capabilities, projects, workspaces, inspection_workspace, threads, cards, thread, models, runtime_status, startup_status, runs, effects, approvals, tasks, messages, blocks, content };
+    const CommandKind = enum { prompt_cleanup, followup_enqueue, followup_edit, followup_cancel, followup_order, attachment_add, attachment_remove, project, workspace, thread, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
     fn create(allocator: std.mem.Allocator, io: std.Io, host: *domain.Host, file: std.Io.File, wake: *Wake, workspace_root: []const u8) !*Conversation {
@@ -1742,6 +1743,7 @@ const Conversation = struct {
 
     fn submitIdentified(self: *Conversation, kind: CommandKind, target: types.Target, revision: types.Precondition, payload: types.Payload, draft_revision: u64, id: [32]u8) !void {
         if (self.command != null) return error.CommandPending;
+        if (self.unknown_send != null) return error.SendReceiptUnknown;
         const ticket = try self.host.submit(.{ .command_id = .{ .value = &id }, .target = target, .expected_revision = revision, .payload = payload });
         self.command = .{ .ticket = ticket, .kind = kind, .draft_revision = draft_revision, .id = id };
     }
@@ -1750,6 +1752,14 @@ const Conversation = struct {
     /// queue admission and its concrete provider-frame check remain authoritative.
     fn sendIdentified(self: *Conversation, app: *App, target: types.Target, revision: types.Precondition, prompt: []const u8, selection: contract.Selection, draft_revision: u64, id: [32]u8) !void {
         if (self.command != null) return error.CommandPending;
+        if (self.unknown_send) |*pending| {
+            if (self.query == null) {
+                try self.ask(.send_receipt, .{ .command_receipt = .{ .value = &pending.id } });
+                self.receipt_lookup_attempted = true;
+            }
+            self.notice(&app.view, "Checking the previous Send receipt. Your current draft stays here.");
+            return;
+        }
         const preflight = domain.startPreflight(prompt.len);
         if (self.attachment_loading or app.view.followup_editing != null) {
             app.view.send_diagnostic.stage = .disabled;
@@ -1832,6 +1842,10 @@ const Conversation = struct {
         self.workflow_pending = .{ .thread = self.thread, .run = self.run };
         view.workflow_error = "";
         switch (action) {
+            .cleanup_prompt => {
+                try self.submit(.prompt_cleanup, .absent, .absent, .{ .prompt_discard = .{} }, view.revision);
+                view.workflowNotice("Discarding one unfinished prompt upload. Sent messages and your draft are retained.");
+            },
             .add => {
                 const loader = self.attachment_loader orelse return error.AttachmentLoaderUnavailable;
                 try loader.request(view.workflow_path[0..view.workflow_path_len], attachment_text.max_bytes - view.attachments.content_bytes);
@@ -1997,6 +2011,8 @@ const Conversation = struct {
                             else => {},
                         }
                         if (pending.kind == .send) {
+                            self.unknown_send = pending;
+                            self.receipt_lookup_attempted = false;
                             app.view.send_diagnostic.stage = .outcome_unknown;
                             @import("ui/coding.zig").SendDiagnostic.bounded(&app.view.send_diagnostic.rejection, &app.view.send_diagnostic.rejection_len, @tagName(value.failure.reason));
                         }
@@ -2015,6 +2031,10 @@ const Conversation = struct {
                     if (value.failure.refresh_required) self.refresh = true;
                 },
             }
+        }
+        if (self.query == null and self.unknown_send != null and !self.receipt_lookup_attempted) {
+            try self.ask(.send_receipt, .{ .command_receipt = .{ .value = &self.unknown_send.?.id } });
+            self.receipt_lookup_attempted = true;
         }
         if (drained.more_pending) Wake.notify(self.wake);
         self.pumpInspection(app);
@@ -2160,7 +2180,7 @@ const Conversation = struct {
             else => false,
         } else true;
         const settled = self.command == null and self.query == null and !self.refresh and (self.worker_key == null or self.history_paused);
-        if (settled and terminal and self.thread.len != 0 and self.selectionNeedsSave(&app.view)) {
+        if (self.unknown_send == null and settled and terminal and self.thread.len != 0 and self.selectionNeedsSave(&app.view)) {
             const selected = app.view.selected.?;
             try self.submit(.selection, .{ .thread = .{ .value = self.thread.slice() } }, .{ .revision = self.thread_revision }, .{ .thread_select = .{ .selection = selected.selection() } }, 0);
             self.attempted_selection = selected;
@@ -2189,13 +2209,13 @@ const Conversation = struct {
             }
         }
         app.view.workflow_active = !terminal and self.run_state != .queued and self.run_state != .cancel_requested;
-        app.view.workflow_busy = !settled or self.attachment_loading;
+        app.view.workflow_busy = !settled or self.attachment_loading or self.unknown_send != null;
         app.view.can_send = app.view.send_disabled_reason == null;
-        app.view.can_cancel = self.run.len != 0 and !terminal and self.command == null;
+        app.view.can_cancel = self.unknown_send == null and self.run.len != 0 and !terminal and self.command == null;
         app.view.tasks_enabled = self.command == null and !self.refresh;
-        app.view.can_approve = self.approval_live and self.command == null and !self.refresh;
-        app.view.navigation_enabled = (!self.normal_startup or self.runtime_configured) and self.command == null and self.query == null and !self.refresh and !self.attachment_loading and !self.source_pending and (self.worker_key == null or self.history_paused);
-        app.view.setup_busy = self.command != null or self.query != null or self.setup_login_after_configure != null;
+        app.view.can_approve = self.unknown_send == null and self.approval_live and self.command == null and !self.refresh;
+        app.view.navigation_enabled = self.unknown_send == null and (!self.normal_startup or self.runtime_configured) and self.command == null and self.query == null and !self.refresh and !self.attachment_loading and !self.source_pending and (self.worker_key == null or self.history_paused);
+        app.view.setup_busy = self.unknown_send != null or self.command != null or self.query != null or self.setup_login_after_configure != null;
         app.view.setup_login_pending = self.login_inflight;
         app.view.setup_feedback = app.view.notice;
         if (self.pending_history_move) |move| {
@@ -2211,6 +2231,7 @@ const Conversation = struct {
         const pending = self.command orelse return error.UnexpectedCommandReceipt;
         if (pending.ticket.value != ticket.value or !std.mem.eql(u8, &pending.id, value.command_id.value)) return error.UnexpectedCommandReceipt;
         self.command = null;
+        if (pending.kind == .send) self.unknown_send = null;
         const workflow_command = switch (pending.kind) {
             .followup_enqueue, .followup_edit, .followup_cancel, .followup_order, .attachment_add, .attachment_remove => true,
             else => false,
@@ -2244,6 +2265,7 @@ const Conversation = struct {
             return;
         }
         switch (pending.kind) {
+            .prompt_cleanup => app.view.workflowNotice("One unfinished upload discarded. Your draft is retained; close More and retry Send."),
             .attachment_add, .attachment_remove => {
                 app.view.workflowNotice("Host accepted metadata command; provider delivery remains unavailable.");
                 self.refresh = true;
@@ -2358,6 +2380,18 @@ const Conversation = struct {
 
     fn consume(self: *Conversation, app: *App, kind: QueryKind, value: types.QueryPage) !void {
         switch (kind) {
+            .send_receipt => {
+                const pending = self.unknown_send orelse return;
+                if (value.items.len != 1 or value.items[0] != .command_receipt) return error.UnexpectedCommandReceipt;
+                if (value.items[0].command_receipt) |committed| {
+                    self.command = pending;
+                    try self.receipt(app, pending.ticket, committed);
+                } else {
+                    self.unknown_send = null;
+                    app.view.send_diagnostic.stage = .admission_failed;
+                    self.notice(&app.view, "Previous Send did not commit. Your draft is retained; retry Send when storage is available.");
+                }
+            },
             .capabilities => {
                 self.followup_capability = .unknown;
                 self.capability_runtime = .{};
@@ -3041,16 +3075,17 @@ test "send preflight reports accounted bytes and preserves the editable draft re
     defer view.deinit();
     var root = [_]u8{'/'};
     var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = &root };
-    const prompt = ("x" ** 3790) ++ "€";
-    try view.editor.setText(prompt);
+    const prompt = ("x" ** 65534) ++ "€";
+    try view.editor.setText(prompt[0..65534]);
     view.revision = 17;
     const before = view.editor.textBytes();
-    const reason = conversation.sendPreflight(&view) orelse return error.ExpectedPreflightRejection;
-    try std.testing.expect(std.mem.indexOf(u8, reason, "3793") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reason, "3792") != null);
+    const reason = conversation.promptDisabledReason(prompt.len) orelse return error.ExpectedPreflightRejection;
+    try std.testing.expect(std.mem.indexOf(u8, reason, "65537") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "65536") != null);
     try std.testing.expectEqual(@as(u64, 17), view.revision);
     try std.testing.expectEqualSlices(u8, before, view.editor.textBytes());
-    try std.testing.expectEqual(@as(usize, 4097), domain.startPreflight(view.editor.len).frame_bytes);
+    try std.testing.expect(domain.startPreflight(view.editor.len).fits());
+    try std.testing.expect(!domain.startPreflight(prompt.len).fits());
 }
 
 test "native and custom send preflight rejects proposed text before touching Host" {
@@ -3060,11 +3095,11 @@ test "native and custom send preflight rejects proposed text before touching Hos
     var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
     try app.view.insert("retained Unicode draft €", .paste);
     const revision = app.view.revision;
-    const prompt = ("x" ** 3790) ++ "€";
+    const prompt = ("x" ** 65534) ++ "€";
     try conversation.sendIdentified(&app, .absent, .absent, prompt, usability_selection, revision, @splat('a'));
     try std.testing.expect(conversation.command == null);
     try std.testing.expectEqual(.preflight_rejected, app.view.send_diagnostic.stage);
-    try std.testing.expectEqual(@as(usize, 3793), app.view.send_diagnostic.prompt_bytes);
+    try std.testing.expectEqual(@as(usize, 65537), app.view.send_diagnostic.prompt_bytes);
     try std.testing.expectEqualStrings("retained Unicode draft €", app.view.editor.textBytes());
     try std.testing.expectEqual(revision, app.view.revision);
     try std.testing.expect(std.mem.indexOf(u8, app.view.notice.?, "Shorten") != null);
@@ -3553,4 +3588,36 @@ test "workflow file read and follow-up edit block delayed custom sends before Ho
     try conversation.sendIdentified(&app, .absent, .absent, "retained", usability_selection, app.view.revision, @splat('a'));
     try std.testing.expect(conversation.command == null);
     try std.testing.expectEqualStrings("retained", app.view.editor.textBytes());
+}
+
+test "unknown Send receipt lookup resolves original identity and preserves newer full drafts" {
+    for ([_]bool{ false, true }) |newer| {
+        for (0..3) |outcome| {
+            var app: App = undefined;
+            app.view = try Coding.init(std.testing.allocator);
+            defer app.view.deinit();
+            var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+            const text = "😀" ** 16384;
+            try app.view.insert(text, .paste);
+            const sent_revision = app.view.revision;
+            if (newer) {
+                app.view.editor.selectAll();
+                try app.view.insert("newer draft €", .paste);
+            }
+            const id = [_]u8{'a'} ** 32;
+            conversation.unknown_send = .{ .ticket = .{ .value = 41 }, .kind = .send, .draft_revision = sent_revision, .id = id };
+            app.view.send_diagnostic.begin(&id, text.len, domain.startPreflight(text.len).frame_bytes);
+            app.view.send_diagnostic.stage = .outcome_unknown;
+            try std.testing.expectError(error.SendReceiptUnknown, conversation.submitIdentified(.send, .absent, .absent, .{ .thread_send = .{ .text = "duplicate", .selection = usability_selection } }, app.view.revision, @splat('b')));
+            const receipt: types.Receipt = .{ .command_id = .{ .value = &id }, .outcome = if (outcome == 0) .accepted else .rejected, .reason = if (outcome == 0) null else .prompt_staging_full, .commit_sequence = 12, .entity_ids = if (outcome == 0) .{ .run = .{ .value = "original-run" }, .session = .{ .value = "original-session" } } else .{} };
+            const rows = [_]types.Row{.{ .command_receipt = if (outcome == 2) null else receipt }};
+            const revision = app.view.revision;
+            try conversation.consume(&app, .send_receipt, .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{}, .items = &rows, .expires_at = 1 });
+            try std.testing.expect(conversation.unknown_send == null);
+            try std.testing.expect(conversation.command == null);
+            try std.testing.expectEqualStrings(if (newer) "newer draft €" else if (outcome == 0) "" else text, app.view.editor.textBytes());
+            try std.testing.expectEqual(revision + @as(u64, @intFromBool(!newer and outcome == 0)), app.view.revision);
+            if (outcome == 0) try std.testing.expectEqualStrings("original-run", conversation.run.slice());
+        }
+    }
 }
