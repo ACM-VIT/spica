@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const test_filter = b.option([]const u8, "test-filter", "Compile matching Zig tests only; leave unset for integration checks");
     const bootstrap = b.addSystemCommand(&.{ "python3", "build/bootstrap.py" });
     b.step("deps", "Acquire and build locked native dependencies").dependOn(&bootstrap.step);
     const prefix = b.fmt(".deps/install/{s}-{s}", .{ @tagName(target.result.os.tag), @tagName(target.result.cpu.arch) });
@@ -88,7 +89,7 @@ pub fn build(b: *std.Build) void {
     libraryDependencies(b, test_module, prefix);
     scriptDependencies(b, test_module, prefix);
     test_module.addCSourceFile(.{ .file = b.path("src/native/parse_arena_test.c"), .flags = &.{ "-std=c11", "-O2" } });
-    const tests = b.addTest(.{ .root_module = test_module });
+    const tests = b.addTest(.{ .root_module = test_module, .filters = if (test_filter) |filter| &.{filter} else &.{} });
     const test_step = b.step("test", "Run reusable native, Unicode, content, platform, and bootstrap regressions");
     const test_run = b.addRunArtifact(tests);
     // Reuse compiled artifacts, but exercise tests on every check invocation.

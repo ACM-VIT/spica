@@ -800,6 +800,15 @@ pub const View = struct {
             self.workspace_stale = true;
             return false;
         }
+        for (files) |file| {
+            if (file.path_len == 0 or file.path_len > file.path.len or file.original_len > file.original.len or
+                !std.unicode.utf8ValidateSlice(file.path[0..file.path_len]) or
+                !std.unicode.utf8ValidateSlice(file.original[0..file.original_len]))
+            {
+                self.workspace_stale = true;
+                return false;
+            }
+        }
         var selected_path: [256]u8 = undefined;
         var selected_path_len: usize = 0;
         if (self.workspace_selected_file) |index| if (index < self.workspace_file_count) {
@@ -807,15 +816,15 @@ pub const View = struct {
             @memcpy(selected_path[0..selected_path_len], self.workspace_files[index].path[0..selected_path_len]);
         };
         self.workspace_checkout_len = checkout.len;
-        @memcpy(self.workspace_checkout[0..checkout.len], checkout);
+        @memmove(self.workspace_checkout[0..checkout.len], checkout);
         self.workspace_file_count = files.len;
-        @memcpy(self.workspace_files[0..files.len], files);
+        @memmove(self.workspace_files[0..files.len], files);
         self.workspace_diff_len = diff.len;
-        @memcpy(self.workspace_diff[0..diff.len], diff);
+        @memmove(self.workspace_diff[0..diff.len], diff);
         self.workspace_revision = revision;
         self.workspace_stale = false;
         self.workspace_selected_file = null;
-        if (selected_path_len != 0) for (files, 0..) |file, index| {
+        if (selected_path_len != 0) for (self.workspace_files[0..self.workspace_file_count], 0..) |file, index| {
             if (file.path_len == selected_path_len and std.mem.eql(u8, file.path[0..file.path_len], selected_path[0..selected_path_len])) {
                 self.workspace_selected_file = index;
                 break;
@@ -2263,6 +2272,18 @@ test "workspace inspection keeps selection and rejects stale checkout results" {
     try std.testing.expect(view.admitWorkspaceInspection(5, "/tmp/checkout", &.{file}, "next\n"));
     try std.testing.expectEqual(@as(?usize, 0), view.workspace_selected_file);
     try std.testing.expectEqual(@as(f32, 19), view.workspace_scroll);
+    // A selected-file completion retains the view's already admitted file list.
+    // Refreshing that diff must allow the retained slices to alias their output.
+    try std.testing.expect(view.admitWorkspaceInspection(6, view.workspace_checkout[0..view.workspace_checkout_len], view.workspace_files[0..view.workspace_file_count], "selected file diff\n"));
+    try std.testing.expectEqualStrings("src/main", view.workspace_files[0].path[0..view.workspace_files[0].path_len]);
+    try std.testing.expectEqualStrings("selected file diff\n", view.workspace_diff[0..view.workspace_diff_len]);
+    try std.testing.expectEqual(@as(?usize, 0), view.workspace_selected_file);
+    try std.testing.expect(view.admitWorkspaceInspection(7, view.workspace_checkout[0..view.workspace_checkout_len], view.workspace_files[0..view.workspace_file_count], view.workspace_diff[0..view.workspace_diff_len]));
+    try std.testing.expectEqualStrings("selected file diff\n", view.workspace_diff[0..view.workspace_diff_len]);
+    file.path_len = file.path.len + 1;
+    try std.testing.expect(!view.admitWorkspaceInspection(8, "/tmp/checkout", &.{file}, "invalid\n"));
+    try std.testing.expectEqual(@as(u64, 7), view.workspace_revision);
+    try std.testing.expectEqualStrings("selected file diff\n", view.workspace_diff[0..view.workspace_diff_len]);
     try std.testing.expect(!view.admitWorkspaceInspection(4, "/tmp/other", &.{file}, "wrong\n"));
     try std.testing.expect(view.workspace_stale);
 }

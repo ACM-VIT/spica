@@ -144,6 +144,18 @@ class SpicaUiOfflineTests(unittest.TestCase):
         target = {"id": "workspace.file.0", "enabled": True, "pointer_bounds": [10, 20, 30, 40]}
         self.assertEqual(module.find_target({"navigation_targets": [target]}, "workspace.file.0"), target)
 
+    def test_workspace_diff_requires_fresh_result_in_the_same_checkout_and_thread(self):
+        module = load_cli()
+        before = {"workspace_root": "/fixture", "workspace_revision": 2, "project_id": "p", "thread_id": "t"}
+        current = {**before, "workspace_revision": 3, "workspace_file_count": 1, "workspace_diff_bytes": 100}
+        module.assert_workspace_diff(before, current, "/fixture")
+        for changed in ({"workspace_root": "/other"}, {"project_id": "other"}, {"thread_id": "other"},
+                        {"workspace_stale": True}, {"workspace_revision": 2}, {"workspace_busy": True},
+                        {"workspace_diff_bytes": 0}, {"workspace_file_count": 0}, {"run_id": "unexpected"},
+                        {"send_command_id": "unexpected"}):
+            with self.assertRaises(module.DriverError):
+                module.assert_workspace_diff(before, {**current, **changed}, "/fixture")
+
     def test_oversized_refusal_requires_preserved_draft_and_no_command(self):
         module = load_cli()
         before = {"run_id": "", "send_command_id": ""}

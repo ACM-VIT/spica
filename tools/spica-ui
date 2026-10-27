@@ -754,6 +754,22 @@ def assert_empty_send_disabled(current: dict[str, Any]) -> None:
         raise DriverError("empty composer did not retain disabled Send without command/run admission", EX_ASSERTION)
 
 
+def assert_workspace_diff(before: dict[str, Any], current: dict[str, Any], workspace: str) -> None:
+    # workspace_revision sequences inspection responses, not checkout bindings.
+    # The inspector verifies its captured binding; the driver verifies the
+    # observed project/thread/root and requires a fresh selected-file result.
+    if (before.get("workspace_root") != workspace or current.get("workspace_root") != workspace
+            or current.get("workspace_stale")
+            or any(current.get(key) != before.get(key) for key in ("project_id", "thread_id"))):
+        raise DriverError("diff inspection changed its project/thread/checkout target", EX_STALE)
+    if (current.get("workspace_revision", 0) <= before.get("workspace_revision", 0)
+            or current.get("workspace_busy") or current.get("workspace_diff_bytes", 0) <= 0
+            or current.get("workspace_file_count") != 1):
+        raise DriverError("selected-file diff is missing or belongs to an old inspection response", EX_ASSERTION)
+    if current.get("run_id") or current.get("send_command_id"):
+        raise DriverError("read-only inspection started provider work", EX_ASSERTION)
+
+
 def capability_refusal(session: Session, timeout: float, identifiers: tuple[str, ...]) -> None:
     before = composer_ready(session, timeout)
     for identifier in identifiers:
@@ -838,16 +854,14 @@ def scenario(args: argparse.Namespace) -> int:
                                     args.timeout, "captured checkout changed-file list")
             if current.get("workspace_root") != session.data["workspace"] or current.get("workspace_stale"):
                 raise DriverError("inspection belongs to a stale or different checkout", EX_STALE)
-            revision = current.get("workspace_revision")
+            before = current
             perform_input(session, "click", "workspace.file.0", args.timeout)
             current = wait_snapshot(session, lambda value: not value.get("workspace_busy")
                                     and value.get("workspace_diff_bytes", 0) > 0, args.timeout, "selected-file diff")
-            if current.get("workspace_revision") != revision or current.get("workspace_stale"):
-                raise DriverError("checkout binding changed during diff inspection", EX_STALE)
-            if current.get("run_id") or current.get("send_command_id"):
-                raise DriverError("read-only inspection started provider work", EX_ASSERTION)
+            assert_workspace_diff(before, current, session.data["workspace"])
             session.data["expected_outcome"] = "disposable_checkout_diff_visible"
-            session.journal("scenario.workspace-diff", None, current, fixture="fixture.txt", workspace_revision=revision)
+            session.journal("scenario.workspace-diff", before, current, fixture="fixture.txt",
+                            workspace_revision=current.get("workspace_revision"))
         elif args.name in {"capability-refusal", "followup-refusal", "question-refusal"}:
             identifiers = {"capability-refusal": ("followup.enqueue", "question.answer"),
                            "followup-refusal": ("followup.enqueue",), "question-refusal": ("question.answer",)}
