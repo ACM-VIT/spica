@@ -130,7 +130,7 @@ pub fn RuntimeFor(comptime Transport: type) type {
             if (mcp.value != .array) return error.InvalidMcpServers;
             self.* = .{ .allocator = allocator, .transport = transport, .config = config };
             self.retained = std.heap.FixedBufferAllocator.init(&self.storage);
-            self.turn = std.heap.FixedBufferAllocator.init(&self.turn_storage);
+            self.turn = std.heap.FixedBufferAllocator.init(self.turn_storage[0..16384]);
             self.selection = try clone(self.retained.allocator(), config.selection);
             self.correlation = .{ .session = .{ .value = "unopened" } };
             try self.rpc("initialize", .{ .protocolVersion = 1, .clientCapabilities = Value{ .object = .empty }, .clientInfo = .{ .name = "spica", .version = "1" } });
@@ -285,6 +285,10 @@ pub fn RuntimeFor(comptime Transport: type) type {
                     // ACP v1 ContentBlock (pinned effect-acp schema): images carry
                     // base64 data/mimeType; embedded resources carry text or blob.
                     // Encode inactive fields by omission, never invented file URLs.
+                    // Preserve the pre-attachment 16KiB authority/turn budget.
+                    // Payload scratch is disjoint and lives only through rpc().
+                    var attachment_scratch = std.heap.FixedBufferAllocator.init(self.turn_storage[16384..]);
+                    const payload_allocator = attachment_scratch.allocator();
                     const Resource = struct { uri: []const u8, mimeType: []const u8, text: ?[]const u8 = null, blob: ?[]const u8 = null };
                     const Part = struct { type: []const u8, text: ?[]const u8 = null, data: ?[]const u8 = null, mimeType: ?[]const u8 = null, resource: ?Resource = null };
                     var parts: [9]Part = undefined;
@@ -296,18 +300,18 @@ pub fn RuntimeFor(comptime Transport: type) type {
                     for (r.attachments) |attachment| {
                         const m = attachment.metadata;
                         if (m.kind == .image) {
-                            const encoded = try self.turn.allocator().alloc(u8, std.base64.standard.Encoder.calcSize(attachment.content.len));
+                            const encoded = try payload_allocator.alloc(u8, std.base64.standard.Encoder.calcSize(attachment.content.len));
                             _ = std.base64.standard.Encoder.encode(encoded, attachment.content);
                             parts[part_count] = .{ .type = "image", .mimeType = m.media_type, .data = encoded };
                         } else {
                             // Digest-only URI cannot contain path escapes or refer to
                             // local/provider files. Resource body is self-contained.
-                            const uri = try std.fmt.allocPrint(self.turn.allocator(), "spica-attachment:sha256:{s}", .{m.digest});
+                            const uri = try std.fmt.allocPrint(payload_allocator, "spica-attachment:sha256:{s}", .{m.digest});
                             var resource: Resource = .{ .uri = uri, .mimeType = m.media_type };
                             if (eq(m.media_type, "text/plain")) {
                                 resource.text = attachment.content;
                             } else {
-                                const encoded = try self.turn.allocator().alloc(u8, std.base64.standard.Encoder.calcSize(attachment.content.len));
+                                const encoded = try payload_allocator.alloc(u8, std.base64.standard.Encoder.calcSize(attachment.content.len));
                                 _ = std.base64.standard.Encoder.encode(encoded, attachment.content);
                                 resource.blob = encoded;
                             }

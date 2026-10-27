@@ -20,6 +20,9 @@ pub const Transport = struct {
     prompt_input: ?[]u8 = null,
     prompt_offset: usize = 0,
     output_len: usize = 0,
+    /// Optional synchronous metadata observer; it borrows the same frame the
+    /// consumer receives and cannot change queue/frame admission budgets.
+    observe_line: ?struct { context: *anyopaque, call: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!void } = null,
     exited: bool = false,
     status: c_int = 0,
     pub fn init(allocator: std.mem.Allocator, options: Options) !Transport {
@@ -118,6 +121,8 @@ pub const Transport = struct {
     pub fn poll(self: *Transport, allocator: std.mem.Allocator) !?[]const u8 {
         const end = std.mem.indexOfScalar(u8, self.output[0..self.output_len], '\n') orelse return null;
         const line = try allocator.dupe(u8, std.mem.trimEnd(u8, self.output[0..end], "\r"));
+        errdefer allocator.free(line);
+        if (self.observe_line) |observer| try observer.call(observer.context, allocator, line);
         std.mem.copyForwards(u8, self.output[0 .. self.output_len - end - 1], self.output[end + 1 .. self.output_len]);
         self.output_len -= end + 1;
         return line;

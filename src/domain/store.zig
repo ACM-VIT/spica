@@ -10,7 +10,7 @@ extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, Closed };
 pub const application_id = 0x53504334;
-pub const schema_version = 6;
+pub const schema_version = 7;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
 
 pub const Statement = struct {
@@ -82,6 +82,8 @@ pub const Store = struct {
         if (!fresh and (identity != application_id or version < 1 or version > schema_version)) return error.UnsupportedStore;
         if (!fresh) {
             if (try result.scalar("SELECT schema_version FROM meta WHERE singleton=1") != version) return error.Corrupt;
+            // Attachment tables are introduced by the v7 migration below;
+            // older accepted stores must reach that migration first.
             if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN('meta','commands','projects','workspaces','sessions','threads','runs','messages','blocks','chunks','tools','approvals','effects','observations','events')") != 15) return error.Corrupt;
         }
         // WAL initialization precedes readers and the writer's first transaction.
@@ -134,6 +136,15 @@ pub const Store = struct {
                 try result.exec("ALTER TABLE threads ADD COLUMN title TEXT NOT NULL DEFAULT ''");
             try result.exec("UPDATE meta SET schema_version=6 WHERE singleton=1; PRAGMA user_version=6; COMMIT");
         } else if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name='title'") != 1) return error.Corrupt;
+        if (fresh or version < 7) {
+            try result.exec("BEGIN IMMEDIATE");
+            errdefer result.exec("ROLLBACK") catch {};
+            try result.exec(attachment_schema);
+            try result.exec("UPDATE meta SET schema_version=7 WHERE singleton=1; PRAGMA user_version=7; COMMIT");
+        } else if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN('attachments','attachment_refs')") != 2) return error.Corrupt;
+        // Staging budgets exclude sent history; lookup by attachment must not
+        // scan all message refs for every historical row in the thread.
+        try result.exec("CREATE INDEX IF NOT EXISTS attachment_refs_by_attachment ON attachment_refs(attachment_id)");
         try result.exec("CREATE TABLE IF NOT EXISTS thread_selections(thread_id TEXT PRIMARY KEY REFERENCES threads(id),selection BLOB NOT NULL CHECK(length(selection)<=16384))");
         // The implicit rowid suffix supports latest selection/status lookups
         // without scanning completed runs from other threads.
@@ -460,4 +471,10 @@ const task_schema =
 const prompt_schema =
     \\CREATE TABLE IF NOT EXISTS prompt_uploads(id TEXT PRIMARY KEY CHECK(length(id) BETWEEN 1 AND 128),byte_length INTEGER NOT NULL CHECK(byte_length BETWEEN 1 AND 65536),digest BLOB NOT NULL CHECK(length(digest)=32),received INTEGER NOT NULL CHECK(received BETWEEN 0 AND byte_length),complete INTEGER NOT NULL CHECK(complete IN(0,1)));
     \\CREATE TABLE IF NOT EXISTS prompt_chunks(upload_id TEXT NOT NULL REFERENCES prompt_uploads(id) ON DELETE CASCADE,byte_offset INTEGER NOT NULL CHECK(byte_offset BETWEEN 0 AND 65535),bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 2048),PRIMARY KEY(upload_id,byte_offset));
+;
+
+const attachment_schema =
+    \\CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY,revision INTEGER NOT NULL CHECK(revision>0),thread_id TEXT NOT NULL REFERENCES threads(id),name TEXT NOT NULL,media_type TEXT NOT NULL,byte_length INTEGER NOT NULL CHECK(byte_length BETWEEN 0 AND 262144),digest TEXT NOT NULL CHECK(length(digest)=64),kind TEXT NOT NULL CHECK(kind IN('file','image')),content BLOB NOT NULL);
+    \\CREATE TABLE IF NOT EXISTS attachment_refs(message_id TEXT NOT NULL REFERENCES messages(id),attachment_id TEXT NOT NULL REFERENCES attachments(id),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(message_id,attachment_id),UNIQUE(message_id,ordinal));
+    \\CREATE INDEX IF NOT EXISTS attachments_by_thread ON attachments(thread_id,id);
 ;

@@ -795,7 +795,7 @@ fn attachmentForTest(bytes: []const u8, image: bool, digest: *[64]u8) c.Attachme
 }
 
 test "Codex production Start serializer delivers binary images and maximal escaped UTF8 text" {
-    for (0..3) |scenario| {
+    for (0..4) |scenario| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -803,18 +803,19 @@ test "Codex production Start serializer delivers binary images and maximal escap
         var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "attachments" });
         defer runtime.deinit();
         try openErrorFixture(a, &wire, &runtime);
-        const bytes = try a.alloc(u8, 256 * 1024);
-        @memset(bytes, if (scenario == 0) 0xff else if (scenario == 1) 1 else 'x');
+        const bytes = if (scenario == 3) try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "assets/resource.png", a, .limited(256 * 1024)) else try a.alloc(u8, 256 * 1024);
+        if (scenario != 3) @memset(bytes, if (scenario == 0) 0xff else if (scenario == 1) 1 else 'x');
+        if (scenario == 3) try std.testing.expect(!std.unicode.utf8ValidateSlice(bytes));
         if (scenario == 2) @memcpy(bytes[0.."café 世界".len], "café 世界");
         var digest: [64]u8 = undefined;
-        const attachment = attachmentForTest(bytes, scenario == 0, &digest);
+        const attachment = attachmentForTest(bytes, scenario == 0 or scenario == 3, &digest);
         const start: c.Request = .{ .start = .{ .correlation = .{ .session = .{ .value = "session" }, .run = .{ .value = "run" }, .effect = .{ .value = "start" } }, .prompt = "\x01" ** 65536, .attachments = &.{attachment} } };
         _ = try runtime.dispatch(a, start);
         const line = wire.lines.items[wire.lines.items.len - 1];
         const parsed = try std.json.parseFromSlice(std.json.Value, a, line, .{});
         const items = parsed.value.object.get("params").?.object.get("input").?.array.items;
         try std.testing.expectEqual(@as(usize, 2), items.len);
-        if (scenario == 0) {
+        if (scenario == 0 or scenario == 3) {
             try std.testing.expectEqualStrings("image", items[1].object.get("type").?.string);
             const url = items[1].object.get("url").?.string;
             const prefix = "data:image/png;base64,";

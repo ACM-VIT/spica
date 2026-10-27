@@ -31,6 +31,7 @@ pub const NativeFactory = struct {
     catalog_count: usize = 0,
     catalog_authoritative: bool = false,
     opencode_resume_supported: bool = false,
+    opencode_attachments_supported: bool = false,
     status: c.RuntimeStatus = .{},
     status_reason: [1024]u8 = undefined,
     action_diagnostic: catalog.RpcDiagnostic = .{},
@@ -65,7 +66,7 @@ pub const NativeFactory = struct {
             for ([_]c.Capability{ .create, .start, .stream, .tools, .approval, .cancel, .selection, .workspace }) |cap| {
                 caps[@intFromEnum(cap)] = .{ .status = .supported, .evidence = "Compiled adapter protocol support; installed version and effective selection require instance handshake" };
             }
-            caps[@intFromEnum(c.Capability.attachment)] = .{ .status = .supported, .evidence = "Bounded native text/image serialization accepted by offline consumer fixtures; OpenCode instance requires promptCapabilities" };
+            if (std.mem.eql(u8, selection.runtime_kind, "codex") or self.opencode_attachments_supported) caps[@intFromEnum(c.Capability.attachment)] = .{ .status = .supported, .evidence = "Native attachment wire accepted by strict offline consumers; OpenCode image and embeddedContext negotiated during catalog refresh" };
             if (std.mem.eql(u8, selection.runtime_kind, "codex")) caps[@intFromEnum(c.Capability.attach)] = .{ .status = .supported, .evidence = "Codex thread/resume protocol; instance handshake required" };
             if (std.mem.eql(u8, selection.runtime_kind, "opencode") and self.opencode_resume_supported) caps[@intFromEnum(c.Capability.attach)] = .{ .status = .supported, .evidence = "OpenCode session/resume negotiated during catalog refresh; instance handshake required" };
             caps[@intFromEnum(c.Capability.coordinator_bridge)] = .{ .status = .unknown, .evidence = "Host endpoint and actual provider tool callback require consumer verification" };
@@ -266,6 +267,7 @@ pub const NativeFactory = struct {
                 self.catalog_count = 0;
                 self.catalog_authoritative = true;
                 self.opencode_resume_supported = false;
+                self.opencode_attachments_supported = false;
                 const installed = self.owned_configs[index];
                 self.status = .{ .runtime_kind = kind, .workspace_root = installed.selection.workspace.value, .configuration = installed.setup(), .reason = if (restoring) "Saved setup restored. Save or sign in explicitly to discover available models." else "Configured explicitly; refresh catalog to discover models and account readiness." };
                 if (restoring) {
@@ -280,6 +282,7 @@ pub const NativeFactory = struct {
                 self.catalog_count = 0;
                 self.catalog_authoritative = true;
                 self.opencode_resume_supported = false;
+                self.opencode_attachments_supported = false;
                 var retained = std.heap.FixedBufferAllocator.init(&self.catalog_storage);
                 const scratch_bytes = try allocator.alloc(u8, 4 * 1024 * 1024);
                 defer allocator.free(scratch_bytes);
@@ -361,13 +364,37 @@ pub const NativeFactory = struct {
         const root = try scratch.dupeZ(u8, config.selection.workspace.value);
         var wire = try transport.Transport.init(allocator, .{ .argv = if (codex) &.{ config.executable, "app-server", "--stdio" } else &.{ config.executable, "acp" }, .cwd = root, .environment = config.environment });
         defer wire.deinit();
+        var prompt_caps: OpenCodePromptCapabilities = .{};
+        if (!codex) wire.observe_line = .{ .context = &prompt_caps, .call = OpenCodePromptCapabilities.observe };
         var diagnostic: catalog.RpcDiagnostic = .{};
         const result = if (codex) catalog.codexWithDiagnostic(scratch, retained, &wire, config.selection, output, &diagnostic) else catalog.opencodeWithCapabilities(scratch, retained, &wire, config.selection, root, output, &diagnostic, &self.opencode_resume_supported);
-        return result catch |err| {
+        const count = result catch |err| {
             self.action_diagnostic = diagnostic;
             return err;
         };
+        if (!codex) self.opencode_attachments_supported = prompt_caps.image and prompt_caps.embedded;
+        return count;
     }
+    const OpenCodePromptCapabilities = struct {
+        image: bool = false,
+        embedded: bool = false,
+        fn field(value: std.json.Value, key: []const u8) std.json.Value {
+            return if (value == .object) value.object.get(key) orelse .null else .null;
+        }
+        fn observe(context: *anyopaque, allocator: std.mem.Allocator, line: []const u8) !void {
+            const self: *OpenCodePromptCapabilities = @ptrCast(@alignCast(context));
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+            defer parsed.deinit();
+            const id = field(parsed.value, "id");
+            if (id != .integer or id.integer != 1) return;
+            const caps = field(field(field(parsed.value, "result"), "agentCapabilities"), "promptCapabilities");
+            const image = field(caps, "image");
+            const embedded = field(caps, "embeddedContext");
+            self.image = image == .bool and image.bool;
+            self.embedded = embedded == .bool and embedded.bool;
+        }
+    };
+
     fn rememberReason(self: *NativeFactory, reason: []const u8) void {
         var len = @min(reason.len, self.status_reason.len);
         while (len < reason.len and len > 0 and reason[len] & 0xc0 == 0x80) len -= 1;

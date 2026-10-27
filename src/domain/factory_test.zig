@@ -66,6 +66,13 @@ const Factory = struct {
                     self.prompt_length = start.prompt.len;
                     self.owner.prompt_digest = self.prompt_digest;
                     self.owner.prompt_length = self.prompt_length;
+                    self.owner.attachment_length = 0;
+                    self.owner.attachment_count = start.attachments.len;
+                    for (start.attachments) |attachment| {
+                        if (!c.attachmentDigestMatches(attachment) or attachment.content.len != attachment.metadata.byte_length) return error.InvalidAttachment;
+                        self.owner.attachment_length += attachment.content.len;
+                        self.owner.attachment_digest = t.digest(attachment.content);
+                    }
                     _ = self.owner.start_calls.fetchAdd(1, .release);
                     _ = self.starts.fetchAdd(1, .release);
                     return .{ .outcome = self.owner.start_outcome };
@@ -110,6 +117,9 @@ const Factory = struct {
     start_calls: std.atomic.Value(u32) = .init(0),
     prompt_digest: [32]u8 = undefined,
     prompt_length: usize = 0,
+    attachment_length: usize = 0,
+    attachment_count: usize = 0,
+    attachment_digest: [32]u8 = undefined,
     creates: std.atomic.Value(u32) = .init(0),
     shutdowns: std.atomic.Value(u32) = .init(0),
     destroys: std.atomic.Value(u32) = .init(0),
@@ -119,8 +129,11 @@ const Factory = struct {
     fn factoryCast(context: *anyopaque) *Factory {
         return @ptrCast(@alignCast(context));
     }
-    fn factoryDiscover(_: *anyopaque, _: c.Selection) c.Discovery {
-        return Instance.discover(undefined);
+    fn factoryDiscover(_: *anyopaque, selection: c.Selection) c.Discovery {
+        var result = Instance.discover(undefined);
+        result.runtime_kind = selection.runtime_kind;
+        result.runtime_version = selection.required_runtime_version;
+        return result;
     }
     fn factoryAccount(_: *anyopaque, selection: c.Selection) c.Account {
         return .{ .reference = selection.account_ref, .readiness = .unknown };
@@ -555,4 +568,64 @@ test "Host staging full refusal is durable and explicit cleanup releases only on
     conflict.byte_length = std.math.maxInt(usize);
     try prompts.discardMatching(&db, conflict);
     try std.testing.expectEqual(@as(i64, 3), try db.scalar("SELECT count(*) FROM prompt_uploads"));
+}
+
+fn hostAttachment(a: std.mem.Allocator, id: []const u8, bytes: []const u8) !c.Attachment {
+    return .{ .metadata = .{ .id = .{ .value = id }, .name = "fixture.png", .media_type = "image/png", .kind = .image, .byte_length = bytes.len, .digest = try a.dupe(u8, &std.fmt.bytesToHex(t.digest(bytes), .lower)) }, .content = bytes };
+}
+
+test "Host attachment admission copies binary bytes honors custom staging limits and hydrates immutable refs before real dispatch" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &directory);
+    const root = directory[0..n];
+    var consumer: Consumer = .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer consumer.arena.deinit();
+    const a = consumer.arena.allocator();
+    var factory: Factory = .{ .auto_ready = true };
+    var chosen = sampleSelection("");
+    chosen.runtime_kind = "codex";
+    chosen.required_runtime_version = "0.163.0";
+    const limits: t.Limits = .{ .attachment_count = 1, .attachment_metadata_bytes = 256 };
+    consumer.host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = root, .factory = factory.handle(), .selection = chosen, .workspace_root = root, .limits = limits, .wake = Consumer.wake, .wake_context = &consumer });
+    defer consumer.host.destroy();
+    const project = (try consumer.command(.{ .command_id = .{ .value = "project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "attachments" } } })).entity_ids.project.?;
+    const workspace = try consumer.register(project, root, "workspace");
+    chosen.workspace = workspace;
+    const thread = (try consumer.command(.{ .command_id = .{ .value = "thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+    const bytes = try a.alloc(u8, 256 * 1024);
+    @memset(bytes, 0xff);
+    const expected = t.digest(bytes);
+    const attached = try hostAttachment(a, "binary", bytes);
+    _ = try consumer.host.uploadAttachment(.{ .value = "upload" }, thread, 1, attached);
+    @memset(bytes, 0); // Input is independently owned as soon as admission returns.
+    const uploaded = try consumer.next();
+    try std.testing.expectEqual(.accepted, uploaded.command_receipt.receipt.outcome);
+    const refused = try consumer.command(.{ .command_id = .{ .value = "custom-count" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .attachment_add = try hostAttachment(a, "extra", "x") } });
+    try std.testing.expectEqual(.attachment_limit, refused.reason.?);
+    try std.testing.expectEqual(@as(usize, 1), (try consumer.query(.{ .attachments = .{ .thread = thread } })).items.len);
+    var send: t.CommandEnvelope = .{ .command_id = .{ .value = "send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "\x01" ** 65536, .selection = chosen, .attachments = &.{attached.metadata.id} } } };
+    const sent = try consumer.command(send);
+    try std.testing.expectEqual(.accepted, sent.outcome);
+    _ = try consumer.query(.{ .runs = .{ .thread = thread } });
+    try std.testing.expectEqual(@as(u32, 1), factory.start_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), factory.attachment_count);
+    try std.testing.expectEqual(@as(usize, 256 * 1024), factory.attachment_length);
+    try std.testing.expectEqualSlices(u8, &expected, &factory.attachment_digest);
+    const next = try consumer.command(.{ .command_id = .{ .value = "next-draft" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 3 }, .payload = .{ .attachment_add = try hostAttachment(a, "draft", "next") } });
+    try std.testing.expectEqual(.accepted, next.outcome);
+    try std.testing.expectEqual(@as(usize, 2), (try consumer.query(.{ .attachments = .{ .thread = thread } })).items.len);
+    try std.testing.expectEqual(sent.commit_sequence, (try consumer.command(send)).commit_sequence);
+    send.command_id.value = "new-attempt";
+    send.expected_revision.revision = 4;
+    // Custom per-packet limit is independent of all immutable history refs.
+    send.payload.thread_send.attachments = &.{ attached.metadata.id, .{ .value = "draft" } };
+    try std.testing.expectEqual(.attachment_limit, (try consumer.command(send)).reason.?);
+    consumer.host.destroy();
+    consumer.host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = root, .factory = factory.handle(), .selection = chosen, .limits = limits, .wake = Consumer.wake, .wake_context = &consumer });
+    try std.testing.expectEqual(@as(usize, 2), (try consumer.query(.{ .attachments = .{ .thread = thread } })).items.len);
+    try std.testing.expectEqual(@as(u32, 1), factory.creates.load(.acquire));
+    const replay = try consumer.query(.{ .command_receipt = .{ .value = "send" } });
+    try std.testing.expectEqual(sent.commit_sequence, replay.items[0].command_receipt.?.commit_sequence);
 }

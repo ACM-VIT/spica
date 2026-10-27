@@ -3,6 +3,7 @@ const std = @import("std");
 pub const types = @import("domain/types.zig");
 pub const store = @import("domain/store.zig");
 const prompts = @import("domain/prompts.zig");
+const attachments = @import("domain/attachments.zig");
 const t = types;
 const a = t.adapter;
 const V = store.Value;
@@ -15,6 +16,7 @@ pub const workspace_binding = @import("domain/workspace.zig");
 
 /// Prompt admission is independent of the ordinary provider frame budget.
 pub const start_frame_limit = (a.Limits{}).frame_bytes;
+pub const attachment_packet_limit = start_frame_limit + (a.Limits{}).attachment_packet_bytes;
 pub const max_prompt_bytes = prompts.max_bytes;
 const generated_id_bytes = 32;
 pub const StartPreflight = struct {
@@ -36,6 +38,30 @@ pub fn startPreflight(prompt_bytes: usize) StartPreflight {
     return .{ .prompt_bytes = prompt_bytes, .frame_bytes = a.frameBytes(request) +| prompt_bytes, .max_prompt_bytes = max_prompt_bytes };
 }
 
+/// Journals retain intent and a content digest, while attachment bytes stay in
+/// the dedicated durable table. This also makes retries compare metadata
+/// exactly without copying binary bodies into command/event rows.
+fn canonicalEnvelope(allocator: std.mem.Allocator, envelope: t.CommandEnvelope) !t.CommandEnvelope {
+    var result = envelope;
+    if (result.payload == .attachment_add) {
+        result.payload.attachment_add.content = &.{};
+    }
+    const attached = switch (result.payload) {
+        .followup_enqueue => |v| v.attachments,
+        .followup_edit => |v| v.attachments,
+        else => return result,
+    };
+    if (attached.len > attachments.max_count) return error.Limit;
+    const metadata = try allocator.dupe(a.Attachment, attached);
+    for (metadata) |*item| item.content = &.{};
+    switch (result.payload) {
+        .followup_enqueue => |*v| v.attachments = metadata,
+        .followup_edit => |*v| v.attachments = metadata,
+        else => unreachable,
+    }
+    return result;
+}
+
 // Every nested lookup is a point/range lookup on an existing primary/unique
 // index (plus runs_by_thread). The preview reads only a prefix of one chunk.
 const thread_columns = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)),coalesce((SELECT substr(bytes,1,163) FROM chunks WHERE block_id=(SELECT id FROM blocks WHERE message_id=(SELECT id FROM messages WHERE thread_id=threads.id AND ordinal=0 AND role='user') AND ordinal=0) AND byte_offset=0),''),(SELECT state FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1),coalesce((SELECT substr(display_name,1,256) FROM projects WHERE id=threads.project_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.expected_branch') FROM workspaces WHERE id=threads.workspace_id),''),coalesce(title,'') FROM threads ";
@@ -48,6 +74,7 @@ pub const Owner = struct {
     epoch: []const u8,
     utc_ms: ?u64,
     factory: ?Factory = null,
+    limits: t.Limits = .{},
     workspace_root: ?[]const u8 = null,
     setup_factory: ?Factory = null,
     runtime_registry: ?*const Registry = null,
@@ -112,13 +139,27 @@ pub const Owner = struct {
         try self.database.appendEvent(.{ .event_id = .{ .value = try self.id(allocator) }, .position = .{ .commit_sequence = sequence, .event_index = position }, .aggregate = aggregate, .aggregate_revision = revision_value, .kind = kind, .causation_command_id = causation, .effect_id = effect, .payload = payload });
     }
     fn plan(self: *Owner, allocator: std.mem.Allocator, effect: []const u8, run: []const u8, session: []const u8, kind: t.EffectKind, request: a.Request, dependency: ?[]const u8, approval: ?[]const u8, causation: t.CommandId) !void {
-        const bytes = try encoded(allocator, request);
+        // Attachment bodies are hydrated from the durable attachment table at
+        // dispatch. Effects retain immutable metadata only.
+        var persisted = request;
+        var metadata: [8]a.Attachment = undefined;
+        if (persisted == .start) {
+            if (persisted.start.attachments.len > metadata.len) return error.Limit;
+            for (persisted.start.attachments, 0..) |attachment, i| {
+                metadata[i] = attachment;
+                metadata[i].content = &.{};
+            }
+            persisted.start.attachments = metadata[0..persisted.start.attachments.len];
+        } else if (persisted == .message and persisted.message.attachments.len != 0) {
+            return error.CapabilityUnavailable;
+        }
+        const bytes = try encoded(allocator, persisted);
         const digest = t.digest(bytes);
         try self.database.execute("INSERT INTO effects(id,revision,run_id,session_id,kind,read_only,request,digest,state,depends_on,approval_id,command_id) VALUES(?,1,?,?,?,?,?,?,'planned',?,?,?)", &.{ .{ .text = effect }, .{ .text = run }, .{ .text = session }, .{ .text = @tagName(kind) }, .{ .integer = @intFromBool(request == .inspect or request == .attach) }, .{ .blob = bytes }, .{ .blob = &digest }, if (dependency) |v| .{ .text = v } else .null, if (approval) |v| .{ .text = v } else .null, .{ .text = causation.value } });
     }
 
     fn commandReplay(self: *Owner, allocator: std.mem.Allocator, e: t.CommandEnvelope) !?t.Receipt {
-        const canonical = try encoded(allocator, e);
+        const canonical = try encoded(allocator, try canonicalEnvelope(allocator, e));
         const output = try allocator.alloc(u8, 65536);
         const bytes = self.database.lookupCommand(e.command_id.value, canonical, output) catch |err| switch (err) {
             error.Conflict => {
@@ -136,7 +177,7 @@ pub const Owner = struct {
                     };
                     if (previous.payload == .thread_send) {
                         const p = previous.payload.thread_send;
-                        previous.payload = .{ .thread_send_staged = .{ .prompt = prompts.reference(previous.command_id.value, p.text), .selection = p.selection } };
+                        previous.payload = .{ .thread_send_staged = .{ .prompt = prompts.reference(previous.command_id.value, p.text), .selection = p.selection, .attachments = p.attachments } };
                         if (a.equal(previous, e)) return original;
                     }
                 }
@@ -166,7 +207,7 @@ pub const Owner = struct {
             if (p.text.len != 0 and p.text.len <= max_prompt_bytes and std.unicode.utf8ValidateSlice(p.text)) {
                 const ref = prompts.reference(envelope.command_id.value, p.text);
                 var compact = envelope;
-                compact.payload = .{ .thread_send_staged = .{ .prompt = ref, .selection = p.selection } };
+                compact.payload = .{ .thread_send_staged = .{ .prompt = ref, .selection = p.selection, .attachments = p.attachments } };
                 // Receipt lookup must precede staging: a retry after consumption
                 // must work even when all upload reservations are in use.
                 if (try self.commandReplay(allocator, compact)) |receipt| return receipt;
@@ -177,7 +218,7 @@ pub const Owner = struct {
         return self.commandCanonical(allocator, envelope, null);
     }
     fn commandCanonical(self: *Owner, allocator: std.mem.Allocator, envelope: t.CommandEnvelope, refusal: ?t.Reason) !t.Receipt {
-        const canonical = try encoded(allocator, envelope);
+        const canonical = try encoded(allocator, try canonicalEnvelope(allocator, envelope));
         const output = try allocator.alloc(u8, 65536);
         try self.database.begin();
         errdefer self.database.rollback() catch {};
@@ -340,7 +381,7 @@ pub const Owner = struct {
             },
             .followup_enqueue => |p| {
                 if (e.target != .run or e.expected_revision != .revision or p.content.len == 0) return .followup_invalid;
-                if (a.validateAttachments(p.attachments, .{})) |_| {} else |_| return .attachment_limit;
+                if (p.attachments.len != 0) return .attachment_unsupported;
                 const run = e.target.run.value;
                 const state = try self.field(allocator, "SELECT state FROM runs WHERE id=?", &.{.{ .text = run }}) orelse return .not_found;
                 if (!(std.mem.eql(u8, state, "starting") or std.mem.eql(u8, state, "streaming") or std.mem.eql(u8, state, "awaiting_approval"))) return .busy;
@@ -361,7 +402,7 @@ pub const Owner = struct {
                     .attachments = p.attachments,
                     .followup = .{ .id = .{ .value = effect_id }, .content = p.content },
                 } };
-                if (a.frameBytes(request) > start_frame_limit) return .admission_limit;
+                if (a.frameBytes(request) > @min(attachment_packet_limit, start_frame_limit +| self.limits.attachment_packet_bytes)) return .admission_limit;
                 const dependency = try self.field(allocator, "SELECT id FROM effects WHERE run_id=? AND kind='message' AND state='planned' AND instr(CAST(request AS TEXT),'\"followup\":{\"id\"')>0 AND NOT EXISTS(SELECT 1 FROM effects child WHERE child.depends_on=effects.id AND child.state='planned') ORDER BY rowid DESC LIMIT 1", &.{.{ .text = run }});
                 try self.plan(allocator, effect_id, run, session, .message, request, dependency, null, e.command_id);
                 r.entity_ids.run = e.target.run;
@@ -372,7 +413,7 @@ pub const Owner = struct {
             },
             .followup_edit => |p| {
                 if (e.target != .effect or e.expected_revision != .revision or p.content.len == 0) return .followup_invalid;
-                if (a.validateAttachments(p.attachments, .{})) |_| {} else |_| return .attachment_limit;
+                if (p.attachments.len != 0) return .attachment_unsupported;
                 const statement = try db.prepare("SELECT run_id,session_id,kind,state,request FROM effects WHERE id=?", &.{.{ .text = e.target.effect.value }});
                 defer statement.deinit();
                 if (!try statement.step()) return .followup_not_found;
@@ -382,7 +423,7 @@ pub const Owner = struct {
                 request.message.content = p.content;
                 request.message.attachments = p.attachments;
                 request.message.followup.?.content = p.content;
-                if (a.frameBytes(request) > start_frame_limit) return .admission_limit;
+                if (a.frameBytes(request) > @min(attachment_packet_limit, start_frame_limit +| self.limits.attachment_packet_bytes)) return .admission_limit;
                 const bytes = try encoded(allocator, request);
                 const digest = t.digest(bytes);
                 try db.execute("UPDATE effects SET request=?,digest=?,revision=revision+1 WHERE id=? AND state='planned'", &.{ .{ .blob = bytes }, .{ .blob = &digest }, .{ .text = e.target.effect.value } });
@@ -426,7 +467,7 @@ pub const Owner = struct {
                 aggregate = .{ .run = e.target.run };
                 revision_value = e.expected_revision.revision + 1;
             },
-            .question_answer, .attachment_add, .attachment_remove => return .capability_unavailable,
+            .question_answer => return .capability_unavailable,
             .prompt_discard => |p| {
                 if (e.target != .absent or e.expected_revision != .absent) return .invalid_command;
                 if (p.id) |upload| {
@@ -447,12 +488,55 @@ pub const Owner = struct {
                     error.PromptConflict, error.InvalidPrompt => .prompt_invalid,
                     else => .admission_limit,
                 };
-                const result = try self.reduceWithPrompt(allocator, .{ .command_id = e.command_id, .target = e.target, .expected_revision = e.expected_revision, .payload = .{ .thread_send = .{ .text = prompt, .selection = p.selection } } }, r, p.prompt);
+                const result = try self.reduceWithPrompt(allocator, .{ .command_id = e.command_id, .target = e.target, .expected_revision = e.expected_revision, .payload = .{ .thread_send = .{ .text = prompt, .selection = p.selection, .attachments = p.attachments } } }, r, p.prompt);
                 return result;
+            },
+            .attachment_add => |attachment| {
+                if (e.target != .thread or e.expected_revision != .revision) return .invalid_command;
+                attachments.validate(attachment, true) catch |err| return switch (err) {
+                    error.UnsupportedAttachment => .attachment_unsupported,
+                    error.AttachmentLimit => .attachment_limit,
+                    error.DigestMismatch => .attachment_limit,
+                    else => .invalid_command,
+                };
+                if (!attachments.digestMatches(attachment)) return .attachment_limit;
+                if (attachment.metadata.byte_length > self.limits.attachment_bytes or attachments.metadataBytes(attachment.metadata) > self.limits.attachment_metadata_bytes or self.limits.attachment_count == 0) return .attachment_limit;
+                const thread = e.target.thread.value;
+                if (try self.field(allocator, "SELECT id FROM threads WHERE id=?", &.{.{ .text = thread }}) == null) return .not_found;
+                const limits = try db.prepare("SELECT count(*),coalesce(sum(byte_length),0),coalesce(sum(length(CAST(name AS BLOB))+length(CAST(media_type AS BLOB))+length(CAST(digest AS BLOB))+length(CAST(id AS BLOB))),0) FROM attachments WHERE thread_id=? AND NOT EXISTS(SELECT 1 FROM attachment_refs r WHERE r.attachment_id=attachments.id)", &.{.{ .text = thread }});
+                defer limits.deinit();
+                if (!try limits.step()) return error.Corrupt;
+                if (limits.integer(0) >= @as(i64, @intCast(self.limits.attachment_count)) or limits.integer(1) > @as(i64, @intCast(self.limits.attachment_bytes)) -| @as(i64, @intCast(attachment.metadata.byte_length)) or limits.integer(2) > @as(i64, @intCast(self.limits.attachment_metadata_bytes)) -| @as(i64, @intCast(attachments.metadataBytes(attachment.metadata)))) return .attachment_limit;
+                if (try self.field(allocator, "SELECT id FROM attachments WHERE id=?", &.{.{ .text = attachment.metadata.id.value }}) != null) return .attachment_limit;
+                try db.execute("INSERT INTO attachments(id,revision,thread_id,name,media_type,byte_length,digest,kind,content) VALUES(?,1,?,?,?,?,?,?,?)", &.{ .{ .text = attachment.metadata.id.value }, .{ .text = thread }, .{ .text = attachment.metadata.name }, .{ .text = attachment.metadata.media_type }, .{ .integer = @intCast(attachment.metadata.byte_length) }, .{ .text = attachment.metadata.digest }, .{ .text = @tagName(attachment.metadata.kind) }, .{ .blob = attachment.content } });
+                try db.execute("UPDATE threads SET revision=revision+1 WHERE id=?", &.{.{ .text = thread }});
+                r.entity_ids = .{ .thread = e.target.thread, .attachment = attachment.metadata.id };
+                aggregate = .{ .thread = e.target.thread };
+                revision_value = e.expected_revision.revision + 1;
+                event_payload = try encoded(allocator, attachment.metadata);
+            },
+            .attachment_remove => |attachment_id| {
+                if (e.target != .thread or e.expected_revision != .revision) return .invalid_command;
+                const thread = e.target.thread.value;
+                const found = try self.database.prepare("SELECT revision FROM attachments WHERE id=? AND thread_id=?", &.{ .{ .text = attachment_id.value }, .{ .text = thread } });
+                defer found.deinit();
+                if (!try found.step()) return .not_found;
+                if (try self.scalar("SELECT count(*) FROM attachment_refs WHERE attachment_id=?", &.{.{ .text = attachment_id.value }}) != 0) return .busy;
+                try db.execute("DELETE FROM attachments WHERE id=? AND thread_id=?", &.{ .{ .text = attachment_id.value }, .{ .text = thread } });
+                try db.execute("UPDATE threads SET revision=revision+1 WHERE id=?", &.{.{ .text = thread }});
+                r.entity_ids = .{ .thread = e.target.thread, .attachment = attachment_id };
+                aggregate = .{ .thread = e.target.thread };
+                revision_value = e.expected_revision.revision + 1;
             },
             .thread_send => |p| {
                 if (e.target != .thread or e.expected_revision != .revision or p.text.len == 0 or !std.unicode.utf8ValidateSlice(p.text)) return .invalid_command;
                 if (p.text.len > max_prompt_bytes) return .admission_limit;
+                if (p.attachments.len > @min(self.limits.attachment_count, attachments.max_count)) return .attachment_limit;
+                for (p.attachments, 0..) |id_value, index| {
+                    if (id_value.value.len == 0 or id_value.value.len > attachments.max_id_bytes) return .attachment_limit;
+                    for (p.attachments[0..index]) |previous| if (a.equal(id_value, previous)) return .attachment_limit;
+                }
+                if (p.attachments.len != 0 and !std.mem.eql(u8, p.selection.runtime_kind, "codex") and !std.mem.eql(u8, p.selection.runtime_kind, "opencode")) return .attachment_unsupported;
                 const thread = e.target.thread.value;
                 const workspace = try self.field(allocator, "SELECT workspace_id FROM threads WHERE id=?", &.{.{ .text = thread }}) orelse return .not_found;
                 if (!std.mem.eql(u8, workspace, p.selection.workspace.value)) return .workspace_mismatch;
@@ -465,6 +549,7 @@ pub const Owner = struct {
                 if (p.selection.account_ref.len == 0 or p.selection.model_id.len == 0 or p.selection.model_provider.len == 0) return .capability_unavailable;
                 if (self.factory) |runtime| {
                     const discovery = runtime.discover(p.selection);
+                    if (p.attachments.len != 0 and discovery.capabilities[@intFromEnum(a.Capability.attachment)].status != .supported) return .attachment_unsupported;
                     const account = runtime.accountStatus(p.selection);
                     const resolved = runtime.resolveSelection(p.selection);
                     if (!std.mem.eql(u8, discovery.runtime_kind, p.selection.runtime_kind) or
@@ -506,8 +591,20 @@ pub const Owner = struct {
                 // command/effect journals never JSON-escape the large text.
                 var prompt_ref = staged_ref orelse prompts.reference(user_block, p.text);
                 prompt_ref.id = user_block;
-                const request: a.Request = .{ .start = .{ .correlation = .{ .effect = .{ .value = start }, .run = .{ .value = run }, .session = .{ .value = session } }, .prompt_ref = prompt_ref } };
-                if (a.frameBytes(request) > start_frame_limit) return .admission_limit;
+                var attached = try allocator.alloc(a.Attachment, p.attachments.len);
+                for (p.attachments, 0..) |attachment_id, index| {
+                    const found = try db.prepare("SELECT name,media_type,byte_length,digest,kind FROM attachments WHERE id=? AND thread_id=?", &.{ .{ .text = attachment_id.value }, .{ .text = thread } });
+                    defer found.deinit();
+                    if (!try found.step()) return .not_found;
+                    attached[index] = .{ .metadata = .{ .id = .{ .value = try allocator.dupe(u8, attachment_id.value) }, .name = try allocator.dupe(u8, try found.bytes(0)), .media_type = try allocator.dupe(u8, try found.bytes(1)), .byte_length = @intCast(found.integer(2)), .digest = try allocator.dupe(u8, try found.bytes(3)), .kind = std.meta.stringToEnum(a.AttachmentKind, try found.bytes(4)) orelse return error.Corrupt } };
+                    const provider: attachments.Provider = if (std.mem.eql(u8, p.selection.runtime_kind, "codex")) .codex else .opencode;
+                    if (!attachments.supported(attached[index].metadata.media_type, attached[index].metadata.kind, provider)) return .attachment_unsupported;
+                }
+                a.validateNativeAttachments(attached, .{ .attachment_count = self.limits.attachment_count, .attachment_bytes = self.limits.attachment_bytes, .attachment_metadata_bytes = self.limits.attachment_metadata_bytes }) catch return .attachment_limit;
+                const request: a.Request = .{ .start = .{ .correlation = .{ .effect = .{ .value = start }, .run = .{ .value = run }, .session = .{ .value = session } }, .prompt_ref = prompt_ref, .attachments = attached } };
+                var materialized_bytes = a.frameBytes(request) +| p.text.len;
+                for (attached) |attachment| materialized_bytes +|= @intCast(attachment.metadata.byte_length);
+                if (materialized_bytes > @min(attachment_packet_limit, start_frame_limit +| self.limits.attachment_packet_bytes)) return .admission_limit;
                 const selection = try encoded(allocator, p.selection);
                 try db.execute("INSERT INTO thread_selections VALUES(?,?) ON CONFLICT(thread_id) DO UPDATE SET selection=excluded.selection", &.{ .{ .text = thread }, .{ .blob = selection } });
                 if (resumed == null) try db.execute("INSERT INTO sessions(id,revision,workspace_id,selection) VALUES(?,1,?,?)", &.{ .{ .text = session }, .{ .text = workspace }, .{ .blob = selection } });
@@ -525,6 +622,7 @@ pub const Owner = struct {
                     _ = try db.appendChunk(user_block, offset, p.text[offset..end]);
                     offset = end;
                 }
+                for (p.attachments, 0..) |attachment_id, index| try db.execute("INSERT INTO attachment_refs(message_id,attachment_id,ordinal) VALUES(?,?,?)", &.{ .{ .text = user }, .{ .text = attachment_id.value }, .{ .integer = @intCast(index) } });
                 try db.execute("UPDATE threads SET revision=revision+1,session_id=?,next_ordinal=next_ordinal+2 WHERE id=?", &.{ .{ .text = session }, .{ .text = thread } });
                 if (resumed) |existing| {
                     try self.plan(allocator, open, run, session, .attach, .{ .open = .{ .existing = .{ .session = existing } } }, null, null, e.command_id);
@@ -1191,6 +1289,30 @@ pub const Owner = struct {
         if (task != null and count == 0) return error.AuthorityUnavailable;
         return rows[0..count];
     }
+    /// Materialize only immutable refs belonging to the Start's durable user
+    /// message. Draft rows in the same thread do not grant dispatch authority.
+    pub fn hydrateStartAttachments(self: *Owner, allocator: std.mem.Allocator, request: *a.Request) !void {
+        if (request.* != .start or request.start.attachments.len == 0) return;
+        const start = &request.start;
+        a.validateNativeAttachments(start.attachments, .{ .attachment_count = self.limits.attachment_count, .attachment_bytes = self.limits.attachment_bytes, .attachment_metadata_bytes = self.limits.attachment_metadata_bytes }) catch return error.Corrupt;
+        const run = start.correlation.run orelse return error.Corrupt;
+        const hydrated = try allocator.alloc(a.Attachment, start.attachments.len);
+        for (start.attachments, 0..) |reference, index| {
+            const body = try self.database.prepare("SELECT a.name,a.media_type,a.byte_length,a.digest,a.kind,a.content FROM attachments a JOIN attachment_refs ref ON ref.attachment_id=a.id JOIN messages m ON m.id=ref.message_id WHERE a.id=? AND m.run_id=? AND m.role='user' AND a.thread_id=m.thread_id AND ref.ordinal=?", &.{ .{ .text = reference.metadata.id.value }, .{ .text = run.value }, .{ .integer = @intCast(index) } });
+            defer body.deinit();
+            if (!try body.step()) return error.Corrupt;
+            const content = try body.bytes(5);
+            const metadata: a.AttachmentMetadata = .{ .id = reference.metadata.id, .name = try body.bytes(0), .media_type = try body.bytes(1), .byte_length = @intCast(body.integer(2)), .digest = try body.bytes(3), .kind = std.meta.stringToEnum(a.AttachmentKind, try body.bytes(4)) orelse return error.Corrupt };
+            const borrowed: a.Attachment = .{ .metadata = metadata, .content = content };
+            // Validate borrowed SQLite views before allocating any body/metadata.
+            if (!a.equal(reference.metadata, metadata)) return error.Corrupt;
+            attachments.validate(borrowed, true) catch return error.Corrupt;
+            if (!attachments.digestMatches(borrowed)) return error.Corrupt;
+            hydrated[index] = try @import("runtime/adapter.zig").clone(allocator, borrowed);
+        }
+        start.attachments = hydrated;
+    }
+
     pub fn recover(self: *Owner) !void {
         try self.database.begin();
         errdefer self.database.rollback() catch {};
@@ -1220,7 +1342,14 @@ pub const Host = struct {
         workspace_root: ?[]const u8 = null,
     };
     const Request = union(enum) { command: t.CommandEnvelope, query: t.Query, subscribe: t.Subscribe, unsubscribe: t.SubscriptionId };
-    const Frame = struct { prompt_bytes: usize = 0, ticket: t.Ticket = .{ .value = 0 }, len: usize = 0, bytes: [65536]u8 = undefined };
+    const Frame = struct {
+        prompt_bytes: usize = 0,
+        attachment_bytes: usize = 0,
+        ticket: t.Ticket = .{ .value = 0 },
+        len: usize = 0,
+        bytes: [65536]u8 = undefined,
+        attachment_content: [attachments.max_bytes]u8 = undefined,
+    };
     const Result = struct { len: usize = 0, bytes: [262144]u8 = undefined };
     const Snapshot = struct { generation: u64 = 0, database: ?*store.c.sqlite3 = null, position: t.EventPosition = .{}, deadline: u64 = 0 };
     const Subscription = struct { generation: u64 = 0, active: bool = false, scope: t.Scope = .all, after: t.EventPosition = .{}, max_bytes: usize = 65536, arena: std.heap.ArenaAllocator };
@@ -1254,7 +1383,7 @@ pub const Host = struct {
 
     pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Host {
         const l = options.limits;
-        if (l.request_slots == 0 or l.request_slots > 8 or l.result_slots == 0 or l.result_slots > 8 or l.snapshot_slots == 0 or l.snapshot_slots > 2 or l.subscription_slots > 4 or l.command_bytes > 65536 or l.page_bytes > 65536 or l.page_rows > 128 or l.page_rows == 0) return error.InvalidLimits;
+        if (l.request_slots == 0 or l.request_slots > 8 or l.result_slots == 0 or l.result_slots > 8 or l.snapshot_slots == 0 or l.snapshot_slots > 2 or l.subscription_slots > 4 or l.command_bytes > 65536 or l.page_bytes > 65536 or l.page_rows > 128 or l.page_rows == 0 or l.attachment_count > attachments.max_count or l.attachment_bytes > attachments.max_bytes or l.attachment_metadata_bytes > attachments.max_metadata_bytes or l.attachment_packet_bytes > attachment_packet_limit) return error.InvalidLimits;
         if (options.factory != null and options.selection == null) return error.InvalidSelection;
         const self = try allocator.create(Host);
         errdefer allocator.destroy(self);
@@ -1275,7 +1404,7 @@ pub const Host = struct {
         for (&self.subscriptions) |*sub| sub.* = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        var owner: Owner = .{ .database = &self.database, .io = io, .epoch = "", .utc_ms = null };
+        var owner: Owner = .{ .database = &self.database, .io = io, .epoch = "", .utc_ms = null, .limits = options.limits };
         @memcpy(&self.epoch, try owner.id(arena.allocator()));
         try owner.recover();
         // Restore explicit configuration only. Never replay refresh, sign-in,
@@ -1333,20 +1462,54 @@ pub const Host = struct {
         return selection;
     }
     pub fn submit(self: *Host, command: t.CommandEnvelope) t.AdmissionError!t.Ticket {
+        if (command.payload == .followup_enqueue or command.payload == .followup_edit) {
+            const attached = if (command.payload == .followup_enqueue) command.payload.followup_enqueue.attachments else command.payload.followup_edit.attachments;
+            if (attached.len > attachments.max_count) return error.TooLarge;
+            var metadata: [attachments.max_count]a.Attachment = undefined;
+            for (attached, 0..) |item, index| {
+                metadata[index] = item;
+                metadata[index].content = &.{};
+            }
+            var compact = command;
+            if (compact.payload == .followup_enqueue) compact.payload.followup_enqueue.attachments = metadata[0..attached.len] else compact.payload.followup_edit.attachments = metadata[0..attached.len];
+            return self.admit(.{ .command = compact });
+        }
+        if (command.payload == .attachment_add) {
+            const input = command.payload.attachment_add;
+            attachments.validate(input, true) catch return error.TooLarge;
+            if (!attachments.digestMatches(input)) return error.TooLarge;
+            if (input.content.len > self.options.limits.attachment_bytes or attachments.metadataBytes(input.metadata) > self.options.limits.attachment_metadata_bytes) return error.TooLarge;
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            var compact = command;
+            compact.payload.attachment_add.content = &.{};
+            const ticket = try self.admitLocked(.{ .command = compact });
+            const frame = &self.requests[(self.request_head + self.request_count - 1) % 8];
+            frame.attachment_bytes = input.content.len;
+            @memcpy(frame.attachment_content[0..input.content.len], input.content);
+            return ticket;
+        }
         if (command.payload != .thread_send) return self.admit(.{ .command = command });
         const p = command.payload.thread_send;
         if (p.text.len == 0 or p.text.len > max_prompt_bytes or !std.unicode.utf8ValidateSlice(p.text)) return error.TooLarge;
         var compact = command;
-        compact.payload = .{ .thread_send_staged = .{ .prompt = prompts.reference(command.command_id.value, p.text), .selection = p.selection } };
+        compact.payload = .{ .thread_send_staged = .{ .prompt = prompts.reference(command.command_id.value, p.text), .selection = p.selection, .attachments = p.attachments } };
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.prompt_pending) return error.Busy;
         const ticket = try self.admitLocked(.{ .command = compact });
         const frame = &self.requests[(self.request_head + self.request_count - 1) % 8];
         frame.prompt_bytes = p.text.len;
+        frame.attachment_bytes = 0;
         @memcpy(self.prompt_inbox[0..p.text.len], p.text);
         self.prompt_pending = true;
         return ticket;
+    }
+    /// Copies one bounded attachment into the Host request ring and admits its
+    /// durable add command. The caller may release or reuse all input memory
+    /// immediately after this call returns.
+    pub fn uploadAttachment(self: *Host, command_id: t.CommandId, thread: t.ThreadId, revision: u64, attachment: a.Attachment) t.AdmissionError!t.Ticket {
+        return self.submit(.{ .command_id = command_id, .target = .{ .thread = thread }, .expected_revision = .{ .revision = revision }, .payload = .{ .attachment_add = attachment } });
     }
     pub fn query(self: *Host, request: t.Query) t.AdmissionError!t.Ticket {
         return self.admit(.{ .query = request });
@@ -1369,6 +1532,7 @@ pub const Host = struct {
         const bytes = t.encode(request, frame.bytes[0..self.options.limits.command_bytes]) catch return error.TooLarge;
         frame.len = bytes.len;
         frame.prompt_bytes = 0;
+        frame.attachment_bytes = 0;
         frame.ticket = .{ .value = self.next_ticket };
         self.next_ticket += 1;
         self.request_count += 1;
@@ -1422,7 +1586,7 @@ pub const Host = struct {
         snapshot.database = null;
     }
     fn run(self: *Host) void {
-        var owner: Owner = .{ .database = &self.database, .io = self.io, .epoch = &self.epoch, .utc_ms = null, .factory = self.registry.?.factory, .workspace_root = self.options.workspace_root, .setup_factory = self.options.setup_factory, .runtime_registry = &self.registry.? };
+        var owner: Owner = .{ .database = &self.database, .io = self.io, .epoch = &self.epoch, .utc_ms = null, .factory = self.registry.?.factory, .workspace_root = self.options.workspace_root, .setup_factory = self.options.setup_factory, .runtime_registry = &self.registry.?, .limits = self.options.limits };
         defer if (self.registry) |*registry| registry.deinit(&self.mcp.?);
         defer if (self.options.setup_factory) |setup| {
             if (setup.vtable.shutdownSetup) |call| call(setup.context);
@@ -1458,10 +1622,18 @@ pub const Host = struct {
                 self.closeSnapshot(snapshot);
             };
             if (frame) |input| {
-                const request = t.decode(Request, input.bytes[0..input.len], allocator) catch {
+                var request = t.decode(Request, input.bytes[0..input.len], allocator) catch {
                     self.fail(input.ticket, .admission_limit);
                     continue;
                 };
+                if (request == .command and request.command.payload == .attachment_add and input.attachment_bytes != 0) {
+                    const bytes = allocator.alloc(u8, input.attachment_bytes) catch {
+                        self.fail(input.ticket, .admission_limit);
+                        continue;
+                    };
+                    @memcpy(bytes, input.attachment_content[0..input.attachment_bytes]);
+                    request.command.payload.attachment_add.content = bytes;
+                }
                 self.handle(&owner, allocator, input.ticket, request, prompt_transfer[0..input.prompt_bytes]) catch |err| {
                     self.database.rollback() catch {};
                     self.fail(input.ticket, switch (err) {
@@ -1766,6 +1938,7 @@ pub const Host = struct {
                     };
                     request.start.prompt_ref = null;
                 };
+                try owner.hydrateStartAttachments(allocator, &request);
                 try owner.delivered(allocator, effect.id, try entry.adapter.dispatch(allocator, request));
             } else {
                 try owner.delivered(allocator, effect.id, .{ .outcome = .unknown, .detail = "No live instance for durable session; explicit reconciliation required" });
@@ -1829,6 +2002,7 @@ pub const Host = struct {
             .threads => |v| v.page,
             .messages => |v| v.page,
             .blocks => |v| v.page,
+            .attachments => |v| v.page,
             .content => |v| v.page,
             .runs => |v| v.page,
             .effects => |v| v.page,
@@ -1855,6 +2029,7 @@ pub const Host = struct {
             .threads => |*v| v.page = .{},
             .messages => |*v| v.page = .{},
             .blocks => |*v| v.page = .{},
+            .attachments => |*v| v.page = .{},
             .content => |*v| v.page = .{},
             .runs => |*v| v.page = .{},
             .effects => |*v| v.page = .{},
@@ -1982,6 +2157,11 @@ pub const Host = struct {
                 values[0] = .{ .text = v.message.value };
                 n = 1;
             },
+            .attachments => |v| {
+                sql = "SELECT rowid,id,revision,thread_id,name,media_type,byte_length,digest,kind FROM attachments WHERE thread_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                values[0] = .{ .text = v.thread.value };
+                n = 1;
+            },
             .runs => |v| {
                 sql = "SELECT rowid,id,revision,thread_id,session_id,state,requested,effective,coalesce((SELECT evidence FROM observations WHERE session_id=runs.session_id AND json_extract(CAST(correlation AS TEXT),'$.run.value')=runs.id AND evidence IS NOT NULL ORDER BY commit_sequence DESC LIMIT 1),'') FROM runs WHERE thread_id=? AND rowid>? ORDER BY rowid LIMIT ?";
                 values[0] = .{ .text = v.thread.value };
@@ -2058,6 +2238,7 @@ pub const Host = struct {
                     break :blk .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator), .title_preview = if (explicit_title.len != 0) explicit_title else try allocator.dupe(u8, prompt_preview), .title = explicit_title, .latest_run_state = if (s.isNull(8)) null else try enumeration(t.RunState, s, 8), .project_name = try text(allocator, s, 9), .workspace_root = try text(allocator, s, 10), .workspace_branch = try text(allocator, s, 11) } };
                 },
                 .blocks => .{ .block = try descriptor(allocator, s) },
+                .attachments => .{ .attachment = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .thread = .{ .value = try text(allocator, s, 3) }, .name = try text(allocator, s, 4), .media_type = try text(allocator, s, 5), .byte_length = try number(s, 6), .digest = try text(allocator, s, 7), .kind = try enumeration(a.AttachmentKind, s, 8) } },
                 .messages => blk: {
                     const message_id = a.MessageId{ .value = try text(allocator, s, 1) };
                     // One descriptor keeps nested work bounded; continuation uses

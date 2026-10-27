@@ -88,10 +88,12 @@ test "direct runtime Start validates attachment count bytes metadata kind duplic
     try std.testing.expectError(error.InvalidAttachment, validate(request));
     var metadata: [8]c.Attachment = undefined;
     var hashes: [8][64]u8 = undefined;
+    var ids: [8][128]u8 = undefined;
     for (&metadata, 0..) |*item, i| {
         item.* = testAttachment("", &.{@as(u8, @intCast('a' + i))}, &hashes[i]);
         item.metadata.name = "n" ** 256;
-        item.metadata.id.value = &([_]u8{@as(u8, @intCast('a' + i))} ** 128);
+        @memset(&ids[i], @intCast('a' + i));
+        item.metadata.id.value = &ids[i];
         item.metadata.media_type = "t" ** 128;
     }
     request.attachments = &metadata;

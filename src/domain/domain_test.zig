@@ -280,6 +280,40 @@ test "explicit chat titles are durable, bounded, revisioned and idempotent" {
     try std.testing.expectEqualStrings(title, try retained.bytes(0));
 }
 
+test "durable attachment boundary validates digest, keeps bytes out of effects, and binds immutably" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "attachments", .utc_ms = 1 };
+    const conversation = try Conversation.create(&owner, allocator);
+    var runtime: AsyncAdapter = .{};
+    owner.factory = runtime.factory();
+    const bytes = try allocator.alloc(u8, 256 * 1024);
+    @memset(bytes, 0x5a);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    var digest_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&digest_hex, "{s}", .{std.fmt.bytesToHex(digest, .lower)}) catch unreachable;
+    const add = try owner.command(allocator, .{ .command_id = .{ .value = "attachment-add" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .attachment_add = .{ .metadata = .{ .id = .{ .value = "a1" }, .name = "blob.txt", .media_type = "text/plain", .byte_length = bytes.len, .digest = &digest_hex }, .content = bytes } } });
+    try std.testing.expectEqual(.accepted, add.outcome);
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM attachments WHERE id='a1' AND length(content)=262144"));
+    const bad = try owner.command(allocator, .{ .command_id = .{ .value = "attachment-bad" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .attachment_add = .{ .metadata = .{ .id = .{ .value = "bad" }, .name = "bad.txt", .media_type = "text/plain", .byte_length = 1, .digest = &digest_hex }, .content = "x" } } });
+    try std.testing.expectEqual(.rejected, bad.outcome);
+    try std.testing.expectEqual(.attachment_limit, bad.reason.?);
+    const send = try owner.command(allocator, .{ .command_id = .{ .value = "attachment-send" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "read this", .selection = .{ .runtime_kind = "codex", .required_runtime_version = "0.163.0", .model_provider = "openai", .model_id = "fixture", .effort = "none", .account_ref = "local", .workspace = conversation.workspace }, .attachments = &.{.{ .value = "a1" }} } } });
+    try std.testing.expectEqual(.accepted, send.outcome);
+    const start_effect = try f.store.prepare("SELECT request FROM effects WHERE kind='start'", &.{});
+    defer start_effect.deinit();
+    try std.testing.expect(try start_effect.step());
+    try std.testing.expect(std.mem.indexOf(u8, try start_effect.bytes(0), "5a5a5a") == null);
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM attachment_refs"));
+    const remove = try owner.command(allocator, .{ .command_id = .{ .value = "attachment-remove" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 3 }, .payload = .{ .attachment_remove = .{ .value = "a1" } } });
+    try std.testing.expectEqual(.rejected, remove.outcome);
+    try std.testing.expectEqual(.busy, remove.reason.?);
+}
+
 test "title validation is transactional at Unicode byte boundaries and survives reopen" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -321,7 +355,7 @@ test "schema five adds empty titles without changing existing messages or revisi
     try f.store.close();
     var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
     f.store = try storage.Store.open(std.testing.io, try f.path(&directory));
-    try std.testing.expectEqual(@as(i64, 6), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 7), try f.store.scalar("PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM threads WHERE id='h' AND title='' AND revision=1"));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM messages WHERE id='m'"));
 }
@@ -706,8 +740,11 @@ const AsyncAdapter = struct {
     fn handle(self: *AsyncAdapter) adapter.Adapter {
         return .{ .context = self, .vtable = &vtable };
     }
-    fn discoverFactory(context: *anyopaque, _: t.adapter.Selection) t.adapter.Discovery {
-        return discover(context);
+    fn discoverFactory(context: *anyopaque, requested: t.adapter.Selection) t.adapter.Discovery {
+        var result = discover(context);
+        result.runtime_kind = requested.runtime_kind;
+        result.runtime_version = requested.required_runtime_version;
+        return result;
     }
     fn accountFactory(context: *anyopaque, _: t.adapter.Selection) t.adapter.Account {
         return account(context);
@@ -1585,4 +1622,220 @@ test "late request refusal stays with its original run across reopen and a newer
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE kind='message' AND state='failed' AND CAST(outcome AS TEXT)='old message refused'"));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='completed'"));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='interrupted'"));
+}
+
+fn fixtureAttachment(allocator: std.mem.Allocator, id: []const u8, bytes: []const u8) !t.adapter.Attachment {
+    return .{ .metadata = .{ .id = .{ .value = id }, .name = "notes.txt", .media_type = "text/plain", .byte_length = bytes.len, .digest = try allocator.dupe(u8, &std.fmt.bytesToHex(t.digest(bytes), .lower)) }, .content = bytes };
+}
+fn uploadEnvelope(conversation: Conversation, id: []const u8, revision: u64, attachment: t.adapter.Attachment) t.CommandEnvelope {
+    return .{ .command_id = .{ .value = id }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = revision }, .payload = .{ .attachment_add = attachment } };
+}
+fn attachedSend(conversation: Conversation, id: []const u8, revision: u64, refs: []const t.adapter.AttachmentId) t.CommandEnvelope {
+    var result = conversation.send(id, "attachment fixture", revision);
+    result.payload.thread_send.selection.runtime_kind = "codex";
+    result.payload.thread_send.selection.required_runtime_version = "0.163.0";
+    result.payload.thread_send.selection.model_provider = "openai";
+    result.payload.thread_send.attachments = refs;
+    return result;
+}
+
+test "attachment history is immutable across ten packets retry reopen and fresh staging budgets" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "attachment-history", .utc_ms = 1 };
+    const conversation = try Conversation.create(&owner, allocator);
+    var runtime: AsyncAdapter = .{};
+    owner.factory = runtime.factory();
+    const bytes = "a" ** (256 * 1024);
+    var revision: u64 = 1;
+    for (0..10) |index| {
+        const label = try std.fmt.allocPrint(allocator, "upload-{d}", .{index});
+        const attachment = try fixtureAttachment(allocator, label, bytes);
+        const command = uploadEnvelope(conversation, label, revision, attachment);
+        const receipt = try owner.command(allocator, command);
+        try std.testing.expectEqual(.accepted, receipt.outcome);
+        try std.testing.expectEqual(receipt.commit_sequence, (try owner.command(allocator, command)).commit_sequence);
+        revision += 1;
+        const send = attachedSend(conversation, try std.fmt.allocPrint(allocator, "send-{d}", .{index}), revision, &.{attachment.metadata.id});
+        const sent = try owner.command(allocator, send);
+        try std.testing.expectEqual(.accepted, sent.outcome);
+        try std.testing.expectEqual(sent.commit_sequence, (try owner.command(allocator, send)).commit_sequence);
+        revision += 1;
+        const open = (try owner.claimNext(allocator)).?;
+        try owner.delivered(allocator, open.id, .{ .outcome = .acknowledged, .session = .{ .id = sent.entity_ids.session.?, .instance = .{ .value = "instance" }, .upstream = .{ .value = "session" } }, .continuity = .proven });
+        const start = (try owner.claimNext(allocator)).?;
+        try std.testing.expectEqual(@as(usize, 0), start.request.start.attachments[0].content.len);
+        try std.testing.expectEqualStrings(attachment.metadata.digest, start.request.start.attachments[0].metadata.digest);
+        var materialized = start.request;
+        try owner.hydrateStartAttachments(allocator, &materialized);
+        try std.testing.expectEqualSlices(u8, bytes, materialized.start.attachments[0].content);
+        try owner.delivered(allocator, start.id, .{ .outcome = .acknowledged });
+        try owner.observe(allocator, .{ .correlation = start.request.start.correlation, .upstream_event = try std.fmt.allocPrint(allocator, "completed-{d}", .{index}), .body = .completed });
+    }
+    try std.testing.expectEqual(@as(i64, 10), try f.store.scalar("SELECT count(*) FROM attachment_refs"));
+    try std.testing.expectEqual(@as(i64, 10 * 256 * 1024), try f.store.scalar("SELECT sum(length(content)) FROM attachments"));
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try f.path(&path_buffer);
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, path);
+    try owner.recover();
+    const persisted = try f.store.prepare("SELECT request FROM effects WHERE kind='start' ORDER BY rowid LIMIT 1", &.{});
+    defer persisted.deinit();
+    try std.testing.expect(try persisted.step());
+    const durable = try t.decode(t.adapter.Request, try persisted.bytes(0), allocator);
+    var hydrated = durable;
+    try owner.hydrateStartAttachments(allocator, &hydrated);
+    try std.testing.expectEqualSlices(u8, bytes, hydrated.start.attachments[0].content);
+    // Altered refs, metadata, and on-disk bytes must fail before external IO.
+    var forged = durable;
+    const forged_items = try allocator.dupe(t.adapter.Attachment, durable.start.attachments);
+    forged_items[0].metadata.id.value = "not-bound-to-message";
+    forged.start.attachments = forged_items;
+    try std.testing.expectError(error.Corrupt, owner.hydrateStartAttachments(allocator, &forged));
+    forged_items[0] = durable.start.attachments[0];
+    forged_items[0].metadata.name = "changed.txt";
+    try std.testing.expectError(error.Corrupt, owner.hydrateStartAttachments(allocator, &forged));
+    try f.store.exec("UPDATE attachments SET content=X'00' WHERE id='upload-0'");
+    var corrupted = durable;
+    try std.testing.expectError(error.Corrupt, owner.hydrateStartAttachments(allocator, &corrupted));
+    try f.store.execute("UPDATE attachments SET content=? WHERE id='upload-0'", &.{.{ .blob = bytes }});
+    const orphan = try fixtureAttachment(allocator, "unsent", "café 世界");
+    const add = uploadEnvelope(conversation, "new-after-reopen", revision, orphan);
+    try std.testing.expectEqual(.accepted, (try owner.command(allocator, add)).outcome);
+    revision += 1;
+    var changed = add;
+    changed.payload.attachment_add.metadata.name = "changed.txt";
+    try std.testing.expectEqual(.command_id_conflict, (try owner.command(allocator, changed)).reason.?);
+    const removal: t.CommandEnvelope = .{ .command_id = .{ .value = "cleanup-unsent" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = revision }, .payload = .{ .attachment_remove = orphan.metadata.id } };
+    try std.testing.expectEqual(.accepted, (try owner.command(allocator, removal)).outcome);
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM attachments WHERE id='unsent'"));
+    // Retry returns the original acceptance without resurrecting deleted bytes.
+    try std.testing.expectEqual(.accepted, (try owner.command(allocator, add)).outcome);
+    try std.testing.expectEqual(@as(i64, 10), try f.store.scalar("SELECT count(*) FROM attachments"));
+    const first = try f.store.prepare("SELECT content FROM attachments WHERE id='upload-0'", &.{});
+    defer first.deinit();
+    try std.testing.expect(try first.step());
+    try std.testing.expectEqualSlices(u8, bytes, try first.bytes(0));
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM commands WHERE instr(CAST(canonical AS TEXT),'aaaaaaaaaaaaaaaa')>0"));
+}
+
+test "attachment sends reject count duplicates cross thread unsupported provider and packet aggregate without consuming staging" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "attachment-reject", .utc_ms = 1 };
+    const conversation = try Conversation.create(&owner, allocator);
+    var runtime: AsyncAdapter = .{};
+    owner.factory = runtime.factory();
+    const a1 = try fixtureAttachment(allocator, "a1", "notes");
+    const a2 = try fixtureAttachment(allocator, "a2", "other");
+    try std.testing.expectEqual(.accepted, (try owner.command(allocator, uploadEnvelope(conversation, "add1", 1, a1))).outcome);
+    try std.testing.expectEqual(.accepted, (try owner.command(allocator, uploadEnvelope(conversation, "add2", 2, a2))).outcome);
+    const other = try owner.command(allocator, .{ .command_id = .{ .value = "other-thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = conversation.project, .workspace = conversation.workspace } } });
+    var wrong = conversation;
+    wrong.thread = other.entity_ids.thread.?;
+    const cross = try owner.command(allocator, attachedSend(wrong, "cross-thread", 1, &.{a1.metadata.id}));
+    try std.testing.expectEqual(.not_found, cross.reason.?);
+    const many = [_]t.adapter.AttachmentId{a1.metadata.id} ** 9;
+    const overflow = try owner.command(allocator, attachedSend(conversation, "too-many", 3, &many));
+    try std.testing.expectEqual(.attachment_limit, overflow.reason.?);
+    const duplicate = try owner.command(allocator, attachedSend(conversation, "duplicate", 3, &.{ a1.metadata.id, a1.metadata.id }));
+    try std.testing.expectEqual(.attachment_limit, duplicate.reason.?);
+    var unsupported = attachedSend(conversation, "unsupported", 3, &.{a1.metadata.id});
+    unsupported.payload.thread_send.selection.runtime_kind = "fake";
+    unsupported.payload.thread_send.selection.required_runtime_version = "1";
+    try std.testing.expectEqual(.attachment_unsupported, (try owner.command(allocator, unsupported)).reason.?);
+    owner.limits.attachment_bytes = 9;
+    const aggregate = attachedSend(conversation, "aggregate", 3, &.{ a1.metadata.id, a2.metadata.id });
+    const refused = try owner.command(allocator, aggregate);
+    try std.testing.expectEqual(.attachment_limit, refused.reason.?);
+    owner.limits.attachment_bytes = 256 * 1024;
+    try std.testing.expectEqual(refused.commit_sequence, (try owner.command(allocator, aggregate)).commit_sequence);
+    try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM attachments"));
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM attachment_refs"));
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM runs"));
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM prompt_uploads"));
+    try std.testing.expectEqual(.accepted, (try owner.command(allocator, attachedSend(conversation, "valid-after-refusals", 3, &.{ a1.metadata.id, a2.metadata.id }))).outcome);
+}
+
+test "attachment staging custom count bytes and Unicode metadata byte budgets survive reopen" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "attachment-limits", .utc_ms = 1 };
+    const conversation = try Conversation.create(&owner, allocator);
+    var a1 = try fixtureAttachment(allocator, "1", "café");
+    a1.metadata.name = "界" ** 30;
+    const a2 = try fixtureAttachment(allocator, "2", "x");
+    const budget = @import("attachments.zig").metadataBytes(a1.metadata) + @import("attachments.zig").metadataBytes(a2.metadata) - 1;
+    owner.limits.attachment_metadata_bytes = budget;
+    try std.testing.expectEqual(.accepted, (try owner.command(allocator, uploadEnvelope(conversation, "first", 1, a1))).outcome);
+    const rejected = try owner.command(allocator, uploadEnvelope(conversation, "unicode-over-budget", 2, a2));
+    try std.testing.expectEqual(.attachment_limit, rejected.reason.?);
+    owner.limits.attachment_metadata_bytes = 4096;
+    owner.limits.attachment_count = 1;
+    try std.testing.expectEqual(.attachment_limit, (try owner.command(allocator, uploadEnvelope(conversation, "count-limit", 2, a2))).reason.?);
+    owner.limits.attachment_count = 8;
+    owner.limits.attachment_bytes = a1.content.len;
+    try std.testing.expectEqual(.attachment_limit, (try owner.command(allocator, uploadEnvelope(conversation, "bytes-limit", 2, a2))).reason.?);
+    var invalid = try fixtureAttachment(allocator, "invalid", "\xff");
+    owner.limits = .{};
+    try std.testing.expectEqual(.invalid_command, (try owner.command(allocator, uploadEnvelope(conversation, "bad-utf8", 2, invalid))).reason.?);
+    invalid.metadata.kind = .image;
+    try std.testing.expectEqual(.invalid_command, (try owner.command(allocator, uploadEnvelope(conversation, "bad-kind", 2, invalid))).reason.?);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try f.path(&path_buffer);
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, path);
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM attachments"));
+    try std.testing.expectEqual(rejected.commit_sequence, (try owner.command(allocator, uploadEnvelope(conversation, "unicode-over-budget", 2, a2))).commit_sequence);
+}
+
+test "followup attachments are explicitly refused without changing active run or queued message" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var runtime: AsyncAdapter = .{};
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "attachment-followup", .utc_ms = 1, .factory = runtime.factory() };
+    const turn = try FollowupTurn.begin(&owner, allocator);
+    const attachment = try fixtureAttachment(allocator, "a", "file body");
+    const revision: u64 = @intCast(try f.store.scalar("SELECT revision FROM runs"));
+    const enqueue = try owner.command(allocator, .{ .command_id = .{ .value = "attached-followup" }, .target = .{ .run = turn.sent.entity_ids.run.? }, .expected_revision = .{ .revision = revision }, .payload = .{ .followup_enqueue = .{ .content = "continue", .attachments = &.{attachment} } } });
+    try std.testing.expectEqual(.attachment_unsupported, enqueue.reason.?);
+    try std.testing.expectEqual(revision, @as(u64, @intCast(try f.store.scalar("SELECT revision FROM runs"))));
+    const queued = try turn.enqueue(&owner, allocator, "plain-followup");
+    const effect_revision: u64 = @intCast(try f.store.scalar("SELECT revision FROM effects WHERE kind='message'"));
+    const edited = try owner.command(allocator, .{ .command_id = .{ .value = "attached-edit" }, .target = .{ .effect = .{ .value = queued.entity_ids.followup.?.value } }, .expected_revision = .{ .revision = effect_revision }, .payload = .{ .followup_edit = .{ .content = "replace", .attachments = &.{attachment} } } });
+    try std.testing.expectEqual(.attachment_unsupported, edited.reason.?);
+    try std.testing.expectEqual(effect_revision, @as(u64, @intCast(try f.store.scalar("SELECT revision FROM effects WHERE kind='message'"))));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE state='streaming'"));
+    const pending = (try owner.claimNext(allocator)).?;
+    try std.testing.expectEqual(@as(usize, 0), pending.request.message.attachments.len);
+    try std.testing.expectEqualStrings("later 世界", pending.request.message.content);
+}
+
+test "attachment schema v6 migration preserves prior data and reopens with durable bodies and references" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try seed(&f.store);
+    try f.store.exec("DROP TABLE attachment_refs; DROP TABLE attachments; UPDATE meta SET schema_version=6; PRAGMA user_version=6");
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try f.path(&path_buffer);
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, path);
+    try std.testing.expectEqual(@as(i64, 7), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM messages WHERE id='m'"));
+    try f.store.exec("INSERT INTO attachments VALUES('a',1,'h','fixture.txt','text/plain',3,'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad','file',X'616263'); INSERT INTO attachment_refs VALUES('m','a',0)");
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, path);
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM attachments JOIN attachment_refs ON attachment_id=id WHERE content=X'616263'"));
 }

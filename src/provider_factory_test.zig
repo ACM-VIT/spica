@@ -847,6 +847,10 @@ fn nativeAttachmentConsumer(comptime kind: c.RuntimeKind) !void {
     const environment = try @import("runtime/environment.zig").build(a, kind, account, &.{});
     var config: native.NativeFactory = .{ .configs = &.{.{ .selection = chosen, .executable = executable, .environment = environment }} };
     const factory = config.asFactory();
+    if (kind == .opencode) {
+        try std.testing.expectEqual(.unsupported, factory.discover(chosen).capabilities[@intFromEnum(c.Capability.attachment)].status);
+        config.opencode_attachments_supported = true;
+    }
     try std.testing.expectEqual(.supported, factory.discover(chosen).capabilities[@intFromEnum(c.Capability.attachment)].status);
     try std.testing.expectEqual(.unsupported, factory.discover(chosen).capabilities[@intFromEnum(c.Capability.followup_queue)].status);
     const instance = try factory.create(std.testing.allocator, chosen, root, .{ .value = "attachment-session" }, null);
@@ -855,7 +859,7 @@ fn nativeAttachmentConsumer(comptime kind: c.RuntimeKind) !void {
     try pumpAttachmentFixture(instance, a, kind, .ready);
     _ = try instance.dispatch(a, .{ .open = .{ .create = .{ .session = .{ .value = "attachment-session" }, .effect = .{ .value = "open" }, .selection = chosen } } });
     try pumpAttachmentFixture(instance, a, kind, .opened);
-    for (0..3) |scenario| {
+    for (0..(if (kind == .opencode) @as(usize, 4) else 3)) |scenario| {
         const bytes = try a.alloc(u8, 256 * 1024);
         @memset(bytes, if (scenario == 0) 0xff else 1);
         var attached: [8]c.Attachment = undefined;
@@ -863,6 +867,7 @@ fn nativeAttachmentConsumer(comptime kind: c.RuntimeKind) !void {
         for (attached[0..count], 0..) |*item, index| {
             const id_value = try std.fmt.allocPrint(a, "a-{d}-{d}", .{ scenario, index });
             item.* = try attachmentFixtureBytes(a, bytes[index * (bytes.len / count) .. (index + 1) * (bytes.len / count)], id_value, scenario == 0 or (scenario == 2 and index % 2 == 0));
+            if (scenario == 3) item.metadata.media_type = "application/pdf";
         }
         // Invalid UTF8 text is refused before provider state changes; the same
         // session then accepts the valid maximal packet through the real process.
@@ -887,7 +892,7 @@ fn nativeAttachmentConsumer(comptime kind: c.RuntimeKind) !void {
         try std.testing.expectEqual(@as(i64, 256 * 1024), total);
         turns += 1;
     }
-    try std.testing.expectEqual(@as(usize, 3), turns);
+    try std.testing.expectEqual(@as(usize, if (kind == .opencode) 4 else 3), turns);
 }
 
 test "Codex production factory attachment wire is accepted by strict offline consumer at maximum inputs" {
