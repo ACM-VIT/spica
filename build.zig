@@ -47,6 +47,17 @@ pub fn build(b: *std.Build) void {
     const smoke_run = b.addRunArtifact(domain_smoke);
     if (b.args) |args| smoke_run.addArgs(args);
     b.step("domain-smoke", "Exercise the actual isolated SQLite storage consumer").dependOn(&smoke_run.step);
+
+    // Bounded synthetic history pressure fixture. It depends only on the public
+    // domain Host and storage boundary, never on the UI/provider executable.
+    const history_module = b.createModule(.{ .root_source_file = b.path("src/history_fixture.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    history_module.addImport("domain", domain_module);
+    const history_fixture = b.addExecutable(.{ .name = "build-history-fixture", .root_module = history_module });
+    const history_install = b.addInstallArtifact(history_fixture, .{});
+    b.step("build-history-fixture", "Build the bounded public Host history fixture").dependOn(&history_install.step);
+    const history_test = b.addSystemCommand(&.{ "python3", "build/history_fixture_test.py" });
+    history_test.step.dependOn(&history_install.step);
+    b.step("test-history-fixture", "Exercise the bounded public Host history fixture").dependOn(&history_test.step);
     const catalog_module = b.createModule(.{ .root_source_file = b.path("src/provider_catalog_smoke.zig"), .target = target, .optimize = optimize, .link_libc = true });
     storageDependencies(b, catalog_module);
     catalog_module.addIncludePath(b.path("src/runtime"));
@@ -96,6 +107,7 @@ pub fn build(b: *std.Build) void {
     test_module.addCSourceFile(.{ .file = b.path("src/native/parse_arena_test.c"), .flags = &.{ "-std=c11", "-O2" } });
     const tests = b.addTest(.{ .root_module = test_module, .filters = if (test_filter) |filter| &.{filter} else &.{} });
     const test_step = b.step("test", "Run reusable native, Unicode, content, platform, and bootstrap regressions");
+    test_step.dependOn(&history_test.step);
     const test_run = b.addRunArtifact(tests);
     // Reuse compiled artifacts, but exercise tests on every check invocation.
     test_run.has_side_effects = true;
