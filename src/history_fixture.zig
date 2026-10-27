@@ -25,6 +25,7 @@ const Config = struct {
     seed: u64,
     name: []const u8,
     cancel_last: bool,
+    git_init: bool,
 };
 
 const Manifest = struct {
@@ -54,6 +55,7 @@ const Provenance = struct {
     runtime: []const u8,
     seed: u64,
     name: []const u8,
+    git_initialized: bool,
 };
 
 const Approval = struct {
@@ -113,7 +115,7 @@ const Consumer = struct {
 fn usage(io: std.Io) !void {
     try std.Io.File.stderr().writeStreamingAll(
         io,
-        "usage: build-history-fixture --state PATH --workspace PATH --threads N --turns N --content-bytes N --seed N --name NAME [--cancel-last]\n",
+        "usage: build-history-fixture --state PATH --workspace PATH --threads N --turns N --content-bytes N --seed N --name NAME [--cancel-last] [--git-init]\n",
     );
 }
 
@@ -133,9 +135,15 @@ fn parse(args: []const []const u8, io: std.Io) !Config {
     var seed: ?u64 = null;
     var name: ?[]const u8 = null;
     var cancel_last = false;
+    var git_init = false;
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
         const flag = args[index];
+        if (std.mem.eql(u8, flag, "--git-init")) {
+            if (git_init) return error.InvalidArgument;
+            git_init = true;
+            continue;
+        }
         if (std.mem.eql(u8, flag, "--cancel-last")) {
             if (cancel_last) return error.InvalidArgument;
             cancel_last = true;
@@ -181,7 +189,7 @@ fn parse(args: []const []const u8, io: std.Io) !Config {
     if (generated_turns > max_generated_turns or generated_turns > max_total_prompt_bytes / content.?) return error.InvalidArgument;
     if (!std.fs.path.isAbsolute(state.?) or !std.fs.path.isAbsolute(workspace.?)) return error.AmbiguousPath;
     if (std.mem.eql(u8, state.?, workspace.?)) return error.AmbiguousPath;
-    return .{ .state_path = state.?, .workspace_path = workspace.?, .threads = threads.?, .turns = turns.?, .content_bytes = content.?, .seed = seed.?, .name = name.?, .cancel_last = cancel_last };
+    return .{ .state_path = state.?, .workspace_path = workspace.?, .threads = threads.?, .turns = turns.?, .content_bytes = content.?, .seed = seed.?, .name = name.?, .cancel_last = cancel_last, .git_init = git_init };
 }
 
 fn directoryIsEmpty(io: std.Io, path: []const u8) !bool {
@@ -446,7 +454,7 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, config: Config, state_pa
         .cancelled_runs = cancelled_runs,
         .prompt_bytes = prompt_bytes,
         .content_bytes = content_bytes,
-        .provenance = .{ .generator = "build-history-fixture", .runtime = "domain.Host fake", .seed = config.seed, .name = config.name },
+        .provenance = .{ .generator = "build-history-fixture", .runtime = "domain.Host fake", .seed = config.seed, .name = config.name, .git_initialized = config.git_init },
     };
     var output: [16 * 1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output);
@@ -476,5 +484,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer allocator.free(state_path);
     const workspace_path = try ensureFreshDirectory(allocator, io, config.workspace_path);
     defer allocator.free(workspace_path);
+    if (config.git_init) {
+        // Capture the intended checkout identity only after creating its own
+        // empty repository. Initializing Git after capture would invalidate
+        // every Send binding and could inherit a surrounding checkout.
+        const result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "-C", workspace_path, "init", "--quiet" }, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        if (result.term != .exited or result.term.exited != 0) return error.GitInitFailed;
+    }
     try runFixture(allocator, io, config, state_path, workspace_path);
 }

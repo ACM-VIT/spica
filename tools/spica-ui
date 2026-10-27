@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Drive Spica through ordinary private-desktop input and read-only observations.
 
-The driver deliberately has no database or Host API.  It resolves semantic
-targets from the latest painted snapshot, translates them into compositor
+The driver deliberately has no database or Host API. History scenarios seed
+fresh disposable state through the public-Host fixture before launch. It resolves
+semantic targets from the latest painted snapshot, translates them into compositor
 coordinates, and records enough provenance to reproduce a failed action.
 """
 from __future__ import annotations
@@ -36,6 +37,8 @@ EX_PROVIDER = 15
 EX_ASSERTION = 16
 EX_PROCESS = 17
 EX_BUILD = 18
+
+HISTORY_CASES = {"history-deep": (2, 130), "history-wide": (40, 2)}
 
 
 class DriverError(Exception):
@@ -402,6 +405,8 @@ def launch(args: argparse.Namespace) -> int:
         build_command = ["python3", "build/driver.py", f"-Doptimize={args.optimize}"]
         try:
             run_command(build_command, timeout=300)
+            if args.scenario in HISTORY_CASES:
+                run_command(["python3", "build/driver.py", "build-history-fixture", f"-Doptimize={args.optimize}"], timeout=300)
         except DriverError as error:
             error.code = EX_BUILD
             raise
@@ -412,9 +417,11 @@ def launch(args: argparse.Namespace) -> int:
     state.mkdir()
     workspace = output / "workspace"
     workspace.mkdir()
+    history = prepare_history_fixture(binary, output, args.scenario) if args.scenario in HISTORY_CASES else None
     # Prevent Git discovery from inheriting the developer checkout surrounding
     # .artifacts. Even empty-workspace scenarios own a distinct unborn repo.
-    run_command(["git", "-C", workspace, "init", "--quiet"])
+    if history is None:
+        run_command(["git", "-C", workspace, "init", "--quiet"])
     if args.scenario == "workspace-diff":
         prepare_workspace_fixture(workspace)
     if args.provider in {"codex-fixture", "opencode-fixture"}:
@@ -461,6 +468,9 @@ def launch(args: argparse.Namespace) -> int:
         manifest.update({"session_nonce": secrets.token_hex(16), "window": window,
                          "observations": str(output / "live.json"), "launch": launch_info, "workspace": str(workspace),
                          "actions": []})
+        if history is not None:
+            manifest["history_fixture"] = history
+            manifest["limitations"].append("Synthetic public-Host history with fixed fake responses; no real provider or performance acceptance.")
         session = Session(output, manifest)
         bind_process(session, launch_info["pid"], process_nonce)
         session.save()
@@ -1235,6 +1245,121 @@ def assert_chat_title(current: dict[str, Any], title: str, draft: str | None = N
         raise DriverError("saved chat title/header/sidebar or retained draft disagree", EX_ASSERTION)
 
 
+def prepare_history_fixture(binary: Path, output: Path, name: str) -> dict[str, Any]:
+    """Run the bounded producer to completion before starting any GUI process."""
+    executable = binary.parent / "build-history-fixture"
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise DriverError("history fixture unavailable beside native binary; pass --build explicitly", EX_UNAVAILABLE)
+    threads, turns = HISTORY_CASES[name]
+    argv = [str(executable), "--state", str(output / "state"), "--workspace", str(output / "workspace"),
+            "--threads", str(threads), "--turns", str(turns), "--content-bytes", "96",
+            "--seed", "17", "--name", "GUI café 世界", "--git-init"]
+    result = run_command(argv, timeout=180)
+    if len(result.stdout.encode()) > 16 * 1024:
+        raise DriverError("history fixture manifest exceeds its bound", EX_ASSERTION)
+    manifest = json.loads(result.stdout)
+    if (manifest.get("fixture") != "synthetic-large-history"
+            or manifest.get("generated_threads") != threads or manifest.get("generated_turns") != threads * turns
+            or manifest.get("generated_messages") != threads * turns * 2
+            or manifest.get("completed_runs") != threads * turns or manifest.get("cancelled_runs") != 0
+            or manifest.get("state_path") != str(output / "state")
+            or manifest.get("workspace_path") != str(output / "workspace")
+            or not manifest.get("provenance", {}).get("git_initialized")
+            or not manifest.get("latest_thread_id")):
+        raise DriverError("history fixture manifest does not match requested disposable history", EX_ASSERTION)
+    atomic_json(output / "history-fixture.json", manifest)
+    return {"manifest": manifest, "binary_sha256": sha256(executable), "argv": argv}
+
+
+def history_ordinals(current: dict[str, Any]) -> list[int]:
+    return [ordinal for message, ordinal in zip(current.get("transcript_message_ids", []), current.get("transcript_ordinals", []))
+            if message and isinstance(ordinal, int)]
+
+
+def assert_history_page(before: dict[str, Any], current: dict[str, Any], *, draft: str, latest: bool) -> None:
+    if (current.get("thread_id") != before.get("thread_id") or current.get("draft") != draft
+            or current.get("follow_latest") != latest or current.get("visible_rich_blocks", 0) > 8
+            or not history_ordinals(current) or current.get("notice")):
+        raise DriverError("history navigation lost identity, draft, bounded tiles or expected position", EX_ASSERTION)
+    assert_no_new_provider_work(before, current, "history navigation")
+
+
+def scenario_history_deep(session: Session, args: argparse.Namespace) -> None:
+    turns = HISTORY_CASES["history-deep"][1]
+    end = turns * 2 - 1
+    before = composer_ready(session, args.timeout)
+    draft = "Retained history draft café 世界"
+    perform_input(session, "text", "composer.input", args.timeout, draft)
+    latest = wait_snapshot(session, lambda s: s.get("draft") == draft and end in history_ordinals(s),
+                           args.timeout, "deep history latest messages")
+    capture(session, "history-latest.png")
+    perform_key(session, "alt+Page_Up", args.timeout)
+    older = wait_snapshot(session, lambda s: history_ordinals(s) and min(history_ordinals(s)) < min(history_ordinals(latest))
+                          and not s.get("follow_latest"), args.timeout, "previous history page")
+    assert_history_page(latest, older, draft=draft, latest=False)
+    perform_key(session, "alt+Home", args.timeout)
+    first = wait_snapshot(session, lambda s: history_ordinals(s) and max(history_ordinals(s)) == 0
+                          and not s.get("follow_latest"),
+                          args.timeout, "first durable message")
+    assert_history_page(latest, first, draft=draft, latest=False)
+    capture(session, "history-first.png")
+    perform_key(session, "alt+Page_Down", args.timeout)
+    next_page = wait_snapshot(session, lambda s: history_ordinals(s) and max(history_ordinals(s)) > max(history_ordinals(first)),
+                              args.timeout, "next history page")
+    assert_history_page(latest, next_page, draft=draft, latest=False)
+    perform_key(session, "alt+End", args.timeout)
+    returned = wait_snapshot(session, lambda s: end in history_ordinals(s) and s.get("follow_latest"),
+                             args.timeout, "return to latest durable message")
+    assert_history_page(latest, returned, draft=draft, latest=True)
+    other = session.data["history_fixture"]["manifest"]["latest_thread_id"]
+    if other == before.get("thread_id"):
+        raise DriverError("deep fixture did not open its first thread", EX_ASSERTION)
+    perform_input(session, "click", other, args.timeout)
+    wait_snapshot(session, lambda s: s.get("thread_id") == other and s.get("draft") == ""
+                  and end in history_ordinals(s), args.timeout, "second populated chat")
+    perform_input(session, "click", before["thread_id"], args.timeout)
+    restored = wait_snapshot(session, lambda s: s.get("thread_id") == before["thread_id"] and s.get("draft") == draft
+                             and end in history_ordinals(s), args.timeout, "original populated chat and draft")
+    assert_history_page(latest, restored, draft=draft, latest=True)
+    perform_input(session, "click", "composer.input", args.timeout)
+    perform_key(session, "ctrl+a", args.timeout)
+    perform_key(session, "BackSpace", args.timeout)
+    sent = send_turn(session, "New turn after 130 durable turns 世界", args.timeout)
+    wait_snapshot(session, lambda s: end + 2 in history_ordinals(s), args.timeout, "new history tail")
+    restart_app(session, args)
+    reopened = wait_snapshot(session, lambda s: s.get("thread_id") == before["thread_id"]
+                             and s.get("run_id") == sent.get("run_id") and end + 2 in history_ordinals(s),
+                             args.timeout, "appended turn survives restart")
+    session.journal("scenario.history-deep", before, reopened, first_ordinal=0, last_ordinal=end + 2,
+                    input_origin="ordinary private vd keyboard and pointer", draft_retained_before_restart=True)
+    session.data["expected_outcome"] = "bounded_history_pages_chat_draft_retention_new_turn_and_restart"
+
+
+def scenario_history_wide(session: Session, args: argparse.Namespace) -> None:
+    before = composer_ready(session, args.timeout)
+    target = session.data["history_fixture"]["manifest"]["latest_thread_id"]
+    if any(item.get("id") == target for item in target_groups(before)):
+        raise DriverError("wide-history target unexpectedly belongs to the first resident page", EX_ASSERTION)
+    draft = "Retained wide-history draft café 世界"
+    perform_input(session, "text", "composer.input", args.timeout, draft)
+    query = f"thread={HISTORY_CASES['history-wide'][0] - 1} turn=0"
+    perform_input(session, "text", "sidebar.search", args.timeout, query)
+    found = wait_snapshot(session, lambda s: s.get("sidebar_search") == query
+                          and any(t.get("id") == target and t.get("enabled") for t in target_groups(s)),
+                          args.timeout, "automatic search beyond first 32 chat cards")
+    if found.get("draft") != draft or found.get("title_text") != before.get("title_text"):
+        raise DriverError("history search lost active draft or title", EX_ASSERTION)
+    assert_no_new_provider_work(before, found, "history search")
+    capture(session, "history-search.png")
+    perform_input(session, "click", target, args.timeout)
+    selected = wait_snapshot(session, lambda s: s.get("thread_id") == target and s.get("sidebar_search") == ""
+                             and s.get("draft") == "" and history_ordinals(s), args.timeout, "select matched durable chat")
+    capture(session, "history-selected.png")
+    session.journal("scenario.history-wide", before, selected, searched_thread_id=target,
+                    input_origin="ordinary private vd search and pointer; no Enter to scan")
+    session.data["expected_outcome"] = "automatic_durable_chat_search_beyond_resident_cards"
+
+
 def scenario_thread_title(session: Session, args: argparse.Namespace) -> None:
     first = send_turn(session, "offline title editing fixture", args.timeout)
     draft = "Retained draft café 世界"
@@ -1412,6 +1537,10 @@ def scenario(args: argparse.Namespace) -> int:
             scenario_opencode_session(session, args)
         elif args.name == "thread-title":
             scenario_thread_title(session, args)
+        elif args.name == "history-deep":
+            scenario_history_deep(session, args)
+        elif args.name == "history-wide":
+            scenario_history_wide(session, args)
         elif args.name == "codex-error":
             scenario_codex_error(session, args)
         elif args.name == "opencode-error":
@@ -1488,6 +1617,8 @@ def scenario_steps(name: str) -> list[str]:
             "opencode-session": ["launch production OpenCode 2.1.4 adapter with isolated offline ACP fixture", "Send two turns", "restart native app on same private desktop", "Send third turn", "assert one upstream session, distinct commands/runs/turns, exact UTF-8 prompt digests and resumed prior context"],
             "opencode-error": ["launch production OpenCode 2.1.4 adapter with isolated failing offline ACP fixture", "Send a prompt", "assert accepted command then failed run with retained specific synthetic provider diagnostic", "copy diagnostic with Ctrl+Shift+C and verify correlation without prompt content", "capture failure banner for visual review"],
             "thread-title": ["launch fake and complete a turn", "save a Unicode title with F2 and Enter", "cancel a pointer edit with Escape", "click composer while editing and verify draft input", "open Changes and search renamed chat", "switch chats and verify draft", "restart and verify durable title"],
+            "history-deep": ["seed 2 chats with 130 turns each through public Host before launch", "navigate previous, first, next and latest bounded history pages", "switch populated chats and retain draft", "Send a new turn", "restart and verify appended history"],
+            "history-wide": ["seed 40 chats through public Host before launch", "type a query matching chat outside first 32 cards", "wait for automatic durable search without Enter", "verify active title and draft", "select matched chat"],
             "disabled-send": ["launch fake", "snapshot empty composer", "assert command.send disabled"],
             "large-send": ["launch fake", "paste and Send all 65536 composer bytes", "assert accepted command, correlated completed run and empty draft"],
             "codex-large-send": ["launch production Codex adapter with offline fixture", "Send exact 65536-byte ASCII, emoji, escaped JSON and split-codepoint prompts", "assert four completed turns and matching upstream prompt digests"],
@@ -1514,6 +1645,7 @@ def receipt(args: argparse.Namespace, session: Session | None = None) -> int:
     receipt_data = {"version": 1, "status": "passed" if manifest.get("passed") else "incomplete",
                     "provider": manifest.get("provider"), "fixture_sha256": manifest.get("fixture_sha256"),
                     "scenario": manifest.get("scenario"), "revision": manifest.get("revision"),
+                    "history_fixture": manifest.get("history_fixture"),
                     "source_sha256": manifest.get("source_sha256"), "binary_sha256": manifest.get("binary_sha256"),
                     "input_method": manifest.get("input_method"), "expected_outcome": manifest.get("expected_outcome"),
                     "actions": len(manifest.get("actions", [])),
@@ -1601,7 +1733,7 @@ def parser() -> argparse.ArgumentParser:
     item = commands.add_parser("scenario", help="run a bounded offline GUI scenario")
     item.add_argument("name", choices=("send-restart", "disabled-send", "large-send", "composer-capacity", "codex-large-send", "opencode-large-send", "second-turn",
                                              "workspace-diff", "capability-refusal", "followup-refusal", "question-refusal", "attachment-refusal",
-                                             "codex-session", "codex-error", "opencode-session", "opencode-error", "thread-title"))
+                                             "codex-session", "codex-error", "opencode-session", "opencode-error", "thread-title", "history-deep", "history-wide"))
     item.add_argument("--provider", choices=("fake", "codex-fixture", "opencode-fixture"), help="offline fixture; inferred from scenario")
     item.add_argument("--prompt", default="offline GUI send")
     item.add_argument("--binary", type=Path)

@@ -53,6 +53,23 @@ class HistoryFixtureTest(unittest.TestCase):
                 self.assertEqual(list(actual.iterdir()), [])
                 self.assertFalse((root / "state/conversation.sqlite3").exists())
 
+    def test_git_is_initialized_before_durable_workspace_capture(self):
+        with tempfile.TemporaryDirectory(prefix="spica-history-git-") as directory:
+            root = pathlib.Path(directory)
+            result = self.invoke(root, extra=("--git-init",))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(json.loads(result.stdout)["provenance"]["git_initialized"])
+            workspace = root / "workspace"
+            self.assertTrue((workspace / ".git").is_dir())
+            top = subprocess.run(["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+                                 check=True, text=True, capture_output=True).stdout.strip()
+            self.assertEqual(top, str(workspace))
+            with sqlite3.connect((root / "state/conversation.sqlite3").as_uri() + "?mode=ro", uri=True) as db:
+                binding = json.loads(db.execute("SELECT binding FROM workspaces").fetchone()[0])
+                self.assertFalse(binding["non_git"])
+                self.assertEqual(binding["canonical_root"], str(workspace))
+                self.assertEqual(binding["repository_identity"], str(workspace / ".git"))
+
     def test_generates_and_rejects_reuse(self):
         executable = pathlib.Path("zig-out/bin/build-history-fixture").resolve()
         self.assertTrue(executable.is_file(), executable)

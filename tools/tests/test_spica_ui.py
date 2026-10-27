@@ -67,6 +67,58 @@ class SpicaUiOfflineTests(unittest.TestCase):
             self.assertIn("restart", result.stdout)
             self.assertFalse((Path(directory) / "session.json").exists())
 
+    def test_history_scenarios_dry_run_never_create_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ("history-deep", "history-wide"):
+                result = self.run_cli("scenario", name, "--output", directory, "--dry-run")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("public Host", result.stdout)
+                self.assertEqual(json.loads(result.stdout)["provider"], "fake")
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_history_fixture_requires_exact_paths_counts_and_successful_exit(self):
+        module = load_cli()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            binary = output / "spica"
+            executable = output / "build-history-fixture"
+            executable.write_text("synthetic test executable")
+            executable.chmod(0o700)
+            manifest = {"fixture": "synthetic-large-history", "generated_threads": 2,
+                        "generated_turns": 260, "generated_messages": 520, "completed_runs": 260,
+                        "cancelled_runs": 0, "state_path": str(output / "state"),
+                        "workspace_path": str(output / "workspace"), "latest_thread_id": "last",
+                        "provenance": {"git_initialized": True}}
+            for changed in ({"state_path": "/other"}, {"workspace_path": "/other"},
+                            {"completed_runs": 259}, {"generated_messages": 518}, {"latest_thread_id": ""},
+                            {"provenance": {"git_initialized": False}}):
+                with patch.object(module, "run_command", return_value=subprocess.CompletedProcess([], 0, json.dumps({**manifest, **changed}), "")):
+                    with self.assertRaises(module.DriverError):
+                        module.prepare_history_fixture(binary, output, "history-deep")
+                self.assertFalse((output / "history-fixture.json").exists())
+            with patch.object(module, "run_command", side_effect=module.DriverError("fixture failed")):
+                with self.assertRaises(module.DriverError):
+                    module.prepare_history_fixture(binary, output, "history-deep")
+            with patch.object(module, "run_command", return_value=subprocess.CompletedProcess([], 0, json.dumps(manifest), "")) as run:
+                result = module.prepare_history_fixture(binary, output, "history-deep")
+            self.assertEqual(result["manifest"], manifest)
+            self.assertEqual(run.call_args.kwargs["timeout"], 180)
+            self.assertEqual(json.loads((output / "history-fixture.json").read_text()), manifest)
+
+    def test_history_page_assertion_requires_identity_draft_bounded_tiles_and_no_commands(self):
+        module = load_cli()
+        before = {"thread_id": "thread", "run_id": "run", "send_command_id": "",
+                  "send_run_id": "", "pending_command": False}
+        page = {**before, "draft": "retained", "follow_latest": False, "visible_rich_blocks": 8,
+                "transcript_message_ids": ["message", ""], "transcript_ordinals": [0, 999]}
+        self.assertEqual(module.history_ordinals(page), [0])
+        module.assert_history_page(before, page, draft="retained", latest=False)
+        for changed in ({"thread_id": "other"}, {"run_id": "other"}, {"send_command_id": "new"},
+                        {"draft": "lost"}, {"visible_rich_blocks": 9}, {"follow_latest": True},
+                        {"transcript_message_ids": []}, {"notice": "QueryFailed"}):
+            with self.assertRaises(module.DriverError):
+                module.assert_history_page(before, {**page, **changed}, draft="retained", latest=False)
+
     def test_vd_symlink_resolves_to_packaged_resource_directory(self):
         module = load_cli()
         with tempfile.TemporaryDirectory() as directory:
