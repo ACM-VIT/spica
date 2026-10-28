@@ -3194,6 +3194,13 @@ const Conversation = struct {
                 }
                 const key = sidebarStateKey(self.workspace_root);
                 for (value.items) |row| try addEntry(&app.view.projects, &app.view.project_count, row.project.id.value, row.project.display_name);
+                // Keep project residency bounded while consuming opaque pages;
+                // the sidebar owns at most its fixed project table and never
+                // materializes an unbounded catalog in UI memory.
+                if (value.next_cursor) |cursor| if (app.view.project_count < app.view.projects.len) {
+                    try self.ask(.projects, .{ .projects = .{ .limit = @min(page.limit, app.view.projects.len - app.view.project_count), .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = cursor } });
+                    return;
+                };
                 if (!self.sidebar_state_loaded or !std.mem.eql(u8, &key, &self.sidebar_state_key)) {
                     self.sidebar_state_key = key;
                     self.sidebar_state_loaded = false;
