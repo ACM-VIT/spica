@@ -177,7 +177,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try dir.deleteFile(threaded.io(), ".ui-projection");
         try app.connect(threaded.io(), host.?, spool, &wake, provider.workspace_root orelse workspace_buffer[0..workspace_length]);
         if (!options.provider_explicit) {
-            const setup_defaults = try @import("startup.zig").defaults(arena.allocator(), threaded.io(), workspace_buffer[0..workspace_length], init.environ.getPosix("PATH"), init.environ.getPosix("HOME"), init.environ.getPosix("CODEX_HOME"));
+            const setup_defaults = try @import("startup.zig").defaults(arena.allocator(), threaded.io(), directory, init.environ.getPosix("PATH"), init.environ.getPosix("HOME"), init.environ.getPosix("CODEX_HOME"));
             try app.configureStartup(setup_defaults);
         } else if (provider.selection) |selection| try app.configureRuntime(selection, provider.configs[0].executable);
     }
