@@ -90,6 +90,71 @@ class SidebarEvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MODULE.assert_suppressed({"thread_targets": [{"enabled": True}]})
 
+    def test_child_actions_resolve_only_their_real_menu_parent(self):
+        for action in ("copy_id", "copy_path", "copy_branch"):
+            self.assertEqual(MODULE.menu_parent(action), "copy")
+        for action in ("snooze.1h", "snooze.3h", "snooze.custom"):
+            self.assertEqual(MODULE.menu_parent(action), "snooze")
+        for action in ("pin", "settle", "wake", "rename", "copy", "snooze"):
+            self.assertIsNone(MODULE.menu_parent(action))
+
+    def test_menu_topology_rejects_parent_leaks_overlap_and_offscreen_boxes(self):
+        value = {"thread_targets": [{"enabled": False}], "logical_width": 720, "logical_height": 480}
+        target = lambda identifier, y, x=450: {
+            "id": identifier, "enabled": True, "pointer_bounds": [x, y, 240, 28]}
+        child = target("sidebar.menu.copy_id", 320)
+        MODULE.assert_menu(value, [child], {child["id"]}, {"sidebar.menu.copy"})
+        failures = [([child, target("sidebar.menu.copy", 350)], {"sidebar.menu.copy_id"}),
+                    ([child, target("sidebar.menu.copy_path", 325)], {"sidebar.menu.copy_id"}),
+                    ([target("sidebar.menu.copy_id", 470)], {"sidebar.menu.copy_id"}),
+                    ([target("sidebar.menu.copy_id", 320, 500)], {"sidebar.menu.copy_id"}),
+                    ([child], {"sidebar.menu.copy_path"})]
+        for targets, required in failures:
+            with self.assertRaises(ValueError):
+                MODULE.assert_menu(value, targets, required, {"sidebar.menu.copy"})
+        with self.assertRaises(ValueError):
+            MODULE.assert_menu({**value, "thread_targets": [{"enabled": True}]},
+                               [child], {child["id"]})
+
+    def test_menu_choice_opens_parent_before_child_without_internal_state_mutation(self):
+        proof = MODULE.Proof(None, None)
+        actions = []
+        proof.menu_open = lambda parent: actions.append(("parent", parent))
+        proof.click = lambda identifier: actions.append(("click", identifier))
+        proof.menu_choose("snooze.1h")
+        proof.menu_choose("copy_id")
+        proof.menu_choose("wake")
+        self.assertEqual(actions, [("parent", "snooze"), ("click", "sidebar.menu.snooze.1h"),
+                                   ("parent", "copy"), ("click", "sidebar.menu.copy_id"),
+                                   ("click", "sidebar.menu.wake")])
+
+    def test_cancel_metadata_requires_aligned_explicit_revisions(self):
+        value = {"thread_targets": [{"id": "alpha"}, {"id": "bravo"}],
+                 "thread_count": 1, "thread_revisions": [3, 0],
+                 "thread_pinned": [False, False], "thread_settled": [False, False],
+                 "thread_snoozed_until": [0, 0], "thread_sort_order": [1, 0]}
+        self.assertEqual(MODULE.sidebar_metadata(value), {
+            "alpha": {"pinned": False, "settled": False, "snoozed_until": 0,
+                      "sort_order": 1, "revision": 3}})
+        for revisions in (None, [], [3]):
+            with self.assertRaises(ValueError):
+                MODULE.sidebar_metadata({**value, "thread_revisions": revisions})
+
+    def test_fractional_duration_requires_actual_submit_time_bracket(self):
+        for unit, delta in (("minutes", 90_000), ("hours", 5_400_000), ("days", 129_600_000)):
+            MODULE.assert_duration_deadline(1_000 + delta, 1_000, 1_100, 1.5, unit)
+            MODULE.assert_duration_deadline(1_100 + delta, 1_000, 1_100, 1.5, unit)
+            for actual in (True, None, delta + 999, delta + 1_101):
+                with self.assertRaises(ValueError):
+                    MODULE.assert_duration_deadline(actual, 1_000, 1_100, 1.5, unit)
+        for amount in (0, -1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                MODULE.assert_duration_deadline(1_000, 1_000, 1_100, amount, "hours")
+        with self.assertRaises(ValueError):
+            MODULE.assert_duration_deadline(1_000, 1_100, 1_000, 1.5, "hours")
+        with self.assertRaises(ValueError):
+            MODULE.assert_duration_deadline(1_000, 1_000, 1_100, 1.5, "weeks")
+
     def test_editor_requires_exact_text_and_observation_presence(self):
         expected = "Ae\u0301👩‍💻B"
         MODULE.assert_editor({"sidebar_search": expected}, "sidebar_search", expected)

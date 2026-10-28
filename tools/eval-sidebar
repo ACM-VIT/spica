@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -108,6 +109,62 @@ def assert_suppressed(snapshot: dict[str, Any]) -> None:
         raise ValueError("overlay admits covered thread hit targets")
 
 
+def menu_parent(action: str) -> str | None:
+    """Native child items require ordinary input through their painted parent."""
+    if action.startswith("copy_"):
+        return "copy"
+    if action.startswith("snooze."):
+        return "snooze"
+    return None
+
+
+def assert_menu(snapshot: dict[str, Any], targets: list[dict[str, Any]], required: set[str],
+                absent: set[str] = frozenset()) -> None:
+    """A menu can pass only with painted, bounded and nonoverlapping hit boxes."""
+    assert_suppressed(snapshot)
+    menu = {target.get("id"): target for target in targets
+            if target.get("id", "").startswith("sidebar.menu.") and target.get("enabled")}
+    if not required <= menu.keys() or absent & menu.keys():
+        raise ValueError("native menu differs from the expected submenu topology")
+    width, height = snapshot.get("logical_width"), snapshot.get("logical_height")
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+        raise ValueError("native menu lacks valid viewport dimensions")
+    bounds = []
+    for target in menu.values():
+        box = target.get("pointer_bounds")
+        if (not isinstance(box, list) or len(box) != 4
+                or any(type(value) not in (int, float) or not math.isfinite(value) for value in box)):
+            raise ValueError("native menu lacks a finite pointer box")
+        x, y, w, h = box
+        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > width or y + h > height:
+            raise ValueError("native menu hit box escapes its viewport")
+        bounds.append(box)
+    bounds.sort(key=lambda box: box[1])
+    if any(b[1] < a[1] + a[3] for a, b in zip(bounds, bounds[1:])):
+        raise ValueError("native menu hit boxes overlap")
+
+
+def sidebar_metadata(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    indexed = rows(snapshot)
+    revisions = snapshot.get("thread_revisions")
+    if not isinstance(revisions, list) or len(revisions) != len(snapshot.get("thread_targets", [])):
+        raise ValueError("missing or misaligned native sidebar revisions")
+    return {identifier: {**{field: row[field] for field in
+                           ("pinned", "settled", "snoozed_until", "sort_order")},
+                         "revision": revisions[row["index"]]}
+            for identifier, row in indexed.items()}
+
+
+def assert_duration_deadline(actual: Any, begin_ms: int, end_ms: int, amount: float, unit: str) -> None:
+    multipliers = {"minutes": 60_000, "hours": 3_600_000, "days": 86_400_000}
+    if (type(actual) is not int or unit not in multipliers or not math.isfinite(amount)
+            or amount <= 0 or end_ms < begin_ms):
+        raise ValueError("invalid native duration evidence")
+    delta = round(amount * multipliers[unit])
+    if not begin_ms + delta <= actual <= end_ms + delta:
+        raise ValueError("native duration deadline is outside the actual submit-time bracket")
+
+
 def assert_editor(snapshot: dict[str, Any], field: str, expected: str) -> None:
     if field not in snapshot or snapshot[field] != expected:
         raise ValueError("native line editor differs from exact expected text: " + field)
@@ -145,6 +202,8 @@ def plan() -> list[str]:
             "create three completed chats across two projects through painted controls",
             "verify compact Unicode search, keyboard activation and project scope",
             "right-click an inactive chat, pin/unpin, settle/restore, snooze/wake and reorder",
+            "open nested Copy/Snooze menus through pointer and keyboard input",
+            "reject invalid custom snooze dates, cancel without mutation, and submit local date/fractional durations",
             "verify inactive-chat actions retain active execution and the Unicode draft",
             "exercise real search/title editors: caret, selection, graphemes, clipboard and overflow",
             "save trimmed titles on blur and cancel title edits through ordinary F2/Escape input",
@@ -370,11 +429,169 @@ class Proof:
 
     def action(self, identifier, action, predicate, label, retained, draft):
         self.right_click(identifier)
-        self.click("sidebar.menu." + action)
+        self.menu_choose(action)
         current = self.wait(lambda value: not value.get("pending_command")
                             and predicate(rows(value)[identifier]), label)
         assert_retained(retained, current, draft)
         return current
+
+    def menu_open(self, parent, method="pointer"):
+        parent_id = "sidebar.menu." + parent
+        if method == "pointer":
+            self.click(parent_id)
+        elif method == "keyboard":
+            # Home selects the first enabled item; walk the actual main-menu
+            # order so keyboard opening never depends on an invented row index.
+            current = self.session.snapshot(self.args.timeout)
+            targets = [target for target in self.ui.target_groups(current)
+                       if target.get("enabled") and target.get("id", "").startswith("sidebar.menu.")]
+            parent_index = next((index for index, target in enumerate(targets)
+                                 if target["id"] == parent_id), None)
+            if parent_index is None:
+                raise ValueError("native parent menu item unavailable: " + parent_id)
+            self.key("Home")
+            for _ in range(parent_index):
+                self.key("Down")
+            self.key("Right")
+        else:
+            raise ValueError("unsupported ordinary menu input method")
+        required = {"sidebar.menu.copy_id"} if parent == "copy" else {
+            "sidebar.menu.snooze.1h", "sidebar.menu.snooze.3h", "sidebar.menu.snooze.custom"}
+        current = self.wait(lambda value: required <= {target.get("id")
+                            for target in self.ui.target_groups(value) if target.get("enabled")},
+                            parent + " submenu painted through " + method + " input")
+        assert_menu(current, self.ui.target_groups(current), required,
+                    {"sidebar.menu.pin", "sidebar.menu.rename", "sidebar.menu.copy", "sidebar.menu.snooze"})
+        return current
+
+    def menu_choose(self, action):
+        parent = menu_parent(action)
+        if parent is not None:
+            self.menu_open(parent)
+        return self.click("sidebar.menu." + action)
+
+    def exercise_submenus(self, identifier, retained, draft):
+        """Enter and leave both nested menus with ordinary keyboard input."""
+        for parent in ("copy", "snooze"):
+            self.right_click(identifier)
+            current = self.menu_open(parent, "keyboard")
+            assert_retained(retained, current, draft)
+
+            self.shot(parent + "-submenu.png")
+            self.key("Left")
+            current = self.wait(lambda value: any(target.get("enabled")
+                                and target.get("id") == "sidebar.menu." + parent
+                                for target in self.ui.target_groups(value)),
+                                "Left returns from " + parent + " submenu to its parent")
+            assert_menu(current, self.ui.target_groups(current), {"sidebar.menu." + parent},
+                        {"sidebar.menu.copy_id", "sidebar.menu.snooze.1h"})
+            self.key("Right")
+            required = "sidebar.menu.copy_id" if parent == "copy" else "sidebar.menu.snooze.1h"
+            current = self.wait(lambda value: any(target.get("enabled") and target.get("id") == required
+                                for target in self.ui.target_groups(value)),
+                                "Right reopens the retained " + parent + " parent selection")
+            assert_retained(retained, current, draft)
+            self.key("Escape")
+            current = self.wait(lambda value: not value.get("sidebar_menu_thread"),
+                                "Escape dismisses " + parent + " submenu without mutation")
+            assert_retained(retained, current, draft)
+
+    def custom_open(self, identifier, retained, draft):
+        self.right_click(identifier)
+        self.menu_choose("snooze.custom")
+        current = self.wait(lambda value: value.get("sidebar_custom_snooze_open") is True
+                            and value.get("sidebar_custom_snooze_thread") == identifier,
+                            "custom snooze dialog owns exact inactive thread")
+        required = {"sidebar.custom_snooze.mode.date", "sidebar.custom_snooze.mode.duration",
+                    "sidebar.custom_snooze.date", "sidebar.custom_snooze.time",
+                    "sidebar.custom_snooze.cancel", "sidebar.custom_snooze.submit"}
+        enabled = {target.get("id") for target in self.ui.target_groups(current) if target.get("enabled")}
+        if not required <= enabled:
+            raise ValueError("custom snooze lacks painted date controls")
+        assert_suppressed(current)
+        assert_retained(retained, current, draft)
+        return current
+
+    def custom_field(self, target, value, retained, draft):
+        self.click("sidebar.custom_snooze." + target)
+        return self.replace_editor("sidebar_custom_snooze_" + target, value,
+                                   "custom snooze " + target + " exact ordinary input", retained, draft)
+
+    def custom_snooze_cases(self, identifier, retained, draft):
+        before = sidebar_metadata(self.session.snapshot(self.args.timeout))
+        self.custom_open(identifier, retained, draft)
+        self.custom_field("date", "2026-02-30", retained, draft)
+        self.click("sidebar.custom_snooze.submit")
+        current = self.wait(lambda value: value.get("sidebar_custom_snooze_open") is True
+                            and bool(value.get("sidebar_custom_snooze_error")),
+                            "invalid local snooze date shows error and keeps dialog open")
+        if sidebar_metadata(current) != before:
+            raise ValueError("invalid custom date mutated durable thread metadata")
+        assert_retained(retained, current, draft)
+        self.shot("custom-snooze-invalid.png")
+        self.click("sidebar.custom_snooze.cancel")
+        current = self.wait(lambda value: value.get("sidebar_custom_snooze_open") is False,
+                            "custom snooze cancel dismisses without mutation")
+        if sidebar_metadata(current) != before:
+            raise ValueError("custom date cancellation mutated durable thread metadata")
+        assert_retained(retained, current, draft)
+
+        self.custom_open(identifier, retained, draft)
+        self.click("sidebar.custom_snooze.calendar")
+        self.wait(lambda value: value.get("sidebar_custom_snooze_calendar_open") is True,
+                  "custom snooze calendar opens through painted control")
+        self.shot("custom-snooze-calendar.png")
+        self.key("Escape")
+        self.wait(lambda value: value.get("sidebar_custom_snooze_open") is True
+                  and value.get("sidebar_custom_snooze_calendar_open") is False,
+                  "Escape closes calendar while preserving custom dialog")
+        local = datetime.datetime.now() + datetime.timedelta(days=2)
+        chosen = local.replace(hour=12, minute=34, second=0, microsecond=0)
+        self.custom_field("date", chosen.strftime("%Y-%m-%d"), retained, draft)
+        self.custom_field("time", chosen.strftime("%H:%M"), retained, draft)
+        self.shot("custom-snooze-date.png")
+        self.click("sidebar.custom_snooze.submit")
+        current = self.wait(lambda value: value.get("sidebar_custom_snooze_open") is False
+                            and not value.get("pending_command")
+                            and rows(value)[identifier]["snoozed_until"] > 0,
+                            "valid custom date commits exact inactive thread")
+        expected = int(time.mktime(chosen.timetuple()) * 1000)
+        if rows(current)[identifier]["snoozed_until"] != expected:
+            raise ValueError("custom local date does not resolve to the expected calendar instant")
+        assert_retained(retained, current, draft)
+        self.reveal("snoozed", identifier)
+        self.action(identifier, "wake", lambda row: row["snoozed_until"] == 0,
+                    "custom date snooze wakes through painted menu", retained, draft)
+
+        for unit in ("minutes", "hours", "days"):
+            self.custom_open(identifier, retained, draft)
+            self.click("sidebar.custom_snooze.mode.duration")
+            self.wait(lambda value: value.get("sidebar_custom_snooze_mode") == "duration",
+                      "custom snooze duration mode paints")
+            self.custom_field("amount", "1.5", retained, draft)
+            for _ in range(3):
+                current = self.session.snapshot(self.args.timeout)
+                if current.get("sidebar_custom_snooze_unit") == unit:
+                    break
+                self.click("sidebar.custom_snooze.unit")
+            current = self.wait(lambda value: value.get("sidebar_custom_snooze_unit") == unit,
+                                "custom snooze unit selects " + unit)
+            assert_retained(retained, current, draft)
+            self.shot("custom-snooze-duration-" + unit + ".png")
+            begin_ms = time.time_ns() // 1_000_000
+            self.click("sidebar.custom_snooze.submit")
+            current = self.wait(lambda value: value.get("sidebar_custom_snooze_open") is False
+                                and not value.get("pending_command")
+                                and rows(value)[identifier]["snoozed_until"] > 0,
+                                "fractional custom snooze " + unit + " commits")
+            end_ms = time.time_ns() // 1_000_000
+            assert_duration_deadline(rows(current)[identifier]["snoozed_until"], begin_ms, end_ms, 1.5, unit)
+            assert_retained(retained, current, draft)
+            self.session.journal("sidebar.custom.duration", None, current, thread=identifier,
+                                 begin_ms=begin_ms, end_ms=end_ms, amount=1.5, unit=unit)
+            self.reveal("snoozed", identifier)
+            self.action(identifier, "wake", lambda row: row["snoozed_until"] == 0,
+                        "fractional custom snooze " + unit + " wakes", retained, draft)
 
     def reveal(self, shelf, identifier):
         current = self.session.snapshot(self.args.timeout)
@@ -437,7 +654,7 @@ class Proof:
         self.shot("row-renamed.png")
         for action, expected in (("copy_id", identifier), ("copy_path", self.session.data["workspace"])):
             self.right_click(identifier)
-            self.click("sidebar.menu." + action)
+            self.menu_choose(action)
             current = self.wait(lambda value: not value.get("sidebar_menu_thread"),
                                 "row " + action + " closes menu")
             if self.clipboard() != expected:
@@ -447,6 +664,7 @@ class Proof:
         current = self.session.snapshot(self.args.timeout)
         branch = current["thread_branches"][rows(current)[identifier]["index"]]
         self.right_click(identifier)
+        self.menu_open("copy", "keyboard")
         if branch:
             self.click("sidebar.menu.copy_branch")
             current = self.wait(lambda value: not value.get("sidebar_menu_thread"), "row branch copied")
@@ -454,9 +672,8 @@ class Proof:
                 raise ValueError("private clipboard contains wrong branch")
             assert_retained(retained, current, draft)
         else:
-            target = next(target for target in self.ui.target_groups(self.session.snapshot(self.args.timeout))
-                          if target.get("id") == "sidebar.menu.copy_branch")
-            if target.get("enabled"):
+            if any(target.get("id") == "sidebar.menu.copy_branch" and target.get("enabled")
+                   for target in self.ui.target_groups(self.session.snapshot(self.args.timeout))):
                 raise ValueError("copy branch admitted despite missing branch metadata")
             self.key("Escape")
         self.right_click(identifier)
@@ -634,6 +851,8 @@ class Proof:
             self.measure_sidebar(alpha, retained, draft)
 
         self.row_menu_utilities(alpha, retained, draft)
+        self.exercise_submenus(alpha, retained, draft)
+        self.custom_snooze_cases(alpha, retained, draft)
 
         self.action(alpha, "pin", lambda row: row["pinned"], "inactive Alpha pin persisted", retained, draft)
         self.shot("pinned.png")
