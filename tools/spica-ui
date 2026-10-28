@@ -390,6 +390,8 @@ def offline_provider_argv(provider: str, output: Path) -> list[str]:
 def launch(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
     provider_argv = offline_provider_argv(args.provider, output)
+    metrics = getattr(args, "metrics_output", None)
+    metrics_argv = ["--metrics-output", str(Path(metrics).resolve())] if metrics else []
     if args.dry_run:
         binary = Path(args.binary).resolve() if args.binary else ROOT / "zig-out/bin/spica"
         plan = {"command": "launch", "private": args.private, "provider": args.provider,
@@ -397,7 +399,7 @@ def launch(args: argparse.Namespace) -> int:
                 "state_directory": str(output / "state"), "workspace": str(output / "workspace"),
                 "argv": [str(binary), *provider_argv, "--state-directory", str(output / "state"), "--workspace", str(output / "workspace"),
                          "--automation-live", str(output / "live.json"), "--automation-output", str(output / "final.json"),
-                         "--automation-session", "<fresh 32-digit process nonce>"]}
+                         "--automation-session", "<fresh 32-digit process nonce>", *metrics_argv]}
         print(json.dumps(plan, indent=2))
         return 0
     if not args.private:
@@ -468,7 +470,7 @@ def launch(args: argparse.Namespace) -> int:
         argv = [str(binary), *provider_argv, "--state-directory", str(state), "--workspace", str(workspace),
                 "--automation-live", str(output / "live.json"), "--automation-output", str(output / "final.json"),
                 "--automation-session", process_nonce,
-                "--quit-after-ms", str(args.quit_after_ms)]
+                "--quit-after-ms", str(args.quit_after_ms), *metrics_argv]
         launch_result = run_command(["vd", "run", private_path, "--bg", "--log", str(output / "app.log"), "--", *argv])
         launch_info = json.loads(launch_result.stdout)
         deadline = time.monotonic() + args.timeout
@@ -1944,6 +1946,7 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--width", type=int, default=1280)
     item.add_argument("--height", type=int, default=800)
     item.add_argument("--quit-after-ms", type=int, default=180000)
+    item.add_argument("--metrics-output", type=Path, help="opt in to bounded native frame/cache telemetry")
     item.add_argument("--scenario", default="manual")
     add_common(item)
 

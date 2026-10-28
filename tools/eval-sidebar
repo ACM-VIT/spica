@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""Exercise the native sidebar with ordinary input on an owned vd desktop."""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import math
+from pathlib import Path
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_driver():
+    loader = importlib.machinery.SourceFileLoader("sidebar_spica_ui", str(ROOT / "tools/spica-ui"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_tool(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def rows(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Require aligned, explicit native metadata; missing exports cannot pass."""
+    targets = snapshot.get("thread_targets", [])
+    fields = ("thread_pinned", "thread_settled", "thread_snoozed_until", "thread_sort_order")
+    if not targets or any(not isinstance(snapshot.get(field), list)
+                          or len(snapshot[field]) != len(targets) for field in fields):
+        raise ValueError("missing or misaligned native sidebar metadata")
+    count = snapshot.get("thread_count", len(targets))
+    if type(count) is not int or not 0 <= count <= len(targets):
+        raise ValueError("invalid native resident thread count")
+    result = {}
+    for index, target in enumerate(targets[:count]):
+        identifier = target.get("id")
+        if not identifier:
+            continue
+        if identifier in result:
+            raise ValueError("duplicate native thread identity")
+        result[identifier] = {field.removeprefix("thread_"): snapshot[field][index] for field in fields}
+        result[identifier].update(target=target, index=index)
+    return result
+
+
+def assert_retained(before: dict[str, Any], after: dict[str, Any], draft: str) -> None:
+    for field in ("thread_id", "project_id", "run_id", "send_command_id", "send_run_id"):
+        if after.get(field) != before.get(field):
+            raise ValueError("sidebar action changed active execution: " + field)
+    if after.get("draft") != draft:
+        raise ValueError("sidebar action changed the active draft")
+
+
+def assert_compact(snapshot: dict[str, Any], identifiers: set[str]) -> None:
+    visible = [target for target in snapshot.get("thread_targets", []) if target.get("enabled")]
+    if {target.get("id") for target in visible} != identifiers:
+        raise ValueError("search did not retain the expected native thread identities")
+    bounds = sorted((target["pointer_bounds"] for target in visible), key=lambda box: box[1])
+    if any(len(box) != 4 or box[2] <= 0 or not 0 < box[3] <= 36 for box in bounds):
+        raise ValueError("search results do not use compact T3 rows")
+    if any(b[1] < a[1] + a[3] for a, b in zip(bounds, bounds[1:])):
+        raise ValueError("search result hit regions overlap")
+
+
+def assert_suppressed(snapshot: dict[str, Any]) -> None:
+    if any(target.get("enabled") for target in snapshot.get("thread_targets", [])):
+        raise ValueError("overlay admits covered thread hit targets")
+
+
+def plan() -> list[str]:
+    return ["launch an offline fake provider in fresh state on a private vd desktop",
+            "create three completed chats across two projects through painted controls",
+            "verify compact Unicode search, keyboard activation and project scope",
+            "right-click an inactive chat, pin/unpin, settle/restore, snooze/wake and reorder",
+            "verify inactive-chat actions retain active execution and the Unicode draft",
+            "save and cancel title edits through ordinary F2 input",
+            "collapse, reopen and drag-resize the native sidebar",
+            "inspect regular and minimum-window screenshot artifacts",
+            "restart the native process and verify durable sidebar metadata"]
+
+
+class Proof:
+    def __init__(self, driver, args):
+        self.ui, self.args = driver, args
+        self.session = None
+        self.assertions = []
+        self.samples = []
+        self.phases = []
+
+    def wait(self, predicate, label):
+        current = self.ui.wait_snapshot(self.session, predicate, self.args.timeout, label)
+        self.assertions.append(label)
+        self.session.journal("sidebar.assert", None, current, assertion=label)
+        return current
+
+    def click(self, identifier):
+        return self.ui.perform_input(self.session, "click", identifier, self.args.timeout)
+
+    def text(self, identifier, value):
+        return self.ui.perform_input(self.session, "text", identifier, self.args.timeout, value)
+
+    def key(self, value):
+        return self.ui.perform_key(self.session, value, self.args.timeout)
+
+    def ipc(self, *arguments):
+        if not self.session.sway_socket:
+            raise ValueError("owned private desktop has no compositor socket")
+        result = self.ui.run_command(["swaymsg", "--socket", self.session.sway_socket,
+                                      "--raw", *arguments])
+        response = json.loads(result.stdout)
+        if not isinstance(response, list) or not all(item.get("success") for item in response):
+            raise ValueError("private compositor rejected input: " + result.stdout)
+
+    def right_click(self, identifier):
+        before = self.session.snapshot(self.args.timeout)
+        target = self.ui.find_target(before, identifier)
+        self.ui.focus(self.session)
+        x, y = self.ui.pointer(self.session, target)
+        self.ui.run_command(["vd", "move", str(self.session.vd_session), self.session.window,
+                             str(x), str(y)])
+        self.ipc("seat", "seat0", "cursor", "press", "button3")
+        self.ipc("seat", "seat0", "cursor", "release", "button3")
+        self.session.journal("sidebar.context", before, self.session.snapshot(self.args.timeout),
+                             target=identifier, pointer=[x, y],
+                             input_origin="ordinary vd pointer and private compositor right button")
+        current = self.wait(lambda value: any(target.get("enabled")
+                            and target.get("id", "").startswith("sidebar.menu.")
+                            for target in self.ui.target_groups(value)), "painted row context menu")
+        assert_suppressed(current)
+        return current
+
+    def action(self, identifier, action, predicate, label, retained, draft):
+        self.right_click(identifier)
+        self.click("sidebar.menu." + action)
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and predicate(rows(value)[identifier]), label)
+        assert_retained(retained, current, draft)
+        return current
+
+    def reveal(self, shelf, identifier):
+        current = self.session.snapshot(self.args.timeout)
+        if rows(current)[identifier]["target"].get("enabled"):
+            return current
+        self.click("sidebar.shelf." + shelf)
+        return self.wait(lambda value: rows(value)[identifier]["target"].get("enabled"),
+                         shelf + " shelf expands to an actual thread target")
+
+    def shot(self, filename):
+        self.ui.capture(self.session, filename)
+
+    def measure_sidebar(self, identifier, retained, draft):
+        """Measure painted sidebar work; input delivery itself has no latency claim."""
+        self.measure = load_tool("measure_process", ROOT / "tools/measure_process.py")
+        pid = self.session.data["launch"]["pid"]
+        initial = self.measure.stat(Path(f"/proc/{pid}/stat"))
+        identity = self.measure.identity(initial)
+
+        def sample(name):
+            row = self.measure.sample(pid, expected_root=identity)
+            row["phase"] = name
+            self.samples.append(row)
+            self.ui.atomic_json(self.session.output / "samples.json", self.samples)
+            if row["root_exited"]:
+                raise ValueError("native process exited during sidebar measurement")
+
+        def idle(name):
+            begin = time.monotonic()
+            due = begin
+            while time.monotonic() < begin + 5:
+                sample(name)
+                due += .25
+                time.sleep(max(0, due - time.monotonic()))
+            self.phases.append(dict(name=name, begin=begin, end=time.monotonic()))
+
+        # Screenshots and recording are outside all measured phase boundaries.
+        idle("idle_before")
+        begin = time.monotonic()
+        for cycle in range(self.args.cycles):
+            query = "Sidebar" if cycle % 2 == 0 else "Side"
+            self.text("sidebar.search", query)
+            self.wait(lambda value: value.get("sidebar_search") == query, "measured search query painted")
+            sample("active_sidebar")
+            self.key("Escape")
+            self.wait(lambda value: not value.get("sidebar_search"), "measured search cleared")
+            sample("active_sidebar")
+            self.click("sidebar.scope")
+            self.wait(lambda value: value.get("sidebar_scope_open"), "measured scope opened")
+            sample("active_sidebar")
+            self.key("Escape")
+            self.wait(lambda value: not value.get("sidebar_scope_open"), "measured scope closed")
+            self.right_click(identifier)
+            sample("active_sidebar")
+            self.key("Escape")
+            self.wait(lambda value: not any(target.get("enabled")
+                      and target.get("id", "").startswith("sidebar.menu.")
+                      for target in self.ui.target_groups(value)), "measured context menu closed")
+            self.click("sidebar.toggle")
+            self.wait(lambda value: value.get("sidebar_collapsed") is True, "measured sidebar collapsed")
+            sample("active_sidebar")
+            self.key("ctrl+b")
+            current = self.wait(lambda value: value.get("sidebar_collapsed") is False,
+                                "measured sidebar reopened")
+            assert_retained(retained, current, draft)
+            sample("active_sidebar")
+        self.phases.append(dict(name="active_sidebar", begin=begin, end=time.monotonic(), cycles=self.args.cycles))
+        idle("settled_after")
+        self.ui.atomic_json(self.session.output / "phases.json", self.phases)
+
+    def finish_metrics(self):
+        # The first process exports native.json on ordinary close before restart.
+        sys.modules.setdefault("measure_process", self.measure)
+        starter = load_tool("sidebar_eval_starter", ROOT / "tools/eval-starter")
+        native = self.ui.read_json(self.session.output / "native.json", time.monotonic() + self.args.timeout)
+        starter.validate_native(native)
+        frames = [dict(phase=phase["name"], **starter.frame_summary(native, phase)) for phase in self.phases]
+        active = next(phase for phase in frames if phase["phase"] == "active_sidebar")
+        if active["successful_samples"] < 100:
+            raise ValueError("sidebar active cohort has fewer than 100 frames; p99 is not accepted")
+        resources = [dict(phase=phase["name"], **self.measure.summarize(
+            [sample for sample in self.samples if sample["phase"] == phase["name"]])) for phase in self.phases]
+        if any(phase["incomplete_samples"] for phase in resources):
+            raise ValueError("sidebar process-tree samples are incomplete")
+        summary = dict(renderer=native["renderer"], video=native["video"],
+                       frames=frames, resources=resources,
+                       cache_tail=starter.cache_tail_summary(native, self.phases[-1]),
+                       limitations=["Native paint work and present-return timing; no physical input-to-photon claim.",
+                                    "Process-tree memory covers observed sample boundaries, not an absolute peak.",
+                                    "Repeated three-chat sidebar fixture; low-end hardware and large-history acceptance remain separate."])
+        self.ui.atomic_json(self.session.output / "performance.json", summary)
+        self.session.data["sidebar_performance"] = summary
+
+    def run(self):
+        launch_args = argparse.Namespace(output=self.args.output, binary=self.args.binary,
+                                        provider="fake", private=True, build=False,
+                                        optimize="ReleaseSafe", scenario="sidebar",
+                                        width=1280, height=800, quit_after_ms=600000,
+                                        metrics_output=self.args.output / "native.json" if self.args.measure else None,
+                                        timeout=self.args.timeout, dry_run=False)
+        self.ui.launch(launch_args)
+        self.session = self.ui.Session.load(self.args.output)
+        self.wait(lambda value: value.get("send_ready"), "fresh native conversation ready")
+        first = self.ui.send_turn(self.session, "Sidebar Alpha café", self.args.timeout)
+        alpha, first_project = first["thread_id"], first["project_id"]
+        self.click("workspace.new_thread")
+        self.wait(lambda value: value.get("thread_id") != alpha and value.get("send_ready"),
+                  "second chat created through native new-thread control")
+        second = self.ui.send_turn(self.session, "Sidebar Bravo 世界", self.args.timeout)
+        bravo = second["thread_id"]
+        self.click("workspace.new_project")
+        self.wait(lambda value: value.get("project_id") != first_project and value.get("send_ready"),
+                  "second project created through native control")
+        third = self.ui.send_turn(self.session, "Sidebar Charlie 🎮", self.args.timeout)
+        charlie = third["thread_id"]
+        draft = "Keep this draft café 世界 🎮"
+        self.text("composer.input", draft)
+        retained = self.wait(lambda value: value.get("draft") == draft,
+                             "Unicode composer draft retained before sidebar input")
+        identifiers = {alpha, bravo, charlie}
+        self.shot("cards.png")
+
+        self.text("sidebar.search", "Sidebar")
+        current = self.wait(lambda value: value.get("sidebar_search") == "Sidebar"
+                            and len([target for target in value.get("thread_targets", [])
+                                     if target.get("enabled")]) == 3, "three native compact search results")
+        assert_compact(current, identifiers)
+        assert_retained(retained, current, draft)
+        self.shot("search.png")
+        self.key("ctrl+a")
+        self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, "CAFé"])
+        current = self.wait(lambda value: value.get("sidebar_search") == "CAFé"
+                            and [target.get("id") for target in value.get("thread_targets", [])
+                                 if target.get("enabled")] == [alpha], "Unicode case-folded search selects exact Alpha chat")
+        self.key("Return")
+        self.wait(lambda value: value.get("thread_id") == alpha and not value.get("sidebar_search"),
+                  "keyboard search activation opens exact matched chat")
+        self.click(charlie)
+        retained = self.wait(lambda value: value.get("thread_id") == charlie and value.get("draft") == draft,
+                             "search navigation restores the other chat draft")
+        self.click("sidebar.scope")
+        current = self.wait(lambda value: value.get("sidebar_scope_open"), "scope dropdown painted")
+        assert_suppressed(current)
+        projects = [target["id"] for target in current.get("scope_targets", [])
+                    if target.get("enabled") and target.get("id") != "scope.all"]
+        if len(projects) != 2:
+            raise ValueError("scope lacks two actual project identities")
+        self.key("Home")
+        self.key("Down")
+        self.key("Return")
+        current = self.wait(lambda value: not value.get("sidebar_scope_open")
+                            and value.get("sidebar_scope_project") == projects[0],
+                            "scope keyboard selection follows actual project identity")
+        assert_retained(retained, current, draft)
+        self.click("sidebar.scope")
+        self.wait(lambda value: value.get("sidebar_scope_open"), "scope reopened")
+        self.click("scope.all")
+        self.wait(lambda value: not value.get("sidebar_scope_project"), "all-project scope restored")
+
+        if self.args.measure:
+            self.measure_sidebar(alpha, retained, draft)
+
+        self.action(alpha, "pin", lambda row: row["pinned"], "inactive Alpha pin persisted", retained, draft)
+        self.shot("pinned.png")
+        self.action(alpha, "pin", lambda row: not row["pinned"], "inactive Alpha unpin persisted", retained, draft)
+        self.action(bravo, "settle", lambda row: row["settled"], "inactive Bravo settlement persisted", retained, draft)
+        self.reveal("settled", bravo)
+        self.shot("settled.png")
+        self.action(bravo, "settle", lambda row: not row["settled"], "inactive Bravo restoration persisted", retained, draft)
+        self.action(alpha, "snooze.1h", lambda row: row["snoozed_until"] > time.time() * 1000,
+                    "inactive Alpha one-hour snooze persisted", retained, draft)
+        self.reveal("snoozed", alpha)
+        self.shot("snoozed.png")
+        self.action(alpha, "wake", lambda row: row["snoozed_until"] == 0,
+                    "inactive Alpha wake persisted", retained, draft)
+
+        current = self.session.snapshot(self.args.timeout)
+        order_before = rows(current)[alpha]["sort_order"]
+        self.action(alpha, "move_up", lambda row: row["sort_order"] != order_before,
+                    "inactive Alpha order mutation persisted", retained, draft)
+        self.key("F2")
+        self.wait(lambda value: value.get("title_editing"), "active title edit opened")
+        self.key("ctrl+a")
+        title = "Sidebar Charlie renamed 🎮"
+        self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, title])
+        self.key("Return")
+        current = self.wait(lambda value: not value.get("title_editing")
+                            and value.get("title_text") == title and not value.get("pending_command"),
+                            "Unicode active title committed")
+        assert_retained(retained, current, draft)
+        self.key("F2")
+        self.wait(lambda value: value.get("title_editing"), "second title edit opened")
+        self.key("ctrl+a")
+        self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, "Discard this title"])
+        self.key("Escape")
+        self.wait(lambda value: not value.get("title_editing") and value.get("title_text") == title,
+                  "Escape cancels title edit")
+
+        self.click("sidebar.toggle")
+        current = self.wait(lambda value: value.get("sidebar_collapsed") is True,
+                            "sidebar collapses through native toggle")
+        assert_suppressed(current)
+        assert_retained(retained, current, draft)
+        self.shot("collapsed.png")
+        self.key("ctrl+b")
+        current = self.wait(lambda value: value.get("sidebar_collapsed") is False,
+                            "Ctrl+B reopens sidebar")
+        before_width = current["sidebar_width"]
+        target = self.ui.find_target(current, "sidebar.resize")
+        x, y = self.ui.pointer(self.session, target)
+        self.ui.focus(self.session)
+        self.ui.run_command(["vd", "move", str(self.session.vd_session), self.session.window, str(x), str(y)])
+        self.ipc("seat", "seat0", "cursor", "press", "button1")
+        try:
+            for delta in (20, 40, 60):
+                self.ipc("seat", "seat0", "cursor", "set", str(x + delta), str(y))
+                time.sleep(.06)
+        finally:
+            self.ipc("seat", "seat0", "cursor", "release", "button1")
+        current = self.wait(lambda value: value.get("sidebar_width", 0) > before_width + 20,
+                            "observed resize rail changes native sidebar width")
+        assert_retained(retained, current, draft)
+        self.shot("resized.png")
+        self.ipc(f"[con_id={self.session.window}]", "resize", "set", "width", "720", "px", "height", "480", "px")
+        self.wait(lambda value: value.get("logical_width") == 720 and value.get("logical_height") == 480,
+                  "minimum supported native window painted")
+        self.shot("minimum.png")
+        self.ipc(f"[con_id={self.session.window}]", "resize", "set", "width", "1280", "px", "height", "800", "px")
+        self.wait(lambda value: value.get("logical_width") == 1280 and value.get("logical_height") == 800,
+                  "regular native window restored")
+
+        self.action(alpha, "pin", lambda row: row["pinned"], "Alpha pin prepared for restart", retained, draft)
+        self.action(bravo, "settle", lambda row: row["settled"], "Bravo settled prepared for restart", retained, draft)
+        before_restart = self.session.snapshot(self.args.timeout)
+        persisted = {identifier: {field: row[field] for field in ("pinned", "settled", "snoozed_until", "sort_order")}
+                     for identifier, row in rows(before_restart).items() if identifier in identifiers}
+        current = self.ui.restart_app(self.session, launch_args)
+        if self.args.measure:
+            self.finish_metrics()
+        self.wait(lambda value: identifiers <= rows(value).keys(), "all durable sidebar rows reopened")
+        for identifier, expected in persisted.items():
+            actual = rows(self.session.snapshot(self.args.timeout))[identifier]
+            if any(actual[field] != value for field, value in expected.items()):
+                raise ValueError("sidebar metadata changed across process restart: " + identifier)
+        if current.get("title_text") != title:
+            raise ValueError("saved Unicode title changed across process restart")
+        if (self.session.data["source_sha256"] != self.ui.source_fingerprint()
+                or self.session.data["binary_sha256"] != self.ui.sha256(self.args.binary)):
+            raise ValueError("source or native binary changed during the sidebar cohort")
+        self.assertions.append("pin, settlement, wake and order metadata survive process restart")
+        self.shot("reopened.png")
+        self.session.data.update(passed=True, sidebar_verified=self.assertions)
+        self.session.save()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / ".artifacts/sidebar-evidence/ui")
+    parser.add_argument("--binary", type=Path, default=ROOT / "zig-out/bin/spica")
+    parser.add_argument("--timeout", type=float, default=20)
+    parser.add_argument("--private", action="store_true", help="required acknowledgement of private vd desktop")
+    parser.add_argument("--measure", action="store_true", help="collect isolated idle and active-sidebar native frame/process-tree evidence")
+    parser.add_argument("--cycles", type=int, default=16, help="12..50 repeated sidebar input cycles in the measured active phase")
+    parser.add_argument("--dry-run", action="store_true", help="print steps without filesystem, build or desktop activity")
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.timeout) or not 0 < args.timeout <= 120:
+        parser.error("timeout must be finite and between zero and 120 seconds")
+    if not 12 <= args.cycles <= 50:
+        parser.error("measurement cycles must be between 12 and 50")
+    if args.dry_run:
+        print(json.dumps({"scenario": "sidebar", "provider": "fake", "build": False,
+                          "steps": plan(), "limitations": ["No performance or physical latency claim."]}, indent=2))
+        return 0
+    if not args.private:
+        parser.error("--private is required; the user's active desktop is never used")
+    args.output, args.binary = args.output.resolve(), args.binary.resolve()
+    ui = load_driver()
+    proof = Proof(ui, args)
+    try:
+        proof.run()
+        ui.receipt(argparse.Namespace(dry_run=False), proof.session)
+        return 0
+    except Exception as error:
+        if proof.session is not None:
+            ui.failure_packet(proof.session, error)
+        print("eval-sidebar: " + str(error), file=sys.stderr)
+        return 1
+    finally:
+        if proof.session is not None:
+            try:
+                ui.close_app(proof.session, args.timeout)
+            except Exception as error:
+                print("eval-sidebar cleanup: " + str(error), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -49,6 +49,18 @@ class SpicaUiOfflineTests(unittest.TestCase):
         self.assertIn("scenario", result.stdout)
         self.assertIn("ordinary private-desktop", result.stdout)
 
+    def test_launch_dry_run_forwards_optional_metrics_without_creating_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "session"
+            metrics = Path(temporary) / "metrics.json"
+            result = self.run_cli("launch", "--private", "--dry-run", "--output", str(output),
+                                  "--metrics-output", str(metrics))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            command = json.loads(result.stdout)["argv"]
+            self.assertEqual(command[command.index("--metrics-output") + 1], str(metrics))
+            self.assertFalse(output.exists())
+            self.assertFalse(metrics.exists())
+
     def test_title_assertion_requires_header_sidebar_commit_and_retained_draft(self):
         module = load_cli()
         saved = {"title_editing": False, "pending_command": False, "title_text": "Native café 🎮",
