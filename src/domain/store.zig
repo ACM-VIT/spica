@@ -10,7 +10,7 @@ extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, Closed };
 pub const application_id = 0x53504334;
-pub const schema_version = 11;
+pub const schema_version = 12;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
 
 pub const Statement = struct {
@@ -173,6 +173,17 @@ pub const Store = struct {
             errdefer result.exec("ROLLBACK") catch {};
             try result.exec("CREATE TABLE IF NOT EXISTS presentation_state(key TEXT PRIMARY KEY CHECK(length(key) BETWEEN 1 AND 128),value BLOB NOT NULL CHECK(length(value)<=4096)); UPDATE meta SET schema_version=11 WHERE singleton=1; PRAGMA user_version=11; COMMIT");
         } else if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='presentation_state'") != 1) return error.Corrupt;
+        if (fresh or version < 12) {
+            // Input ownership is immutable provenance. Rebuild the two small
+            // input tables so every row carries its thread directly; a join
+            // mismatch aborts the migration before any old table is dropped.
+            try result.exec("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE");
+            errdefer result.exec("ROLLBACK; PRAGMA foreign_keys=ON") catch {};
+            if (try result.scalar("SELECT count(*) FROM approvals") != try result.scalar("SELECT count(*) FROM approvals a JOIN runs r ON r.id=a.run_id WHERE r.thread_id IS NOT NULL")) return error.Corrupt;
+            if (try result.scalar("SELECT count(*) FROM questions") != try result.scalar("SELECT count(*) FROM questions q JOIN runs r ON r.id=q.run_id WHERE r.thread_id IS NOT NULL")) return error.Corrupt;
+            try result.exec(input_owner_migration);
+            try result.exec("UPDATE meta SET schema_version=12 WHERE singleton=1; PRAGMA user_version=12; COMMIT; PRAGMA foreign_keys=ON");
+        } else if (try result.scalar("SELECT count(*) FROM pragma_table_info('approvals') WHERE name='thread_id'") != 1 or try result.scalar("SELECT count(*) FROM pragma_table_info('questions') WHERE name='thread_id'") != 1) return error.Corrupt;
         // Staging budgets exclude sent history; lookup by attachment must not
         // scan all message refs for every historical row in the thread.
         try result.exec("CREATE INDEX IF NOT EXISTS attachment_refs_by_attachment ON attachment_refs(attachment_id)");
@@ -180,7 +191,8 @@ pub const Store = struct {
         // The implicit rowid suffix supports latest selection/status lookups
         // without scanning completed runs from other threads.
         try result.exec("CREATE INDEX IF NOT EXISTS runs_by_thread ON runs(thread_id)");
-        try result.exec("CREATE INDEX IF NOT EXISTS runs_snooze_pending ON runs(thread_id) WHERE state IN('queued','starting','awaiting_approval','awaiting_question'); CREATE INDEX IF NOT EXISTS approvals_pending_run ON approvals(run_id) WHERE state='pending'; CREATE INDEX IF NOT EXISTS questions_pending_run ON questions(run_id) WHERE state='pending'");
+        try result.exec("CREATE INDEX IF NOT EXISTS runs_snooze_pending ON runs(thread_id) WHERE state IN('queued','starting','awaiting_approval','awaiting_question'); CREATE INDEX IF NOT EXISTS approvals_pending_thread ON approvals(thread_id) WHERE state='pending'; CREATE INDEX IF NOT EXISTS questions_pending_thread ON questions(thread_id) WHERE state='pending'; CREATE INDEX IF NOT EXISTS approvals_by_run ON approvals(run_id,id); CREATE INDEX IF NOT EXISTS questions_by_run ON questions(run_id,id)");
+        try result.exec("CREATE TRIGGER IF NOT EXISTS approvals_owner_insert BEFORE INSERT ON approvals WHEN (SELECT thread_id FROM runs WHERE id=NEW.run_id) IS NULL OR NEW.thread_id<>(SELECT thread_id FROM runs WHERE id=NEW.run_id) BEGIN SELECT RAISE(ABORT,'approval thread owner mismatch'); END; CREATE TRIGGER IF NOT EXISTS questions_owner_insert BEFORE INSERT ON questions WHEN (SELECT thread_id FROM runs WHERE id=NEW.run_id) IS NULL OR NEW.thread_id<>(SELECT thread_id FROM runs WHERE id=NEW.run_id) BEGIN SELECT RAISE(ABORT,'question thread owner mismatch'); END; CREATE TRIGGER IF NOT EXISTS approvals_owner_immutable BEFORE UPDATE OF run_id,thread_id ON approvals WHEN NEW.run_id<>OLD.run_id OR NEW.thread_id<>OLD.thread_id OR NEW.thread_id<>(SELECT thread_id FROM runs WHERE id=NEW.run_id) BEGIN SELECT RAISE(ABORT,'approval thread owner immutable'); END; CREATE TRIGGER IF NOT EXISTS questions_owner_immutable BEFORE UPDATE OF run_id,thread_id ON questions WHEN NEW.run_id<>OLD.run_id OR NEW.thread_id<>OLD.thread_id OR NEW.thread_id<>(SELECT thread_id FROM runs WHERE id=NEW.run_id) BEGIN SELECT RAISE(ABORT,'question thread owner immutable'); END;");
         // Only diagnostic observations enter this index; streamed content never
         // accumulates in the run-status lookup. Correlation was normalized by Owner.
         try result.exec("CREATE INDEX IF NOT EXISTS observation_diagnostics ON observations(session_id,json_extract(CAST(correlation AS TEXT),'$.run.value'),commit_sequence DESC) WHERE evidence IS NOT NULL");
@@ -491,7 +503,7 @@ const schema =
     \\CREATE TABLE blocks(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,message_id TEXT NOT NULL REFERENCES messages(id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL,committed_bytes INTEGER NOT NULL DEFAULT 0 CHECK(committed_bytes>=0),tool_id TEXT,UNIQUE(message_id,ordinal));
     \\CREATE TABLE chunks(block_id TEXT NOT NULL REFERENCES blocks(id),byte_offset INTEGER NOT NULL CHECK(byte_offset>=0),bytes BLOB NOT NULL,PRIMARY KEY(block_id,byte_offset));
     \\CREATE TABLE tools(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,run_id TEXT NOT NULL REFERENCES runs(id),session_id TEXT NOT NULL REFERENCES sessions(id),upstream_tool TEXT NOT NULL,name TEXT NOT NULL,action_digest BLOB NOT NULL,outcome TEXT NOT NULL,result_block TEXT REFERENCES blocks(id),UNIQUE(session_id,upstream_tool));
-    \\CREATE TABLE approvals(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,run_id TEXT NOT NULL REFERENCES runs(id),session_id TEXT NOT NULL REFERENCES sessions(id),tool_id TEXT NOT NULL REFERENCES tools(id),workspace_id TEXT NOT NULL REFERENCES workspaces(id),upstream_request TEXT NOT NULL,action_digest BLOB NOT NULL,scope BLOB NOT NULL,expires_at INTEGER,state TEXT NOT NULL,decision TEXT,live_epoch TEXT,reply_effect TEXT UNIQUE);
+    \\CREATE TABLE approvals(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,run_id TEXT NOT NULL REFERENCES runs(id),thread_id TEXT NOT NULL REFERENCES threads(id),session_id TEXT NOT NULL REFERENCES sessions(id),tool_id TEXT NOT NULL REFERENCES tools(id),workspace_id TEXT NOT NULL REFERENCES workspaces(id),upstream_request TEXT NOT NULL,action_digest BLOB NOT NULL,scope BLOB NOT NULL,expires_at INTEGER,state TEXT NOT NULL,decision TEXT,live_epoch TEXT,reply_effect TEXT UNIQUE);
     \\CREATE TABLE effects(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,run_id TEXT NOT NULL REFERENCES runs(id),session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL CHECK(kind IN('create_session','start','approval_reply','cancel','inspect','attach')),read_only INTEGER NOT NULL DEFAULT 0,request BLOB NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=32),state TEXT NOT NULL CHECK(state IN('planned','in_flight','withdrawn','confirmed','failed','unknown')),depends_on TEXT REFERENCES effects(id),approval_id TEXT UNIQUE REFERENCES approvals(id),command_id TEXT NOT NULL,claim_owner TEXT,outcome TEXT NOT NULL DEFAULT '',evidence BLOB);
     \\CREATE UNIQUE INDEX one_effect ON effects(run_id,kind) WHERE kind IN('create_session','start','cancel');
     \\CREATE UNIQUE INDEX one_reconcile_call ON effects(command_id,kind) WHERE kind IN('inspect','attach');
@@ -526,6 +538,19 @@ const attachment_schema =
 ;
 
 const question_schema =
-    \\CREATE TABLE IF NOT EXISTS questions(id TEXT PRIMARY KEY,revision INTEGER NOT NULL CHECK(revision>0),run_id TEXT NOT NULL REFERENCES runs(id),session_id TEXT NOT NULL REFERENCES sessions(id),question BLOB NOT NULL CHECK(length(question)<=16384),expires_at INTEGER,state TEXT NOT NULL CHECK(state IN('pending','resolved','invalidated')),answer BLOB,live_epoch TEXT,reply_effect TEXT UNIQUE);
+    \\CREATE TABLE IF NOT EXISTS questions(id TEXT PRIMARY KEY,revision INTEGER NOT NULL CHECK(revision>0),run_id TEXT NOT NULL REFERENCES runs(id),thread_id TEXT NOT NULL REFERENCES threads(id),session_id TEXT NOT NULL REFERENCES sessions(id),question BLOB NOT NULL CHECK(length(question)<=16384),expires_at INTEGER,state TEXT NOT NULL CHECK(state IN('pending','resolved','invalidated')),answer BLOB,live_epoch TEXT,reply_effect TEXT UNIQUE);
     \\CREATE INDEX IF NOT EXISTS questions_by_run ON questions(run_id,id);
+;
+
+const input_owner_migration =
+    \\CREATE TABLE approvals_v12(id TEXT PRIMARY KEY,revision INTEGER NOT NULL CHECK(revision>0),run_id TEXT NOT NULL REFERENCES runs(id),thread_id TEXT NOT NULL REFERENCES threads(id),session_id TEXT NOT NULL REFERENCES sessions(id),tool_id TEXT NOT NULL REFERENCES tools(id),workspace_id TEXT NOT NULL REFERENCES workspaces(id),upstream_request TEXT NOT NULL,action_digest BLOB NOT NULL,scope BLOB NOT NULL,expires_at INTEGER,state TEXT NOT NULL,decision TEXT,live_epoch TEXT,reply_effect TEXT UNIQUE);
+    \\INSERT INTO approvals_v12 SELECT a.id,a.revision,a.run_id,r.thread_id,a.session_id,a.tool_id,a.workspace_id,a.upstream_request,a.action_digest,a.scope,a.expires_at,a.state,a.decision,a.live_epoch,a.reply_effect FROM approvals a JOIN runs r ON r.id=a.run_id;
+    \\CREATE TABLE questions_v12(id TEXT PRIMARY KEY,revision INTEGER NOT NULL CHECK(revision>0),run_id TEXT NOT NULL REFERENCES runs(id),thread_id TEXT NOT NULL REFERENCES threads(id),session_id TEXT NOT NULL REFERENCES sessions(id),question BLOB NOT NULL CHECK(length(question)<=16384),expires_at INTEGER,state TEXT NOT NULL CHECK(state IN('pending','resolved','invalidated')),answer BLOB,live_epoch TEXT,reply_effect TEXT UNIQUE);
+    \\INSERT INTO questions_v12 SELECT q.id,q.revision,q.run_id,r.thread_id,q.session_id,q.question,q.expires_at,q.state,q.answer,q.live_epoch,q.reply_effect FROM questions q JOIN runs r ON r.id=q.run_id;
+    \\DROP TABLE approvals;
+    \\ALTER TABLE approvals_v12 RENAME TO approvals;
+    \\DROP TABLE questions;
+    \\ALTER TABLE questions_v12 RENAME TO questions;
+    \\CREATE INDEX approvals_by_run ON approvals(run_id,id);
+    \\CREATE INDEX questions_by_run ON questions(run_id,id);
 ;

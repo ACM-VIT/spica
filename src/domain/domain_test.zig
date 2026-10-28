@@ -451,6 +451,41 @@ test "sidebar snooze accepts running and uncertain runs as metadata only" {
     }
 }
 
+test "schema12 input ownership migration preserves revisions and events and uses thread pending indexes" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try seed(&f.store);
+    try f.store.exec("INSERT INTO events VALUES(1,0,'migration-event',X'7b7d',1,'BeforeMigration',NULL,NULL,X'7b7d'); DROP TRIGGER approvals_owner_insert; DROP TRIGGER approvals_owner_immutable; DROP TRIGGER questions_owner_insert; DROP TRIGGER questions_owner_immutable; DROP INDEX approvals_pending_thread; DROP INDEX questions_pending_thread; ALTER TABLE approvals DROP COLUMN thread_id; ALTER TABLE questions DROP COLUMN thread_id; UPDATE meta SET schema_version=11; PRAGMA user_version=11");
+    const position = try f.store.position();
+    try f.store.close();
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const directory_path = try f.path(&path);
+    f.store = try storage.Store.open(std.testing.io, directory_path);
+    try std.testing.expectEqual(@as(i64, storage.schema_version), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(position, try f.store.position());
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM events WHERE event_id='migration-event'"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT revision FROM threads WHERE id='h'"));
+    var plan = try f.store.prepare("EXPLAIN QUERY PLAN SELECT 1 FROM approvals WHERE state='pending' AND thread_id=?", &.{.{ .text = "h" }});
+    defer plan.deinit();
+    var indexed = false;
+    while (try plan.step()) {
+        if (std.mem.indexOf(u8, try plan.bytes(3), "approvals_pending_thread") != null) indexed = true;
+    }
+    try std.testing.expect(indexed);
+}
+
+test "pending input ownership is immutable and rejects cross-thread inserts" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try seed(&f.store);
+    try f.store.exec("INSERT INTO projects VALUES('p2',1,'second'); INSERT INTO threads(id,revision,project_id,workspace_id,session_id,sort_order) VALUES('h2',1,'p2','w','s',-2048)");
+    try f.store.execute("INSERT INTO questions(id,revision,run_id,thread_id,session_id,question,state,live_epoch) VALUES(?,1,?,?,?,?,?,?)", &.{ .{ .text = "q-owner" }, .{ .text = "r" }, .{ .text = "h" }, .{ .text = "s" }, .{ .blob = "{}" }, .{ .text = "pending" }, .{ .text = "epoch" } });
+    try std.testing.expectError(storage.Error.Conflict, f.store.execute("UPDATE questions SET thread_id='h2' WHERE id='q-owner'", &.{}));
+    try std.testing.expectError(storage.Error.Conflict, f.store.execute("INSERT INTO questions(id,revision,run_id,thread_id,session_id,question,state,live_epoch) VALUES('q-bad',1,'r','h2','s',X'7b7d','pending','epoch')", &.{}));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM threads WHERE id='h' AND revision=1 AND snoozed_until=0 AND EXISTS(SELECT 1 FROM questions WHERE thread_id=threads.id AND state='pending')"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM threads WHERE id='h2' AND NOT EXISTS(SELECT 1 FROM questions WHERE thread_id=threads.id AND state='pending')"));
+}
+
 test "sidebar move swaps global neighbors atomically and reports both revisions" {
     var f = try Fixture.init();
     defer f.deinit();

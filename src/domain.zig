@@ -64,7 +64,7 @@ fn canonicalEnvelope(allocator: std.mem.Allocator, envelope: t.CommandEnvelope) 
 
 // Every nested lookup is a point/range lookup on an existing primary/unique
 // index (plus runs_by_thread). The preview reads only a prefix of one chunk.
-const snooze_blockers = "EXISTS(SELECT 1 FROM runs r WHERE r.thread_id=threads.id AND r.state IN('queued','starting','awaiting_approval','awaiting_question')) OR EXISTS(SELECT 1 FROM approvals a INDEXED BY approvals_pending_run CROSS JOIN runs r ON r.id=a.run_id WHERE a.state='pending' AND r.thread_id=threads.id) OR EXISTS(SELECT 1 FROM questions q INDEXED BY questions_pending_run CROSS JOIN runs r ON r.id=q.run_id WHERE q.state='pending' AND r.thread_id=threads.id)";
+const snooze_blockers = "EXISTS(SELECT 1 FROM runs r WHERE r.thread_id=threads.id AND r.state IN('queued','starting','awaiting_approval','awaiting_question')) OR EXISTS(SELECT 1 FROM approvals a INDEXED BY approvals_pending_thread WHERE a.state='pending' AND a.thread_id=threads.id) OR EXISTS(SELECT 1 FROM questions q INDEXED BY questions_pending_thread WHERE q.state='pending' AND q.thread_id=threads.id)";
 
 const thread_columns = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)),coalesce((SELECT substr(bytes,1,163) FROM chunks WHERE block_id=(SELECT id FROM blocks WHERE message_id=(SELECT id FROM messages WHERE thread_id=threads.id AND ordinal=0 AND role='user') AND ordinal=0) AND byte_offset=0),''),(SELECT state FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1),coalesce((SELECT substr(display_name,1,256) FROM projects WHERE id=threads.project_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.expected_branch') FROM workspaces WHERE id=threads.workspace_id),''),coalesce(title,''),pinned,settled,snoozed_until,sort_order,created_at_ms,last_user_message_at_ms,updated_at_ms,NOT(" ++ snooze_blockers ++ ") FROM threads ";
 
@@ -1220,7 +1220,8 @@ pub const Owner = struct {
                 } else if (!std.mem.eql(u8, tool_digest, approval.action_digest)) return error.Conflict;
                 if (!std.mem.eql(u8, workspace, approval.workspace.value)) return error.Conflict;
                 if (approval.expires_at) |expiry| if (expiry > std.math.maxInt(i64)) return error.Limit;
-                try db.execute("INSERT INTO approvals(id,revision,run_id,session_id,tool_id,workspace_id,upstream_request,action_digest,scope,expires_at,state,live_epoch) VALUES(?,1,?,?,?,?,?,?,?,?,'pending',?)", &.{ .{ .text = approval_id.value }, .{ .text = run.value }, .{ .text = session.value }, .{ .text = tool_id.value }, .{ .text = workspace }, .{ .text = request }, .{ .blob = approval.action_digest }, .{ .blob = approval.scope }, if (approval.expires_at) |v| .{ .integer = @intCast(v) } else .null, .{ .text = self.epoch } });
+                const thread = try self.field(allocator, "SELECT thread_id FROM runs WHERE id=?", &.{.{ .text = run.value }}) orelse return error.Corrupt;
+                try db.execute("INSERT INTO approvals(id,revision,run_id,thread_id,session_id,tool_id,workspace_id,upstream_request,action_digest,scope,expires_at,state,live_epoch) VALUES(?,1,?,?,?,?,?,?,?,?,?,'pending',?)", &.{ .{ .text = approval_id.value }, .{ .text = run.value }, .{ .text = thread }, .{ .text = session.value }, .{ .text = tool_id.value }, .{ .text = workspace }, .{ .text = request }, .{ .blob = approval.action_digest }, .{ .blob = approval.scope }, if (approval.expires_at) |v| .{ .integer = @intCast(v) } else .null, .{ .text = self.epoch } });
                 next_state = "awaiting_approval";
                 try self.wakeSnoozed(allocator, sequence, observation.correlation.effect, run.value);
                 try self.event(allocator, sequence, index, .{ .approval = approval_id }, 1, "ApprovalPending", null, observation.correlation.effect, "");
@@ -1236,7 +1237,8 @@ pub const Owner = struct {
                     if (value > std.math.maxInt(i64)) return error.Limit;
                     break :blk V{ .integer = @intCast(value) };
                 } else V.null;
-                try db.execute("INSERT INTO questions(id,revision,run_id,session_id,question,expires_at,state,live_epoch) VALUES(?,1,?,?,?,?, 'pending',?)", &.{ .{ .text = question_id.value }, .{ .text = run.value }, .{ .text = session.value }, .{ .blob = try encoded(allocator, question) }, expires, .{ .text = self.epoch } });
+                const thread = try self.field(allocator, "SELECT thread_id FROM runs WHERE id=?", &.{.{ .text = run.value }}) orelse return error.Corrupt;
+                try db.execute("INSERT INTO questions(id,revision,run_id,thread_id,session_id,question,expires_at,state,live_epoch) VALUES(?,1,?,?,?,?,?, 'pending',?)", &.{ .{ .text = question_id.value }, .{ .text = run.value }, .{ .text = thread }, .{ .text = session.value }, .{ .blob = try encoded(allocator, question) }, expires, .{ .text = self.epoch } });
                 next_state = "awaiting_question";
                 try self.wakeSnoozed(allocator, sequence, observation.correlation.effect, run.value);
                 try self.event(allocator, sequence, index, .{ .question = question_id }, 1, "QuestionPending", null, observation.correlation.effect, "");
