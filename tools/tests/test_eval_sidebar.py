@@ -29,6 +29,44 @@ class SidebarEvidenceTests(unittest.TestCase):
             self.assertEqual(json.loads(result.stdout)["fixture_lifetime_ms"], 1_800_000)
             self.assertFalse(output.exists())
 
+    def test_focused_dry_run_declares_scope_and_keeps_measurement_separate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "unused"
+            command = ["python3", str(CLI), "--dry-run", "--focus", "menus", "--output", str(output)]
+            result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            value = json.loads(result.stdout)
+            self.assertEqual(value["focus"], "menus")
+            self.assertFalse(value["build"])
+            self.assertTrue(any("successor" in step for step in value["steps"]))
+            self.assertTrue(any("editor and reorder" in limitation for limitation in value["limitations"]))
+            self.assertFalse(output.exists())
+            result = subprocess.run([*command, "--measure"], cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("must run separately", result.stderr)
+            self.assertFalse(output.exists())
+
+    def test_measurement_focus_requires_explicit_measure_and_bounded_cycles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "unused"
+            command = ["python3", str(CLI), "--dry-run", "--focus", "measure", "--output", str(output)]
+            result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("requires --measure", result.stderr)
+            for cycles in (12, 50):
+                result = subprocess.run([*command, "--measure", "--cycles", str(cycles)],
+                                        cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                value = json.loads(result.stdout)
+                self.assertEqual(value["focus"], "measure")
+                self.assertTrue(any("100" in step for step in value["steps"]))
+                self.assertTrue(any("large-history" in item for item in value["limitations"]))
+            for cycles in (11, 51):
+                result = subprocess.run([*command, "--measure", "--cycles", str(cycles)],
+                                        cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+            self.assertFalse(output.exists())
+
     def test_clipboard_daemon_stdio_is_detached_with_bounded_parent_timeout(self):
         environment = {"WAYLAND_DISPLAY": "owned", "XDG_RUNTIME_DIR": "/private/runtime"}
         with patch.object(MODULE.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:

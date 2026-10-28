@@ -197,7 +197,20 @@ def assert_preferences(before: dict[str, Any], after: dict[str, Any]) -> None:
             raise ValueError("active route changed across native process restart: " + field)
 
 
-def plan() -> list[str]:
+def plan(focus="full") -> list[str]:
+    if focus == "measure":
+        return ["launch an offline fake provider and create three chats across two projects on a private vd desktop",
+                "collect isolated idle, repeated ordinary sidebar input and settled-idle process-tree samples",
+                "close the app through ordinary Ctrl+Q input and validate native frame/cache metrics",
+                "require at least 100 successful active frames and preserve exact source/binary fingerprints"]
+    if focus == "menus":
+        return ["launch an offline fake provider and create three chats across two projects on a private vd desktop",
+                "verify Copy clipboard values, nested pointer/keyboard menus and inactive execution/draft retention",
+                "reject/cancel custom snooze without mutation, then submit exact local date and fractional durations",
+                "settle an active chat to its exact successor and restore its retained draft",
+                "snooze the sole scoped chat into a fresh same-project chat, then restore its original draft",
+                "collapse/reopen, drag-resize and inspect regular/minimum-window screenshots",
+                "restart and verify exact active route, durable metadata and sidebar preferences"]
     return ["launch an offline fake provider in fresh state on a private vd desktop",
             "create three completed chats across two projects through painted controls",
             "verify compact Unicode search, keyboard activation and project scope",
@@ -216,6 +229,7 @@ class Proof:
     def __init__(self, driver, args):
         self.ui, self.args = driver, args
         self.session = None
+        self.app_closed = False
         self.assertions = []
         self.samples = []
         self.phases = []
@@ -652,6 +666,9 @@ class Proof:
                             "Escape cancels inactive row rename")
         assert_retained(retained, current, draft)
         self.shot("row-renamed.png")
+        self.menu_copy_cases(identifier, retained, draft)
+
+    def menu_copy_cases(self, identifier, retained, draft):
         for action, expected in (("copy_id", identifier), ("copy_path", self.session.data["workspace"])):
             self.right_click(identifier)
             self.menu_choose(action)
@@ -687,6 +704,78 @@ class Proof:
         current = self.wait(lambda value: not value.get("sidebar_scope_project"),
                             "row project filter toggles back to all projects")
         assert_retained(retained, current, draft)
+
+    def active_park_cases(self, alpha, charlie, retained, draft):
+        self.click(alpha)
+        self.wait(lambda value: value.get("thread_id") == alpha and value.get("send_ready"),
+                  "active park fixture selects exact Alpha chat")
+        parked_draft = "Retain parked Alpha café 🎮"
+        self.text("composer.input", parked_draft)
+        before = self.wait(lambda value: value.get("draft") == parked_draft,
+                           "active Alpha park fixture owns a distinct draft")
+        ordered = sorted((row for row in rows(before).values() if row["target"].get("enabled")),
+                         key=lambda row: row["target"]["pointer_bounds"][1])
+        ordered_ids = [row["target"]["id"] for row in ordered]
+        at = ordered_ids.index(alpha)
+        candidates = ordered_ids[at + 1:] + ordered_ids[:at]
+        next_id = next((identifier for identifier in candidates
+                        if not rows(before)[identifier]["settled"]
+                        and rows(before)[identifier]["snoozed_until"] == 0), None)
+        if next_id is None:
+            raise ValueError("active successor fixture lacks a distinct eligible chat")
+        self.right_click(alpha)
+        self.menu_choose("settle")
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and rows(value)[alpha]["settled"] and value.get("thread_id") == next_id,
+                            "active settlement advances to exact observed successor after acceptance")
+        if next_id == charlie:
+            assert_retained(retained, current, draft)
+        self.shot("active-settle-successor.png")
+        self.reveal("settled", alpha)
+        self.click(alpha)
+        alpha_retained = self.wait(lambda value: value.get("thread_id") == alpha
+                                   and value.get("draft") == parked_draft and value.get("send_ready"),
+                                   "revisiting settled Alpha restores its exact retained draft")
+        self.action(alpha, "settle", lambda row: not row["settled"],
+                    "active Alpha restore retains its route and draft", alpha_retained, parked_draft)
+        self.click(charlie)
+        current = self.wait(lambda value: value.get("thread_id") == charlie
+                            and value.get("draft") == draft and value.get("send_ready"),
+                            "Charlie draft restored before sole-project snooze")
+        assert_retained(retained, current, draft)
+        project = current["project_id"]
+        self.click("sidebar.scope")
+        self.wait(lambda value: value.get("sidebar_scope_open"), "sole-project park scope opens")
+        self.click(project)
+        before = self.wait(lambda value: value.get("sidebar_scope_project") == project,
+                           "sole-project park scope selects Charlie project")
+        if [identifier for identifier, row in rows(before).items()
+            if row["target"].get("enabled") and not row["settled"] and row["snoozed_until"] == 0] != [charlie]:
+            raise ValueError("new-chat fallback fixture contains another eligible scoped chat")
+        self.right_click(charlie)
+        self.menu_choose("snooze.1h")
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and value.get("thread_id") not in ("", alpha, charlie)
+                            and value.get("project_id") == project and value.get("send_ready")
+                            and rows(value).get(charlie, {}).get("snoozed_until", 0) > time.time() * 1000,
+                            "active sole-project snooze opens a fresh chat in the same project")
+        if current.get("run_id") or current.get("draft"):
+            raise ValueError("fresh fallback chat inherited parked execution or draft")
+        fallback = current
+        self.shot("active-snooze-new-chat.png")
+        self.reveal("snoozed", charlie)
+        self.action(charlie, "wake", lambda row: row["snoozed_until"] == 0,
+                    "inactive wake preserves fresh fallback route", fallback, "")
+        self.click(charlie)
+        current = self.wait(lambda value: value.get("thread_id") == charlie
+                            and value.get("draft") == draft and value.get("send_ready"),
+                            "revisiting snoozed Charlie restores original run and draft")
+        assert_retained(retained, current, draft)
+        self.click("sidebar.scope")
+        self.wait(lambda value: value.get("sidebar_scope_open"), "park proof scope opens for reset")
+        self.click("scope.all")
+        return self.wait(lambda value: not value.get("sidebar_scope_project"),
+                         "all-project scope restored after active park proofs")
 
     def measure_sidebar(self, identifier, retained, draft):
         """Measure painted sidebar work; input delivery itself has no latency claim."""
@@ -803,6 +892,36 @@ class Proof:
         identifiers = {alpha, bravo, charlie}
         self.shot("cards.png")
 
+        if self.args.focus == "measure":
+            self.session.data["sidebar_focus"] = "measure"
+            self.session.data["limitations"].append(
+                "Focused three-chat sidebar measurement only; full functional, large-history, low-end-hardware and one-to-one visual acceptance are separate.")
+            self.session.save()
+            self.measure_sidebar(alpha, retained, draft)
+            self.shot("measured-settled.png")
+            self.ui.close_app(self.session, self.args.timeout)
+            self.app_closed = True
+            self.finish_metrics()
+            if (self.session.data["source_sha256"] != self.ui.source_fingerprint()
+                    or self.session.data["binary_sha256"] != self.ui.sha256(self.args.binary)):
+                raise ValueError("source or native binary changed during the sidebar measurement")
+            self.session.data.update(passed=True, sidebar_verified=self.assertions)
+            self.session.save()
+            return
+
+        if self.args.focus == "menus":
+            self.session.data["sidebar_focus"] = "menus"
+            self.session.data["limitations"].append(
+                "Focused menu/custom-snooze/active-park/restart cohort; full editor, drag/reorder and one-to-one visual acceptance are separate.")
+            self.session.save()
+            self.menu_copy_cases(alpha, retained, draft)
+            self.exercise_submenus(alpha, retained, draft)
+            self.custom_snooze_cases(alpha, retained, draft)
+            retained = self.active_park_cases(alpha, charlie, retained, draft)
+            title = retained["title_text"]
+            self.resize_restart(launch_args, alpha, bravo, identifiers, retained, draft, title)
+            return
+
         self.click("sidebar.search")
         self.exercise_editor("sidebar_search", retained, draft)
         self.key("Escape")
@@ -889,6 +1008,9 @@ class Proof:
         self.wait(lambda value: not value.get("title_editing") and value.get("title_text") == title,
                   "Escape cancels title edit")
 
+        self.resize_restart(launch_args, alpha, bravo, identifiers, retained, draft, title)
+
+    def resize_restart(self, launch_args, alpha, bravo, identifiers, retained, draft, title):
         self.click("sidebar.toggle")
         current = self.wait(lambda value: value.get("sidebar_collapsed") is True,
                             "sidebar collapses through native toggle")
@@ -971,6 +1093,8 @@ def main(argv=None):
     parser.add_argument("--binary", type=Path, default=ROOT / "zig-out/bin/spica")
     parser.add_argument("--timeout", type=float, default=20)
     parser.add_argument("--private", action="store_true", help="required acknowledgement of private vd desktop")
+    parser.add_argument("--focus", choices=("full", "menus", "measure"), default="full",
+                        help="menus runs focused functional checks; measure runs only the measured sidebar cohort")
     parser.add_argument("--measure", action="store_true", help="collect isolated idle and active-sidebar native frame/process-tree evidence")
     parser.add_argument("--cycles", type=int, default=16, help="12..50 repeated sidebar input cycles in the measured active phase")
     parser.add_argument("--dry-run", action="store_true", help="print steps without filesystem, build or desktop activity")
@@ -979,10 +1103,17 @@ def main(argv=None):
         parser.error("timeout must be finite and between zero and 120 seconds")
     if not 12 <= args.cycles <= 50:
         parser.error("measurement cycles must be between 12 and 50")
+    if args.focus == "menus" and args.measure:
+        parser.error("focused functional evidence and performance measurements must run separately")
+    if args.focus == "measure" and not args.measure:
+        parser.error("--focus measure requires --measure")
     if args.dry_run:
         print(json.dumps({"scenario": "sidebar", "provider": "fake", "build": False,
                           "fixture_lifetime_ms": SCENARIO_LIFETIME_MS,
-                          "steps": plan(), "limitations": ["No performance or physical latency claim."]}, indent=2))
+                          "focus": args.focus, "steps": plan(args.focus),
+                          "limitations": ["No performance or physical latency claim."] +
+                          (["Focused menus omits full editor and reorder acceptance."] if args.focus == "menus" else []) +
+                          (["Focused measurement omits full functional, large-history and low-end-hardware acceptance."] if args.focus == "measure" else [])}, indent=2))
         return 0
     if not args.private:
         parser.error("--private is required; the user's active desktop is never used")
@@ -999,7 +1130,7 @@ def main(argv=None):
         print("eval-sidebar: " + str(error), file=sys.stderr)
         return 1
     finally:
-        if proof.session is not None:
+        if proof.session is not None and not proof.app_closed:
             try:
                 ui.close_app(proof.session, args.timeout)
             except Exception as error:
