@@ -42,12 +42,20 @@ comment on each item with `pass`, `fail`, or a short correction.
 
 ## Current automated evidence
 
-- Debug and ReleaseSafe native integration: `354 passed, 2 skipped` per mode.
+- Debug and ReleaseSafe native integration: `363 passed, 2 skipped` per mode.
 - OpenCode prefix parsing regression: `src/runtime/catalog.zig`.
 - Runtime-switch stale-selection regression: `src/app.zig` and
   `src/ui/coding.zig`.
-- Live-provider acceptance is still pending human review; offline fixtures do
-  not prove a real GLM request.
+- Installed-provider private-desktop evidence now includes three native UI
+  requests to the advertised free `opencode/glm-5.3-flash-free`, including a
+  request after app restart. The historical `opencode-free/glm-5.3-flash`
+  identity is not an alias for this installation's advertised model.
+- Ordinary Codex setup recognizes the existing ChatGPT login with installed
+  Codex 0.164.0. This verifies authentication discovery, not Codex inference or
+  model entitlement. Browser/device completion remains fixture-tested.
+- The unchecked boxes remain the human review queue. Offline fixtures and
+  installed-provider evidence are kept separately in
+  `.artifacts/usability-repair/`; neither proves every provider/account works.
 
 ## Interaction polish review
 
