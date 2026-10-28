@@ -1376,7 +1376,10 @@ pub const View = struct {
     pub fn takeSidebarUndoRequest(self: *View) ?SidebarUndoOperation {
         const undo_request = self.sidebar_undo_request;
         self.sidebar_undo_request = null;
-        return undo_request orelse self.sidebar_lifecycle.takeUndo(wallTimeMs());
+        // Undo is claimed by an explicit button or shortcut event. A plain
+        // App.update poll must not consume the five-second notice before the
+        // user has chosen it.
+        return undo_request;
     }
     pub fn invalidateSidebarUndo(self: *View, id: transcript.Id) void {
         self.sidebar_lifecycle.invalidateUndo(id);
@@ -4121,6 +4124,17 @@ test "root emits only enabled explicit intents and preserves draft until receipt
     view.can_cancel = true;
     view.request(.cancel);
     try std.testing.expectEqual(Intent.cancel, view.takeIntent().?);
+}
+
+test "sidebar Undo is not consumed by a plain view poll" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    const id = try transcript.Id.init("undo-poll");
+    view.offerSidebarUndo(.{ .restore = .{ .id = id, .navigate = true } }, "Archived", View.wallTimeMs());
+    try std.testing.expect(view.takeSidebarUndoRequest() == null);
+    view.sidebar_undo_request = .{ .restore = .{ .id = id, .navigate = true } };
+    try std.testing.expect(view.takeSidebarUndoRequest() != null);
+    try std.testing.expect(view.takeSidebarUndoRequest() == null);
 }
 
 test "workspace inspection keeps selection and rejects stale checkout results" {
