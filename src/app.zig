@@ -71,7 +71,7 @@ const NavigationObservation = struct {
         for (self.view.navigation_targets.slice()) |target| {
             try writer.write(setupTarget(target.id[0..target.id_len], target.role[0..target.role_len], target.bounds, target.enabled));
         }
-        try writer.write(setupTarget("sidebar.search.more", "button", self.view.search_more_bounds, self.view.search_more_available and self.view.navigation_enabled and self.view.search_more_bounds.w > 0 and self.view.search_more_bounds.h > 0 and self.view.sidebar_menu_thread.len == 0));
+        try writer.write(setupTarget("sidebar.search.more", "button", self.view.search_more_bounds, !self.view.customSnoozeOpen() and self.view.search_more_available and self.view.navigation_enabled and self.view.search_more_bounds.w > 0 and self.view.search_more_bounds.h > 0 and self.view.sidebar_menu_thread.len == 0));
         try writer.endArray();
         try writer.objectField("workspace_open");
         try writer.write(self.view.workspace_open);
@@ -467,6 +467,11 @@ pub const App = struct {
                 self.view.notice = @errorName(err);
             };
         }
+        if (self.view.takeCustomSnoozeRequest()) |request| {
+            if (self.conversation) |conversation| {
+                conversation.beginCustomSnooze(request) catch |err| self.view.finishCustomSnooze(@errorName(err));
+            } else self.view.finishCustomSnooze("No connected conversation. Your selection is retained.");
+        }
         if (self.view.title_action) |action| {
             self.view.title_action = null;
             if (action == .cancel) {
@@ -632,6 +637,26 @@ pub const App = struct {
         self.snapshot.sidebar_menu_thread = self.view.sidebar_menu_thread.slice();
         self.snapshot.sidebar_rename_thread = self.view.sidebar_rename_thread.slice();
         self.snapshot.sidebar_rename_text = self.view.sidebar_rename_buffer[0..self.view.sidebar_rename_len];
+        self.snapshot.sidebar_custom_snooze_open = self.view.customSnoozeOpen();
+        self.snapshot.sidebar_custom_snooze_thread = self.view.custom_snooze_thread.slice();
+        self.snapshot.sidebar_custom_snooze_mode = "";
+        self.snapshot.sidebar_custom_snooze_date = "";
+        self.snapshot.sidebar_custom_snooze_time = "";
+        self.snapshot.sidebar_custom_snooze_amount = "";
+        self.snapshot.sidebar_custom_snooze_unit = "";
+        self.snapshot.sidebar_custom_snooze_error = "";
+        self.snapshot.sidebar_custom_snooze_calendar_open = false;
+        self.snapshot.sidebar_custom_snooze_pending = false;
+        if (self.view.custom_snooze) |*state| {
+            self.snapshot.sidebar_custom_snooze_mode = @tagName(state.mode);
+            self.snapshot.sidebar_custom_snooze_date = state.date.slice();
+            self.snapshot.sidebar_custom_snooze_time = state.time.slice();
+            self.snapshot.sidebar_custom_snooze_amount = state.amount.slice();
+            self.snapshot.sidebar_custom_snooze_unit = @tagName(state.unit);
+            self.snapshot.sidebar_custom_snooze_error = state.error_bytes[0..state.error_len];
+            self.snapshot.sidebar_custom_snooze_calendar_open = state.calendar_open;
+            self.snapshot.sidebar_custom_snooze_pending = state.pending;
+        }
         self.snapshot.effort_open = self.view.effort_open;
         const sidebar_bounds = [_]c.SDL_FRect{ self.view.search_bounds, self.view.scope_bounds };
         for (sidebar_bounds, 0..) |bounds, index| {
@@ -803,6 +828,18 @@ pub const App = struct {
             self.snapshot.selected_provider = selected.model_provider.slice();
             self.snapshot.selected_model = selected.model_id.slice();
             self.snapshot.selected_effort = selected.effort.slice();
+        }
+        if (self.view.customSnoozeOpen()) {
+            self.snapshot.editor_focused = false;
+            // The modal publishes its own painted targets through the native
+            // navigation ledger. Disable every covered base snapshot target.
+            inline for (std.meta.fields(automation.Snapshot)) |field| {
+                if (field.type == automation.Target) {
+                    @field(self.snapshot, field.name).enabled = false;
+                } else if (@typeInfo(field.type) == .array and @typeInfo(field.type).array.child == automation.Target) {
+                    for (&@field(self.snapshot, field.name)) |*target| target.enabled = false;
+                }
+            }
         }
         if (self.live) |live| {
             // Explicit automation only. Fixed storage, after measured present,
@@ -1026,7 +1063,8 @@ const Conversation = struct {
         }
     };
     const PendingCommand = struct { ticket: types.Ticket, kind: CommandKind, draft_revision: u64, id: [32]u8 };
-    const SidebarPending = struct { id: Id, revision: u64 };
+    const SidebarPending = struct { id: Id, revision: u64, advance: bool = false, next: Id = .{}, next_project: Id = .{}, custom: bool = false };
+    const SidebarPlan = struct { id: Id, revision: u64, action: Coding.SidebarAction, deadline: i64 };
     const ThreadCursor = struct {
         bytes: [1024]u8 = undefined,
         len: usize = 0,
@@ -1053,6 +1091,8 @@ const Conversation = struct {
     sidebar_route_validated: bool = false,
     sidebar_validated_route: Id = .{},
     sidebar_pending: ?SidebarPending = null,
+    sidebar_plan: ?SidebarPlan = null,
+    custom_snooze_request: ?Coding.CustomSnoozeRequest = null,
     rename_followup: ?Coding.RenameFollowup = null,
     worker: *presentation.Worker,
     wake: *Wake,
@@ -1648,7 +1688,7 @@ const Conversation = struct {
                 if (operation.index >= app.view.thread_count) return error.NoThread;
                 const entry = app.view.threads[operation.index];
                 if (entry.id.len == 0 or entry.revision == 0) return error.NoThread;
-                try self.submitSidebar(entry.id, entry.revision, operation.action, operation.snoozed_until);
+                try self.beginSidebar(app, entry.id, entry.revision, operation.action, operation.snoozed_until);
             },
             .rename => |operation| {
                 if (operation.index >= app.view.thread_count or operation.len == 0 or operation.len > operation.title.len) return error.NoThread;
@@ -1710,6 +1750,23 @@ const Conversation = struct {
     fn submitSidebar(self: *Conversation, id: Id, revision: u64, action: Coding.SidebarAction, deadline: i64) !void {
         try self.submit(.sidebar, .{ .thread = .{ .value = id.slice() } }, .{ .revision = revision }, sidebarPayload(action, deadline), 0);
         self.sidebar_pending = .{ .id = id, .revision = revision };
+    }
+
+    fn beginSidebar(self: *Conversation, app: *App, id: Id, revision: u64, action: Coding.SidebarAction, deadline: i64) !void {
+        // Capture the successor before parking changes pin/order partitioning.
+        // The Host scans the root index; the resident page is not authoritative.
+        if (id.eql(self.thread.slice()) and (action == .settle or action == .snooze)) {
+            self.sidebar_plan = .{ .id = id, .revision = revision, .action = action, .deadline = deadline };
+            errdefer self.sidebar_plan = null;
+            try self.ask(.sidebar_next, .{ .thread_sidebar_next = .{ .canonical_root = self.workspace_root, .project = if (app.view.scope_project.len != 0) .{ .value = app.view.scope_project.slice() } else null, .after = .{ .value = id.slice() } } });
+        } else try self.submitSidebar(id, revision, action, deadline);
+    }
+
+    fn beginCustomSnooze(self: *Conversation, request: Coding.CustomSnoozeRequest) !void {
+        if (self.query != null or self.command != null or self.unknown_send != null) return error.WorkspaceBusy;
+        self.custom_snooze_request = request;
+        errdefer self.custom_snooze_request = null;
+        try self.ask(.custom_snooze, .{ .thread = .{ .value = request.id.slice() } });
     }
 
     fn applyRenameFollowup(self: *Conversation, app: *App, followup: Coding.RenameFollowup) !void {
@@ -2067,7 +2124,7 @@ const Conversation = struct {
         }
     }
 
-    const QueryKind = enum { send_receipt, capabilities, projects, startup_thread, rename_followup, workspaces, inspection_workspace, threads, cards, thread_search, thread, models, runtime_status, startup_status, runs, effects, approvals, questions, tasks, messages, blocks, content };
+    const QueryKind = enum { send_receipt, capabilities, projects, startup_thread, rename_followup, sidebar_next, custom_snooze, workspaces, inspection_workspace, threads, cards, thread_search, thread, models, runtime_status, startup_status, runs, effects, approvals, questions, tasks, messages, blocks, content };
     const CommandKind = enum { prompt_cleanup, followup_enqueue, followup_edit, followup_cancel, followup_order, attachment_add, attachment_remove, question, project, workspace, thread, title, sidebar_title, sidebar, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
@@ -2502,6 +2559,11 @@ const Conversation = struct {
                     if (self.query) |pending| if (pending.ticket.value == value.ticket.value) {
                         self.query = null;
                         if (pending.kind == .rename_followup) self.rename_followup = null;
+                        if (pending.kind == .sidebar_next) self.sidebar_plan = null;
+                        if (pending.kind == .custom_snooze or (pending.kind == .sidebar_next and self.custom_snooze_request != null)) {
+                            self.custom_snooze_request = null;
+                            app.view.finishCustomSnooze(@tagName(value.failure.reason));
+                        }
                         if (pending.kind == .startup_thread and value.failure.reason == .not_found) {
                             self.thread = .{};
                             try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
@@ -2545,6 +2607,10 @@ const Conversation = struct {
                         }
                     };
                     if (self.command) |pending| if (pending.ticket.value == value.ticket.value) {
+                        if (pending.kind == .sidebar) {
+                            if (self.sidebar_pending) |operation| if (operation.custom) app.view.finishCustomSnooze(@tagName(value.failure.reason));
+                            self.sidebar_pending = null;
+                        }
                         if (pending.kind == .sidebar_title) _ = app.view.takeRenameFollowup();
                         switch (pending.kind) {
                             .followup_enqueue, .followup_edit, .followup_cancel, .followup_order => {
@@ -2791,6 +2857,7 @@ const Conversation = struct {
         if (workflow_command and (!self.workflow_pending.thread.eql(self.thread.slice()) or !self.workflow_pending.run.eql(self.run.slice()))) return error.StaleWorkflowReceipt;
         if (value.outcome == .rejected) {
             if (pending.kind == .sidebar or pending.kind == .sidebar_title) {
+                if (self.sidebar_pending) |operation| if (operation.custom) app.view.finishCustomSnooze(if (value.reason) |reason| rejectionMessage(reason) else "Snooze was rejected. Your selection is retained.");
                 if (pending.kind == .sidebar_title) _ = app.view.takeRenameFollowup();
                 self.sidebar_pending = null;
                 app.view.thread_search_revision +%= 1;
@@ -2836,13 +2903,23 @@ const Conversation = struct {
             .sidebar, .sidebar_title => {
                 const operation = self.sidebar_pending orelse return error.UnexpectedCommandReceipt;
                 self.sidebar_pending = null;
-                _ = operation;
+                if (operation.custom) app.view.finishCustomSnooze(null);
                 for (value.committed_revisions) |committed| {
                     if (committed.target == .thread and self.thread.eql(committed.target.thread.value)) self.thread_revision = committed.revision;
                 }
                 app.view.thread_search_revision +%= 1;
                 self.thread_search_started = true;
                 self.notice(&app.view, "Sidebar updated.");
+                if (operation.advance and operation.id.eql(self.thread.slice())) {
+                    if (operation.next.len != 0) {
+                        self.project = operation.next_project;
+                        try self.selectThread(app, operation.next);
+                    } else {
+                        // No eligible successor: keep the parked draft in the
+                        // view's retained store and open a fresh project chat.
+                        try self.createThread();
+                    }
+                }
                 if (pending.kind == .sidebar_title) if (app.view.takeRenameFollowup()) |followup| {
                     self.applyRenameFollowup(app, followup) catch |err| self.notice(&app.view, @errorName(err));
                 };
@@ -2983,6 +3060,67 @@ const Conversation = struct {
 
     fn consume(self: *Conversation, app: *App, kind: QueryKind, value: types.QueryPage) !void {
         switch (kind) {
+            .custom_snooze => {
+                const request = self.custom_snooze_request orelse return error.StaleSidebarPlan;
+                if (value.items.len != 1 or value.items[0] != .thread or !request.id.eql(value.items[0].thread.id.value)) {
+                    self.custom_snooze_request = null;
+                    app.view.finishCustomSnooze("The thread is no longer available.");
+                    return;
+                }
+                const row = value.items[0].thread;
+                if (!std.mem.eql(u8, row.workspace_root, self.workspace_root) or row.archived or !row.can_snooze) {
+                    self.custom_snooze_request = null;
+                    app.view.finishCustomSnooze("This thread cannot be snoozed now. Your selection is retained.");
+                    return;
+                }
+                self.beginSidebar(app, request.id, row.revision, .snooze, request.snoozed_until) catch |err| {
+                    self.custom_snooze_request = null;
+                    app.view.finishCustomSnooze(@errorName(err));
+                    return;
+                };
+                if (self.sidebar_pending) |*operation| {
+                    operation.custom = true;
+                    self.custom_snooze_request = null;
+                }
+            },
+            .sidebar_next => {
+                errdefer if (self.custom_snooze_request != null) {
+                    self.custom_snooze_request = null;
+                    app.view.finishCustomSnooze("Unable to resolve the next thread. Your selection is retained.");
+                };
+                const plan = self.sidebar_plan orelse return error.StaleSidebarPlan;
+                self.sidebar_plan = null;
+                if (!plan.id.eql(self.thread.slice())) {
+                    if (self.custom_snooze_request != null) app.view.finishCustomSnooze("The active thread changed. Retry your selection.");
+                    self.custom_snooze_request = null;
+                    return;
+                }
+                if (value.items.len > 1) return error.InvalidSidebarSuccessor;
+                var next: Id = .{};
+                var next_project: Id = .{};
+                if (value.items.len == 1) {
+                    if (value.items[0] != .thread) return error.InvalidSidebarSuccessor;
+                    const row = value.items[0].thread;
+                    if (!std.mem.eql(u8, row.workspace_root, self.workspace_root)) return error.WrongCheckout;
+                    if (!plan.id.eql(row.id.value)) {
+                        next = try Id.init(row.id.value);
+                        next_project = try Id.init(row.project.value);
+                    }
+                }
+                self.submitSidebar(plan.id, plan.revision, plan.action, plan.deadline) catch |err| {
+                    if (self.custom_snooze_request != null) app.view.finishCustomSnooze(@errorName(err));
+                    self.custom_snooze_request = null;
+                    self.notice(&app.view, @errorName(err));
+                    return;
+                };
+                self.sidebar_pending.?.advance = true;
+                self.sidebar_pending.?.next = next;
+                self.sidebar_pending.?.next_project = next_project;
+                if (self.custom_snooze_request != null) {
+                    self.sidebar_pending.?.custom = true;
+                    self.custom_snooze_request = null;
+                }
+            },
             .rename_followup => {
                 const followup = self.rename_followup orelse return error.StaleRenameFollowup;
                 self.rename_followup = null;
@@ -2998,7 +3136,7 @@ const Conversation = struct {
                 switch (followup) {
                     .sidebar => |operation| {
                         if (!operation.id.eql(row.id.value)) return error.StaleRenameFollowup;
-                        self.submitSidebar(operation.id, row.revision, operation.action, operation.snoozed_until) catch |err| self.notice(&app.view, @errorName(err));
+                        self.beginSidebar(app, operation.id, row.revision, operation.action, operation.snoozed_until) catch |err| self.notice(&app.view, @errorName(err));
                     },
                     .edit_active_title => {
                         if (!app.view.active_thread.eql(row.id.value)) return;
@@ -3171,7 +3309,7 @@ const Conversation = struct {
                 }
             },
             .startup_thread => {
-                if (value.items.len == 1 and std.mem.eql(u8, value.items[0].thread.workspace_root, self.workspace_root)) {
+                if (value.items.len == 1 and !value.items[0].thread.archived and std.mem.eql(u8, value.items[0].thread.workspace_root, self.workspace_root)) {
                     self.project = try Id.init(value.items[0].thread.project.value);
                     self.workspace = try Id.init(value.items[0].thread.workspace.value);
                     // Saved routing is checked against a fresh thread query,
@@ -4298,6 +4436,129 @@ test "sidebar action payloads promote pin and clear pin on settle without coupli
     const snooze = Conversation.sidebarPayload(.snooze, 5000).thread_sidebar_set;
     try std.testing.expectEqual(@as(?i64, 5000), snooze.snoozed_until);
     try std.testing.expect(snooze.pinned == null and snooze.settled == null and !snooze.clear_snooze);
+}
+
+test "active park snapshots its successor before command and navigates only after acceptance" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path);
+    const host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path[0..n] });
+    defer host.destroy();
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    app.view.active_thread = try Id.init("parked");
+    try app.view.editor.setText("Keep parked café 🎮");
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = host, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/park") };
+    conversation.thread = app.view.active_thread;
+    conversation.project = try Id.init("project-a");
+    conversation.run = try Id.init("parked-run");
+    conversation.thread_revision = 9;
+    try conversation.beginSidebar(&app, conversation.thread, 9, .settle, 0);
+    try std.testing.expect(conversation.command == null);
+    try std.testing.expectEqual(Conversation.QueryKind.sidebar_next, conversation.query.?.kind);
+    try std.testing.expect(conversation.sidebar_plan != null);
+    conversation.query = null;
+    // The successor is outside the resident cards and in a different project.
+    const candidate = [_]types.Row{.{ .thread = .{ .id = .{ .value = "next" }, .revision = 3, .project = .{ .value = "project-b" }, .workspace = .{ .value = "work-b" }, .workspace_root = "/tmp/park", .session = null } }};
+    try conversation.consume(&app, .sidebar_next, .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{}, .items = &candidate, .expires_at = 0 });
+    try std.testing.expectEqualStrings("parked", conversation.thread.slice());
+    try std.testing.expectEqualStrings("parked-run", conversation.run.slice());
+    try std.testing.expectEqualStrings("Keep parked café 🎮", app.view.editor.textBytes());
+    try std.testing.expect(conversation.sidebar_pending.?.advance);
+    const pending = conversation.command.?;
+    const revisions = [_]types.CommittedRevision{.{ .target = .{ .thread = .{ .value = "parked" } }, .revision = 10 }};
+    try conversation.receipt(&app, pending.ticket, .{ .command_id = .{ .value = &pending.id }, .outcome = .accepted, .commit_sequence = 1, .committed_revisions = &revisions });
+    try std.testing.expectEqualStrings("next", conversation.thread.slice());
+    try std.testing.expectEqualStrings("project-b", conversation.project.slice());
+    try std.testing.expect(conversation.run.len == 0);
+    try app.view.selectThread(try Id.init("parked"));
+    try std.testing.expectEqualStrings("Keep parked café 🎮", app.view.editor.textBytes());
+}
+
+test "rejected active park retains route run and exact draft" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    app.view.active_thread = try Id.init("active");
+    try app.view.editor.setText("Stay here é 🎮");
+    const command_id = [_]u8{'b'} ** 32;
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/park") };
+    conversation.thread = app.view.active_thread;
+    conversation.run = try Id.init("live-run");
+    conversation.command = .{ .ticket = .{ .value = 43 }, .kind = .sidebar, .draft_revision = 0, .id = command_id };
+    conversation.sidebar_pending = .{ .id = conversation.thread, .revision = 7, .advance = true, .next = try Id.init("next"), .next_project = try Id.init("other") };
+    try conversation.receipt(&app, .{ .value = 43 }, .{ .command_id = .{ .value = &command_id }, .outcome = .rejected, .reason = .revision_conflict, .commit_sequence = 1 });
+    try std.testing.expectEqualStrings("active", conversation.thread.slice());
+    try std.testing.expectEqualStrings("live-run", conversation.run.slice());
+    try std.testing.expectEqualStrings("Stay here é 🎮", app.view.editor.textBytes());
+    try std.testing.expect(conversation.sidebar_pending == null);
+}
+
+test "successor plan fails closed on foreign roots and abandons changed routes" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/park") };
+    conversation.thread = try Id.init("active");
+    const request: Conversation.SidebarPlan = .{ .id = conversation.thread, .revision = 2, .action = .snooze, .deadline = 9000 };
+    const candidate = [_]types.Row{.{ .thread = .{ .id = .{ .value = "foreign" }, .revision = 3, .project = .{ .value = "other" }, .workspace = .{ .value = "w" }, .workspace_root = "/tmp/foreign", .session = null } }};
+    const result: types.QueryPage = .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{}, .items = &candidate, .expires_at = 0 };
+    conversation.sidebar_plan = request;
+    try std.testing.expectError(error.WrongCheckout, conversation.consume(&app, .sidebar_next, result));
+    try std.testing.expect(conversation.command == null and conversation.sidebar_plan == null);
+    conversation.sidebar_plan = request;
+    conversation.thread = try Id.init("changed-route");
+    try conversation.consume(&app, .sidebar_next, result);
+    try std.testing.expect(conversation.command == null and conversation.sidebar_plan == null);
+}
+
+test "custom sidebar snooze resolves fresh inactive revision and closes only on acceptance" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path);
+    const host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path[0..n] });
+    defer host.destroy();
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    app.view.active_thread = try Id.init("active");
+    try app.view.editor.setText("Keep active 🎮 draft");
+    app.view.custom_snooze = try @import("ui/sidebar_snooze.zig").State.init(Coding.wallTimeMs());
+    app.view.custom_snooze_thread = try Id.init("background");
+    app.view.custom_snooze.?.mode = .duration;
+    app.view.custom_snooze.?.amount.set("1.5");
+    try std.testing.expect(app.view.custom_snooze.?.submit(Coding.wallTimeMs()));
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = host, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/custom") };
+    conversation.thread = app.view.active_thread;
+    conversation.run = try Id.init("active-run");
+    try conversation.beginCustomSnooze(app.view.takeCustomSnoozeRequest().?);
+    try std.testing.expectEqual(Conversation.QueryKind.custom_snooze, conversation.query.?.kind);
+    conversation.query = null;
+    const candidate = [_]types.Row{.{ .thread = .{ .id = .{ .value = "background" }, .revision = 31, .project = .{ .value = "p" }, .workspace = .{ .value = "w" }, .workspace_root = "/tmp/custom", .session = null, .can_snooze = true } }};
+    const result: types.QueryPage = .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{}, .items = &candidate, .expires_at = 0 };
+    try conversation.consume(&app, .custom_snooze, result);
+    try std.testing.expectEqual(@as(u64, 31), conversation.sidebar_pending.?.revision);
+    try std.testing.expect(conversation.sidebar_pending.?.custom);
+    try std.testing.expect(!conversation.sidebar_pending.?.advance);
+    try std.testing.expect(app.view.customSnoozePending());
+    const rejected = conversation.command.?;
+    try conversation.receipt(&app, rejected.ticket, .{ .command_id = .{ .value = &rejected.id }, .outcome = .rejected, .reason = .revision_conflict, .commit_sequence = 0 });
+    try std.testing.expect(app.view.customSnoozeOpen() and !app.view.customSnoozePending());
+    try std.testing.expectEqualStrings("1.5", app.view.custom_snooze.?.amount.slice());
+    try std.testing.expect(app.view.custom_snooze.?.error_len > 0);
+    try std.testing.expect(app.view.custom_snooze.?.submit(Coding.wallTimeMs()));
+    try conversation.beginCustomSnooze(app.view.takeCustomSnoozeRequest().?);
+    conversation.query = null;
+    try conversation.consume(&app, .custom_snooze, result);
+    const accepted = conversation.command.?;
+    try conversation.receipt(&app, accepted.ticket, .{ .command_id = .{ .value = &accepted.id }, .outcome = .accepted, .commit_sequence = 1 });
+    try std.testing.expect(!app.view.customSnoozeOpen());
+    try std.testing.expectEqualStrings("active", conversation.thread.slice());
+    try std.testing.expectEqualStrings("active-run", conversation.run.slice());
+    try std.testing.expectEqualStrings("Keep active 🎮 draft", app.view.editor.textBytes());
 }
 
 test "rename followup resolves fresh sidebar target revision without selecting it or reusing row index" {
