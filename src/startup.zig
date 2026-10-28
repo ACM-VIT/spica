@@ -18,11 +18,11 @@ pub fn defaults(allocator: std.mem.Allocator, io: std.Io, state_directory: []con
 }
 
 /// Resolve path syntax only; never create/read an account or inspect its auth.
-/// Empty CODEX_HOME follows Codex's normal HOME fallback. Relative overrides
-/// are made absolute against the launch cwd before crossing the Host boundary.
+/// Prefer the ordinary desktop login over a harness-specific CODEX_HOME. An
+/// explicit saved/UI selection remains authoritative after these defaults.
 pub fn codexAccount(a: std.mem.Allocator, state: []const u8, cwd: []const u8, home: ?[]const u8, override: ?[]const u8) ![]const u8 {
-    if (override) |value| if (value.len != 0) return std.fs.path.resolve(a, &.{ cwd, value });
     if (home) |value| if (std.fs.path.isAbsolute(value)) return std.fs.path.resolve(a, &.{ value, ".codex" });
+    if (override) |value| if (value.len != 0) return std.fs.path.resolve(a, &.{ cwd, value });
     return std.fs.path.join(a, &.{ state, "accounts", "codex" });
 }
 
@@ -104,12 +104,15 @@ test "Codex auth home precedence resolves Unicode overrides without reading or c
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectEqualStrings("/custom/账号", try codexAccount(a, "/state", "/launch", "/user", "/custom/账号"));
+    try std.testing.expectEqualStrings("/user/.codex", try codexAccount(a, "/state", "/launch", "/user", "/custom/账号"));
     try std.testing.expectEqualStrings("/user/.codex", try codexAccount(a, "/state", "/launch", "/user", ""));
     try std.testing.expectEqualStrings("/state/accounts/codex", try codexAccount(a, "/state", "/launch", "relative", null));
-    try std.testing.expectEqualStrings("/launch/relative/账号", try codexAccount(a, "/state", "/launch", "/user", "relative/账号"));
+    try std.testing.expectEqualStrings("/user/.codex", try codexAccount(a, "/state", "/launch", "/user", "relative/账号"));
+    try std.testing.expectEqualStrings("/custom/账号", try codexAccount(a, "/state", "/launch", null, "/custom/账号"));
+    try std.testing.expectEqualStrings("/launch/relative/账号", try codexAccount(a, "/state", "/launch", null, "relative/账号"));
+    try std.testing.expectEqualStrings("/state/accounts/codex", try codexAccount(a, "/state", "/launch", null, ""));
     const setups = try defaults(a, std.testing.io, "/state", "", "/user", "/custom/账号");
-    try std.testing.expectEqualStrings("/custom/账号", setups[0].account_directory);
+    try std.testing.expectEqualStrings("/user/.codex", setups[0].account_directory);
     try std.testing.expectEqualStrings("/state/accounts/opencode", setups[1].account_directory);
     try std.testing.expectEqualStrings("auto", setups[1].model_provider);
 }

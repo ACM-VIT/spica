@@ -54,6 +54,7 @@ pub const NativeFactory = struct {
             expected.workspace = selection.workspace;
             expected.model_id = selection.model_id;
             expected.effort = selection.effort;
+            if (std.mem.eql(u8, expected.runtime_kind, "codex") and catalog.codexVersionSupported(expected.required_runtime_version) and catalog.codexVersionSupported(selection.required_runtime_version)) expected.required_runtime_version = selection.required_runtime_version;
             const provider_matches = std.mem.eql(u8, expected.model_provider, selection.model_provider) or
                 (std.mem.eql(u8, expected.runtime_kind, "opencode") and std.mem.eql(u8, expected.model_provider, "auto") and selection.model_provider.len != 0);
             expected.model_provider = selection.model_provider;

@@ -29,6 +29,26 @@ fn initializeFixture(runtime: *codex.RuntimeFor(Mock), wire: *Mock, a: std.mem.A
     try runtime.pump();
 }
 
+test "Codex 0.164 handshake recognizes existing ChatGPT auth and records actual observation version" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: Mock = .{ .allocator = a };
+    var runtime = try codex.RuntimeFor(Mock).init(std.testing.allocator, &wire, .{ .selection = selection, .cwd = "/tmp/project", .instance = "installed-revision" });
+    defer runtime.deinit();
+    try wire.input.append(a, "{\"id\":1,\"result\":{\"userAgent\":\"spica/0.164.0 (Linux; x86_64) unknown (spica; 1)\",\"codexHome\":\"/tmp/spica-codex\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\"}}");
+    try wire.input.append(a, "{\"id\":2,\"result\":{\"account\":{\"type\":\"chatgpt\",\"email\":null,\"planType\":\"pro\"},\"requiresOpenaiAuth\":true,\"workspaceRouting\":null}}");
+    try runtime.pump();
+    try std.testing.expect(runtime.initialized);
+    try std.testing.expectEqual(.ready, runtime.readiness);
+    try std.testing.expectEqualStrings("0.164.0", runtime.discover().runtime_version);
+    for (wire.lines.items) |line| try std.testing.expect(std.mem.indexOf(u8, line, "account/login/start") == null);
+    _ = try runtime.asAdapter().dispatch(a, .{ .open = .{ .create = .{ .effect = .{ .value = "open" }, .session = .{ .value = "session" }, .selection = selection } } });
+    try wire.input.append(a, "{\"id\":3,\"result\":{\"thread\":{\"id\":\"upstream\"},\"model\":\"gpt-6.1-sol\",\"modelProvider\":\"openai\",\"cwd\":\"/tmp/project\",\"reasoningEffort\":\"medium\"}}");
+    try runtime.pump();
+    try std.testing.expectEqualStrings("0.164.0", (try runtime.poll(a)).?.runtime_version);
+}
+
 test "Codex subsequent turns preserve exact session with bounded metadata and no terminal replay" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -488,7 +508,7 @@ test "Codex installed isolated handshake and unsigned account" {
         try runtime.pump();
         if (runtime.initialized and runtime.pending == null) {
             try std.testing.expectEqual(c.Readiness.unavailable, runtime.accountStatus().readiness);
-            std.debug.print("isolated Codex0.163.0 initialized; managed ChatGPT account absent; state={s}\\n", .{root});
+            std.debug.print("isolated Codex {s} initialized; managed ChatGPT account absent; state={s}\\n", .{ runtime.runtime_version, root });
             return;
         }
         _ = transport.c.spica_process_poll(&wire.process, -1, @intFromBool(wire.input_len != 0), 20);

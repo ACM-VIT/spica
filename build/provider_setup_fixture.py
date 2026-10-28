@@ -57,15 +57,19 @@ def main():
             continue
         if method == 'initialize':
             reply(request, dict(protocolVersion=1, agentInfo=dict(name='offline-setup', version='2.1.4'), agentCapabilities=dict())
-                  if OPENCODE else dict(userAgent='offline-spica-fixture/0.163.0'))
+                  if OPENCODE else dict(userAgent='offline-spica-fixture/' + os.environ.get('SPICA_FIXTURE_CODEX_VERSION', '0.163.0')))
         elif method == 'account/read':
             reply(request, dict(account=account(), requiresOpenaiAuth=account() is None))
         elif method == 'model/list':
             reply(request, dict(data=[dict(id=MODEL, model=MODEL, displayName='Offline setup fixture',
                   defaultReasoningEffort='low', supportedReasoningEfforts=[dict(reasoningEffort='low'), dict(reasoningEffort='high')])], nextCursor=None))
         elif method == 'account/login/start':
-            reply(request, dict(type='chatgptDeviceCode', loginId='setup-login',
-                  verificationUrl='https://example.invalid/spica-fixture', userCode='TEST-1234'))
+            if params.get('type') == 'chatgpt':
+                reply(request, dict(type='chatgpt', loginId='setup-login',
+                      authUrl='https://example.invalid/spica-fixture'))
+            else:
+                reply(request, dict(type='chatgptDeviceCode', loginId='setup-login',
+                      verificationUrl='https://example.invalid/spica-fixture', userCode='TEST-1234'))
             threading.Thread(target=complete_login, daemon=True).start()
         elif method in ('thread/start', 'thread/resume'):
             reply(request, dict(thread=dict(id=params.get('threadId', 'setup-thread')),

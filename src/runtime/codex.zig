@@ -1,4 +1,4 @@
-//! Codex 0.163.0 app-server, experimental dynamicTools explicitly negotiated.
+//! Codex 0.163.0/0.164.0 app-server, experimental dynamicTools negotiated.
 const std = @import("std");
 const c = @import("../contract.zig");
 const adapter = @import("adapter.zig");
@@ -52,6 +52,7 @@ pub fn RuntimeFor(comptime T: type) type {
         wire: *T,
         config: Config,
         initialized: bool = false,
+        runtime_version: []const u8 = "0.163.0",
         readiness: c.Readiness = .unknown,
         login: []const u8 = "",
         login_id: []const u8 = "",
@@ -133,11 +134,11 @@ pub fn RuntimeFor(comptime T: type) type {
             self.diagnostic = "";
             self.readiness = .unknown;
         }
-        pub fn discover(_: *Self) c.Discovery {
+        pub fn discover(self: *Self) c.Discovery {
             var caps = [_]c.CapabilityInfo{.{ .status = .unsupported, .evidence = "Codex adapter unsupported surface" }} ** @typeInfo(c.Capability).@"enum".fields.len;
-            inline for ([_]c.Capability{ .create, .attach, .start, .stream, .tools, .approval, .cancel, .selection, .workspace, .message, .followup_queue, .question, .attachment }) |cap| caps[@intFromEnum(cap)] = .{ .status = .supported, .evidence = "Codex 0.163.0 app-server turns, steering and user input" };
+            inline for ([_]c.Capability{ .create, .attach, .start, .stream, .tools, .approval, .cancel, .selection, .workspace, .message, .followup_queue, .question, .attachment }) |cap| caps[@intFromEnum(cap)] = .{ .status = .supported, .evidence = "Codex 0.163.0/0.164.0 app-server turns, steering and user input" };
             caps[@intFromEnum(c.Capability.coordinator_bridge)] = .{ .status = .unknown, .evidence = "dynamicTools protocol available; live app bridge acceptance required" };
-            return .{ .runtime_kind = "codex", .runtime_version = "0.163.0", .capabilities = caps, .limits = .{} };
+            return .{ .runtime_kind = "codex", .runtime_version = self.runtime_version, .capabilities = caps, .limits = .{} };
         }
         pub fn accountStatus(self: *Self) c.Account {
             return .{ .reference = self.config.selection.account_ref, .readiness = self.readiness };
@@ -321,7 +322,7 @@ pub fn RuntimeFor(comptime T: type) type {
             self.sequence += 1;
             var id: [512]u8 = undefined;
             const event = try std.fmt.bufPrint(&id, "codex:{s}:{d}", .{ self.config.instance, self.sequence });
-            self.queue[index] = try adapter.clone(fixed.allocator(), c.Observation{ .correlation = correlation, .upstream_event = event, .sequence = self.sequence, .runtime_version = "0.163.0", .body = body });
+            self.queue[index] = try adapter.clone(fixed.allocator(), c.Observation{ .correlation = correlation, .upstream_event = event, .sequence = self.sequence, .runtime_version = self.runtime_version, .body = body });
             self.count += 1;
         }
         fn emit(self: *Self, body: @FieldType(c.Observation, "body")) !void {
@@ -434,7 +435,7 @@ pub fn RuntimeFor(comptime T: type) type {
                 const result = field(value, "result");
                 switch (pending.kind) {
                     .initialize => {
-                        if (std.mem.indexOf(u8, text(field(result, "userAgent")), "0.163.0") == null) return error.RuntimeVersionMismatch;
+                        self.runtime_version = try @import("catalog.zig").codexRuntimeVersion(text(field(result, "userAgent")));
                         self.initialized = true;
                         try self.wire.send("{\"method\":\"initialized\",\"params\":{}}");
                         try self.rpc(.account, .{ .refreshToken = false }, self.correlation);

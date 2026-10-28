@@ -6,6 +6,20 @@ const common = @import("adapter.zig");
 const Value = std.json.Value;
 pub const max_models = 128;
 pub const max_efforts = 16;
+/// Explicitly tested app-server revisions. Parse the protocol version from the
+/// first UA product token, whose name is the initializing client's identity.
+pub fn codexVersionSupported(version: []const u8) bool {
+    return std.mem.eql(u8, version, "0.163.0") or std.mem.eql(u8, version, "0.164.0");
+}
+pub fn codexRuntimeVersion(user_agent: []const u8) ![]const u8 {
+    const end = std.mem.indexOfScalar(u8, user_agent, ' ') orelse user_agent.len;
+    const product = user_agent[0..end];
+    const slash = std.mem.lastIndexOfScalar(u8, product, '/') orelse return error.RuntimeVersionMismatch;
+    const version = product[slash + 1 ..];
+    if (std.mem.eql(u8, version, "0.163.0")) return "0.163.0";
+    if (std.mem.eql(u8, version, "0.164.0")) return "0.164.0";
+    return error.RuntimeVersionMismatch;
+}
 pub fn field(v: Value, key: []const u8) Value {
     return if (v == .object) v.object.get(key) orelse .null else .null;
 }
@@ -79,6 +93,12 @@ pub fn codexAccountReadiness(result: Value) c.Readiness {
     const kind = text(field(field(result, "account"), "type"));
     return if (eq(kind, "chatgpt") or eq(kind, "apiKey")) .ready else .unavailable;
 }
+pub fn codexAccountReason(result: Value) []const u8 {
+    const kind = text(field(field(result, "account"), "type"));
+    if (eq(kind, "chatgpt")) return "ChatGPT account signed in; model access is verified when a request completes.";
+    if (eq(kind, "apiKey")) return "API-key account configured; this uses API billing, not a ChatGPT subscription. Sign in to use ChatGPT instead.";
+    return "Codex account needs authentication. Choose the existing ChatGPT account folder or sign in.";
+}
 
 pub fn codex(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire: *transport.Transport, selection: c.Selection, output: []c.Model) !usize {
     var diagnostic: RpcDiagnostic = .{};
@@ -86,7 +106,7 @@ pub fn codex(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire: *t
 }
 pub fn codexWithDiagnostic(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire: *transport.Transport, selection: c.Selection, output: []c.Model, diagnostic: *RpcDiagnostic) !usize {
     const init = try call(wire, allocator, diagnostic, 1, "initialize", .{ .clientInfo = .{ .name = "spica", .version = "1" }, .capabilities = .{ .experimentalApi = true } });
-    if (std.mem.indexOf(u8, text(field(init, "userAgent")), "0.163.0") == null) return error.RuntimeVersionMismatch;
+    const version = try codexRuntimeVersion(text(field(init, "userAgent")));
     try wire.send("{\"method\":\"initialized\",\"params\":{}}");
     const account = try call(wire, allocator, diagnostic, 2, "account/read", .{ .refreshToken = false });
     const readiness = codexAccountReadiness(account);
@@ -99,7 +119,10 @@ pub fn codexWithDiagnostic(allocator: std.mem.Allocator, retained: std.mem.Alloc
         if (data != .array) return error.InvalidCatalog;
         for (data.array.items) |model| {
             if (count == output.len) return error.CatalogLimit;
-            output[count] = try codexModel(retained, selection, model, readiness);
+            var actual = selection;
+            actual.required_runtime_version = version;
+            output[count] = try codexModel(retained, actual, model, readiness);
+            output[count].reason = codexAccountReason(account);
             count += 1;
         }
         const next = text(field(result, "nextCursor"));
@@ -239,6 +262,28 @@ fn appendOpenCode(allocator: std.mem.Allocator, input: c.Selection, model: Value
     selection.effort = "default";
     output[count.*] = .{ .selection = try common.clone(allocator, selection), .supported_efforts = &.{"default"}, .display_name = try allocator.dupe(u8, text(field(model, "name"))), .readiness = .unknown, .reason = "OpenCode negotiated catalog; account entitlement unverified; per-model variants require exact session negotiation" };
     count.* += 1;
+}
+
+test "Codex supported revisions use the first UA token and reject untested versions" {
+    try std.testing.expectEqualStrings("0.163.0", try codexRuntimeVersion("codex/0.163.0"));
+    try std.testing.expectEqualStrings("0.164.0", try codexRuntimeVersion("spica/0.164.0 (Linux; x86_64) unknown (spica; 1)"));
+    for ([_][]const u8{ "codex/0.163.01", "codex/0.164.0-beta.1", "spica/0.165.0 (client/0.163.0)", "0.164.0", "" }) |ua| try std.testing.expectError(error.RuntimeVersionMismatch, codexRuntimeVersion(ua));
+}
+
+test "Codex account reasons distinguish subscription login from API billing without retaining identity" {
+    const a = std.testing.allocator;
+    for ([_]struct { json: []const u8, reason: []const u8, readiness: c.Readiness }{
+        .{ .json = "{\"account\":{\"type\":\"chatgpt\",\"email\":\"private@example.invalid\"}}", .reason = "ChatGPT account signed in", .readiness = .ready },
+        .{ .json = "{\"account\":{\"type\":\"apiKey\"}}", .reason = "API-key account configured", .readiness = .ready },
+        .{ .json = "{\"account\":null}", .reason = "Codex account needs authentication", .readiness = .unavailable },
+    }) |fixture| {
+        const parsed = try std.json.parseFromSlice(Value, a, fixture.json, .{});
+        defer parsed.deinit();
+        const reason = codexAccountReason(parsed.value);
+        try std.testing.expect(std.mem.startsWith(u8, reason, fixture.reason));
+        try std.testing.expect(std.mem.indexOf(u8, reason, "private@example.invalid") == null);
+        try std.testing.expectEqual(fixture.readiness, codexAccountReadiness(parsed.value));
+    }
 }
 
 test "Codex catalog preserves protocol efforts and unauthed evidence" {

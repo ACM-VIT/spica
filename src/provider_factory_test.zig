@@ -366,49 +366,93 @@ test "saved setup restoration owns fields without touching missing account state
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(std.testing.io, account, .{}));
 }
 
-test "pending sign-in survives refresh rejection and completes through setup polling" {
+test "Codex 0.164 catalog records the installed revision and authorizes compatible configuration" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const allocator = arena.allocator();
-    const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", allocator);
-    const account = try std.fs.path.join(allocator, &.{ root, "fixture-account" });
-    var configured: native.NativeFactory = .{ .configs = &.{} };
+    const a = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", a);
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = ".spica-fixture-signed-in", .data = "offline fixture only\n" });
+    const executable = try fixtureExecutable(a);
+    var chosen = selection;
+    chosen.workspace.value = root;
+    chosen.account_ref = root;
+    var configured: native.NativeFactory = .{ .configs = &.{.{ .selection = chosen, .executable = executable, .environment = &.{ try std.fmt.allocPrintSentinel(a, "CODEX_HOME={s}", .{root}, 0), "SPICA_FIXTURE_CODEX_VERSION=0.164.0" } }}, .status = .{ .runtime_kind = "codex", .workspace_root = root } };
     const factory = configured.asFactory();
-    defer if (factory.vtable.shutdownSetup) |shutdown| shutdown(factory.context);
-    try factory.runtimeAction(std.testing.allocator, std.testing.io, .{ .configure = .{ .runtime_kind = .codex, .executable = try fixtureExecutable(allocator), .account_directory = account, .workspace_root = root, .model_provider = "openai" } });
-    try factory.runtimeAction(std.testing.allocator, std.testing.io, .{ .login = .{ .runtime_kind = .codex, .mode = .device } });
-    try std.testing.expect(factory.runtimeStatus().login_pending);
-    const started = @import("runtime/transport.zig").c.spica_monotonic_ms();
-    var saw_url = false;
-    var completed = false;
-    while (@import("runtime/transport.zig").c.spica_monotonic_ms() - started < 5000) {
-        _ = factory.vtable.pumpSetup.?(factory.context);
-        const status = factory.runtimeStatus();
-        if (status.login_pending and status.login.len != 0) {
-            saw_url = true;
-            const url = try allocator.dupe(u8, status.login);
-            try std.testing.expect(std.mem.indexOf(u8, url, "https://example.invalid/spica-fixture") != null);
-            const instance = configured.login_instance.?.context;
-            try std.testing.expectError(error.RuntimeBusy, factory.runtimeAction(std.testing.allocator, std.testing.io, .refresh));
-            try std.testing.expectEqual(instance, configured.login_instance.?.context);
-            try std.testing.expect(factory.runtimeStatus().login_pending);
-            try std.testing.expectEqualStrings(url, factory.runtimeStatus().login);
-            try std.testing.expectEqual(status.readiness, factory.runtimeStatus().readiness);
-        }
-        if (!status.login_pending) {
-            try std.testing.expectEqual(.ready, status.readiness);
-            completed = true;
-            break;
-        }
-        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
-    }
-    try std.testing.expect(saw_url and completed);
-    try std.testing.expectEqual(@as(usize, 0), factory.models().len);
     try factory.runtimeAction(std.testing.allocator, std.testing.io, .refresh);
     try std.testing.expectEqual(@as(usize, 1), factory.models().len);
-    try std.testing.expectEqual(.ready, factory.runtimeStatus().readiness);
+    const discovered = factory.models()[0];
+    try std.testing.expectEqualStrings("0.164.0", discovered.selection.required_runtime_version);
+    try std.testing.expectEqual(.ready, factory.resolveSelection(discovered.selection).readiness);
+    try std.testing.expectEqualStrings("0.164.0", factory.discover(discovered.selection).runtime_version);
+    try std.testing.expect(std.mem.startsWith(u8, factory.runtimeStatus().reason, "ChatGPT account signed in"));
+    const instance = try factory.create(std.testing.allocator, discovered.selection, root, .{ .value = "newer-supported-runtime" }, null);
+    defer factory.destroy(std.testing.allocator, instance);
+    defer instance.shutdown();
+    const runtime: *@import("runtime/codex.zig").Runtime = @ptrCast(@alignCast(instance.context));
+    const clock = @import("runtime/transport.zig").c;
+    const start = clock.spica_monotonic_ms();
+    while (!runtime.initialized or runtime.pending != null) {
+        try runtime.pump();
+        if (clock.spica_monotonic_ms() - start > 3000) return error.HandshakeTimeout;
+        _ = clock.spica_process_poll(&runtime.wire.process, -1, @intFromBool(runtime.wire.input_len != 0), 10);
+    }
+    try std.testing.expectEqual(.ready, runtime.readiness);
+    try std.testing.expectEqualStrings("0.164.0", runtime.discover().runtime_version);
+    var unsupported = discovered.selection;
+    unsupported.required_runtime_version = "0.165.0";
+    try std.testing.expectError(error.SelectionUnavailable, factory.create(std.testing.allocator, unsupported, root, .{ .value = "untested" }, null));
+}
+
+test "Codex browser and device sign-in survive refresh rejection and complete through setup polling" {
+    for ([_]c.RuntimeLogin{ .{ .runtime_kind = .codex, .mode = .browser }, .{ .runtime_kind = .codex, .mode = .device } }) |login| {
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+        const account = try std.fs.path.join(allocator, &.{ root, "fixture-account" });
+        var configured: native.NativeFactory = .{ .configs = &.{} };
+        const factory = configured.asFactory();
+        defer if (factory.vtable.shutdownSetup) |shutdown| shutdown(factory.context);
+        try factory.runtimeAction(std.testing.allocator, std.testing.io, .{ .configure = .{ .runtime_kind = .codex, .executable = try fixtureExecutable(allocator), .account_directory = account, .workspace_root = root, .model_provider = "openai" } });
+        try factory.runtimeAction(std.testing.allocator, std.testing.io, .{ .login = login });
+        try std.testing.expect(factory.runtimeStatus().login_pending);
+        const started = @import("runtime/transport.zig").c.spica_monotonic_ms();
+        var saw_url = false;
+        var completed = false;
+        while (@import("runtime/transport.zig").c.spica_monotonic_ms() - started < 5000) {
+            _ = factory.vtable.pumpSetup.?(factory.context);
+            const status = factory.runtimeStatus();
+            if (status.login_pending and status.login.len != 0) {
+                saw_url = true;
+                const url = try allocator.dupe(u8, status.login);
+                try std.testing.expect(std.mem.indexOf(u8, url, "https://example.invalid/spica-fixture") != null);
+                const shape = try std.json.parseFromSlice(std.json.Value, allocator, url, .{});
+                try std.testing.expectEqualStrings(if (login.mode == .browser) "chatgpt" else "chatgptDeviceCode", shape.value.object.get("type").?.string);
+                try std.testing.expect(shape.value.object.contains(if (login.mode == .browser) "authUrl" else "verificationUrl"));
+                const instance = configured.login_instance.?.context;
+                try std.testing.expectError(error.RuntimeBusy, factory.runtimeAction(std.testing.allocator, std.testing.io, .refresh));
+                try std.testing.expectEqual(instance, configured.login_instance.?.context);
+                try std.testing.expect(factory.runtimeStatus().login_pending);
+                try std.testing.expectEqualStrings(url, factory.runtimeStatus().login);
+                try std.testing.expectEqual(status.readiness, factory.runtimeStatus().readiness);
+            }
+            if (!status.login_pending) {
+                try std.testing.expectEqual(.ready, status.readiness);
+                completed = true;
+                break;
+            }
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+        }
+        try std.testing.expect(saw_url and completed);
+        try std.testing.expectEqual(@as(usize, 0), factory.models().len);
+        try factory.runtimeAction(std.testing.allocator, std.testing.io, .refresh);
+        try std.testing.expectEqual(@as(usize, 1), factory.models().len);
+        try std.testing.expectEqual(.ready, factory.runtimeStatus().readiness);
+    }
 }
 
 const domain = @import("domain.zig");
