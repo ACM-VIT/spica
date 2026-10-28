@@ -840,8 +840,12 @@ class Proof:
         before = self.session.snapshot(self.args.timeout)
         lifecycle_rows(before)
         # Background archive preserves the exact active route, execution and draft.
-        self.lifecycle_action(alpha, "archive", lambda row: row["archived"],
-                              "inactive Alpha archives durably", retained, draft)
+        self.right_click(alpha)
+        self.menu_choose("archive")
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and alpha not in lifecycle_rows(value),
+                            "inactive Alpha archives durably")
+        assert_retained(retained, current, draft)
         current = self.session.snapshot(self.args.timeout)
         if current.get("thread_id") != retained.get("thread_id"):
             raise ValueError("background archive changed the active route")
