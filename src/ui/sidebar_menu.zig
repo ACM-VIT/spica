@@ -69,6 +69,19 @@ pub const Panel = struct {
         const index = self.selected orelse return null;
         return if (index < self.len and self.items[index].enabled) self.items[index] else null;
     }
+    pub fn rowTop(self: *const Panel, index: usize) f32 {
+        var top: f32 = 4;
+        for (self.slice()[0..@min(index + 1, self.len)], 0..) |item, row| {
+            if (item.separator_before and row != 0) top += 9;
+            if (row == index) return top;
+            top += 28;
+        }
+        return top;
+    }
+    pub fn height(self: *const Panel) f32 {
+        if (self.len == 0) return 8;
+        return self.rowTop(self.len - 1) + 32;
+    }
 };
 pub const MainState = struct {
     can_operate: bool,
@@ -96,13 +109,13 @@ pub fn copy(has_path: bool, has_branch: bool) Panel {
     return panel;
 }
 
-pub fn snooze() Panel {
+pub fn snooze(available: [5]bool) Panel {
     var panel: Panel = .{};
-    panel.append(.{ .action = .preset, .id = "sidebar.menu.snooze.1h", .label = "In 1 hour", .preset_index = 0 });
-    panel.append(.{ .action = .preset, .id = "sidebar.menu.snooze.3h", .label = "In 3 hours", .preset_index = 1 });
-    panel.append(.{ .action = .preset, .id = "sidebar.menu.snooze.evening", .label = "This evening", .preset_index = 2 });
-    panel.append(.{ .action = .preset, .id = "sidebar.menu.snooze.tomorrow", .label = "Tomorrow 09:00", .preset_index = 3 });
-    panel.append(.{ .action = .preset, .id = "sidebar.menu.snooze.monday", .label = "Next week Monday 09:00", .preset_index = 4 });
+    const ids = [_][]const u8{ "sidebar.menu.snooze.1h", "sidebar.menu.snooze.3h", "sidebar.menu.snooze.evening", "sidebar.menu.snooze.tomorrow", "sidebar.menu.snooze.monday" };
+    const labels = [_][]const u8{ "In 1 hour", "In 3 hours", "This evening", "Tomorrow", "Next week" };
+    for (available, 0..) |present, index| if (present) {
+        panel.append(.{ .action = .preset, .id = ids[index], .label = labels[index], .preset_index = @intCast(index) });
+    };
     panel.append(.{ .action = .custom, .id = "sidebar.menu.snooze.custom", .label = "Custom…", .separator_before = true });
     return panel;
 }
@@ -201,13 +214,26 @@ test "menus keep local utilities available and skip disabled items with wrapped 
     try std.testing.expectEqual(Action.copy_id, copied.current().?.action);
     copied.move(true);
     try std.testing.expectEqual(Action.copy_id, copied.current().?.action);
-    const snoozes = snooze();
+    const snoozes = snooze(@splat(true));
     try std.testing.expectEqual(@as(usize, 6), snoozes.len);
     try std.testing.expectEqual(@as(u3, 0), snoozes.items[0].preset_index);
     try std.testing.expectEqual(Action.custom, snoozes.items[5].action);
     panel = .{};
     panel.move(true);
     try std.testing.expect(panel.current() == null);
+}
+
+test "snooze omits unavailable calendar choices while retaining stable deadline slots" {
+    const panel = snooze(.{ true, true, false, true, false });
+    try std.testing.expectEqual(@as(usize, 4), panel.len);
+    try std.testing.expectEqualStrings("Tomorrow", panel.items[2].label);
+    try std.testing.expectEqual(@as(u3, 3), panel.items[2].preset_index);
+    try std.testing.expectEqual(Action.custom, panel.items[3].action);
+    try std.testing.expectEqual(@as(f32, 97), panel.rowTop(3));
+    try std.testing.expectEqual(@as(f32, 129), panel.height());
+    const without = snooze(@splat(false));
+    try std.testing.expectEqual(@as(f32, 4), without.rowTop(0));
+    try std.testing.expectEqual(@as(f32, 36), without.height());
 }
 
 test "calendar grid includes outside days disables past dates and handles leap/year edges" {

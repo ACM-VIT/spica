@@ -1182,16 +1182,16 @@ pub const View = struct {
 
     fn openSidebarSnooze(self: *View) void {
         self.sidebar_menu_mode = .snooze;
-        self.sidebar_menu_panel = SidebarMenu.snooze();
-        for (0..5) |slot| self.sidebar_menu_panel.items[slot].enabled = false;
         self.sidebar_snooze_deadlines = @splat(0);
         self.sidebar_snooze_when = @splat(.{});
         self.sidebar_snooze_count = 0;
         const options = SidebarTime.presets(wallTimeMs()) catch {
-            self.sidebar_menu_panel.selected = 0;
+            self.sidebar_menu_panel = SidebarMenu.snooze(@splat(false));
             self.sidebar_menu_count = self.sidebar_menu_panel.len;
+            self.sidebar_menu_hover = 0;
             return;
         };
+        var available: [5]bool = @splat(false);
         for (options.slice()) |option| {
             const slot: usize = switch (option.id) {
                 .one_hour => 0,
@@ -1203,8 +1203,9 @@ pub const View = struct {
             self.sidebar_snooze_deadlines[slot] = option.wake_ms;
             self.sidebar_snooze_when[slot] = option.when_label;
             self.sidebar_snooze_count = @max(self.sidebar_snooze_count, slot + 1);
-            self.sidebar_menu_panel.items[slot].enabled = true;
+            available[slot] = true;
         }
+        self.sidebar_menu_panel = SidebarMenu.snooze(available);
         self.sidebar_menu_count = self.sidebar_menu_panel.len;
         self.sidebar_menu_panel.edge(false);
         self.sidebar_menu_hover = self.sidebar_menu_panel.selected orelse 0;
@@ -1591,10 +1592,15 @@ pub const View = struct {
                         rename_blurred = if (self.navigation) |action| std.meta.activeTag(action) == .rename else false;
                     }
                     if (self.sidebar_menu_thread.len != 0) {
+                        var hit = false;
                         for (self.sidebar_menu_rows[0..self.sidebar_menu_count], 0..) |row, index| {
-                            if (widgets.contains(row, x, y)) self.activateSidebarMenu(index);
+                            if (widgets.contains(row, x, y)) {
+                                self.activateSidebarMenu(index);
+                                hit = true;
+                                break;
+                            }
                         }
-                        if (self.sidebar_menu_mode == .main) self.sidebar_menu_thread = .{};
+                        if (!hit and !widgets.contains(self.sidebar_menu_bounds, x, y)) self.sidebar_menu_thread = .{};
                         if (self.sidebar_rename_thread.len != 0) try self.focus(window, true);
                         return true;
                     }
@@ -2074,8 +2080,18 @@ pub const View = struct {
                             self.sidebar_menu_hover = self.sidebar_menu_panel.selected orelse self.sidebar_menu_hover;
                         },
                         c.SDLK_LEFT => if (self.sidebar_menu_mode != .main) {
+                            const parent_action: SidebarMenu.Action = if (self.sidebar_menu_mode == .copy) .copy else .snooze;
                             self.sidebar_menu_mode = .main;
-                            self.sidebar_menu_hover = 0;
+                            if (self.sidebarMenuIndex()) |index| {
+                                const entry = self.threads[index];
+                                self.sidebar_menu_panel = SidebarMenu.main(.{ .can_operate = self.navigation_enabled, .pinned = entry.pinned, .settled = entry.settled, .snoozed = entry.snoozed_until > wallTimeMs(), .can_snooze = entry.can_snooze, .filter_active = self.scope_project.eql(entry.project_id.slice()) });
+                                self.sidebar_menu_count = self.sidebar_menu_panel.len;
+                                for (self.sidebar_menu_panel.slice(), 0..) |item, row| if (item.action == parent_action) {
+                                    self.sidebar_menu_hover = row;
+                                    _ = self.sidebar_menu_panel.choose(row);
+                                    break;
+                                };
+                            }
                         },
                         c.SDLK_RIGHT => if (self.sidebar_menu_mode == .main and self.sidebar_menu_hover < self.sidebar_menu_panel.len) {
                             const action = self.sidebar_menu_panel.items[self.sidebar_menu_hover].action;
@@ -2536,13 +2552,15 @@ pub const View = struct {
 
     // Fixed native strokes: no decorative Unicode, face discovery or retained
     // icon textures. Coordinates use a 16-unit local grid.
-    const Icon = enum { plus, folder, pen, chevron, send, stop, settings, search, filter, branch, close, sidebar, chevron_up, working, alert, question, clock, pin };
+    const Icon = enum { plus, folder, pen, chevron, send, stop, settings, search, filter, branch, close, sidebar, chevron_up, working, alert, question, clock, pin, check, copy };
     fn icon(renderer: *c.SDL_Renderer, kind: Icon, x: f32, y: f32, color: Color) !void {
         // ComposerPrimaryActions.tsx uses an 8px filled rounded square inside
         // its 12px Stop glyph, centered in the 32px action.
         if (kind == .stop) return widgets.panel(renderer, .{ .x = x + 4, .y = y + 4, .w = 8, .h = 8 }, 1.5, color);
         if (!c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, 255)) return error.IconDraw;
         const paths: []const [4]f32 = switch (kind) {
+            .check => &.{ .{ 3, 8, 6, 11 }, .{ 6, 11, 13, 4 } },
+            .copy => &.{ .{ 5, 5, 14, 5 }, .{ 14, 5, 14, 14 }, .{ 14, 14, 5, 14 }, .{ 5, 14, 5, 5 }, .{ 2, 11, 2, 2 }, .{ 2, 2, 11, 2 } },
             .pin => &.{ .{ 5, 1, 12, 1 }, .{ 6, 1, 6, 6 }, .{ 11, 1, 11, 6 }, .{ 6, 6, 3, 9 }, .{ 3, 9, 13, 9 }, .{ 13, 9, 11, 6 }, .{ 8, 9, 8, 15 } },
             .clock => &.{ .{ 5, 1, 11, 1 }, .{ 11, 1, 15, 5 }, .{ 15, 5, 15, 11 }, .{ 15, 11, 11, 15 }, .{ 11, 15, 5, 15 }, .{ 5, 15, 1, 11 }, .{ 1, 11, 1, 5 }, .{ 1, 5, 5, 1 }, .{ 8, 4, 8, 8 }, .{ 8, 8, 11, 10 } },
             .working => &.{ .{ 5, 1, 10, 1 }, .{ 13, 4, 15, 8 }, .{ 13, 12, 10, 15 }, .{ 6, 15, 2, 12 }, .{ 1, 8, 2, 4 } },
@@ -2887,7 +2905,7 @@ pub const View = struct {
         if (self.sidebar_menu_hover < self.sidebar_menu_panel.len and self.sidebar_menu_panel.items[self.sidebar_menu_hover].enabled) _ = self.sidebar_menu_panel.choose(self.sidebar_menu_hover);
         self.sidebar_menu_count = self.sidebar_menu_panel.len;
         const menu_width = @min(260, width - 16);
-        const menu_height: f32 = @as(f32, @floatFromInt(self.sidebar_menu_count)) * 28 + 8;
+        const menu_height = self.sidebar_menu_panel.height();
         self.sidebar_menu_bounds = .{ .x = std.math.clamp(self.sidebar_menu_x, 8, @max(8, width - menu_width - 8)), .y = std.math.clamp(self.sidebar_menu_y, 8, @max(8, height - menu_height - 8)), .w = menu_width, .h = menu_height };
         try widgets.panel(renderer, self.sidebar_menu_bounds, 8, self.design.colors.border);
         try widgets.panel(renderer, .{ .x = self.sidebar_menu_bounds.x + 1, .y = self.sidebar_menu_bounds.y + 1, .w = menu_width - 2, .h = menu_height - 2 }, 7, self.design.colors.raised);
@@ -2898,11 +2916,30 @@ pub const View = struct {
                 std.fmt.bufPrint(&label_buffer, "{s} ({s})", .{ item.label, self.sidebar_snooze_when[item.preset_index].slice() }) catch item.label
             else
                 item.label;
-            const row = c.SDL_FRect{ .x = self.sidebar_menu_bounds.x + 4, .y = self.sidebar_menu_bounds.y + 4 + @as(f32, @floatFromInt(row_index)) * 28, .w = menu_width - 8, .h = 28 };
+            const row = c.SDL_FRect{ .x = self.sidebar_menu_bounds.x + 4, .y = self.sidebar_menu_bounds.y + self.sidebar_menu_panel.rowTop(row_index), .w = menu_width - 8, .h = 28 };
             self.sidebar_menu_rows[row_index] = row;
+            if (item.separator_before and row_index != 0) try widgets.panel(renderer, .{ .x = row.x, .y = row.y - 5, .w = row.w, .h = 1 }, 0, self.design.colors.border);
             _ = self.navigation_targets.add(item.id, "menuitem", row, item.enabled) catch {};
             if (row_index == self.sidebar_menu_hover and item.enabled) try widgets.panel(renderer, row, 4, self.design.colors.sidebar_active);
-            try self.labels.draw(text, label, row.x + 8, row.y + 7, 12, if (item.enabled) self.design.colors.foreground else self.design.colors.muted);
+            const color = if (item.enabled) self.design.colors.foreground else self.design.colors.muted;
+            const glyph: ?Icon = switch (item.action) {
+                .pin, .unpin => .pin,
+                .settle, .unsettle => .check,
+                .wake, .snooze => .clock,
+                .rename => .pen,
+                .filter => .folder,
+                .copy, .copy_id => .copy,
+                .copy_path => .folder,
+                .copy_branch => .branch,
+                else => null,
+            };
+            if (glyph) |value| try icon(renderer, value, row.x + 7, row.y + 6, color);
+            const has_children = item.action == .copy or item.action == .snooze;
+            try self.labels.drawFitted(renderer, text, label, row.x + (if (glyph != null) @as(f32, 30) else 8), row.y + 7, row.w - (if (glyph != null) @as(f32, 38) else 16) - (if (has_children) @as(f32, 18) else 0), 12, color);
+            if (has_children) {
+                const right = row.x + row.w - 12;
+                if (!c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, 255) or !c.SDL_RenderLine(renderer, right - 3, row.y + 10, right + 1, row.y + 14) or !c.SDL_RenderLine(renderer, right + 1, row.y + 14, right - 3, row.y + 18)) return error.IconDraw;
+            }
         }
     }
 
