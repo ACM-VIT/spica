@@ -67,6 +67,21 @@ class SidebarEvidenceTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
             self.assertFalse(output.exists())
 
+    def test_lifecycle_focus_declares_scope_and_keeps_measurement_separate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "unused"
+            command = ["python3", str(CLI), "--dry-run", "--focus", "lifecycle", "--output", str(output)]
+            result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            value = json.loads(result.stdout)
+            self.assertEqual(value["focus"], "lifecycle")
+            self.assertTrue(any("tombstone" in step for step in value["steps"]))
+            self.assertTrue(any("custom snooze" in item for item in value["limitations"]))
+            result = subprocess.run([*command, "--measure"], cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("must run separately", result.stderr)
+            self.assertFalse(output.exists())
+
     def test_clipboard_daemon_stdio_is_detached_with_bounded_parent_timeout(self):
         environment = {"WAYLAND_DISPLAY": "owned", "XDG_RUNTIME_DIR": "/private/runtime"}
         with patch.object(MODULE.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
@@ -188,6 +203,15 @@ class SidebarEvidenceTests(unittest.TestCase):
         for revisions in (None, [], [3]):
             with self.assertRaises(ValueError):
                 MODULE.sidebar_metadata({**value, "thread_revisions": revisions})
+
+    def test_lifecycle_rows_requires_aligned_archive_capabilities(self):
+        value = {"thread_targets": [{"id": "alpha"}], "thread_pinned": [False],
+                 "thread_settled": [False], "thread_snoozed_until": [0], "thread_sort_order": [1],
+                 "thread_archived": [True], "thread_can_archive": [False], "thread_can_delete": [True]}
+        self.assertEqual(MODULE.lifecycle_rows(value)["alpha"]["archived"], True)
+        for field in ("thread_archived", "thread_can_archive", "thread_can_delete"):
+            with self.assertRaises(ValueError):
+                MODULE.lifecycle_rows({**value, field: []})
 
     def test_fractional_duration_requires_actual_submit_time_bracket(self):
         for unit, delta in (("minutes", 90_000), ("hours", 5_400_000), ("days", 129_600_000)):

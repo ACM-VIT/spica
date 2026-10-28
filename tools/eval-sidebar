@@ -165,6 +165,28 @@ def sidebar_metadata(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
             for identifier, row in indexed.items()}
 
 
+def lifecycle_rows(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Require lifecycle capability/archived observations aligned to rows."""
+    indexed = rows(snapshot)
+    targets = snapshot.get("thread_targets", [])
+    fields = ("thread_archived", "thread_can_archive", "thread_can_delete")
+    if any(not isinstance(snapshot.get(field), list) or len(snapshot[field]) != len(targets)
+           for field in fields):
+        raise ValueError("missing or misaligned native lifecycle metadata")
+    for identifier, row in indexed.items():
+        index = row["index"]
+        row.update(archived=snapshot["thread_archived"][index],
+                   can_archive=snapshot["thread_can_archive"][index],
+                   can_delete=snapshot["thread_can_delete"][index])
+    return indexed
+
+
+def assert_lifecycle_unchanged(before: dict[str, Any], after: dict[str, Any], draft: str) -> None:
+    assert_retained(before, after, draft)
+    if lifecycle_rows(before) != lifecycle_rows(after):
+        raise ValueError("cancelled lifecycle action changed durable row metadata")
+
+
 def assert_duration_deadline(actual: Any, begin_ms: int, end_ms: int, amount: float, unit: str) -> None:
     multipliers = {"minutes": 60_000, "hours": 3_600_000, "days": 86_400_000}
     if (type(actual) is not int or unit not in multipliers or not math.isfinite(amount)
@@ -208,6 +230,12 @@ def assert_preferences(before: dict[str, Any], after: dict[str, Any]) -> None:
 
 
 def plan(focus="full") -> list[str]:
+    if focus == "lifecycle":
+        return ["launch an offline fake provider and create three chats across two projects on a private vd desktop",
+                "archive an inactive chat while retaining the active route/run/draft",
+                "open the archived browser, restore the exact row, and reject delete confirmation without mutation",
+                "delete the active chat through confirmation and verify exact successor/tombstone absence",
+                "consume accepted metadata Undo through button and Ctrl+Z, including single-use and five-second expiry"]
     if focus == "measure":
         return ["launch an offline fake provider and create three chats across two projects on a private vd desktop",
                 "collect isolated idle, repeated ordinary sidebar input and settled-idle process-tree samples",
@@ -456,6 +484,14 @@ class Proof:
         self.menu_choose(action)
         current = self.wait(lambda value: not value.get("pending_command")
                             and predicate(rows(value)[identifier]), label)
+        assert_retained(retained, current, draft)
+        return current
+
+    def lifecycle_action(self, identifier, action, predicate, label, retained, draft):
+        self.right_click(identifier)
+        self.menu_choose(action)
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and predicate(lifecycle_rows(value)[identifier]), label)
         assert_retained(retained, current, draft)
         return current
 
@@ -787,6 +823,148 @@ class Proof:
         return self.wait(lambda value: not value.get("sidebar_scope_project"),
                          "all-project scope restored after active park proofs")
 
+    def lifecycle_cases(self, alpha, bravo, charlie, identifiers, retained, draft):
+        """Exercise archive browser, destructive confirmation, successor and Undo."""
+        before = self.session.snapshot(self.args.timeout)
+        lifecycle_rows(before)
+        # Background archive preserves the exact active route, execution and draft.
+        self.lifecycle_action(alpha, "archive", lambda row: row["archived"],
+                              "inactive Alpha archives durably", retained, draft)
+        current = self.session.snapshot(self.args.timeout)
+        if current.get("thread_id") != retained.get("thread_id"):
+            raise ValueError("background archive changed the active route")
+        self.click("sidebar.archived.toggle")
+        current = self.wait(lambda value: value.get("sidebar_archived") is True,
+                            "archived browser opens through painted toggle")
+        archived = lifecycle_rows(current)
+        if not archived.get(alpha, {}).get("archived"):
+            raise ValueError("archived browser omitted the accepted Alpha archive")
+        if any(row["target"].get("enabled") and not row["archived"] for row in archived.values()):
+            raise ValueError("archived browser injected an active row")
+        self.shot("archived-browser.png")
+        self.right_click(alpha)
+        self.click("sidebar.menu.restore")
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and not lifecycle_rows(value)[alpha]["archived"],
+                            "archived Alpha restores through painted action")
+        assert_route_restored(retained, current, draft)
+        self.click("sidebar.archived.toggle")
+        self.wait(lambda value: value.get("sidebar_archived") is False,
+                  "archived browser closes after restore")
+
+        # Active archive parks the route in a fresh same-project chat; the
+        # archived original remains restorable with its composer state.
+        self.click(charlie)
+        active = self.wait(lambda value: value.get("thread_id") == charlie
+                           and value.get("draft") == draft and value.get("send_ready"),
+                          "active Charlie selected before archive")
+        project = active["project_id"]
+        self.right_click(charlie)
+        self.click("sidebar.menu.archive")
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and value.get("thread_id") not in ("", charlie)
+                            and value.get("project_id") == project
+                            and value.get("send_ready")
+                            and lifecycle_rows(value).get(charlie, {}).get("archived") is True,
+                            "active archive opens a fresh same-project chat")
+        if current.get("run_id") or current.get("draft"):
+            raise ValueError("active archive fresh chat inherited execution or draft")
+        self.click("sidebar.archived.toggle")
+        archived = self.wait(lambda value: value.get("sidebar_archived") is True,
+                             "archived browser reopens for active archive restore")
+        self.right_click(charlie)
+        self.click("sidebar.menu.restore")
+        self.wait(lambda value: not value.get("pending_command")
+                  and not lifecycle_rows(value)[charlie]["archived"],
+                  "active archived Charlie restores through browser action")
+        self.click("sidebar.archived.toggle")
+        self.wait(lambda value: value.get("sidebar_archived") is False,
+                  "active archive browser closes after restore")
+        self.click(charlie)
+        current = self.wait(lambda value: value.get("thread_id") == charlie
+                            and value.get("draft") == draft and value.get("send_ready"),
+                           "restored Charlie returns its original draft")
+        assert_route_restored(retained, current, draft)
+
+        # Delete confirmation cancel is observationally inert.
+        before = self.session.snapshot(self.args.timeout)
+        self.right_click(bravo)
+        self.click("sidebar.menu.delete")
+        current = self.wait(lambda value: value.get("sidebar_lifecycle_confirm_open") is True
+                            and value.get("sidebar_lifecycle_confirm_thread") == bravo,
+                            "delete confirmation owns exact inactive Bravo")
+        assert_lifecycle_unchanged(before, current, draft)
+        if not any(target.get("enabled") and target.get("id") == "sidebar.delete.confirm"
+                   for target in self.ui.target_groups(current)):
+            raise ValueError("delete confirmation lacks a painted confirm target")
+        self.click("sidebar.delete.cancel")
+        current = self.wait(lambda value: not value.get("sidebar_lifecycle_confirm_open"),
+                            "delete cancellation closes without mutation")
+        assert_lifecycle_unchanged(before, current, draft)
+
+        # Accepted active delete advances to the exact observed successor and
+        # leaves no row behind after the durable tombstone receipt.
+        self.click(charlie)
+        active = self.wait(lambda value: value.get("thread_id") == charlie
+                           and value.get("draft") == draft and value.get("send_ready"),
+                        "active Charlie selected before delete")
+        ordered = sorted((row for row in lifecycle_rows(active).values()
+                          if row["target"].get("enabled") and not row["archived"] and row["target"]["id"] != charlie),
+                         key=lambda row: row["target"]["pointer_bounds"][1])
+        successor = ordered[0]["target"]["id"] if ordered else None
+        self.right_click(charlie)
+        self.click("sidebar.menu.delete")
+        self.wait(lambda value: value.get("sidebar_lifecycle_confirm_open") is True,
+                  "active delete confirmation opens")
+        self.click("sidebar.delete.confirm")
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and charlie not in lifecycle_rows(value)
+                            and (successor is None or value.get("thread_id") == successor),
+                            "accepted active delete removes tombstone and advances route")
+        if current.get("sidebar_lifecycle_error"):
+            raise ValueError("accepted delete left a lifecycle error")
+
+        # Accepted metadata action offers one exact, single-use Undo claim.
+        target = successor or alpha
+        if target not in lifecycle_rows(current):
+            raise ValueError("lifecycle Undo fixture has no durable target")
+        undo_retained, undo_draft = current, current.get("draft", "")
+        before = self.session.snapshot(self.args.timeout)
+        previous = sidebar_metadata(before)[target]
+        self.action(target, "pin", lambda row: row["pinned"],
+                    "Undo fixture pin accepted", undo_retained, undo_draft)
+        current = self.wait(lambda value: value.get("sidebar_undo_available") is True
+                            and bool(value.get("sidebar_undo_label")),
+                            "accepted pin offers a painted Undo claim")
+        self.click("sidebar.undo")
+        current = self.wait(lambda value: value.get("sidebar_undo_available") is False
+                            and sidebar_metadata(value)[target] == previous,
+                            "painted Undo restores exact prior metadata once")
+        assert_retained(undo_retained, current, undo_draft)
+        if any(target_item.get("enabled") and target_item.get("id") == "sidebar.undo"
+               for target_item in self.ui.target_groups(current)):
+            raise ValueError("consumed Undo remained actionable")
+
+        # Ctrl+Z claims a fresh accepted Undo; expiry is checked without a
+        # second mutation and the claim cannot be consumed twice.
+        self.action(target, "pin", lambda row: row["pinned"],
+                    "second Undo fixture pin accepted", undo_retained, undo_draft)
+        self.wait(lambda value: value.get("sidebar_undo_available") is True,
+                  "second accepted pin offers Ctrl+Z claim")
+        self.key("ctrl+z")
+        current = self.wait(lambda value: value.get("sidebar_undo_available") is False
+                            and sidebar_metadata(value)[target] == previous,
+                            "Ctrl+Z consumes Undo and restores exact metadata")
+        self.action(target, "pin", lambda row: row["pinned"],
+                    "third Undo fixture pin accepted", undo_retained, undo_draft)
+        self.wait(lambda value: value.get("sidebar_undo_available") is True,
+                  "third accepted pin offers expiring Undo claim")
+        time.sleep(5.2)
+        current = self.session.snapshot(self.args.timeout)
+        if current.get("sidebar_undo_available"):
+            raise ValueError("Undo claim remained available after its five-second expiry")
+        self.assertions.append("archive browser, destructive confirmation, active successor and single-use Undo passed")
+
     def measure_sidebar(self, identifier, retained, draft):
         """Measure painted sidebar work; input delivery itself has no latency claim."""
         self.measure = load_tool("measure_process", ROOT / "tools/measure_process.py")
@@ -901,6 +1079,16 @@ class Proof:
                              "Unicode composer draft retained before sidebar input")
         identifiers = {alpha, bravo, charlie}
         self.shot("cards.png")
+
+        if self.args.focus == "lifecycle":
+            self.session.data["sidebar_focus"] = "lifecycle"
+            self.session.data["limitations"].append(
+                "Focused lifecycle/archive cohort; full editor, reorder, custom snooze, performance and one-to-one visual acceptance are separate.")
+            self.session.save()
+            self.lifecycle_cases(alpha, bravo, charlie, identifiers, retained, draft)
+            self.session.data.update(passed=True, sidebar_verified=self.assertions)
+            self.session.save()
+            return
 
         if self.args.focus == "measure":
             self.session.data["sidebar_focus"] = "measure"
@@ -1103,8 +1291,8 @@ def main(argv=None):
     parser.add_argument("--binary", type=Path, default=ROOT / "zig-out/bin/spica")
     parser.add_argument("--timeout", type=float, default=20)
     parser.add_argument("--private", action="store_true", help="required acknowledgement of private vd desktop")
-    parser.add_argument("--focus", choices=("full", "menus", "measure"), default="full",
-                        help="menus runs focused functional checks; measure runs only the measured sidebar cohort")
+    parser.add_argument("--focus", choices=("full", "menus", "lifecycle", "measure"), default="full",
+                        help="menus/lifecycle run focused functional checks; measure runs only the measured sidebar cohort")
     parser.add_argument("--measure", action="store_true", help="collect isolated idle and active-sidebar native frame/process-tree evidence")
     parser.add_argument("--cycles", type=int, default=16, help="12..50 repeated sidebar input cycles in the measured active phase")
     parser.add_argument("--dry-run", action="store_true", help="print steps without filesystem, build or desktop activity")
@@ -1117,12 +1305,15 @@ def main(argv=None):
         parser.error("focused functional evidence and performance measurements must run separately")
     if args.focus == "measure" and not args.measure:
         parser.error("--focus measure requires --measure")
+    if args.focus == "lifecycle" and args.measure:
+        parser.error("focused lifecycle evidence and performance measurements must run separately")
     if args.dry_run:
         print(json.dumps({"scenario": "sidebar", "provider": "fake", "build": False,
                           "fixture_lifetime_ms": SCENARIO_LIFETIME_MS,
                           "focus": args.focus, "steps": plan(args.focus),
                           "limitations": ["No performance or physical latency claim."] +
                           (["Focused menus omits full editor and reorder acceptance."] if args.focus == "menus" else []) +
+                          (["Focused lifecycle omits full editor, reorder, custom snooze and performance acceptance."] if args.focus == "lifecycle" else []) +
                           (["Focused measurement omits full functional, large-history and low-end-hardware acceptance."] if args.focus == "measure" else [])}, indent=2))
         return 0
     if not args.private:
