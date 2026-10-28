@@ -64,7 +64,7 @@ fn canonicalEnvelope(allocator: std.mem.Allocator, envelope: t.CommandEnvelope) 
 
 // Every nested lookup is a point/range lookup on an existing primary/unique
 // index (plus runs_by_thread). The preview reads only a prefix of one chunk.
-const thread_columns = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)),coalesce((SELECT substr(bytes,1,163) FROM chunks WHERE block_id=(SELECT id FROM blocks WHERE message_id=(SELECT id FROM messages WHERE thread_id=threads.id AND ordinal=0 AND role='user') AND ordinal=0) AND byte_offset=0),''),(SELECT state FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1),coalesce((SELECT substr(display_name,1,256) FROM projects WHERE id=threads.project_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.expected_branch') FROM workspaces WHERE id=threads.workspace_id),''),coalesce(title,'') FROM threads ";
+const thread_columns = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)),coalesce((SELECT substr(bytes,1,163) FROM chunks WHERE block_id=(SELECT id FROM blocks WHERE message_id=(SELECT id FROM messages WHERE thread_id=threads.id AND ordinal=0 AND role='user') AND ordinal=0) AND byte_offset=0),''),(SELECT state FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1),coalesce((SELECT substr(display_name,1,256) FROM projects WHERE id=threads.project_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.expected_branch') FROM workspaces WHERE id=threads.workspace_id),''),coalesce(title,''),pinned,settled,snoozed_until,sort_order FROM threads ";
 
 /// Internal single-thread reducer. Every returned slice belongs to the operation
 /// allocator; callers must copy before resetting it. Never call from the UI.
@@ -340,7 +340,10 @@ pub const Owner = struct {
                 const project = try self.field(allocator, "SELECT project_id FROM workspaces WHERE id=?", &.{.{ .text = p.workspace.value }}) orelse return .not_found;
                 if (!std.mem.eql(u8, project, p.project.value)) return .workspace_mismatch;
                 const key = try self.id(allocator);
-                try db.execute("INSERT INTO threads(id,revision,project_id,workspace_id) VALUES(?,1,?,?)", &.{ .{ .text = key }, .{ .text = p.project.value }, .{ .text = p.workspace.value } });
+                const creation = try db.scalar("SELECT coalesce(max(rowid),0) FROM threads");
+                const ordinal = std.math.add(i64, creation, 1) catch return .admission_limit;
+                const order = std.math.mul(i64, ordinal, -1024) catch return .admission_limit;
+                try db.execute("INSERT INTO threads(id,revision,project_id,workspace_id,sort_order) VALUES(?,1,?,?,?)", &.{ .{ .text = key }, .{ .text = p.project.value }, .{ .text = p.workspace.value }, .{ .integer = order } });
                 r.entity_ids.thread = .{ .value = key };
                 aggregate = .{ .thread = r.entity_ids.thread.? };
             },
@@ -358,6 +361,71 @@ pub const Owner = struct {
                 aggregate = .{ .thread = e.target.thread };
                 revision_value = e.expected_revision.revision + 1;
                 event_payload = try encoded(allocator, p);
+            },
+            .thread_sidebar_set => |p| {
+                if (e.target != .thread or e.expected_revision != .revision or
+                    (p.pinned == null and p.settled == null and p.snoozed_until == null and !p.clear_snooze and p.sort_order == null) or
+                    (p.clear_snooze and p.snoozed_until != null)) return .invalid_command;
+                if (p.snoozed_until) |deadline| {
+                    if (deadline <= 0) return .invalid_command;
+                    const now = self.utc_ms orelse return .authority_unavailable;
+                    if (@as(u64, @intCast(deadline)) <= now) return .invalid_command;
+                    if (try self.field(allocator, "SELECT id FROM runs WHERE thread_id=? AND state NOT IN('completed','cancelled','failed','interrupted') LIMIT 1", &.{.{ .text = e.target.thread.value }}) != null) return .busy;
+                }
+                var order = p.sort_order;
+                if (p.pinned == true and order == null) {
+                    const existing = try db.prepare("SELECT pinned FROM threads WHERE id=?", &.{.{ .text = e.target.thread.value }});
+                    defer existing.deinit();
+                    if (!try existing.step()) return .not_found;
+                    if (existing.integer(0) == 0) {
+                        const first = try db.scalar("SELECT coalesce(min(sort_order),0) FROM threads WHERE pinned=1");
+                        order = std.math.sub(i64, first, 1024) catch return .admission_limit;
+                    }
+                }
+                try db.execute("UPDATE threads SET pinned=coalesce(?,pinned),settled=coalesce(?,settled),snoozed_until=CASE WHEN ? THEN 0 ELSE coalesce(?,snoozed_until) END,sort_order=coalesce(?,sort_order),revision=revision+1 WHERE id=?", &.{
+                    if (p.pinned) |value| .{ .integer = @intFromBool(value) } else .null,
+                    if (p.settled) |value| .{ .integer = @intFromBool(value) } else .null,
+                    .{ .integer = @intFromBool(p.clear_snooze) },
+                    if (p.snoozed_until) |value| .{ .integer = value } else .null,
+                    if (order) |value| .{ .integer = value } else .null,
+                    .{ .text = e.target.thread.value },
+                });
+                r.entity_ids.thread = e.target.thread;
+                aggregate = .{ .thread = e.target.thread };
+                revision_value = e.expected_revision.revision + 1;
+                event_payload = try encoded(allocator, p);
+            },
+            .thread_sidebar_move => |p| {
+                if (e.target != .thread or e.expected_revision != .revision) return .invalid_command;
+                const now = self.utc_ms orelse return .authority_unavailable;
+                if (now > std.math.maxInt(i64)) return .authority_unavailable;
+                const source = try db.prepare("SELECT pinned,settled,snoozed_until,sort_order FROM threads WHERE id=?", &.{.{ .text = e.target.thread.value }});
+                defer source.deinit();
+                if (!try source.step()) return .not_found;
+                const original_order = source.integer(3);
+                const neighbor = try db.prepare(if (p.direction == .up)
+                    "SELECT id,revision,sort_order FROM threads WHERE (CASE WHEN snoozed_until>? THEN 3 WHEN settled=1 THEN 2 WHEN pinned=1 THEN 1 ELSE 0 END)=? AND (sort_order,id)<(?,?) ORDER BY sort_order DESC,id DESC LIMIT 1"
+                else
+                    "SELECT id,revision,sort_order FROM threads WHERE (CASE WHEN snoozed_until>? THEN 3 WHEN settled=1 THEN 2 WHEN pinned=1 THEN 1 ELSE 0 END)=? AND (sort_order,id)>(?,?) ORDER BY sort_order,id LIMIT 1", &.{
+                    .{ .integer = @intCast(now) },
+                    .{ .integer = if (source.integer(2) > @as(i64, @intCast(now))) 3 else if (source.integer(1) != 0) 2 else if (source.integer(0) != 0) 1 else 0 },
+                    .{ .integer = original_order },
+                    .{ .text = e.target.thread.value },
+                });
+                defer neighbor.deinit();
+                if (!try neighbor.step()) return .invalid_command;
+                const neighbor_id = try allocator.dupe(u8, try neighbor.bytes(0));
+                const neighbor_revision = neighbor.integer(1);
+                if (neighbor_revision < 0) return error.Corrupt;
+                if (neighbor_revision >= std.math.maxInt(i64)) return .admission_limit;
+                if (neighbor.integer(2) == original_order) return .invalid_command;
+                try db.execute("UPDATE threads SET sort_order=?,revision=revision+1 WHERE id=?", &.{ .{ .integer = neighbor.integer(2) }, .{ .text = e.target.thread.value } });
+                try db.execute("UPDATE threads SET sort_order=?,revision=revision+1 WHERE id=?", &.{ .{ .integer = original_order }, .{ .text = neighbor_id } });
+                r.entity_ids.thread = e.target.thread;
+                const payload = try encoded(allocator, p);
+                try self.event(allocator, seq, 0, .{ .thread = e.target.thread }, e.expected_revision.revision + 1, "ThreadSidebarChanged", e.command_id, null, payload);
+                try self.event(allocator, seq, 1, .{ .thread = .{ .value = neighbor_id } }, @intCast(neighbor_revision + 1), "ThreadSidebarChanged", e.command_id, null, payload);
+                return null;
             },
             .thread_select => |p| {
                 if (e.target != .thread or e.expected_revision != .revision) return .invalid_command;
@@ -779,6 +847,7 @@ pub const Owner = struct {
         }
         const event_kind = switch (e.payload) {
             .thread_title_set => "ThreadTitleChanged",
+            .thread_sidebar_set => "ThreadSidebarChanged",
             .followup_enqueue => "FollowupQueued",
             .followup_edit => "FollowupEdited",
             .followup_cancel => "FollowupCancelled",
@@ -2156,7 +2225,7 @@ pub const Host = struct {
         const rows = try allocator.alloc(t.Row, page.limit);
         var count: usize = 0;
         var bytes_used: usize = 0;
-        const Cursor = struct { query: []const u8, key: u64 };
+        const Cursor = struct { query: []const u8, key: u64, order_pin: i64 = -2, order_sort: i64 = 0, order_id: []const u8 = "" };
         const identity_buffer = try allocator.alloc(u8, 65536);
         var identity_query = q;
         switch (identity_query) {
@@ -2178,13 +2247,21 @@ pub const Host = struct {
         }
         const identity = try t.encode(identity_query, identity_buffer);
         var cursor: u64 = 0;
+        var order_pin: i64 = -2;
+        var order_sort: i64 = 0;
+        var order_id: []const u8 = "";
         if (page.cursor) |raw| {
             const parsed = t.decode(Cursor, raw, allocator) catch return error.CursorInvalid;
             if (!std.mem.eql(u8, parsed.query, identity) or parsed.key > std.math.maxInt(i64)) return error.CursorInvalid;
             cursor = parsed.key;
+            order_pin = parsed.order_pin;
+            order_sort = parsed.order_sort;
+            order_id = parsed.order_id;
+            if (q == .threads and q.threads.sidebar_order and
+                ((order_pin != -1 and order_pin != 0) or order_id.len == 0)) return error.CursorInvalid;
         }
         var sql: [:0]const u8 = undefined;
-        var values: [5]V = undefined;
+        var values: [8]V = undefined;
         var n: usize = 0;
         switch (q) {
             .command_receipt => |id_value| {
@@ -2260,16 +2337,36 @@ pub const Host = struct {
                 n = 1;
             },
             .threads => |v| {
-                if (v.project) |scoped_project| {
+                if (v.sidebar_order) {
+                    if (page.cursor == null) if (v.anchor) |anchor| {
+                        const boundary = try reader.prepare("SELECT -pinned,sort_order,id FROM threads WHERE id=?", &.{.{ .text = anchor.value }});
+                        defer boundary.deinit();
+                        if (!try boundary.step()) return error.NotFound;
+                        order_pin = boundary.integer(0);
+                        order_sort = boundary.integer(1);
+                        order_id = try allocator.dupe(u8, try boundary.bytes(2));
+                    };
+                    if (v.project) |scoped_project| {
+                        sql = thread_columns ++ "WHERE project_id=? AND (-pinned,sort_order,id)>(?,?,?) ORDER BY -pinned,sort_order,id LIMIT ?";
+                        values[0] = .{ .text = scoped_project.value };
+                        n = 1;
+                    } else sql = thread_columns ++ "WHERE (-pinned,sort_order,id)>(?,?,?) ORDER BY -pinned,sort_order,id LIMIT ?";
+                    values[n] = .{ .integer = order_pin };
+                    values[n + 1] = .{ .integer = order_sort };
+                    values[n + 2] = .{ .text = order_id };
+                    n += 3;
+                } else if (v.project) |scoped_project| {
                     sql = thread_columns ++ "WHERE project_id=? AND rowid>max(?,coalesce((SELECT rowid FROM threads WHERE id=?),0)) ORDER BY rowid LIMIT ?";
                     values[0] = .{ .text = scoped_project.value };
                     n = 1;
                 } else {
                     sql = thread_columns ++ "WHERE rowid>max(?,coalesce((SELECT rowid FROM threads WHERE id=?),0)) ORDER BY rowid LIMIT ?";
                 }
-                values[n] = .{ .integer = @intCast(cursor) };
-                values[n + 1] = if (v.anchor) |anchor| .{ .text = anchor.value } else .null;
-                n += 2;
+                if (!v.sidebar_order) {
+                    values[n] = .{ .integer = @intCast(cursor) };
+                    values[n + 1] = if (v.anchor) |anchor| .{ .text = anchor.value } else .null;
+                    n += 2;
+                }
             },
             .thread => |v| {
                 sql = thread_columns ++ "WHERE id=? AND rowid>? LIMIT ?";
@@ -2365,10 +2462,11 @@ pub const Host = struct {
         const statement = try reader.prepare(sql, values[0..n]);
         defer statement.deinit();
         var last_key: u64 = cursor;
+        var last_cursor: Cursor = .{ .query = identity, .key = cursor, .order_pin = order_pin, .order_sort = order_sort, .order_id = order_id };
         var encode_buffer: [131072]u8 = undefined;
         while (try statement.step()) {
             if (count == page.limit) {
-                result.next_cursor = try Owner.encoded(allocator, Cursor{ .query = identity, .key = last_key });
+                result.next_cursor = try Owner.encoded(allocator, last_cursor);
                 break;
             }
             const s = statement;
@@ -2378,7 +2476,7 @@ pub const Host = struct {
                 .threads, .thread => blk: {
                     const explicit_title = try allocator.dupe(u8, @import("text/utf8.zig").prefix(try s.bytes(12), t.max_title_bytes));
                     const prompt_preview = @import("text/utf8.zig").prefix(try s.bytes(7), t.max_title_bytes);
-                    break :blk .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator), .title_preview = if (explicit_title.len != 0) explicit_title else try allocator.dupe(u8, prompt_preview), .title = explicit_title, .latest_run_state = if (s.isNull(8)) null else try enumeration(t.RunState, s, 8), .project_name = try text(allocator, s, 9), .workspace_root = try text(allocator, s, 10), .workspace_branch = try text(allocator, s, 11) } };
+                    break :blk .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator), .title_preview = if (explicit_title.len != 0) explicit_title else try allocator.dupe(u8, prompt_preview), .title = explicit_title, .latest_run_state = if (s.isNull(8)) null else try enumeration(t.RunState, s, 8), .project_name = try text(allocator, s, 9), .workspace_root = try text(allocator, s, 10), .workspace_branch = try text(allocator, s, 11), .pinned = s.integer(13) != 0, .settled = s.integer(14) != 0, .snoozed_until = s.integer(15), .sort_order = s.integer(16) } };
                 },
                 .blocks => .{ .block = try descriptor(allocator, s) },
                 .attachments => .{ .attachment = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .thread = .{ .value = try text(allocator, s, 3) }, .name = try text(allocator, s, 4), .media_type = try text(allocator, s, 5), .byte_length = try number(s, 6), .digest = try text(allocator, s, 7), .kind = try enumeration(a.AttachmentKind, s, 8) } },
@@ -2426,13 +2524,19 @@ pub const Host = struct {
             const row_bytes = (try t.encode(row, &encode_buffer)).len;
             if (row_bytes > page.max_bytes - bytes_used) {
                 if (count == 0) return error.Limit;
-                result.next_cursor = try Owner.encoded(allocator, Cursor{ .query = identity, .key = last_key });
+                result.next_cursor = try Owner.encoded(allocator, last_cursor);
                 break;
             }
             rows[count] = row;
             count += 1;
             bytes_used += row_bytes;
             last_key = try number(s, 0);
+            last_cursor.key = last_key;
+            if (q == .threads and q.threads.sidebar_order) {
+                last_cursor.order_pin = -s.integer(13);
+                last_cursor.order_sort = s.integer(16);
+                last_cursor.order_id = row.thread.id.value;
+            }
         }
         result.items = rows[0..count];
         if (q == .thread and count == 0) return error.NotFound;
@@ -2698,6 +2802,90 @@ test "fake send admission matches the shared start-frame preflight at UTF-8 boun
         try std.testing.expectEqual(receipt.commit_sequence, replay.commit_sequence);
         try std.testing.expectEqual(receipt.outcome, replay.outcome);
     }
+}
+
+test "sidebar ordering pages beyond resident capacity with composite snapshot cursors" {
+    const Harness = struct {
+        fn query(host: *Host, allocator: std.mem.Allocator, request: t.Query) !t.Output {
+            const ticket = try host.query(request);
+            const backing = try allocator.alloc(u8, 262144);
+            for (0..4000) |_| {
+                var output: [1]t.Output = undefined;
+                const drained = host.drain(&output, backing);
+                if (drained.output_count == 0) {
+                    try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+                    continue;
+                }
+                switch (output[0]) {
+                    .query_page => |page_value| if (page_value.ticket.value == ticket.value) return common.clone(allocator, output[0]),
+                    .failure => |failure| if (failure.ticket.value == ticket.value) return common.clone(allocator, output[0]),
+                    else => {},
+                }
+            }
+            return error.Timeout;
+        }
+    };
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = path_buffer[0..try temporary.dir.realPath(std.testing.io, &path_buffer)];
+    var database = try store.Store.open(std.testing.io, path);
+    var database_live = true;
+    defer if (database_live) database.close() catch {};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try database.exec("INSERT INTO projects VALUES('p',1,'Paging'); INSERT INTO workspaces VALUES('w',1,'p',X'7b7d')");
+    for (0..70) |index| {
+        const id_value = try std.fmt.allocPrint(allocator, "thread-{d:0>2}", .{index});
+        try database.execute("INSERT INTO threads(id,revision,project_id,workspace_id,sort_order) VALUES(?,1,'p','w',?)", &.{ .{ .text = id_value }, .{ .integer = -@as(i64, @intCast(index + 1)) * 1024 } });
+    }
+    var owner: Owner = .{ .database = &database, .io = std.testing.io, .epoch = "sidebar-pages", .utc_ms = 1000 };
+    const pin = try owner.command(allocator, .{ .command_id = .{ .value = "paging-pin" }, .target = .{ .thread = .{ .value = "thread-00" } }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_sidebar_set = .{ .pinned = true } } });
+    try std.testing.expectEqual(.accepted, pin.outcome);
+    const move = try owner.command(allocator, .{ .command_id = .{ .value = "paging-move" }, .target = .{ .thread = .{ .value = "thread-01" } }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_sidebar_move = .{ .direction = .up } } });
+    try std.testing.expectEqual(.accepted, move.outcome);
+    try database.close();
+    database_live = false;
+    const host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path });
+    defer host.destroy();
+    var request: t.Query = .{ .threads = .{ .sidebar_order = true, .page = .{ .limit = 7, .max_bytes = 8192 } } };
+    var seen: [70]bool = @splat(false);
+    var count: usize = 0;
+    var first_cursor: ?[]const u8 = null;
+    var first_snapshot: ?t.SnapshotId = null;
+    while (true) {
+        const output = try Harness.query(host, allocator, request);
+        try std.testing.expect(output == .query_page);
+        const value = output.query_page.page;
+        try std.testing.expect(value.items.len <= 7);
+        if (count == 0) {
+            try std.testing.expectEqualStrings("thread-00", value.items[0].thread.id.value);
+            try std.testing.expect(value.items[0].thread.pinned);
+            first_cursor = value.next_cursor;
+            first_snapshot = value.snapshot_id;
+        }
+        for (value.items) |row| {
+            const index = try std.fmt.parseInt(usize, row.thread.id.value[7..], 10);
+            try std.testing.expect(!seen[index]);
+            seen[index] = true;
+            count += 1;
+        }
+        const next = value.next_cursor orelse break;
+        request.threads.page.snapshot = value.snapshot_id;
+        request.threads.page.cursor = next;
+    }
+    try std.testing.expectEqual(@as(usize, 70), count);
+    for (seen) |found| try std.testing.expect(found);
+    const invalid = try Harness.query(host, allocator, .{ .threads = .{ .page = .{ .limit = 7, .max_bytes = 8192, .snapshot = first_snapshot, .cursor = first_cursor } } });
+    try std.testing.expect(invalid == .failure);
+    try std.testing.expectEqual(.cursor_invalid, invalid.failure.failure.reason);
+    const anchored = try Harness.query(host, allocator, .{ .threads = .{ .project = .{ .value = "p" }, .anchor = .{ .value = "thread-00" }, .sidebar_order = true, .page = .{ .limit = 7, .max_bytes = 8192 } } });
+    try std.testing.expect(anchored == .query_page);
+    try std.testing.expectEqualStrings("thread-69", anchored.query_page.page.items[0].thread.id.value);
+    const expired = try Harness.query(host, allocator, .{ .threads = .{ .sidebar_order = true, .page = .{ .limit = 7, .max_bytes = 8192, .snapshot = .{ .slot = first_snapshot.?.slot, .generation = first_snapshot.?.generation + 1 }, .cursor = first_cursor } } });
+    try std.testing.expect(expired == .failure);
+    try std.testing.expectEqual(.cursor_invalid, expired.failure.failure.reason);
 }
 
 test "thread cards read bounded UTF8 first-prompt previews and latest status after reopen" {

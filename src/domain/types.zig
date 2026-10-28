@@ -80,6 +80,17 @@ pub const Payload = union(enum) {
     thread_create: struct { project: ProjectId, workspace: adapter.WorkspaceId },
     /// Replace the durable user title for one thread.
     thread_title_set: struct { title: []const u8 },
+    /// App-owned sidebar metadata never changes provider/session ownership.
+    /// Snooze deadlines are absolute Unix milliseconds; null keeps the field.
+    thread_sidebar_set: struct {
+        pinned: ?bool = null,
+        settled: ?bool = null,
+        snoozed_until: ?i64 = null,
+        clear_snooze: bool = false,
+        sort_order: ?i64 = null,
+    },
+    /// Atomically swap with the nearest row in the same sidebar section.
+    thread_sidebar_move: struct { direction: enum { up, down } },
     thread_send: struct { text: []const u8, selection: adapter.Selection, attachments: []const AttachmentId = &.{} },
     thread_send_staged: struct { prompt: PromptRef, selection: adapter.Selection, attachments: []const AttachmentId = &.{} },
     /// Explicitly discard one bounded orphan upload. Never affects a sent prompt.
@@ -192,7 +203,7 @@ pub const Query = union(enum) {
     models: struct { workspace: adapter.WorkspaceId, page: Page = .{} },
     runtime_status: void,
     workspaces: struct { project: ProjectId, page: Page = .{} },
-    threads: struct { project: ?ProjectId = null, anchor: ?ThreadId = null, page: Page = .{} },
+    threads: struct { project: ?ProjectId = null, anchor: ?ThreadId = null, sidebar_order: bool = false, page: Page = .{} },
     thread: ThreadId,
     messages: struct { thread: ThreadId, anchor: ?adapter.MessageId = null, direction: Direction = .newer, page: Page = .{} },
     blocks: struct { message: adapter.MessageId, page: Page = .{} },
@@ -249,6 +260,10 @@ pub const Row = union(enum) {
         project_name: []const u8 = "",
         workspace_root: []const u8 = "",
         workspace_branch: []const u8 = "",
+        pinned: bool = false,
+        settled: bool = false,
+        snoozed_until: i64 = 0,
+        sort_order: i64 = 0,
     },
     message: struct {
         message_id: adapter.MessageId,

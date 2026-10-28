@@ -355,9 +355,130 @@ test "schema five adds empty titles without changing existing messages or revisi
     try f.store.close();
     var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
     f.store = try storage.Store.open(std.testing.io, try f.path(&directory));
-    try std.testing.expectEqual(@as(i64, 8), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, storage.schema_version), try f.store.scalar("PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM threads WHERE id='h' AND title='' AND revision=1"));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM messages WHERE id='m'"));
+}
+
+test "sidebar metadata is orthogonal revisioned idempotent and durable" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "sidebar", .utc_ms = 1000 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const command: t.CommandEnvelope = .{ .command_id = .{ .value = "sidebar-pin" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_sidebar_set = .{ .pinned = true, .settled = true, .snoozed_until = 5000 } } };
+    const first = try owner.command(allocator, command);
+    try std.testing.expectEqual(.accepted, first.outcome);
+    try std.testing.expectEqual(@as(usize, 1), first.committed_revisions.len);
+    try std.testing.expectEqual(@as(u64, 2), first.committed_revisions[0].revision);
+    const retry = try owner.command(allocator, command);
+    try std.testing.expectEqual(first.commit_sequence, retry.commit_sequence);
+    var stale = command;
+    stale.command_id.value = "sidebar-stale";
+    try std.testing.expectEqual(t.Reason.revision_conflict, (try owner.command(allocator, stale)).reason.?);
+    var conflict = command;
+    conflict.payload.thread_sidebar_set.pinned = false;
+    try std.testing.expectEqual(t.Reason.command_id_conflict, (try owner.command(allocator, conflict)).reason.?);
+    const cleared = try owner.command(allocator, .{ .command_id = .{ .value = "sidebar-wake" }, .target = command.target, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_sidebar_set = .{ .pinned = true, .clear_snooze = true } } });
+    try std.testing.expectEqual(.accepted, cleared.outcome);
+    const invalid = [_]@FieldType(t.Payload, "thread_sidebar_set"){ .{}, .{ .snoozed_until = -1 }, .{ .snoozed_until = 1000 }, .{ .snoozed_until = 5000, .clear_snooze = true } };
+    for (invalid, 0..) |payload, index| {
+        const rejected = try owner.command(allocator, .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "sidebar-invalid-{d}", .{index}) }, .target = command.target, .expected_revision = .{ .revision = 3 }, .payload = .{ .thread_sidebar_set = payload } });
+        try std.testing.expectEqual(t.Reason.invalid_command, rejected.reason.?);
+    }
+    try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM events WHERE kind='ThreadSidebarChanged'"));
+    try f.store.close();
+    var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    f.store = try storage.Store.open(std.testing.io, try f.path(&directory));
+    const stored = try f.store.prepare("SELECT pinned,settled,snoozed_until,revision,sort_order FROM threads WHERE id=?", &.{.{ .text = conversation.thread.value }});
+    defer stored.deinit();
+    try std.testing.expect(try stored.step());
+    try std.testing.expectEqual(@as(i64, 1), stored.integer(0));
+    try std.testing.expectEqual(@as(i64, 1), stored.integer(1));
+    try std.testing.expectEqual(@as(i64, 0), stored.integer(2));
+    try std.testing.expectEqual(@as(i64, 3), stored.integer(3));
+    try std.testing.expectEqual(@as(i64, -1024), stored.integer(4));
+    try std.testing.expectEqual(first.commit_sequence, (try owner.command(allocator, command)).commit_sequence);
+}
+
+test "sidebar snooze refuses live and uncertain execution without touching provider state" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try seed(&f.store);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "sidebar-live", .utc_ms = 1000 };
+    const states = [_][]const u8{ "queued", "starting", "streaming", "awaiting_approval", "awaiting_question", "cancel_requested", "unknown" };
+    for (states, 0..) |state, index| {
+        try f.store.execute("UPDATE runs SET state=? WHERE id='r'", &.{.{ .text = state }});
+        const rejected = try owner.command(allocator, .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "sidebar-live-{d}", .{index}) }, .target = .{ .thread = .{ .value = "h" } }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_sidebar_set = .{ .pinned = true, .snoozed_until = 5000 } } });
+        try std.testing.expectEqual(t.Reason.busy, rejected.reason.?);
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM threads WHERE revision=1 AND pinned=0 AND snoozed_until=0"));
+        const run = try f.store.prepare("SELECT state,revision FROM runs WHERE id='r'", &.{});
+        defer run.deinit();
+        try std.testing.expect(try run.step());
+        try std.testing.expectEqualStrings(state, try run.bytes(0));
+        try std.testing.expectEqual(@as(i64, 1), run.integer(1));
+    }
+    const pinned = try owner.command(allocator, .{ .command_id = .{ .value = "sidebar-pin-live" }, .target = .{ .thread = .{ .value = "h" } }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_sidebar_set = .{ .pinned = true } } });
+    try std.testing.expectEqual(.accepted, pinned.outcome);
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM effects"));
+}
+
+test "sidebar move swaps global neighbors atomically and reports both revisions" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "sidebar-order", .utc_ms = 1000 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const second = (try owner.command(allocator, .{ .command_id = .{ .value = "sidebar-second" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = conversation.project, .workspace = conversation.workspace } } })).entity_ids.thread.?;
+    const command: t.CommandEnvelope = .{ .command_id = .{ .value = "sidebar-move" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_sidebar_move = .{ .direction = .up } } };
+    const moved = try owner.command(allocator, command);
+    try std.testing.expectEqual(.accepted, moved.outcome);
+    try std.testing.expectEqual(@as(usize, 2), moved.committed_revisions.len);
+    for (moved.committed_revisions) |revision| try std.testing.expectEqual(@as(u64, 2), revision.revision);
+    try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM events WHERE kind='ThreadSidebarChanged'"));
+    try std.testing.expectEqual(moved.commit_sequence, (try owner.command(allocator, command)).commit_sequence);
+    const row = try f.store.prepare("SELECT id FROM threads ORDER BY sort_order,id", &.{});
+    defer row.deinit();
+    try std.testing.expect(try row.step());
+    try std.testing.expectEqualStrings(conversation.thread.value, try row.bytes(0));
+    try std.testing.expect(try row.step());
+    try std.testing.expectEqualStrings(second.value, try row.bytes(0));
+    const edge = try owner.command(allocator, .{ .command_id = .{ .value = "sidebar-edge" }, .target = command.target, .expected_revision = .{ .revision = 2 }, .payload = command.payload });
+    try std.testing.expectEqual(t.Reason.invalid_command, edge.reason.?);
+    try f.store.exec("UPDATE threads SET sort_order=0");
+    const tied = try owner.command(allocator, .{ .command_id = .{ .value = "sidebar-tied" }, .target = command.target, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_sidebar_move = .{ .direction = .down } } });
+    try std.testing.expectEqual(t.Reason.invalid_command, tied.reason.?);
+    try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM threads WHERE revision=2"));
+}
+
+test "sidebar schema eight migration preserves execution revisions and creates ordered indexes" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try seed(&f.store);
+    try f.store.exec("DROP INDEX threads_sidebar_order; DROP INDEX threads_project_sidebar_order; DROP INDEX threads_sidebar_move; ALTER TABLE threads DROP COLUMN pinned; ALTER TABLE threads DROP COLUMN settled; ALTER TABLE threads DROP COLUMN snoozed_until; ALTER TABLE threads DROP COLUMN sort_order; UPDATE meta SET schema_version=8; PRAGMA user_version=8");
+    try f.store.close();
+    var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    f.store = try storage.Store.open(std.testing.io, try f.path(&directory));
+    try std.testing.expectEqual(@as(i64, storage.schema_version), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM threads WHERE id='h' AND revision=1 AND pinned=0 AND settled=0 AND snoozed_until=0 AND sort_order=-1024"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE id='r' AND revision=1 AND state='queued'"));
+    const plans = [_][:0]const u8{
+        "EXPLAIN QUERY PLAN SELECT id FROM threads WHERE (-pinned,sort_order,id)>(-2,0,'') ORDER BY -pinned,sort_order,id LIMIT 8",
+        "EXPLAIN QUERY PLAN SELECT id FROM threads WHERE project_id='p' AND (-pinned,sort_order,id)>(-2,0,'') ORDER BY -pinned,sort_order,id LIMIT 8",
+    };
+    for (plans, [_][]const u8{ "threads_sidebar_order", "threads_project_sidebar_order" }) |sql, index| {
+        const plan = try f.store.prepare(sql, &.{});
+        defer plan.deinit();
+        try std.testing.expect(try plan.step());
+        try std.testing.expect(std.mem.indexOf(u8, try plan.bytes(3), index) != null);
+    }
 }
 
 test "real reducers accept arbitrary prompt dedup before revision and withdraw queued effects" {
@@ -1841,7 +1962,7 @@ test "attachment schema v6 migration preserves prior data and reopens with durab
     const path = try f.path(&path_buffer);
     try f.store.close();
     f.store = try storage.Store.open(std.testing.io, path);
-    try std.testing.expectEqual(@as(i64, 8), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, storage.schema_version), try f.store.scalar("PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM messages WHERE id='m'"));
     try f.store.exec("INSERT INTO attachments VALUES('a',1,'h','fixture.txt','text/plain',3,'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad','file',X'616263'); INSERT INTO attachment_refs VALUES('m','a',0)");
     try f.store.close();

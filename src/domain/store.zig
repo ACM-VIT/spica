@@ -10,7 +10,7 @@ extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, Closed };
 pub const application_id = 0x53504334;
-pub const schema_version = 8;
+pub const schema_version = 9;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
 
 pub const Statement = struct {
@@ -148,6 +148,18 @@ pub const Store = struct {
             try result.exec(question_schema);
             try result.exec("UPDATE meta SET schema_version=8 WHERE singleton=1; PRAGMA user_version=8; COMMIT");
         } else if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='questions'") != 1) return error.Corrupt;
+        if (fresh or version < 9) {
+            try result.exec("BEGIN IMMEDIATE");
+            errdefer result.exec("ROLLBACK") catch {};
+            // The migration preserves all thread revisions and accepted work.
+            // Negative creation ordinals put new threads first without reading history.
+            if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name='pinned'") == 0) {
+                if (try result.scalar("SELECT coalesce(max(rowid),0) FROM threads") > @divTrunc(std.math.maxInt(i64), 1024)) return error.Limit;
+                try result.exec("ALTER TABLE threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN(0,1)); ALTER TABLE threads ADD COLUMN settled INTEGER NOT NULL DEFAULT 0 CHECK(settled IN(0,1)); ALTER TABLE threads ADD COLUMN snoozed_until INTEGER NOT NULL DEFAULT 0 CHECK(snoozed_until>=0); ALTER TABLE threads ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0; UPDATE threads SET sort_order=-rowid*1024");
+            }
+            try result.exec("UPDATE meta SET schema_version=9 WHERE singleton=1; PRAGMA user_version=9; COMMIT");
+        } else if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name IN('pinned','settled','snoozed_until','sort_order')") != 4) return error.Corrupt;
+        try result.exec("CREATE INDEX IF NOT EXISTS threads_sidebar_order ON threads(-pinned,sort_order,id); CREATE INDEX IF NOT EXISTS threads_project_sidebar_order ON threads(project_id,-pinned,sort_order,id); CREATE INDEX IF NOT EXISTS threads_sidebar_move ON threads(sort_order,id)");
         // Staging budgets exclude sent history; lookup by attachment must not
         // scan all message refs for every historical row in the thread.
         try result.exec("CREATE INDEX IF NOT EXISTS attachment_refs_by_attachment ON attachment_refs(attachment_id)");
