@@ -117,6 +117,7 @@ pub const App = struct {
     /// the public Host rows do not expose it; it is never inferred from a run ID.
     pub fn sendDiagnosticReport(self: *const App, buffer: []u8) ![]const u8 {
         const evidence = &self.view.send_diagnostic;
+        const selected = self.view.selected;
         return types.encode(.{
             .version = @as(u32, 1),
             .stage = evidence.stage,
@@ -141,6 +142,10 @@ pub const App = struct {
             .send_ready = self.view.can_send,
             .send_enabled = self.view.can_send and self.view.editor.len != 0,
             .send_disabled_reason = self.view.send_disabled_reason,
+            .selected_runtime = if (selected) |value| value.runtime_kind.slice() else "",
+            .selected_provider = if (selected) |value| value.model_provider.slice() else "",
+            .selected_model = if (selected) |value| value.model_id.slice() else "",
+            .selected_effort = if (selected) |value| value.effort.slice() else "",
         }, buffer);
     }
 
@@ -718,11 +723,13 @@ pub const App = struct {
             self.snapshot.thread_run_states[index] = @tagName(entry.run_status);
         }
         self.snapshot.selected_runtime = "";
+        self.snapshot.selected_provider = "";
         self.snapshot.selected_model = "";
         self.snapshot.selected_effort = "";
         self.snapshot.notice = self.view.notice;
         if (self.view.selected) |*selected| {
             self.snapshot.selected_runtime = selected.runtime_kind.slice();
+            self.snapshot.selected_provider = selected.model_provider.slice();
             self.snapshot.selected_model = selected.model_id.slice();
             self.snapshot.selected_effort = selected.effort.slice();
         }

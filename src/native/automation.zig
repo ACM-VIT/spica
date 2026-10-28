@@ -43,6 +43,7 @@ pub const Snapshot = struct {
     thread_count: usize = 0,
     model_count: usize = 0,
     selected_runtime: []const u8 = "",
+    selected_provider: []const u8 = "",
     selected_model: []const u8 = "",
     selected_effort: []const u8 = "",
     send_ready: bool = false,
