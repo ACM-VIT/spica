@@ -25,10 +25,10 @@ class OpenCodeWorkflowFixtureTests(unittest.TestCase):
         self.workspace.mkdir()
         self.profile()
 
-    def profile(self, mode="complete"):
+    def profile(self, mode="complete", provider="opencode", model="big-pickle"):
         (self.account / "workflow-profile.json").write_text(json.dumps({
             "format": FORMAT, "mode": mode, "runtime_version": "2.1.4",
-            "protocol_version": 1, "model_provider": "opencode", "model": "big-pickle",
+            "protocol_version": 1, "model_provider": provider, "model": model,
             "effort": "default", "workspace": str(self.workspace)}), encoding="utf-8")
 
     def run_server(self, requests, *, cwd=None, account=None):
@@ -50,9 +50,9 @@ class OpenCodeWorkflowFixtureTests(unittest.TestCase):
         return {"jsonrpc": "2.0", "id": identifier, "method": "session/resume",
                 "params": {"sessionId": session, "cwd": str(self.workspace), "mcpServers": []}}
 
-    def configure(self, identifier=3, session=None):
+    def configure(self, identifier=3, session=None, model="opencode/big-pickle"):
         return {"jsonrpc": "2.0", "id": identifier, "method": "session/set_config_option",
-                "params": {"sessionId": session, "configId": "model", "value": "opencode/big-pickle"}}
+                "params": {"sessionId": session, "configId": "model", "value": model}}
 
     def prompt(self, identifier, session, text):
         return {"jsonrpc": "2.0", "id": identifier, "method": "session/prompt",
@@ -83,7 +83,9 @@ class OpenCodeWorkflowFixtureTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             output = [json.loads(line) for line in result.stdout.splitlines()]
             self.assertEqual(output[-1]["result"]["stopReason"], "end_turn")
-            self.assertIn(f"prior turns {index}", output[-2]["params"]["update"]["content"]["text"])
+            chunks = [v["params"]["update"]["content"]["text"] for v in output
+                      if v.get("params", {}).get("update", {}).get("sessionUpdate") == "agent_message_chunk"]
+            self.assertIn(f"prior turns {index}", chunks[0])
         events = [json.loads(line) for line in (self.account / "workflow-events.jsonl").read_text().splitlines()]
         sessions = [event for event in events if event["method"] == "session/new"]
         turns = [event for event in events if event["method"] == "session/prompt"]
@@ -111,6 +113,46 @@ class OpenCodeWorkflowFixtureTests(unittest.TestCase):
         self.assertEqual([turn["prior_turns"] for turn in turns], [0, 1])
         self.assertEqual(len({turn["turn_id"] for turn in turns}), 2)
 
+    def test_free_provider_three_turns_and_restart_keep_exact_identity(self):
+        self.profile(provider="opencode", model="glm-5.3-flash-free")
+        created = self.run_server([self.initialize(), self.new()])
+        self.assertEqual(created.returncode, 0, created.stderr)
+        reply = json.loads(created.stdout.splitlines()[-1])["result"]
+        session = reply["sessionId"]
+        model = "opencode/glm-5.3-flash-free"
+        self.assertEqual(reply["configOptions"][0]["currentValue"], model)
+        first = self.run_server([self.initialize(), self.resume(session, 2),
+                                 self.configure(3, session, model),
+                                 self.prompt(4, session, "one"), self.prompt(5, session, "two")])
+        self.assertEqual(first.returncode, 0, first.stderr)
+        responses = [json.loads(line) for line in first.stdout.splitlines()]
+        self.assertEqual([v["id"] for v in responses if v.get("result", {}).get("stopReason") == "end_turn"], [4, 5])
+        self.assertEqual([v["params"]["update"]["sessionUpdate"] for v in responses if v.get("method") == "session/update"],
+                         ["agent_thought_chunk", "agent_message_chunk", "usage_update"] * 2)
+        restarted = self.run_server([self.initialize(), self.resume(session, 2),
+                                     self.configure(3, session, model), self.prompt(4, session, "three")])
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        events = [json.loads(line) for line in (self.account / "workflow-events.jsonl").read_text().splitlines()]
+        turns = [v for v in events if v["method"] == "session/prompt"]
+        self.assertEqual([v["prior_turns"] for v in turns], [0, 1, 2])
+        self.assertEqual({v["session_id"] for v in turns}, {session})
+        self.assertEqual({v["value"] for v in events if v["method"] == "session/set_config_option"}, {model})
+
+    def test_free_provider_refuses_codex_model_and_codex_turn_protocol(self):
+        self.profile(provider="opencode-free", model="glm-5.3-flash")
+        created = self.run_server([self.initialize(), self.new()])
+        session = json.loads(created.stdout.splitlines()[-1])["result"]["sessionId"]
+        stale = self.run_server([self.initialize(), self.resume(session, 2),
+                                self.configure(3, session, "openai/gpt-6.1")])
+        self.assertNotEqual(stale.returncode, 0)
+        codex = self.run_server([self.initialize(), self.resume(session, 2),
+                                {"jsonrpc": "2.0", "id": 3, "method": "turn/start",
+                                 "params": {"threadId": session, "input": [{"type": "text", "text": "wrong route"}]}}])
+        self.assertEqual(codex.returncode, 0, codex.stderr)
+        self.assertEqual(json.loads(codex.stdout.splitlines()[-1])["error"]["code"], -32601)
+        state = json.loads((self.account / "workflow-state.json").read_text())
+        self.assertEqual(state[session], [])
+
     def test_accepts_all_four_exact_64k_prompt_shapes(self):
         prompts = ["x" * 65536, "🙂" * 16384, '\n"\\\t' * 16384,
                    "x" * 2047 + "€" + "\x01" * 63486]
@@ -122,7 +164,9 @@ class OpenCodeWorkflowFixtureTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             output = [json.loads(line) for line in result.stdout.splitlines()]
             self.assertEqual(output[-1]["result"]["stopReason"], "end_turn")
-            self.assertIn(f"prompt bytes 65536", output[-2]["params"]["update"]["content"]["text"])
+            chunks = [v["params"]["update"]["content"]["text"] for v in output
+                      if v.get("params", {}).get("update", {}).get("sessionUpdate") == "agent_message_chunk"]
+            self.assertIn(f"prompt bytes 65536", chunks[0])
         turns = [json.loads(line) for line in (self.account / "workflow-events.jsonl").read_text().splitlines()
                  if json.loads(line).get("method") == "session/prompt"]
         self.assertEqual([turn["prior_turns"] for turn in turns], list(range(4)))

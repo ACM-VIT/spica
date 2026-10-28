@@ -83,6 +83,49 @@ test "ACP subsequent turns keep upstream session and bounded retained state" {
     try std.testing.expect((try textFrame(&runtime, a, "late replay")) == null);
 }
 
+test "ACP free GLM session refuses stale Codex identity before any prompt" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var runtime: Runtime = undefined;
+    var glm = selection;
+    glm.model_id = "glm-5.3-flash-free";
+    try runtime.init(std.testing.allocator, .{}, .{ .selection = glm, .cwd = "/tmp/spica", .instance = .{ .value = "free-glm" }, .account = .{ .reference = "isolated", .readiness = .unknown } });
+    defer runtime.shutdown();
+    _ = try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentInfo\":{\"version\":\"2.1.4\"},\"agentCapabilities\":{\"sessionCapabilities\":{\"resume\":{}}}}}");
+    var codex = glm;
+    codex.runtime_kind = "codex";
+    codex.model_provider = "openai";
+    codex.model_id = "gpt-6.1";
+    const before = runtime.request_id;
+    try std.testing.expectError(error.SelectionUnavailable, runtime.dispatch(a, .{ .open = .{ .create = .{ .session = correlation.session, .effect = correlation.effect.?, .selection = codex } } }));
+    try std.testing.expectEqual(before, runtime.request_id);
+    _ = try runtime.dispatch(a, .{ .open = .{ .create = .{ .session = correlation.session, .effect = correlation.effect.?, .selection = glm } } });
+    _ = try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"ses_free_glm\"}}");
+    const configuration = try std.json.parseFromSlice(std.json.Value, a, runtime.transport.sent[0..runtime.transport.len], .{});
+    try std.testing.expectEqualStrings("opencode/glm-5.3-flash-free", configuration.value.object.get("params").?.object.get("value").?.string);
+    _ = try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"configOptions\":[{\"id\":\"model\",\"currentValue\":\"opencode/glm-5.3-flash-free\"}]}}");
+    const selected = (try runtime.poll(a)).?;
+    try std.testing.expect(c.equal(glm, selected.body.selection.effective.?));
+    for ([_][]const u8{ "glm-first", "glm-second", "glm-third" }) |run| {
+        var next = correlation;
+        next.run = .{ .value = run };
+        _ = try runtime.dispatch(a, .{ .start = .{ .correlation = next, .prompt = "routing-ok" } });
+        const sent = try std.json.parseFromSlice(std.json.Value, a, runtime.transport.sent[0..runtime.transport.len], .{});
+        try std.testing.expectEqualStrings("session/prompt", sent.value.object.get("method").?.string);
+        try std.testing.expectEqualStrings("ses_free_glm", sent.value.object.get("params").?.object.get("sessionId").?.string);
+        try std.testing.expect((try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"ses_free_glm\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"messageId\":\"upstream-reasoning\",\"content\":{\"type\":\"text\",\"text\":\"Synthetic thought\"}}}}")) == null);
+        const chunk = (try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"ses_free_glm\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":\"upstream-message\",\"content\":{\"type\":\"text\",\"text\":\"routing-ok\"}}}}")).?;
+        try std.testing.expectEqualStrings(run, chunk.correlation.run.?.value);
+        try std.testing.expectEqualStrings("routing-ok", chunk.body.chunk.text);
+        try std.testing.expect((try consume(&runtime, a, "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"ses_free_glm\",\"update\":{\"sessionUpdate\":\"usage_update\",\"used\":5036,\"size\":200000,\"cost\":{\"amount\":0,\"currency\":\"USD\"}}}}")) == null);
+        const terminal = try std.json.Stringify.valueAlloc(a, .{ .jsonrpc = "2.0", .id = runtime.pending_id, .result = .{ .stopReason = "end_turn", .usage = .{ .inputTokens = 4991, .outputTokens = 0, .totalTokens = 5036, .thoughtTokens = 45 }, ._meta = .{} } }, .{});
+        const completed = (try consume(&runtime, a, terminal)).?;
+        try std.testing.expect(completed.body == .completed);
+        try std.testing.expectEqualStrings(run, completed.correlation.run.?.value);
+    }
+}
+
 test "ACP OpenCode refuses steering and questions without mutating the active turn" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

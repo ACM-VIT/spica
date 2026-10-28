@@ -20,8 +20,11 @@ import uuid
 FORMAT = "spica-offline-opencode-workflow-v1"
 VERSION = "2.1.4"
 PROTOCOL = 1
-MODEL_PROVIDER = "opencode"
-MODEL = "big-pickle"
+# Explicit synthetic identities: the original workflow model, the prefixed
+# routing regression, and the free GLM identity advertised by installed 2.1.4.
+# None grants network or account access to this offline process.
+MODELS = {("opencode", "big-pickle"), ("opencode-free", "glm-5.3-flash"),
+          ("opencode", "glm-5.3-flash-free")}
 EFFORT = "default"
 FAILURE = "Offline synthetic OpenCode provider failure (synthetic)."
 MAX_FRAME = 6 * (64 * 1024 + 256 * 1024 + 4096) + 16 * 1024
@@ -98,12 +101,12 @@ class Fixture:
                 or self.profile.get("mode") not in {"complete", "fail"}
                 or self.profile.get("runtime_version") != VERSION
                 or self.profile.get("protocol_version") != PROTOCOL
-                or self.profile.get("model_provider") != MODEL_PROVIDER
-                or self.profile.get("model") != MODEL
+                or (self.profile.get("model_provider"), self.profile.get("model")) not in MODELS
                 or self.profile.get("effort") != EFFORT
                 or not workspace.is_absolute()
                 or workspace.resolve() != Path.cwd().resolve()):
             raise ValueError("explicit disposable OpenCode workflow profile required")
+        self.model = f"{self.profile['model_provider']}/{self.profile['model']}"
         self.state_path = self.account / "workflow-state.json"
         self.log_path = self.account / "workflow-events.jsonl"
         self.lock = (self.account / "workflow.lock").open("a")
@@ -243,17 +246,17 @@ class Fixture:
         self.record(method, session_id=upstream, prior_turns=len(state[upstream]))
         self.reply(request, {"sessionId": upstream, "configOptions": [{
             "id": "model", "category": "model", "name": "Model", "type": "select",
-            "currentValue": f"{MODEL_PROVIDER}/{MODEL}",
-            "options": [{"value": f"{MODEL_PROVIDER}/{MODEL}", "name": "Offline OpenCode workflow fixture"}],
+            "currentValue": self.model,
+            "options": [{"value": self.model, "name": "Offline OpenCode workflow fixture"}],
         }]})
 
     def configure(self, request: dict, params: dict) -> None:
         if params.get("sessionId") != self.opened or params.get("configId") != "model":
             raise ValueError("invalid model configuration request")
-        if params.get("value") != f"{MODEL_PROVIDER}/{MODEL}":
+        if params.get("value") != self.model:
             raise ValueError("exact fixture model required")
         self.record("session/set_config_option", session_id=self.opened, config_id="model", value=params["value"])
-        self.reply(request, {"configOptions": [{"id": "model", "currentValue": f"{MODEL_PROVIDER}/{MODEL}"}]})
+        self.reply(request, {"configOptions": [{"id": "model", "currentValue": self.model}]})
 
     def prompt(self, request: dict, params: dict) -> None:
         if params.get("sessionId") != self.opened:
@@ -275,9 +278,17 @@ class Fixture:
         # leaves prompting state on the terminal response and ignores replay.
         if self.profile["mode"] == "complete":
             message = f"Offline OpenCode fixture: turn {prior + 1}; prior turns {prior}; prompt bytes {len(prompt)}. café 世界"
+            # Installed 2.1.4 emits thought and usage notifications around text,
+            # and returns usage alongside stopReason. Keep this envelope in the
+            # fixture so completing one turn cannot depend on text being the
+            # final upstream frame. All payloads here remain synthetic.
+            self.notify({"sessionId": self.opened, "update": {"sessionUpdate": "agent_thought_chunk",
+                         "messageId": turn + ":reasoning:0", "content": {"type": "text", "text": "Offline synthetic thought."}}})
             self.notify({"sessionId": self.opened, "update": {"sessionUpdate": "agent_message_chunk",
-                         "content": {"type": "text", "text": message}}})
-            self.reply(request, {"stopReason": "end_turn"})
+                         "messageId": turn, "content": {"type": "text", "text": message}}})
+            self.notify({"sessionId": self.opened, "update": {"sessionUpdate": "usage_update",
+                         "used": prior + 1, "size": 200000, "cost": {"amount": 0, "currency": "USD"}}})
+            self.reply(request, {"stopReason": "end_turn", "usage": {"inputTokens": len(prompt), "outputTokens": len(message)}, "_meta": {}})
         else:
             self.reply(request, {"stopReason": FAILURE})
 
