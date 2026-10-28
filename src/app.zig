@@ -71,7 +71,7 @@ const NavigationObservation = struct {
         for (self.view.navigation_targets.slice()) |target| {
             try writer.write(setupTarget(target.id[0..target.id_len], target.role[0..target.role_len], target.bounds, target.enabled));
         }
-        try writer.write(setupTarget("sidebar.search.more", "button", self.view.search_more_bounds, self.view.search_len != 0 and self.view.search_more_available and self.view.navigation_enabled));
+        try writer.write(setupTarget("sidebar.search.more", "button", self.view.search_more_bounds, self.view.search_more_available and self.view.navigation_enabled and self.view.search_more_bounds.w > 0 and self.view.search_more_bounds.h > 0 and self.view.sidebar_menu_thread.len == 0));
         try writer.endArray();
         try writer.objectField("workspace_open");
         try writer.write(self.view.workspace_open);
@@ -629,7 +629,7 @@ pub const App = struct {
         self.snapshot.effort_open = self.view.effort_open;
         const sidebar_bounds = [_]c.SDL_FRect{ self.view.search_bounds, self.view.scope_bounds };
         for (sidebar_bounds, 0..) |bounds, index| {
-            self.snapshot.sidebar_targets[index] = .{ .id = if (index == 0) "sidebar.search" else "sidebar.scope", .role = if (index == 0) "textbox" else "button", .key = "", .enabled = self.view.custom_root == null and bounds.w > 0 and bounds.h > 0, .pointer_bounds = .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } };
+            self.snapshot.sidebar_targets[index] = .{ .id = if (index == 0) "sidebar.search" else "sidebar.scope", .role = if (index == 0) "textbox" else "button", .key = "", .enabled = self.view.custom_root == null and !self.view.sidebar_collapsed and self.view.sidebar_menu_thread.len == 0 and !self.view.scope_open and !self.view.setup_open and !self.view.workflow_open and bounds.w > 0 and bounds.h > 0, .pointer_bounds = .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } };
         }
         self.snapshot.scope_targets = @splat(.{ .enabled = false });
         for (0..self.view.project_count + 1) |index| {
@@ -1759,10 +1759,11 @@ const Conversation = struct {
             entry.settled = row.settled;
             entry.snoozed_until = row.snoozed_until;
             entry.sort_order = row.sort_order;
+            entry.updated_at_ms = if (row.last_user_message_at_ms != 0) row.last_user_message_at_ms else row.updated_at_ms;
             entry.runtime_kind = if (row.selection) |selection| try displayId(selection.runtime_kind) else .{};
             entry.model_provider = if (row.selection) |selection| try displayId(selection.model_provider) else .{};
             entry.model_id = if (row.selection) |selection| try displayId(selection.model_id) else .{};
-            const workspace_path = @import("text/utf8.zig").prefix(row.workspace_root, entry.workspace_path.len);
+            const workspace_path = if (row.workspace_root.len <= entry.workspace_path.len) row.workspace_root else "";
             @memcpy(entry.workspace_path[0..workspace_path.len], workspace_path);
             entry.workspace_path_len = workspace_path.len;
             return;
@@ -3978,6 +3979,33 @@ test "thread cards own real titles and workspace metadata across refresh" {
     const full_branch = [_]u8{'b'} ** 255 ++ "é";
     try std.testing.expectEqual(@as(u16, 255), (try Conversation.displayId(full_branch)).len);
     try std.testing.expectEqual(@as(usize, 257), full_branch.len);
+}
+
+test "sidebar projection preserves provider timestamps and refuses truncated workspace paths" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/sidebar") };
+    var row: @FieldType(types.Row, "thread") = .{
+        .id = .{ .value = "thread" },
+        .revision = 9,
+        .project = .{ .value = "project" },
+        .workspace = .{ .value = "workspace" },
+        .session = null,
+        .selection = contract.fakeSelection(.{ .value = "workspace" }),
+        .workspace_root = "/" ++ "p" ** 1024,
+        .last_user_message_at_ms = 3000,
+        .updated_at_ms = 4000,
+    };
+    try conversation.updateThreadCard(&view, row);
+    try std.testing.expectEqual(@as(usize, 0), view.threads[0].workspace_path_len);
+    try std.testing.expectEqual(@as(i64, 3000), view.threads[0].updated_at_ms);
+    try std.testing.expectEqualStrings("fake", view.threads[0].runtime_kind.slice());
+    try std.testing.expectEqual(@as(u64, 9), view.threads[0].revision);
+    row.workspace_root = "/tmp/café";
+    row.last_user_message_at_ms = 0;
+    try conversation.updateThreadCard(&view, row);
+    try std.testing.expectEqualStrings(row.workspace_root, view.threads[0].workspace_path[0..view.threads[0].workspace_path_len]);
+    try std.testing.expectEqual(@as(i64, 4000), view.threads[0].updated_at_ms);
 }
 
 test "sidebar receipt updates active neighbor revision while retaining execution and Unicode draft" {

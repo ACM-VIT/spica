@@ -264,6 +264,9 @@ pub const Row = union(enum) {
         settled: bool = false,
         snoozed_until: i64 = 0,
         sort_order: i64 = 0,
+        created_at_ms: i64 = 0,
+        last_user_message_at_ms: i64 = 0,
+        updated_at_ms: i64 = 0,
     },
     message: struct {
         message_id: adapter.MessageId,

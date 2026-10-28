@@ -10,7 +10,7 @@ extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, Closed };
 pub const application_id = 0x53504334;
-pub const schema_version = 9;
+pub const schema_version = 10;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
 
 pub const Statement = struct {
@@ -160,6 +160,14 @@ pub const Store = struct {
             try result.exec("UPDATE meta SET schema_version=9 WHERE singleton=1; PRAGMA user_version=9; COMMIT");
         } else if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name IN('pinned','settled','snoozed_until','sort_order')") != 4) return error.Corrupt;
         try result.exec("CREATE INDEX IF NOT EXISTS threads_sidebar_order ON threads(-pinned,sort_order,id); CREATE INDEX IF NOT EXISTS threads_project_sidebar_order ON threads(project_id,-pinned,sort_order,id); CREATE INDEX IF NOT EXISTS threads_sidebar_move ON threads(sort_order,id)");
+        if (fresh or version < 10) {
+            try result.exec("BEGIN IMMEDIATE");
+            errdefer result.exec("ROLLBACK") catch {};
+            // Old histories have no trustworthy wall clock; zero stays unknown.
+            if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name='created_at_ms'") == 0)
+                try result.exec("ALTER TABLE threads ADD COLUMN created_at_ms INTEGER NOT NULL DEFAULT 0 CHECK(created_at_ms>=0); ALTER TABLE threads ADD COLUMN last_user_message_at_ms INTEGER NOT NULL DEFAULT 0 CHECK(last_user_message_at_ms>=0); ALTER TABLE threads ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0 CHECK(updated_at_ms>=0)");
+            try result.exec("UPDATE meta SET schema_version=10 WHERE singleton=1; PRAGMA user_version=10; COMMIT");
+        } else if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name IN('created_at_ms','last_user_message_at_ms','updated_at_ms')") != 3) return error.Corrupt;
         // Staging budgets exclude sent history; lookup by attachment must not
         // scan all message refs for every historical row in the thread.
         try result.exec("CREATE INDEX IF NOT EXISTS attachment_refs_by_attachment ON attachment_refs(attachment_id)");

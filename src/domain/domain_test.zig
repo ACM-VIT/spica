@@ -481,6 +481,46 @@ test "sidebar schema eight migration preserves execution revisions and creates o
     }
 }
 
+test "thread card timestamps use known command clocks and preserve latest user message time" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "sidebar-time", .utc_ms = 1000 };
+    const conversation = try Conversation.create(&owner, allocator);
+    owner.utc_ms = 2000;
+    const title = try owner.command(allocator, .{ .command_id = .{ .value = "sidebar-time-title" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_title_set = .{ .title = "Actual time" } } });
+    try std.testing.expectEqual(.accepted, title.outcome);
+    owner.utc_ms = 3000;
+    const send = try owner.command(allocator, .{ .command_id = .{ .value = "sidebar-time-send" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_send = .{ .text = "actual user message", .selection = t.adapter.fakeSelection(conversation.workspace) } } });
+    try std.testing.expectEqual(.accepted, send.outcome);
+    owner.utc_ms = 4000;
+    const pin = try owner.command(allocator, .{ .command_id = .{ .value = "sidebar-time-pin" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 3 }, .payload = .{ .thread_sidebar_set = .{ .pinned = true } } });
+    try std.testing.expectEqual(.accepted, pin.outcome);
+    owner.utc_ms = null;
+    const unpin = try owner.command(allocator, .{ .command_id = .{ .value = "sidebar-time-unpin" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 4 }, .payload = .{ .thread_sidebar_set = .{ .pinned = false } } });
+    try std.testing.expectEqual(.accepted, unpin.outcome);
+    const stored = try f.store.prepare("SELECT created_at_ms,last_user_message_at_ms,updated_at_ms FROM threads WHERE id=?", &.{.{ .text = conversation.thread.value }});
+    defer stored.deinit();
+    try std.testing.expect(try stored.step());
+    try std.testing.expectEqual(@as(i64, 1000), stored.integer(0));
+    try std.testing.expectEqual(@as(i64, 3000), stored.integer(1));
+    try std.testing.expectEqual(@as(i64, 4000), stored.integer(2));
+}
+
+test "schema nine timestamp migration leaves historic ages unknown" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try seed(&f.store);
+    try f.store.exec("ALTER TABLE threads DROP COLUMN created_at_ms; ALTER TABLE threads DROP COLUMN last_user_message_at_ms; ALTER TABLE threads DROP COLUMN updated_at_ms; UPDATE meta SET schema_version=9; PRAGMA user_version=9");
+    try f.store.close();
+    var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    f.store = try storage.Store.open(std.testing.io, try f.path(&directory));
+    try std.testing.expectEqual(@as(i64, storage.schema_version), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM threads WHERE id='h' AND revision=1 AND created_at_ms=0 AND last_user_message_at_ms=0 AND updated_at_ms=0"));
+}
+
 test "real reducers accept arbitrary prompt dedup before revision and withdraw queued effects" {
     var f = try Fixture.init();
     defer f.deinit();
