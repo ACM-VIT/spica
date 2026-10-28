@@ -93,6 +93,16 @@ def assert_retained(before: dict[str, Any], after: dict[str, Any], draft: str) -
         raise ValueError("sidebar action changed the active draft")
 
 
+def assert_route_restored(before: dict[str, Any], after: dict[str, Any], draft: str) -> None:
+    # Deliberate navigation resets the last Send diagnostic. Durable identity,
+    # selected run and retained composer content must still return exactly.
+    for field in ("thread_id", "project_id", "run_id"):
+        if not before.get(field) or after.get(field) != before[field]:
+            raise ValueError("sidebar navigation failed to restore active execution: " + field)
+    if after.get("draft") != draft:
+        raise ValueError("sidebar navigation failed to restore the exact draft")
+
+
 def assert_compact(snapshot: dict[str, Any], identifiers: set[str]) -> None:
     visible = [target for target in snapshot.get("thread_targets", []) if target.get("enabled")]
     if {target.get("id") for target in visible} != identifiers:
@@ -729,7 +739,7 @@ class Proof:
                             and rows(value)[alpha]["settled"] and value.get("thread_id") == next_id,
                             "active settlement advances to exact observed successor after acceptance")
         if next_id == charlie:
-            assert_retained(retained, current, draft)
+            assert_route_restored(retained, current, draft)
         self.shot("active-settle-successor.png")
         self.reveal("settled", alpha)
         self.click(alpha)
@@ -742,7 +752,7 @@ class Proof:
         current = self.wait(lambda value: value.get("thread_id") == charlie
                             and value.get("draft") == draft and value.get("send_ready"),
                             "Charlie draft restored before sole-project snooze")
-        assert_retained(retained, current, draft)
+        assert_route_restored(retained, current, draft)
         project = current["project_id"]
         self.click("sidebar.scope")
         self.wait(lambda value: value.get("sidebar_scope_open"), "sole-project park scope opens")
@@ -770,7 +780,7 @@ class Proof:
         current = self.wait(lambda value: value.get("thread_id") == charlie
                             and value.get("draft") == draft and value.get("send_ready"),
                             "revisiting snoozed Charlie restores original run and draft")
-        assert_retained(retained, current, draft)
+        assert_route_restored(retained, current, draft)
         self.click("sidebar.scope")
         self.wait(lambda value: value.get("sidebar_scope_open"), "park proof scope opens for reset")
         self.click("scope.all")

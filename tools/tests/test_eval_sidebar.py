@@ -102,6 +102,17 @@ class SidebarEvidenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 MODULE.assert_retained(value, {**value, field: "changed"}, value["draft"])
 
+    def test_deliberate_navigation_restores_run_and_draft_with_send_diagnostic_cleared(self):
+        value = {"thread_id": "thread", "project_id": "project", "run_id": "run",
+                 "send_command_id": "command", "send_run_id": "run", "draft": "café 世界"}
+        restored = {**value, "send_command_id": "", "send_run_id": ""}
+        MODULE.assert_route_restored(value, restored, value["draft"])
+        for field in ("thread_id", "project_id", "run_id", "draft"):
+            with self.assertRaises(ValueError):
+                MODULE.assert_route_restored(value, {**restored, field: "changed"}, value["draft"])
+        with self.assertRaises(ValueError):
+            MODULE.assert_route_restored({}, {}, "")
+
     def test_resident_count_excludes_disabled_placeholder_slots(self):
         value = {"thread_count": 1,
                  "thread_targets": [{"id": "alpha"}, {"id": "window.close"}, {"id": "window.close"}],
