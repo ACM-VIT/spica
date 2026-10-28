@@ -1553,7 +1553,14 @@ pub const Host = struct {
         selection: ?a.Selection = null,
         workspace_root: ?[]const u8 = null,
     };
-    const Request = union(enum) { command: t.CommandEnvelope, query: t.Query, subscribe: t.Subscribe, unsubscribe: t.SubscriptionId };
+    const Request = union(enum) {
+        command: t.CommandEnvelope,
+        query: t.Query,
+        subscribe: t.Subscribe,
+        unsubscribe: t.SubscriptionId,
+        presentation_load: []const u8,
+        presentation_save: struct { key: []const u8, value: []const u8 },
+    };
     const Frame = struct {
         prompt_bytes: usize = 0,
         attachment_bytes: usize = 0,
@@ -1725,6 +1732,14 @@ pub const Host = struct {
     }
     pub fn query(self: *Host, request: t.Query) t.AdmissionError!t.Ticket {
         return self.admit(.{ .query = request });
+    }
+    pub fn loadPresentation(self: *Host, key: []const u8) t.AdmissionError!t.Ticket {
+        if (key.len == 0 or key.len > 128) return error.TooLarge;
+        return self.admit(.{ .presentation_load = key });
+    }
+    pub fn savePresentation(self: *Host, key: []const u8, value: []const u8) t.AdmissionError!t.Ticket {
+        if (key.len == 0 or key.len > 128 or value.len > 4096) return error.TooLarge;
+        return self.admit(.{ .presentation_save = .{ .key = key, .value = value } });
     }
     pub fn subscribe(self: *Host, request: t.Subscribe) t.AdmissionError!t.Ticket {
         return self.admit(.{ .subscribe = request });
@@ -2024,6 +2039,14 @@ pub const Host = struct {
     }
     fn handle(self: *Host, owner: *Owner, allocator: std.mem.Allocator, ticket: t.Ticket, request: Request, prompt: []const u8) !void {
         switch (request) {
+            .presentation_load => |key| try self.publish(.{ .presentation_loaded = .{ .ticket = ticket, .value = try self.database.loadPresentation(allocator, key) } }),
+            .presentation_save => |value| {
+                const used = try self.database.scalar("PRAGMA page_count");
+                const page_size = try self.database.scalar("PRAGMA page_size");
+                if (@as(u64, @intCast(used)) *| @as(u64, @intCast(page_size)) >= self.options.limits.durable_bytes) return error.Limit;
+                try self.database.savePresentation(value.key, value.value);
+                try self.publish(.{ .presentation_saved = .{ .ticket = ticket } });
+            },
             .command => |command| {
                 const used = try self.database.scalar("PRAGMA page_count");
                 const page_size = try self.database.scalar("PRAGMA page_size");

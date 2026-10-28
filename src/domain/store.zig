@@ -10,7 +10,7 @@ extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, Closed };
 pub const application_id = 0x53504334;
-pub const schema_version = 10;
+pub const schema_version = 11;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
 
 pub const Statement = struct {
@@ -168,6 +168,11 @@ pub const Store = struct {
                 try result.exec("ALTER TABLE threads ADD COLUMN created_at_ms INTEGER NOT NULL DEFAULT 0 CHECK(created_at_ms>=0); ALTER TABLE threads ADD COLUMN last_user_message_at_ms INTEGER NOT NULL DEFAULT 0 CHECK(last_user_message_at_ms>=0); ALTER TABLE threads ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0 CHECK(updated_at_ms>=0)");
             try result.exec("UPDATE meta SET schema_version=10 WHERE singleton=1; PRAGMA user_version=10; COMMIT");
         } else if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name IN('created_at_ms','last_user_message_at_ms','updated_at_ms')") != 3) return error.Corrupt;
+        if (fresh or version < 11) {
+            try result.exec("BEGIN IMMEDIATE");
+            errdefer result.exec("ROLLBACK") catch {};
+            try result.exec("CREATE TABLE IF NOT EXISTS presentation_state(key TEXT PRIMARY KEY CHECK(length(key) BETWEEN 1 AND 128),value BLOB NOT NULL CHECK(length(value)<=4096)); UPDATE meta SET schema_version=11 WHERE singleton=1; PRAGMA user_version=11; COMMIT");
+        } else if (try result.scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='presentation_state'") != 1) return error.Corrupt;
         // Staging budgets exclude sent history; lookup by attachment must not
         // scan all message refs for every historical row in the thread.
         try result.exec("CREATE INDEX IF NOT EXISTS attachment_refs_by_attachment ON attachment_refs(attachment_id)");
@@ -194,6 +199,20 @@ pub const Store = struct {
         try self.execute("INSERT INTO runtime_configurations VALUES(?,?) ON CONFLICT(runtime_kind) DO UPDATE SET configuration=excluded.configuration", &.{ .{ .text = kind }, .{ .blob = configuration } });
         try self.execute("INSERT INTO runtime_preferences VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET active_runtime_kind=excluded.active_runtime_kind", &.{.{ .text = kind }});
         try self.commit();
+    }
+    /// Opaque UI-owned values, deliberately outside the execution journal.
+    pub fn savePresentation(self: *Store, key: []const u8, value: []const u8) Error!void {
+        if (key.len == 0 or key.len > 128 or value.len > 4096) return error.Limit;
+        try self.execute("INSERT INTO presentation_state VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", &.{ .{ .text = key }, .{ .blob = value } });
+    }
+    pub fn loadPresentation(self: *Store, allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {
+        if (key.len == 0 or key.len > 128) return error.Limit;
+        const statement = try self.prepare("SELECT value FROM presentation_state WHERE key=?", &.{.{ .text = key }});
+        defer statement.deinit();
+        if (!try statement.step()) return null;
+        const bytes = try statement.bytes(0);
+        if (bytes.len > 4096) return error.Corrupt;
+        return try allocator.dupe(u8, bytes);
     }
     pub fn close(self: *Store) Error!void {
         if (self.closed) return;

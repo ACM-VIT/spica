@@ -698,6 +698,89 @@ const Consumer = struct {
     }
 };
 
+test "opaque presentation state migrates independently and preserves execution position" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try seed(&f.store);
+    try f.store.exec("DROP TABLE presentation_state; UPDATE meta SET schema_version=10; PRAGMA user_version=10");
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try f.path(&path_buffer);
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, path);
+    const before = try f.store.position();
+    try f.store.savePresentation("workspace-a", "{\"route\":\"h\"}");
+    try f.store.savePresentation("workspace-b", "opaque\x00value");
+    try f.store.savePresentation("workspace-a", "latest");
+    const loaded = (try f.store.loadPresentation(std.testing.allocator, "workspace-a")).?;
+    defer std.testing.allocator.free(loaded);
+    try std.testing.expectEqualStrings("latest", loaded);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, f.store.loadPresentation(failing.allocator(), "workspace-a"));
+    try std.testing.expect((try f.store.loadPresentation(std.testing.allocator, "missing")) == null);
+    try std.testing.expectEqualDeep(before, try f.store.position());
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT revision FROM threads WHERE id='h'"));
+    try std.testing.expectError(error.Limit, f.store.savePresentation("", "value"));
+    try std.testing.expectError(error.Limit, f.store.savePresentation("k", &(@as([4097]u8, @splat('x')))));
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, path);
+    const reopened = (try f.store.loadPresentation(std.testing.allocator, "workspace-b")).?;
+    defer std.testing.allocator.free(reopened);
+    try std.testing.expectEqualStrings("opaque\x00value", reopened);
+    try f.store.exec("PRAGMA ignore_check_constraints=ON; UPDATE presentation_state SET value=zeroblob(4097) WHERE key='workspace-a'");
+    try std.testing.expectError(error.Corrupt, f.store.loadPresentation(std.testing.allocator, "workspace-a"));
+}
+
+test "Host presentation state copies request buffers and reopens without snapshot invalidation" {
+    const Host = @import("../domain.zig").Host;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var consumer: Consumer = .{ .host = undefined, .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer consumer.arena.deinit();
+    consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .wake = Consumer.wake, .wake_context = &consumer });
+    var live = true;
+    defer if (live) consumer.host.destroy();
+    _ = try consumer.command(.{ .command_id = .{ .value = "ui-project-a" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "A" } } });
+    _ = try consumer.command(.{ .command_id = .{ .value = "ui-project-b" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "B" } } });
+    const first = try consumer.query(.{ .projects = .{ .limit = 1 } });
+    var value = [_]u8{'a'} ** 4096;
+    const saved = try consumer.host.savePresentation("workspace", &value);
+    @memset(&value, 'b');
+    const receipt = try consumer.next();
+    try std.testing.expectEqual(saved.value, receipt.presentation_saved.ticket.value);
+    const next = try consumer.query(.{ .projects = .{ .limit = 1, .snapshot = first.snapshot_id, .cursor = first.next_cursor } });
+    try std.testing.expectEqualDeep(first.snapshot_position, next.snapshot_position);
+    try std.testing.expectEqualStrings("B", next.items[0].project.display_name);
+    try std.testing.expectError(error.TooLarge, consumer.host.savePresentation("workspace", &(@as([4097]u8, @splat('x')))));
+    consumer.host.destroy();
+    live = false;
+    consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .wake = Consumer.wake, .wake_context = &consumer });
+    live = true;
+    const ticket = try consumer.host.loadPresentation("workspace");
+    const loaded = try consumer.next();
+    try std.testing.expectEqual(ticket.value, loaded.presentation_loaded.ticket.value);
+    try std.testing.expectEqualStrings(&(@as([4096]u8, @splat('a'))), loaded.presentation_loaded.value.?);
+}
+
+test "Host presentation writes honor durable store quota" {
+    const Host = @import("../domain.zig").Host;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var consumer: Consumer = .{ .host = undefined, .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer consumer.arena.deinit();
+    consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .limits = .{ .durable_bytes = 1 }, .wake = Consumer.wake, .wake_context = &consumer });
+    defer consumer.host.destroy();
+    const ticket = try consumer.host.savePresentation("workspace", "value");
+    const failure = (try consumer.next()).failure;
+    try std.testing.expectEqual(ticket.value, failure.ticket.value);
+    try std.testing.expectEqual(.admission_limit, failure.failure.reason);
+    _ = try consumer.host.loadPresentation("workspace");
+    try std.testing.expect((try consumer.next()).presentation_loaded.value == null);
+}
+
 test "public Host consumer streams approves cancels pages and reopens durable state" {
     const Host = @import("../domain.zig").Host;
     var temporary = std.testing.tmpDir(.{});

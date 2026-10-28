@@ -356,6 +356,8 @@ pub const Failure = struct {
     anchor_id: ?[]const u8 = null,
 };
 pub const Output = union(enum) {
+    presentation_loaded: struct { ticket: Ticket, value: ?[]const u8 },
+    presentation_saved: struct { ticket: Ticket },
     command_receipt: struct { ticket: Ticket, receipt: Receipt },
     query_page: struct { ticket: Ticket, page: QueryPage },
     subscribed: struct { ticket: Ticket, id: SubscriptionId, after_position: EventPosition },
