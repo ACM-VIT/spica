@@ -225,7 +225,7 @@ pub const Store = struct {
         try result.exec("CREATE TABLE IF NOT EXISTS thread_selections(thread_id TEXT PRIMARY KEY REFERENCES threads(id),selection BLOB NOT NULL CHECK(length(selection)<=16384))");
         // The implicit rowid suffix supports latest selection/status lookups
         // without scanning completed runs from other threads.
-        try result.exec("CREATE INDEX IF NOT EXISTS runs_by_thread ON runs(thread_id)");
+        try result.exec("CREATE INDEX IF NOT EXISTS runs_by_thread ON runs(thread_id); CREATE INDEX IF NOT EXISTS runs_by_thread_session ON runs(thread_id,session_id)");
         try result.exec("CREATE INDEX IF NOT EXISTS threads_root_order ON threads(root_key,-pinned,sort_order,id); CREATE INDEX IF NOT EXISTS threads_root_project_order ON threads(root_key,project_id,-pinned,sort_order,id)");
         try result.exec("CREATE TRIGGER IF NOT EXISTS threads_root_immutable BEFORE UPDATE OF root_key ON threads WHEN NEW.root_key IS NULL OR length(NEW.root_key)<>32 OR NEW.root_key<>OLD.root_key BEGIN SELECT RAISE(ABORT,'thread root key immutable'); END;");
         try result.exec("CREATE INDEX IF NOT EXISTS runs_snooze_pending ON runs(thread_id) WHERE state IN('queued','starting','awaiting_approval','awaiting_question'); CREATE INDEX IF NOT EXISTS approvals_pending_thread ON approvals(thread_id) WHERE state='pending'; CREATE INDEX IF NOT EXISTS questions_pending_thread ON questions(thread_id) WHERE state='pending'; CREATE INDEX IF NOT EXISTS approvals_by_run ON approvals(run_id,id); CREATE INDEX IF NOT EXISTS questions_by_run ON questions(run_id,id)");
@@ -307,6 +307,12 @@ pub const Store = struct {
     }
     pub fn scalar(self: *Store, sql: [:0]const u8) Error!i64 {
         const statement = try self.prepare(sql, &.{});
+        defer statement.deinit();
+        if (!try statement.step()) return error.Corrupt;
+        return statement.integer(0);
+    }
+    pub fn scalarWith(self: *Store, sql: [:0]const u8, values: []const Value) Error!i64 {
+        const statement = try self.prepare(sql, values);
         defer statement.deinit();
         if (!try statement.step()) return error.Corrupt;
         return statement.integer(0);

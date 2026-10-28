@@ -533,9 +533,9 @@ test "sidebar schema eight migration preserves execution revisions and creates o
     };
     for (plans, [_][]const u8{ "threads_sidebar_order", "threads_project_sidebar_order" }) |sql, index| {
         const plan = try f.store.prepare(sql, &.{});
-        defer plan.deinit();
         try std.testing.expect(try plan.step());
         try std.testing.expect(std.mem.indexOf(u8, try plan.bytes(3), index) != null);
+        plan.deinit();
     }
 }
 
@@ -2493,9 +2493,9 @@ test "archive paging is root scoped and tombstones exclude every descendant proj
         try database.exec("WITH RECURSIVE n(i) AS(VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1024) INSERT INTO threads(id,revision,project_id,workspace_id,root_key,archived,deleted) SELECT 'deleted-'||i,1,'p','w',(SELECT root_key FROM threads WHERE id='h'),1,1 FROM n");
         std.crypto.hash.sha2.Sha256.hash("/tmp", &digest, .{});
         const plan = try database.prepare("EXPLAIN QUERY PLAN SELECT id FROM threads WHERE deleted=0 AND archived=1 AND root_key=? AND (-pinned,sort_order,id)>(-2,0,'') ORDER BY -pinned,sort_order,id LIMIT 3", &.{.{ .blob = &digest }});
-        defer plan.deinit();
         try std.testing.expect(try plan.step());
         try std.testing.expect(std.mem.indexOf(u8, try plan.bytes(3), "threads_visible_root_order") != null);
+        plan.deinit();
     }
     var consumer: Consumer = .{ .host = undefined, .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
     defer consumer.arena.deinit();
@@ -2504,6 +2504,8 @@ test "archive paging is root scoped and tombstones exclude every descendant proj
     const active = try consumer.query(.{ .threads = .{ .canonical_root = "/tmp" } });
     try std.testing.expectEqual(@as(usize, 1), active.items.len);
     try std.testing.expectEqualStrings("active", active.items[0].thread.id.value);
+    try std.testing.expect(active.items[0].thread.can_archive);
+    try std.testing.expect(active.items[0].thread.can_delete);
     const next = try consumer.query(.{ .thread_sidebar_next = .{ .canonical_root = "/tmp" } });
     try std.testing.expectEqual(@as(usize, 1), next.items.len);
     try std.testing.expectEqualStrings("active", next.items[0].thread.id.value);
@@ -2515,6 +2517,8 @@ test "archive paging is root scoped and tombstones exclude every descendant proj
         for (page.items) |row| {
             try std.testing.expect(row.thread.archived);
             try std.testing.expectEqualStrings("/tmp", row.thread.workspace_root);
+            try std.testing.expect(!row.thread.can_archive);
+            try std.testing.expect(row.thread.can_delete);
             try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "archive-{d:0>2}", .{seen}), row.thread.id.value);
             seen += 1;
         }
@@ -2525,6 +2529,7 @@ test "archive paging is root scoped and tombstones exclude every descendant proj
     try std.testing.expectEqual(@as(usize, 11), seen);
     const archive_classic = try consumer.query(.{ .threads = .{ .canonical_root = "/tmp", .archived = true } });
     try std.testing.expectEqual(@as(usize, 11), archive_classic.items.len);
+    try std.testing.expect(archive_classic.items[0].thread.can_delete);
     _ = try consumer.host.query(.{ .threads = .{ .archived = true } });
     try std.testing.expectEqual(.invalid_query, (try consumer.next()).failure.failure.reason);
     const direct = try consumer.query(.{ .thread = .{ .value = "archive-00" } });
@@ -2549,7 +2554,6 @@ test "archive paging is root scoped and tombstones exclude every descendant proj
         _ = try consumer.host.query(q);
         const output = try consumer.next();
         if (output != .query_page) {
-            std.debug.print("deleted projection {s}: {s}\n", .{ @tagName(q), @tagName(output.failure.failure.reason) });
             return error.ExpectedPage;
         }
         try std.testing.expectEqual(@as(usize, 0), output.query_page.page.items.len);
@@ -2611,4 +2615,28 @@ test "archive and restore retain sidebar flags snooze deadline and placement" {
         try std.testing.expectEqual(@as(i64, 42), row.integer(3));
         try std.testing.expectEqual(@as(i64, if (index == 0) 1 else 0), row.integer(4));
     }
+}
+
+test "thread lifecycle affordances stay conservative for max revisions and indexed history" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = path_buffer[0..try temporary.dir.realPath(std.testing.io, &path_buffer)];
+    {
+        var database = try storage.Store.open(std.testing.io, path);
+        try seed(&database);
+        try database.exec("UPDATE threads SET revision=9223372036854775807 WHERE id='h'; WITH RECURSIVE n(i) AS(VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<4096) INSERT INTO runs(id,revision,thread_id,session_id,state,requested) SELECT 'history-'||i,1,'h','s','completed',X'7b7d' FROM n");
+        const plan = try database.prepare("EXPLAIN QUERY PLAN SELECT 1 FROM runs INDEXED BY runs_by_thread_session WHERE thread_id=? AND session_id=? LIMIT 1", &.{ .{ .text = "h" }, .{ .text = "s" } });
+        try std.testing.expect(try plan.step());
+        try std.testing.expect(std.mem.indexOf(u8, try plan.bytes(3), "runs_by_thread_session") != null);
+        plan.deinit();
+        database.close() catch @panic("close");
+    }
+    var database = try storage.Store.open(std.testing.io, path);
+    defer database.close() catch @panic("close");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var owner: domain.Owner = .{ .database = &database, .io = std.testing.io, .epoch = "max-revision", .utc_ms = 1000 };
+    const rejected = try owner.command(arena.allocator(), lifecycleCommand("max-archive", .{ .value = "h" }, std.math.maxInt(u64), .thread_archive));
+    try std.testing.expectEqual(t.Reason.revision_conflict, rejected.reason.?);
 }

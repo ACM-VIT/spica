@@ -66,6 +66,31 @@ fn canonicalEnvelope(allocator: std.mem.Allocator, envelope: t.CommandEnvelope) 
 // index (plus runs_by_thread). The preview reads only a prefix of one chunk.
 const snooze_blockers = "EXISTS(SELECT 1 FROM runs r WHERE r.thread_id=threads.id AND r.state IN('queued','starting','awaiting_approval','awaiting_question')) OR EXISTS(SELECT 1 FROM approvals a INDEXED BY approvals_pending_thread WHERE a.state='pending' AND a.thread_id=threads.id) OR EXISTS(SELECT 1 FROM questions q INDEXED BY questions_pending_thread WHERE q.state='pending' AND q.thread_id=threads.id)";
 
+const ThreadLifecycleFlags = struct {
+    archived: bool,
+    can_archive: bool,
+    can_delete: bool,
+};
+
+/// One shared ownership predicate feeds both command admission and sidebar
+/// affordances. The registry check is deliberately conservative: an attached
+/// provider session remains a blocker even after its latest run looks idle.
+fn threadLifecycleFlags(database: *store.Store, runtime_registry: ?*const Registry, thread: []const u8) !?ThreadLifecycleFlags {
+    const row = try database.prepare("SELECT archived,deleted,revision FROM threads WHERE id=?", &.{.{ .text = thread }});
+    defer row.deinit();
+    if (!try row.step() or row.integer(1) != 0) return null;
+    const archived = row.integer(0) != 0;
+    if (row.integer(2) >= std.math.maxInt(i64)) return .{ .archived = archived, .can_archive = false, .can_delete = false };
+    const pending = try database.scalarWith("SELECT EXISTS(SELECT 1 FROM runs WHERE thread_id=? AND state NOT IN('completed','cancelled','failed')) OR EXISTS(SELECT 1 FROM effects e INDEXED BY effects_lifecycle_pending JOIN runs r ON r.id=e.run_id WHERE r.thread_id=? AND e.state IN('planned','in_flight','unknown')) OR EXISTS(SELECT 1 FROM approvals INDEXED BY approvals_pending_thread WHERE thread_id=? AND state='pending') OR EXISTS(SELECT 1 FROM questions INDEXED BY questions_pending_thread WHERE thread_id=? AND state='pending')", &.{ .{ .text = thread }, .{ .text = thread }, .{ .text = thread }, .{ .text = thread } }) != 0;
+    var owned = false;
+    if (runtime_registry) |registry| for (registry.entries) |entry| if (entry) |live| {
+        owned = try database.scalarWith("SELECT EXISTS(SELECT 1 FROM runs INDEXED BY runs_by_thread_session WHERE thread_id=? AND session_id=?)", &.{ .{ .text = thread }, .{ .text = live.session.value } }) != 0;
+        if (owned) break;
+    };
+    const blocked = pending or owned;
+    return .{ .archived = archived, .can_archive = !archived and !blocked, .can_delete = !blocked };
+}
+
 const thread_columns = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)),coalesce((SELECT substr(bytes,1,163) FROM chunks WHERE block_id=(SELECT id FROM blocks WHERE message_id=(SELECT id FROM messages WHERE thread_id=threads.id AND ordinal=0 AND role='user') AND ordinal=0) AND byte_offset=0),''),(SELECT state FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1),coalesce((SELECT substr(display_name,1,256) FROM projects WHERE id=threads.project_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.expected_branch') FROM workspaces WHERE id=threads.workspace_id),''),coalesce(title,''),pinned,settled,snoozed_until,sort_order,created_at_ms,last_user_message_at_ms,updated_at_ms,NOT(" ++ snooze_blockers ++ "),archived FROM threads ";
 
 fn canonicalRootKey(root: []const u8) [32]u8 {
@@ -394,22 +419,10 @@ pub const Owner = struct {
             .thread_archive, .thread_restore, .thread_delete => {
                 if (e.target != .thread or e.expected_revision != .revision) return .invalid_command;
                 const thread = e.target.thread.value;
-                const row = try db.prepare("SELECT archived,session_id FROM threads WHERE id=? AND deleted=0", &.{.{ .text = thread }});
-                defer row.deinit();
-                if (!try row.step()) return .not_found;
-                if (e.payload == .thread_restore and row.integer(0) == 0) return .invalid_command;
-                if (e.payload != .thread_restore) {
-                    // A sidebar mutation never shuts down a process or guesses
-                    // whether an uncertain effect executed. The domain rejects
-                    // until execution ownership has explicitly been resolved.
-                    if (self.runtime_registry) |registry| for (registry.entries) |entry| {
-                        if (entry) |live| {
-                            if ((!row.isNull(1) and std.mem.eql(u8, try row.bytes(1), live.session.value)) or
-                                try self.scalar("SELECT EXISTS(SELECT 1 FROM runs WHERE thread_id=? AND session_id=?)", &.{ .{ .text = thread }, .{ .text = live.session.value } }) != 0) return .busy;
-                        }
-                    };
-                    if (try self.scalar("SELECT EXISTS(SELECT 1 FROM runs WHERE thread_id=? AND state NOT IN('completed','cancelled','failed')) OR EXISTS(SELECT 1 FROM runs r JOIN effects e ON e.run_id=r.id WHERE r.thread_id=? AND e.state IN('planned','in_flight','unknown')) OR EXISTS(SELECT 1 FROM approvals WHERE thread_id=? AND state='pending') OR EXISTS(SELECT 1 FROM questions WHERE thread_id=? AND state='pending')", &.{ .{ .text = thread }, .{ .text = thread }, .{ .text = thread }, .{ .text = thread } }) != 0) return .busy;
-                }
+                const flags = (try threadLifecycleFlags(db, self.runtime_registry, thread)) orelse return .not_found;
+                if (e.payload == .thread_restore and !flags.archived) return .invalid_command;
+                if (!flags.can_delete) return .busy;
+                if (e.payload == .thread_archive and !flags.can_archive) return .invalid_command;
                 try db.execute(switch (e.payload) {
                     .thread_archive => "UPDATE threads SET archived=1,revision=revision+1,updated_at_ms=coalesce(?,updated_at_ms) WHERE id=?",
                     .thread_restore => "UPDATE threads SET archived=0,revision=revision+1,updated_at_ms=coalesce(?,updated_at_ms) WHERE id=?",
@@ -2700,9 +2713,13 @@ pub const Host = struct {
                 .projects => .{ .project = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .display_name = try text(allocator, s, 3) } },
                 .workspaces => .{ .workspace = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .binding = try t.decode(t.WorkspaceBinding, try s.bytes(4), allocator) } },
                 .threads, .thread, .thread_sidebar_next => blk: {
+                    const thread_id = t.ThreadId{ .value = try text(allocator, s, 1) };
+                    const registry: ?*const Registry = if (self.registry) |*value| value else null;
+                    const revision_number = try number(s, 2);
+                    const lifecycle: ThreadLifecycleFlags = if (revision_number >= std.math.maxInt(i64)) .{ .archived = s.integer(21) != 0, .can_archive = false, .can_delete = false } else if (try threadLifecycleFlags(&reader, registry, thread_id.value)) |flags| flags else .{ .archived = s.integer(21) != 0, .can_archive = false, .can_delete = false };
                     const explicit_title = try allocator.dupe(u8, @import("text/utf8.zig").prefix(try s.bytes(12), t.max_title_bytes));
                     const prompt_preview = @import("text/utf8.zig").prefix(try s.bytes(7), t.max_title_bytes);
-                    break :blk .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator), .title_preview = if (explicit_title.len != 0) explicit_title else try allocator.dupe(u8, prompt_preview), .title = explicit_title, .latest_run_state = if (s.isNull(8)) null else try enumeration(t.RunState, s, 8), .project_name = try text(allocator, s, 9), .workspace_root = try text(allocator, s, 10), .workspace_branch = try text(allocator, s, 11), .pinned = s.integer(13) != 0, .settled = s.integer(14) != 0, .snoozed_until = s.integer(15), .sort_order = s.integer(16), .created_at_ms = s.integer(17), .last_user_message_at_ms = s.integer(18), .updated_at_ms = s.integer(19), .can_snooze = s.integer(20) != 0, .archived = s.integer(21) != 0 } };
+                    break :blk .{ .thread = .{ .id = thread_id, .revision = revision_number, .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator), .title_preview = if (explicit_title.len != 0) explicit_title else try allocator.dupe(u8, prompt_preview), .title = explicit_title, .latest_run_state = if (s.isNull(8)) null else try enumeration(t.RunState, s, 8), .project_name = try text(allocator, s, 9), .workspace_root = try text(allocator, s, 10), .workspace_branch = try text(allocator, s, 11), .pinned = s.integer(13) != 0, .settled = s.integer(14) != 0, .snoozed_until = s.integer(15), .sort_order = s.integer(16), .created_at_ms = s.integer(17), .last_user_message_at_ms = s.integer(18), .updated_at_ms = s.integer(19), .can_snooze = s.integer(20) != 0, .archived = lifecycle.archived, .can_archive = lifecycle.can_archive, .can_delete = lifecycle.can_delete } };
                 },
                 .blocks => .{ .block = try descriptor(allocator, s) },
                 .attachments => .{ .attachment = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .thread = .{ .value = try text(allocator, s, 3) }, .name = try text(allocator, s, 4), .media_type = try text(allocator, s, 5), .byte_length = try number(s, 6), .digest = try text(allocator, s, 7), .kind = try enumeration(a.AttachmentKind, s, 8) } },

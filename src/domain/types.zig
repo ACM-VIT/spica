@@ -275,6 +275,9 @@ pub const Row = union(enum) {
         last_user_message_at_ms: i64 = 0,
         updated_at_ms: i64 = 0,
         can_snooze: bool = false,
+        /// Advisory affordances; mutations re-check ownership and revisions.
+        can_archive: bool = false,
+        can_delete: bool = false,
     },
     message: struct {
         message_id: adapter.MessageId,
