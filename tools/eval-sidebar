@@ -87,16 +87,49 @@ def assert_suppressed(snapshot: dict[str, Any]) -> None:
         raise ValueError("overlay admits covered thread hit targets")
 
 
+def assert_editor(snapshot: dict[str, Any], field: str, expected: str) -> None:
+    if field not in snapshot or snapshot[field] != expected:
+        raise ValueError("native line editor differs from exact expected text: " + field)
+
+
+def preferences(snapshot: dict[str, Any]) -> dict[str, Any]:
+    fields = ("sidebar_collapsed", "sidebar_width_override", "sidebar_working_shelf",
+              "sidebar_shelf_expanded", "sidebar_scope_project")
+    if any(field not in snapshot for field in fields):
+        raise ValueError("native sidebar preference observations are incomplete")
+    result = {field: snapshot[field] for field in fields}
+    if (type(result["sidebar_collapsed"]) is not bool
+            or type(result["sidebar_working_shelf"]) is not bool
+            or not isinstance(result["sidebar_scope_project"], str)
+            or not isinstance(result["sidebar_shelf_expanded"], list)
+            or len(result["sidebar_shelf_expanded"]) != 3
+            or any(type(value) is not bool for value in result["sidebar_shelf_expanded"])):
+        raise ValueError("native sidebar preferences have invalid types")
+    width = result["sidebar_width_override"]
+    if width is not None and (type(width) not in (int, float) or not math.isfinite(width) or width < 208):
+        raise ValueError("native sidebar width preference is invalid")
+    return result
+
+
+def assert_preferences(before: dict[str, Any], after: dict[str, Any]) -> None:
+    if preferences(before) != preferences(after):
+        raise ValueError("sidebar presentation preferences changed across native process restart")
+    for field in ("project_id", "thread_id", "run_id"):
+        if not before.get(field) or before[field] != after.get(field):
+            raise ValueError("active route changed across native process restart: " + field)
+
+
 def plan() -> list[str]:
     return ["launch an offline fake provider in fresh state on a private vd desktop",
             "create three completed chats across two projects through painted controls",
             "verify compact Unicode search, keyboard activation and project scope",
             "right-click an inactive chat, pin/unpin, settle/restore, snooze/wake and reorder",
             "verify inactive-chat actions retain active execution and the Unicode draft",
-            "save and cancel title edits through ordinary F2 input",
+            "exercise real search/title editors: caret, selection, graphemes, clipboard and overflow",
+            "save trimmed titles on blur and cancel title edits through ordinary F2/Escape input",
             "collapse, reopen and drag-resize the native sidebar",
             "inspect regular and minimum-window screenshot artifacts",
-            "restart the native process and verify durable sidebar metadata"]
+            "restart and verify durable metadata, active route and exact sidebar preferences"]
 
 
 class Proof:
@@ -197,6 +230,100 @@ class Proof:
     def key(self, value):
         return self.ui.perform_key(self.session, value, self.args.timeout)
 
+    def focused_text(self, value):
+        before = self.session.snapshot(self.args.timeout)
+        self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, value], private=True)
+        current = self.session.snapshot(self.args.timeout)
+        self.session.journal("sidebar.editor.text", before, current, bytes=len(value.encode()),
+                             sha256=hashlib.sha256(value.encode()).hexdigest(),
+                             input_origin="ordinary private vd text at existing editor focus")
+        return current
+
+    def editor_value(self, field, expected, label, retained, draft):
+        current = self.wait(lambda value: field in value and value[field] == expected, label)
+        assert_editor(current, field, expected)
+        assert_retained(retained, current, draft)
+        return current
+
+    def replace_editor(self, field, value, label, retained, draft):
+        self.key("ctrl+a")
+        self.focused_text(value)
+        return self.editor_value(field, value, label, retained, draft)
+
+    def set_clipboard(self, value):
+        self.session.require_live()
+        environment = self.session.data["private_desktop"]["environment"]
+        self.ui.run_command(["wl-copy", "--", value], env=environment, private=True)
+        if self.clipboard() != value:
+            raise ValueError("owned private clipboard failed to retain exact synthetic input")
+        self.session.journal("sidebar.editor.clipboard", None, self.session.snapshot(self.args.timeout),
+                             bytes=len(value.encode()), sha256=hashlib.sha256(value.encode()).hexdigest(),
+                             input_origin="ordinary clipboard owned by verified private compositor")
+
+    def exercise_editor(self, field, retained, draft):
+        """Assert outcomes via SDL observations; never write an internal editor buffer."""
+        self.replace_editor(field, "café 世界", field + " Unicode fixture", retained, draft)
+        self.key("Home")
+        self.key("Right")
+        self.key("Right")
+        self.focused_text("X")
+        self.editor_value(field, "caXfé 世界", field + " middle caret insertion", retained, draft)
+        self.key("Home")
+        self.focused_text("[")
+        self.key("End")
+        self.focused_text("]")
+        self.editor_value(field, "[caXfé 世界]", field + " Home/End insertion", retained, draft)
+        self.replace_editor(field, "alpha café 世界", field + " selection fixture", retained, draft)
+        self.key("Home")
+        for _ in range(5):
+            self.key("shift+Right")
+        self.focused_text("β")
+        self.editor_value(field, "β café 世界", field + " Shift selection replacement", retained, draft)
+        self.replace_editor(field, "Ae\u0301👩‍💻B", field + " grapheme fixture", retained, draft)
+        self.key("End")
+        self.key("Left")
+        self.key("BackSpace")
+        self.editor_value(field, "Ae\u0301B", field + " Backspace removes entire ZWJ grapheme", retained, draft)
+        self.key("Home")
+        self.key("Right")
+        self.key("Delete")
+        self.editor_value(field, "AB", field + " Delete removes entire combining grapheme", retained, draft)
+        copied = "clipboard café 世界"
+        self.replace_editor(field, copied, field + " clipboard fixture", retained, draft)
+        self.key("ctrl+a")
+        self.key("ctrl+c")
+        if self.clipboard() != copied:
+            raise ValueError(field + " Ctrl+C copied wrong text")
+        self.key("ctrl+x")
+        self.editor_value(field, "", field + " Ctrl+X removes selection", retained, draft)
+        if self.clipboard() != copied:
+            raise ValueError(field + " Ctrl+X copied wrong text")
+        self.key("ctrl+v")
+        self.editor_value(field, copied, field + " Ctrl+V restores exact Unicode clipboard", retained, draft)
+        self.key("Home")
+        for _ in range(9):
+            self.key("shift+Right")
+        self.key("ctrl+x")
+        self.editor_value(field, " café 世界", field + " partial cut keeps unselected text", retained, draft)
+        if self.clipboard() != "clipboard":
+            raise ValueError(field + " partial cut copied wrong selection")
+        self.key("End")
+        self.key("ctrl+v")
+        self.editor_value(field, " café 世界clipboard", field + " paste inserts at caret", retained, draft)
+        full = "L" + "é" * 79 + "Z"
+        self.replace_editor(field, full, field + " exact 160-byte Unicode capacity", retained, draft)
+        self.key("Home")
+        self.focused_text("X")
+        self.editor_value(field, full, field + " insertion at capacity retains original text", retained, draft)
+        self.key("End")
+        self.shot("editor-" + field + "-long.png")
+        preserved = "Keep overflow café 世界"
+        self.replace_editor(field, preserved, field + " overflow retained fixture", retained, draft)
+        self.key("ctrl+a")
+        self.set_clipboard("x" * 161)
+        self.key("ctrl+v")
+        self.editor_value(field, preserved, field + " oversized replacement retains original text", retained, draft)
+
     def ipc(self, *arguments):
         if not self.session.sway_socket:
             raise ValueError("owned private desktop has no compositor socket")
@@ -263,20 +390,24 @@ class Proof:
         current = self.wait(lambda value: value.get("sidebar_rename_thread") == identifier,
                             "inactive row rename opened for exact thread")
         assert_retained(retained, current, draft)
-        self.key("ctrl+a")
+        self.exercise_editor("sidebar_rename_text", retained, draft)
         title = "Sidebar Alpha renamed café Straße Σίσυφος"
-        self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, title])
-        self.key("Return")
+        self.replace_editor("sidebar_rename_text", "  " + title + "  ",
+                            "inactive row padded title before blur", retained, draft)
+        # Match normal browser blur behavior: the same click saves the row and
+        # focuses the requested search textbox, preserving route and draft.
+        self.click("sidebar.search")
         current = self.wait(lambda value: not value.get("sidebar_rename_thread")
+                            and value.get("sidebar_search_focused")
                             and not value.get("pending_command") and self.row_label(value, identifier) == title,
-                            "inactive row Unicode title committed to exact thread")
+                            "same blur click saves trimmed title and focuses search")
         assert_retained(retained, current, draft)
         self.right_click(identifier)
         self.click("sidebar.menu.rename")
         self.wait(lambda value: value.get("sidebar_rename_thread") == identifier,
                   "inactive row rename reopened")
-        self.key("ctrl+a")
-        self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, "Discard inactive title"])
+        self.replace_editor("sidebar_rename_text", "Discard inactive title",
+                            "inactive title cancellation fixture", retained, draft)
         self.key("Escape")
         current = self.wait(lambda value: not value.get("sidebar_rename_thread")
                             and self.row_label(value, identifier) == title,
@@ -434,6 +565,10 @@ class Proof:
         identifiers = {alpha, bravo, charlie}
         self.shot("cards.png")
 
+        self.click("sidebar.search")
+        self.exercise_editor("sidebar_search", retained, draft)
+        self.key("Escape")
+        self.wait(lambda value: not value.get("sidebar_search"), "editor search fixture cleared")
         self.text("sidebar.search", "Sidebar")
         current = self.wait(lambda value: value.get("sidebar_search") == "Sidebar"
                             and len([target for target in value.get("thread_targets", [])
@@ -499,9 +634,9 @@ class Proof:
                     "inactive Alpha order mutation persisted", retained, draft)
         self.key("F2")
         self.wait(lambda value: value.get("title_editing"), "active title edit opened")
-        self.key("ctrl+a")
+        self.exercise_editor("title_text", retained, draft)
         title = "Sidebar Charlie renamed 🎮"
-        self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, title])
+        self.replace_editor("title_text", title, "active title save fixture", retained, draft)
         self.key("Return")
         current = self.wait(lambda value: not value.get("title_editing")
                             and value.get("title_text") == title and not value.get("pending_command"),
@@ -509,8 +644,7 @@ class Proof:
         assert_retained(retained, current, draft)
         self.key("F2")
         self.wait(lambda value: value.get("title_editing"), "second title edit opened")
-        self.key("ctrl+a")
-        self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, "Discard this title"])
+        self.replace_editor("title_text", "Discard this title", "active title cancellation fixture", retained, draft)
         self.key("Escape")
         self.wait(lambda value: not value.get("title_editing") and value.get("title_text") == title,
                   "Escape cancels title edit")
@@ -542,12 +676,38 @@ class Proof:
 
         self.action(alpha, "pin", lambda row: row["pinned"], "Alpha pin prepared for restart", retained, draft)
         self.action(bravo, "settle", lambda row: row["settled"], "Bravo settled prepared for restart", retained, draft)
-        before_restart = self.session.snapshot(self.args.timeout)
+        before_scope = self.session.snapshot(self.args.timeout)
         persisted = {identifier: {field: row[field] for field in ("pinned", "settled", "snoozed_until", "sort_order")}
-                     for identifier, row in rows(before_restart).items() if identifier in identifiers}
+                     for identifier, row in rows(before_scope).items() if identifier in identifiers}
+        if set(persisted) != identifiers:
+            raise ValueError("all-project snapshot lacks one of the three restart metadata fixtures")
+        self.click("sidebar.scope")
+        self.wait(lambda value: value.get("sidebar_scope_open"), "nondefault restart scope opened")
+        current = self.session.snapshot(self.args.timeout)
+        active_project = retained["project_id"]
+        scope = next((target["id"] for target in current.get("scope_targets", [])
+                      if target.get("enabled") and target.get("id") == active_project), None)
+        if scope is None:
+            raise ValueError("active project lacks its exact scope target for restart proof")
+        self.click(scope)
+        self.wait(lambda value: value.get("sidebar_scope_project") == active_project,
+                  "nondefault scope prepared for restart")
+        self.click("sidebar.toggle")
+        self.wait(lambda value: value.get("sidebar_collapsed") is True,
+                  "collapsed preference prepared for restart")
+        before_restart = self.session.snapshot(self.args.timeout)
+        preferences(before_restart)
         current = self.ui.restart_app(self.session, launch_args)
+        assert_preferences(before_restart, current)
         if self.args.measure:
             self.finish_metrics()
+        self.shot("reopened-collapsed.png")
+        self.key("ctrl+b")
+        self.wait(lambda value: value.get("sidebar_collapsed") is False, "persisted sidebar reopens after restart")
+        self.click("sidebar.scope")
+        self.wait(lambda value: value.get("sidebar_scope_open"), "persisted scope opens after restart")
+        self.click("scope.all")
+        self.wait(lambda value: not value.get("sidebar_scope_project"), "all-project rows requested after preference proof")
         self.wait(lambda value: identifiers <= rows(value).keys(), "all durable sidebar rows reopened")
         for identifier, expected in persisted.items():
             actual = rows(self.session.snapshot(self.args.timeout))[identifier]
@@ -559,6 +719,7 @@ class Proof:
                 or self.session.data["binary_sha256"] != self.ui.sha256(self.args.binary)):
             raise ValueError("source or native binary changed during the sidebar cohort")
         self.assertions.append("pin, settlement, wake and order metadata survive process restart")
+        self.assertions.append("exact active route, width, collapse, shelves and project scope survive process restart")
         self.shot("reopened.png")
         self.session.data.update(passed=True, sidebar_verified=self.assertions)
         self.session.save()

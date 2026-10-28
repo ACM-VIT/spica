@@ -71,6 +71,39 @@ class SidebarEvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MODULE.assert_suppressed({"thread_targets": [{"enabled": True}]})
 
+    def test_editor_requires_exact_text_and_observation_presence(self):
+        expected = "Ae\u0301👩‍💻B"
+        MODULE.assert_editor({"sidebar_search": expected}, "sidebar_search", expected)
+        for snapshot in ({}, {"sidebar_search": "Aé👩‍💻B"}, {"sidebar_search": "Ae\u0301B"}):
+            with self.assertRaises(ValueError):
+                MODULE.assert_editor(snapshot, "sidebar_search", expected)
+
+    def test_preferences_cannot_omit_fields_or_accept_invalid_widths_and_shelves(self):
+        value = {"sidebar_collapsed": True, "sidebar_width_override": 316,
+                 "sidebar_working_shelf": False, "sidebar_shelf_expanded": [False, True, True],
+                 "sidebar_scope_project": "project"}
+        self.assertEqual(MODULE.preferences(value), value)
+        for field in value:
+            with self.assertRaises(ValueError):
+                MODULE.preferences({key: item for key, item in value.items() if key != field})
+        for changed in ({"sidebar_width_override": float("nan")}, {"sidebar_width_override": True},
+                        {"sidebar_width_override": 207}, {"sidebar_shelf_expanded": [False]},
+                        {"sidebar_shelf_expanded": [0, True, True]}, {"sidebar_collapsed": 1}):
+            with self.assertRaises(ValueError):
+                MODULE.preferences({**value, **changed})
+
+    def test_restart_retention_rejects_any_preference_or_route_change(self):
+        value = {"sidebar_collapsed": True, "sidebar_width_override": 316,
+                 "sidebar_working_shelf": False, "sidebar_shelf_expanded": [False, True, True],
+                 "sidebar_scope_project": "project", "project_id": "project", "thread_id": "thread", "run_id": "run"}
+        MODULE.assert_preferences(value, value)
+        for field, changed in (("sidebar_collapsed", False), ("sidebar_width_override", 256),
+                               ("sidebar_working_shelf", True), ("sidebar_shelf_expanded", [False] * 3),
+                               ("sidebar_scope_project", ""), ("project_id", "other-project"),
+                               ("thread_id", "other-thread"), ("run_id", "other-run")):
+            with self.assertRaises(ValueError):
+                MODULE.assert_preferences(value, {**value, field: changed})
+
 
 if __name__ == "__main__":
     unittest.main()
