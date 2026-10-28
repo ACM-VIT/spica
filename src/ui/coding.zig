@@ -1844,6 +1844,19 @@ pub const View = struct {
         return if (identity.runtime_kind.eql("opencode")) "OpenCode" else if (identity.runtime_kind.eql("codex")) "Codex" else if (identity.runtime_kind.eql("fake")) "Demo" else identity.runtime_kind.slice();
     }
 
+    /// Keep the provider prefix visible at the point where a prompt is sent.
+    /// OpenCode can negotiate prefixes such as `opencode-free`; showing only
+    /// the model id here makes it too easy to send through the wrong account.
+    /// The identity is already bounded, and the fitted label below handles
+    /// narrow composer widths without allocating or changing selection state.
+    fn modelLabel(identity: *const Identity, buffer: []u8) []const u8 {
+        if (identity.runtime_kind.eql("fake")) return "Demo · synthetic";
+        const provider = identity.model_provider.slice();
+        const model = identity.model_id.slice();
+        if (provider.len == 0) return model;
+        return std.fmt.bufPrint(buffer, "{s} / {s}", .{ provider, model }) catch model;
+    }
+
     const EmptyState = struct { description: []const u8, context: []const u8 };
     fn emptyState(self: *const View, buffer: []u8) !EmptyState {
         if (self.selected) |*selected| {
@@ -2159,7 +2172,8 @@ pub const View = struct {
         self.workflow_button = .{ .x = self.controls[primary].x - 110, .y = y, .w = 104, .h = 28 };
         try self.labels.drawFitted(renderer, text, "More · F10", self.workflow_button.x + 4, y + 6, 98, 13, foreground);
         const available = @max(0, self.workflow_button.x - model_x - gap * 2);
-        const label = if (self.selected) |*selected| (if (selected.runtime_kind.eql("fake")) "Demo · synthetic" else selected.model_id.slice()) else "Choose model";
+        var label_buffer: [768]u8 = undefined;
+        const label = if (self.selected) |*selected| modelLabel(selected, &label_buffer) else "Choose model";
         const effort = if (self.selected) |*selected| selected.effort.slice() else "Effort";
         const prefix = @import("../text/utf8.zig").prefix;
         const desired_effort = try self.labels.width(text, prefix(effort, 128), 14) + 34;
@@ -3519,6 +3533,15 @@ test "picker uses compact catalog metadata and retains actionable unavailable re
     model.reason_len = unavailable.len;
     model.readiness = .unavailable;
     try std.testing.expectEqualStrings("explicit-provider · unavailable · Sign in to the selected account", try View.modelSubtitle(&model, &buffer));
+}
+
+test "composer model label keeps negotiated provider prefix visible" {
+    const opencode = try View.Identity.from(.{ .runtime_kind = "opencode", .model_provider = "opencode-free", .model_id = "glm-5.3-flash", .effort = "default", .account_ref = "isolated", .workspace = .{ .value = "checkout" } });
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("opencode-free / glm-5.3-flash", View.modelLabel(&opencode, &buffer));
+
+    const fake = try View.Identity.from(contract.fakeSelection(.{ .value = "fixture" }));
+    try std.testing.expectEqualStrings("Demo · synthetic", View.modelLabel(&fake, &buffer));
 }
 
 test "custom styles share visible paint and action bounds and invalidate font sizes" {
