@@ -98,6 +98,7 @@ pub const Snapshot = struct {
     sidebar_rename_text: []const u8 = "",
     thread_revisions: [32]u64 = @splat(0),
     thread_pinned: [32]bool = @splat(false),
+    thread_can_snooze: [32]bool = @splat(false),
     thread_settled: [32]bool = @splat(false),
     thread_snoozed_until: [32]i64 = @splat(0),
     thread_sort_order: [32]i64 = @splat(0),

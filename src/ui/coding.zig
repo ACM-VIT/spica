@@ -529,7 +529,13 @@ pub const View = struct {
     /// App/Host consumer for the next bounded page while retaining the draft,
     /// current thread and scroll state in this view.
     pub const SidebarAction = enum { pin, unpin, settle, unsettle, snooze, wake, move_up, move_down };
-    pub const RenameFollowup = union(enum) { thread: transcript.Id, new_thread, new_project };
+    pub const RenameFollowup = union(enum) {
+        thread: transcript.Id,
+        new_thread,
+        new_project,
+        edit_active_title,
+        sidebar: struct { id: transcript.Id, action: SidebarAction, snoozed_until: i64 = 0 },
+    };
     pub const Navigation = union(enum) {
         new_project,
         new_thread,
@@ -550,6 +556,7 @@ pub const View = struct {
         workspace_name: transcript.Id = .{},
         branch: transcript.Id = .{},
         run_status: RunStatus = .idle,
+        can_snooze: bool = false,
         runtime_kind: transcript.Id = .{},
         model_provider: transcript.Id = .{},
         model_id: transcript.Id = .{},
@@ -1194,6 +1201,7 @@ pub const View = struct {
             return;
         }
         const action = self.sidebar_menu_actions[row];
+        if (action == .snooze and !self.threads[index].can_snooze) return;
         const duration: i64 = switch (row) {
             2 => 3_600_000,
             3 => 14_400_000,
@@ -1358,6 +1366,22 @@ pub const View = struct {
 
     const LineField = enum { search, rename, title };
     const LineParts = struct { buffer: []u8, len: *usize, select: *bool, edit: *LineEdit };
+    pub fn inputErrorNotice(self: *const View, err: anyerror) ?[]const u8 {
+        return switch (err) {
+            error.TextTooLarge => if (self.activeLine()) |field| switch (field) {
+                .search => "Search is limited to 160 UTF-8 bytes. Existing text retained.",
+                .rename, .title => "Titles are limited to 160 UTF-8 bytes. Existing text retained.",
+            } else "Text exceeds this editor's limit. Existing text retained.",
+            error.PieceLimit => "The editor has reached its limit. Existing text retained.",
+            error.InvalidUtf8 => "Text is not valid UTF-8. Existing text retained.",
+            error.InvalidTitle => "Use a single line without control characters. Existing text retained.",
+            error.ClipboardRead => "Unable to read the clipboard. Existing text retained.",
+            error.ClipboardWrite => "Unable to copy to the clipboard.",
+            error.ClipboardContainsNul => "The clipboard text contains an unsupported null character.",
+            else => null,
+        };
+    }
+
     fn lineParts(self: *View, field: LineField) LineParts {
         return switch (field) {
             .search => .{ .buffer = &self.search_query, .len = &self.search_len, .select = &self.search_select_all, .edit = &self.search_edit },
@@ -1535,6 +1559,10 @@ pub const View = struct {
                         return true;
                     }
                     if (widgets.contains(self.title_bounds, x, y) and self.titleEditAvailable()) {
+                        if (rename_blurred) {
+                            self.sidebar_rename_followup = .edit_active_title;
+                            return true;
+                        }
                         self.beginTitleEdit();
                         try self.focus(window, true);
                         return true;
@@ -1693,12 +1721,13 @@ pub const View = struct {
                         if (widgets.contains(self.sidebar_rows, x, y)) {
                             for (self.sidebar_action_bounds[0..self.thread_count], 0..) |actions, index| {
                                 if (widgets.contains(actions[0], x, y)) {
-                                    if (rename_blurred) return true;
                                     const entry = &self.threads[index];
-                                    self.navigation = .{ .sidebar = .{ .index = index, .action = if (entry.snoozed_until > wallTimeMs()) .wake else if (entry.settled) .unsettle else .settle } };
+                                    const action: SidebarAction = if (entry.snoozed_until > wallTimeMs()) .wake else if (entry.settled) .unsettle else .settle;
+                                    if (rename_blurred) self.sidebar_rename_followup = .{ .sidebar = .{ .id = entry.id, .action = action } } else self.navigation = .{ .sidebar = .{ .index = index, .action = action } };
                                     return true;
                                 }
                                 if (widgets.contains(actions[1], x, y)) {
+                                    if (!self.threads[index].can_snooze) return true;
                                     self.sidebar_menu_thread = self.threads[index].id;
                                     self.sidebar_menu_x = actions[1].x;
                                     self.sidebar_menu_y = actions[1].y + actions[1].h;
@@ -2649,19 +2678,20 @@ pub const View = struct {
                 if (slim) {
                     try icon(renderer, .folder, x, row.y + 10, muted);
                     const hovered = !searching and self.sidebar_hover == index and self.navigation_enabled;
-                    try self.drawSidebarTitle(renderer, text, entry, x + 26, row.y + 10, width - 26 - (if (hovered) @as(f32, 60) else 0), foreground);
+                    try self.drawSidebarTitle(renderer, text, entry, x + 26, row.y + 10, @max(0, (if (hovered) sidebarActionStart(entry, row, true) - 8 else x + width) - x - 26), foreground);
                     if (hovered) try self.drawSidebarRowActions(renderer, text, index, row, true, foreground);
                     ordinal += 1;
                     y += sidebar_search_stride;
                     continue;
                 }
+                const hovered = self.sidebar_hover == index and self.navigation_enabled;
                 if (entry.project_name.len != 0) {
                     try icon(renderer, .folder, x, row.y + 9, muted);
                     if (entry.pinned) try icon(renderer, .pin, x + 20, row.y + 9, muted);
                     const project_inset: f32 = if (entry.pinned) 40 else 22;
-                    try self.labels.drawFitted(renderer, text, entry.project_name.slice(), x + project_inset, row.y + 10, width - project_inset - (if (entry.run_status == .idle) @as(f32, 36) else 84), 12, muted);
+                    const project_end = if (hovered) sidebarActionStart(entry, row, false) - 8 else row.x + row.w - 10 - (if (entry.run_status == .idle) @as(f32, 36) else 84);
+                    try self.labels.drawFitted(renderer, text, entry.project_name.slice(), x + project_inset, row.y + 10, @max(0, project_end - x - project_inset), 12, muted);
                 }
-                const hovered = self.sidebar_hover == index and self.navigation_enabled;
                 if (!hovered and entry.run_status == .idle and entry.updated_at_ms > 0) {
                     var time_buffer: [32]u8 = undefined;
                     const elapsed = @max(0, self.sidebar_now_ms - entry.updated_at_ms);
@@ -2713,6 +2743,11 @@ pub const View = struct {
         }
     }
 
+    fn sidebarActionStart(entry: *const Entry, row: c.SDL_FRect, slim: bool) f32 {
+        const action_width: f32 = if (entry.settled) 68 else 54;
+        return row.x + row.w - action_width - 6 - (if (slim) @as(f32, 0) else 24);
+    }
+
     fn drawSidebarRowActions(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, index: usize, row: c.SDL_FRect, slim: bool, color: Color) !void {
         const entry = &self.threads[index];
         const wake = entry.snoozed_until > self.sidebar_now_ms;
@@ -2727,8 +2762,8 @@ pub const View = struct {
         if (!slim) {
             self.sidebar_action_bounds[index][1] = clippedRect(.{ .x = action.x - 24, .y = top, .w = 24, .h = 22 }, self.sidebar_rows);
             const snooze = self.sidebar_action_bounds[index][1];
-            try icon(renderer, .clock, snooze.x + 4, top + 3, color);
-            _ = self.navigation_targets.add(try std.fmt.bufPrint(&id, "sidebar.thread.{d}.snooze", .{index}), "button", snooze, snooze.h > 0) catch {};
+            try icon(renderer, .clock, snooze.x + 4, top + 3, if (entry.can_snooze) color else self.design.colors.muted);
+            _ = self.navigation_targets.add(try std.fmt.bufPrint(&id, "sidebar.thread.{d}.snooze", .{index}), "button", snooze, snooze.h > 0 and entry.can_snooze) catch {};
         }
     }
 
@@ -2765,10 +2800,10 @@ pub const View = struct {
         for (labels, 0..) |label, row_index| {
             const row = c.SDL_FRect{ .x = self.sidebar_menu_bounds.x + 4, .y = self.sidebar_menu_bounds.y + 4 + @as(f32, @floatFromInt(row_index)) * 28, .w = menu_width - 8, .h = 28 };
             self.sidebar_menu_rows[row_index] = row;
-            const enabled = self.navigation_enabled and (row_index != 10 or entry.branch.len != 0) and (row_index != 11 or entry.workspace_path_len != 0);
+            const enabled = self.navigation_enabled and (row_index < 2 or row_index > 4 or (row_index == 2 and snoozed) or entry.can_snooze) and (row_index != 10 or entry.branch.len != 0) and (row_index != 11 or entry.workspace_path_len != 0);
             _ = self.navigation_targets.add(ids[row_index], "menuitem", row, enabled) catch {};
             if (row_index == self.sidebar_menu_hover) try widgets.panel(renderer, row, 4, self.design.colors.sidebar_active);
-            try self.labels.draw(text, label, row.x + 8, row.y + 7, 12, self.design.colors.foreground);
+            try self.labels.draw(text, label, row.x + 8, row.y + 7, 12, if (enabled) self.design.colors.foreground else self.design.colors.muted);
         }
     }
 
@@ -5058,4 +5093,100 @@ test "blur retains the clicked thread identity until rename receipt" {
     std.mem.swap(View.Entry, &view.threads[0], &view.threads[1]);
     try std.testing.expect(view.takeRenameFollowup().?.thread.eql("clicked"));
     try std.testing.expect(view.takeRenameFollowup() == null);
+}
+
+test "bounded field errors explain limits while diagnostic errors stay available" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.search_focused = true;
+    try std.testing.expectEqualStrings("Search is limited to 160 UTF-8 bytes. Existing text retained.", view.inputErrorNotice(error.TextTooLarge).?);
+    view.search_focused = false;
+    view.title_editing = true;
+    try std.testing.expectEqualStrings("Titles are limited to 160 UTF-8 bytes. Existing text retained.", view.inputErrorNotice(error.TextTooLarge).?);
+    try std.testing.expect(view.inputErrorNotice(error.Unrelated) == null);
+}
+
+test "rename blur preserves hover settlement and header editing intent" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.navigation_enabled = true;
+    view.thread_count = 2;
+    view.threads[0].id = try transcript.Id.init("renamed");
+    view.threads[1].id = try transcript.Id.init("settled-on-click");
+    view.active_thread = view.threads[0].id;
+    view.sidebar_bounds = .{ .x = 0, .y = 0, .w = 256, .h = 300 };
+    view.sidebar_rows = view.sidebar_bounds;
+    view.sidebar_rename_bounds = .{ .x = 10, .y = 10, .w = 100, .h = 22 };
+    view.sidebar_action_bounds[1][0] = .{ .x = 190, .y = 100, .w = 54, .h = 22 };
+    view.beginSidebarRename(0);
+    try view.sidebarRenameInsert("saved title");
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    event.button.x = 200;
+    event.button.y = 110;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqualStrings("saved title", view.navigation.?.rename.title[0..view.navigation.?.rename.len]);
+    const followup = view.takeRenameFollowup().?.sidebar;
+    try std.testing.expect(followup.id.eql("settled-on-click"));
+    try std.testing.expectEqual(View.SidebarAction.settle, followup.action);
+    view.navigation = null;
+    view.title_bounds = .{ .x = 300, .y = 10, .w = 200, .h = 32 };
+    view.beginSidebarRename(0);
+    try view.sidebarRenameInsert("new header title");
+    event.button.x = 320;
+    event.button.y = 20;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expect(!view.title_editing);
+    try std.testing.expectEqualStrings("new header title", view.navigation.?.rename.title[0..view.navigation.?.rename.len]);
+    try std.testing.expectEqual(std.meta.Tag(View.RenameFollowup).edit_active_title, std.meta.activeTag(view.takeRenameFollowup().?));
+}
+
+test "long hovered project text cannot paint underneath sidebar actions" {
+    const surface = c.SDL_CreateSurface(720, 480, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(text);
+    var layout = try Layout.init(std.testing.allocator, 720, 480);
+    defer layout.deinit();
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.sidebar_width_override = 208;
+    layout.sidebar_width_override = 208;
+    view.navigation_enabled = true;
+    view.sidebar_hover = 0;
+    view.thread_count = 1;
+    view.threads[0].id = try transcript.Id.init("long-project");
+    view.threads[0].can_snooze = true;
+    for ([_]bool{ false, true }) |pinned| {
+        view.threads[0].pinned = pinned;
+        view.threads[0].project_name = try transcript.Id.init("Project with a deliberately long name that must stop before hovered controls");
+        _ = c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        _ = c.SDL_RenderClear(renderer);
+        const bounds = layout.coding(720);
+        try view.drawChrome(renderer, text, bounds, view.design.colors.foreground, view.design.colors.muted);
+        _ = c.SDL_RenderPresent(renderer);
+        const expected = c.SDL_DuplicateSurface(surface) orelse return error.Surface;
+        defer c.SDL_DestroySurface(expected);
+        const action = view.sidebar_action_bounds[0][1];
+        view.threads[0].project_name = .{};
+        _ = c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        _ = c.SDL_RenderClear(renderer);
+        try view.drawChrome(renderer, text, bounds, view.design.colors.foreground, view.design.colors.muted);
+        _ = c.SDL_RenderPresent(renderer);
+        const row = view.thread_bounds[0];
+        var y: c_int = @intFromFloat(row.y + 6);
+        while (y < @as(c_int, @intFromFloat(row.y + 30))) : (y += 1) {
+            var x: c_int = @intFromFloat(action.x);
+            while (x < @as(c_int, @intFromFloat(row.x + row.w))) : (x += 1) {
+                var a: [4]u8 = undefined;
+                var b: [4]u8 = undefined;
+                try std.testing.expect(c.SDL_ReadSurfacePixel(surface, x, y, &a[0], &a[1], &a[2], &a[3]));
+                try std.testing.expect(c.SDL_ReadSurfacePixel(expected, x, y, &b[0], &b[1], &b[2], &b[3]));
+                try std.testing.expectEqualSlices(u8, &a, &b);
+            }
+        }
+    }
 }

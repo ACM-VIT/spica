@@ -434,7 +434,7 @@ pub const App = struct {
         }
         const changed = self.view.handle(event, self.window, self.text) catch |err| switch (err) {
             error.TextTooLarge, error.PieceLimit, error.InvalidUtf8, error.InvalidTitle, error.ClipboardRead, error.ClipboardWrite, error.ClipboardContainsNul => blk: {
-                self.view.notice = @errorName(err);
+                self.view.notice = self.view.inputErrorNotice(err) orelse @errorName(err);
                 self.snapshot.admission_errors += 1;
                 self.snapshot.last_admission_error = @errorName(err);
                 break :blk true;
@@ -777,6 +777,7 @@ pub const App = struct {
         self.snapshot.thread_run_states = @splat("");
         self.snapshot.thread_revisions = @splat(0);
         self.snapshot.thread_pinned = @splat(false);
+        self.snapshot.thread_can_snooze = @splat(false);
         self.snapshot.thread_settled = @splat(false);
         self.snapshot.thread_snoozed_until = @splat(0);
         self.snapshot.thread_sort_order = @splat(0);
@@ -787,6 +788,7 @@ pub const App = struct {
             self.snapshot.thread_run_states[index] = @tagName(entry.run_status);
             self.snapshot.thread_revisions[index] = entry.revision;
             self.snapshot.thread_pinned[index] = entry.pinned;
+            self.snapshot.thread_can_snooze[index] = entry.can_snooze;
             self.snapshot.thread_settled[index] = entry.settled;
             self.snapshot.thread_snoozed_until[index] = entry.snoozed_until;
             self.snapshot.thread_sort_order[index] = entry.sort_order;
@@ -1051,6 +1053,7 @@ const Conversation = struct {
     sidebar_route_validated: bool = false,
     sidebar_validated_route: Id = .{},
     sidebar_pending: ?SidebarPending = null,
+    rename_followup: ?Coding.RenameFollowup = null,
     worker: *presentation.Worker,
     wake: *Wake,
     workspace_root: []u8,
@@ -1645,18 +1648,7 @@ const Conversation = struct {
                 if (operation.index >= app.view.thread_count) return error.NoThread;
                 const entry = app.view.threads[operation.index];
                 if (entry.id.len == 0 or entry.revision == 0) return error.NoThread;
-                const payload: types.Payload = switch (operation.action) {
-                    .pin => .{ .thread_sidebar_set = .{ .pinned = true } },
-                    .unpin => .{ .thread_sidebar_set = .{ .pinned = false } },
-                    .settle => .{ .thread_sidebar_set = .{ .settled = true, .clear_snooze = true } },
-                    .unsettle => .{ .thread_sidebar_set = .{ .settled = false } },
-                    .snooze => .{ .thread_sidebar_set = .{ .snoozed_until = operation.snoozed_until } },
-                    .wake => .{ .thread_sidebar_set = .{ .clear_snooze = true } },
-                    .move_up => .{ .thread_sidebar_move = .{ .direction = .up } },
-                    .move_down => .{ .thread_sidebar_move = .{ .direction = .down } },
-                };
-                try self.submit(.sidebar, .{ .thread = .{ .value = entry.id.slice() } }, .{ .revision = entry.revision }, payload, 0);
-                self.sidebar_pending = .{ .id = entry.id, .revision = entry.revision };
+                try self.submitSidebar(entry.id, entry.revision, operation.action, operation.snoozed_until);
             },
             .rename => |operation| {
                 if (operation.index >= app.view.thread_count or operation.len == 0 or operation.len > operation.title.len) return error.NoThread;
@@ -1702,6 +1694,24 @@ const Conversation = struct {
         }
     }
 
+    fn sidebarPayload(action: Coding.SidebarAction, deadline: i64) types.Payload {
+        return switch (action) {
+            .pin => .{ .thread_sidebar_set = .{ .pinned = true, .settled = false, .clear_snooze = true } },
+            .unpin => .{ .thread_sidebar_set = .{ .pinned = false } },
+            .settle => .{ .thread_sidebar_set = .{ .settled = true, .pinned = false, .clear_snooze = true } },
+            .unsettle => .{ .thread_sidebar_set = .{ .settled = false } },
+            .snooze => .{ .thread_sidebar_set = .{ .snoozed_until = deadline } },
+            .wake => .{ .thread_sidebar_set = .{ .clear_snooze = true } },
+            .move_up => .{ .thread_sidebar_move = .{ .direction = .up } },
+            .move_down => .{ .thread_sidebar_move = .{ .direction = .down } },
+        };
+    }
+
+    fn submitSidebar(self: *Conversation, id: Id, revision: u64, action: Coding.SidebarAction, deadline: i64) !void {
+        try self.submit(.sidebar, .{ .thread = .{ .value = id.slice() } }, .{ .revision = revision }, sidebarPayload(action, deadline), 0);
+        self.sidebar_pending = .{ .id = id, .revision = revision };
+    }
+
     fn applyRenameFollowup(self: *Conversation, app: *App, followup: Coding.RenameFollowup) !void {
         switch (followup) {
             // The row can move or leave the resident page during the title
@@ -1709,6 +1719,17 @@ const Conversation = struct {
             .thread => |id| try self.selectThread(app, id),
             .new_thread => try self.applyWorkspaceNavigation(app, .new_thread),
             .new_project => try self.applyWorkspaceNavigation(app, .new_project),
+            .sidebar => |operation| {
+                self.rename_followup = followup;
+                errdefer self.rename_followup = null;
+                try self.ask(.rename_followup, .{ .thread = .{ .value = operation.id.slice() } });
+            },
+            .edit_active_title => {
+                if (app.view.active_thread.len == 0) return error.NoThread;
+                self.rename_followup = followup;
+                errdefer self.rename_followup = null;
+                try self.ask(.rename_followup, .{ .thread = .{ .value = app.view.active_thread.slice() } });
+            },
         }
     }
 
@@ -1820,6 +1841,7 @@ const Conversation = struct {
             entry.pinned = row.pinned;
             entry.settled = row.settled;
             entry.snoozed_until = row.snoozed_until;
+            entry.can_snooze = row.can_snooze;
             entry.sort_order = row.sort_order;
             entry.updated_at_ms = if (row.last_user_message_at_ms != 0) row.last_user_message_at_ms else row.updated_at_ms;
             entry.runtime_kind = if (row.selection) |selection| try displayId(selection.runtime_kind) else .{};
@@ -2045,7 +2067,7 @@ const Conversation = struct {
         }
     }
 
-    const QueryKind = enum { send_receipt, capabilities, projects, startup_thread, workspaces, inspection_workspace, threads, cards, thread_search, thread, models, runtime_status, startup_status, runs, effects, approvals, questions, tasks, messages, blocks, content };
+    const QueryKind = enum { send_receipt, capabilities, projects, startup_thread, rename_followup, workspaces, inspection_workspace, threads, cards, thread_search, thread, models, runtime_status, startup_status, runs, effects, approvals, questions, tasks, messages, blocks, content };
     const CommandKind = enum { prompt_cleanup, followup_enqueue, followup_edit, followup_cancel, followup_order, attachment_add, attachment_remove, question, project, workspace, thread, title, sidebar_title, sidebar, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
@@ -2478,6 +2500,7 @@ const Conversation = struct {
                     };
                     if (self.query) |pending| if (pending.ticket.value == value.ticket.value) {
                         self.query = null;
+                        if (pending.kind == .rename_followup) self.rename_followup = null;
                         if (pending.kind == .startup_thread and value.failure.reason == .not_found) {
                             self.thread = .{};
                             try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
@@ -2959,6 +2982,32 @@ const Conversation = struct {
 
     fn consume(self: *Conversation, app: *App, kind: QueryKind, value: types.QueryPage) !void {
         switch (kind) {
+            .rename_followup => {
+                const followup = self.rename_followup orelse return error.StaleRenameFollowup;
+                self.rename_followup = null;
+                if (value.items.len != 1 or value.items[0] != .thread) {
+                    self.notice(&app.view, "The thread is no longer available. Your active draft is retained.");
+                    return;
+                }
+                const row = value.items[0].thread;
+                if (!std.mem.eql(u8, row.workspace_root, self.workspace_root)) {
+                    self.notice(&app.view, "The thread belongs to another checkout. Your active draft is retained.");
+                    return;
+                }
+                switch (followup) {
+                    .sidebar => |operation| {
+                        if (!operation.id.eql(row.id.value)) return error.StaleRenameFollowup;
+                        self.submitSidebar(operation.id, row.revision, operation.action, operation.snoozed_until) catch |err| self.notice(&app.view, @errorName(err));
+                    },
+                    .edit_active_title => {
+                        if (!app.view.active_thread.eql(row.id.value)) return;
+                        try self.updateThreadCard(&app.view, row);
+                        self.thread_revision = row.revision;
+                        app.view.beginTitleEdit();
+                    },
+                    else => return error.StaleRenameFollowup,
+                }
+            },
             .send_receipt => {
                 const pending = self.unknown_send orelse return;
                 if (value.items.len != 1 or value.items[0] != .command_receipt) return error.UnexpectedCommandReceipt;
@@ -3529,7 +3578,8 @@ test "ordinary text admission failure stays local and preserves draft and undo" 
     event.type = c.SDL_EVENT_TEXT_INPUT;
     event.text.text = "extra";
     try app.handle(event);
-    try std.testing.expectEqualStrings("TextTooLarge", app.view.notice.?);
+    try std.testing.expectEqualStrings("Text exceeds this editor's limit. Existing text retained.", app.view.notice.?);
+    try std.testing.expectEqualStrings("TextTooLarge", app.snapshot.last_admission_error.?);
     try std.testing.expectEqualSlices(u8, &full, app.view.editor.textBytes());
     try std.testing.expect(app.view.editor.redo());
     try std.testing.expectEqualStrings("retained", app.view.editor.textBytes());
@@ -4230,6 +4280,59 @@ test "sidebar receipt updates active neighbor revision while retaining execution
     try std.testing.expect(conversation.command == null);
     try std.testing.expect(conversation.sidebar_pending == null);
     try std.testing.expect(conversation.thread_search_started);
+}
+
+test "sidebar action payloads promote pin and clear pin on settle without coupling snooze" {
+    const pin = Conversation.sidebarPayload(.pin, 0).thread_sidebar_set;
+    try std.testing.expect(pin.pinned.? and !pin.settled.? and pin.clear_snooze);
+    const settle = Conversation.sidebarPayload(.settle, 0).thread_sidebar_set;
+    try std.testing.expect(!settle.pinned.? and settle.settled.? and settle.clear_snooze);
+    const snooze = Conversation.sidebarPayload(.snooze, 5000).thread_sidebar_set;
+    try std.testing.expectEqual(@as(?i64, 5000), snooze.snoozed_until);
+    try std.testing.expect(snooze.pinned == null and snooze.settled == null and !snooze.clear_snooze);
+}
+
+test "rename followup resolves fresh sidebar target revision without selecting it or reusing row index" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path);
+    const host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path[0..n] });
+    defer host.destroy();
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    app.view.active_thread = try Id.init("active");
+    try app.view.editor.setText("Retain active 🎮 draft");
+    app.view.thread_count = 1;
+    app.view.threads[0].id = try Id.init("unrelated-row");
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = host, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/fresh-sidebar") };
+    conversation.thread = app.view.active_thread;
+    conversation.run = try Id.init("active-run");
+    conversation.project = try Id.init("active-project");
+    conversation.rename_followup = .{ .sidebar = .{ .id = try Id.init("background-target"), .action = .settle } };
+    const rows = [_]types.Row{.{ .thread = .{ .id = .{ .value = "background-target" }, .revision = 19, .project = .{ .value = "background-project" }, .workspace = .{ .value = "workspace" }, .workspace_root = "/tmp/fresh-sidebar", .session = null } }};
+    try conversation.consume(&app, .rename_followup, .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{}, .items = &rows, .expires_at = 0 });
+    try std.testing.expect(conversation.rename_followup == null);
+    try std.testing.expectEqualStrings("background-target", conversation.sidebar_pending.?.id.slice());
+    try std.testing.expectEqual(@as(u64, 19), conversation.sidebar_pending.?.revision);
+    try std.testing.expectEqualStrings("active", conversation.thread.slice());
+    try std.testing.expectEqualStrings("active-run", conversation.run.slice());
+    try std.testing.expectEqualStrings("active-project", conversation.project.slice());
+    try std.testing.expectEqualStrings("Retain active 🎮 draft", app.view.editor.textBytes());
+    conversation.rename_followup = .edit_active_title;
+    const active = [_]types.Row{.{ .thread = .{ .id = .{ .value = "active" }, .revision = 21, .project = .{ .value = "active-project" }, .workspace = .{ .value = "workspace" }, .workspace_root = "/tmp/fresh-sidebar", .session = null, .title = "Fresh renamed title", .can_snooze = true } }};
+    try conversation.consume(&app, .rename_followup, .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{}, .items = &active, .expires_at = 0 });
+    try std.testing.expect(app.view.title_editing);
+    try std.testing.expectEqualStrings("Fresh renamed title", app.view.title_buffer[0..app.view.title_len]);
+    try std.testing.expectEqual(@as(u64, 21), conversation.thread_revision);
+    try std.testing.expectEqualStrings("Retain active 🎮 draft", app.view.editor.textBytes());
+    var found = false;
+    for (app.view.threads[0..app.view.thread_count]) |entry| if (entry.id.eql("active")) {
+        try std.testing.expect(entry.can_snooze);
+        found = true;
+    };
+    try std.testing.expect(found);
 }
 
 test "accepted rename releases stable route followup and rejection discards it" {

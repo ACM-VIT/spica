@@ -403,7 +403,7 @@ test "sidebar metadata is orthogonal revisioned idempotent and durable" {
     try std.testing.expectEqual(first.commit_sequence, (try owner.command(allocator, command)).commit_sequence);
 }
 
-test "sidebar snooze refuses live and uncertain execution without touching provider state" {
+test "sidebar snooze refuses queued starts and input waits without touching provider state" {
     var f = try Fixture.init();
     defer f.deinit();
     try seed(&f.store);
@@ -411,7 +411,7 @@ test "sidebar snooze refuses live and uncertain execution without touching provi
     defer arena.deinit();
     const allocator = arena.allocator();
     var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "sidebar-live", .utc_ms = 1000 };
-    const states = [_][]const u8{ "queued", "starting", "streaming", "awaiting_approval", "awaiting_question", "cancel_requested", "unknown" };
+    const states = [_][]const u8{ "queued", "starting", "awaiting_approval", "awaiting_question" };
     for (states, 0..) |state, index| {
         try f.store.execute("UPDATE runs SET state=? WHERE id='r'", &.{.{ .text = state }});
         const rejected = try owner.command(allocator, .{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "sidebar-live-{d}", .{index}) }, .target = .{ .thread = .{ .value = "h" } }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_sidebar_set = .{ .pinned = true, .snoozed_until = 5000 } } });
@@ -426,6 +426,29 @@ test "sidebar snooze refuses live and uncertain execution without touching provi
     const pinned = try owner.command(allocator, .{ .command_id = .{ .value = "sidebar-pin-live" }, .target = .{ .thread = .{ .value = "h" } }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_sidebar_set = .{ .pinned = true } } });
     try std.testing.expectEqual(.accepted, pinned.outcome);
     try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM effects"));
+}
+
+test "sidebar snooze accepts running and uncertain runs as metadata only" {
+    for ([_][]const u8{ "streaming", "cancel_requested", "unknown", "interrupted", "completed", "failed" }) |state| {
+        var f = try Fixture.init();
+        defer f.deinit();
+        try seed(&f.store);
+        try f.store.execute("UPDATE runs SET state=? WHERE id='r'", &.{.{ .text = state }});
+        try effect(&f.store, "unresolved-effect", "unknown", "start");
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "snooze-live", .utc_ms = 1000 };
+        const accepted = try owner.command(arena.allocator(), .{ .command_id = .{ .value = "snooze-running" }, .target = .{ .thread = .{ .value = "h" } }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_sidebar_set = .{ .snoozed_until = 5000 } } });
+        try std.testing.expectEqual(.accepted, accepted.outcome);
+        try std.testing.expectEqual(@as(usize, 0), accepted.effect_ids.len);
+        try std.testing.expectEqual(@as(i64, 5000), try f.store.scalar("SELECT snoozed_until FROM threads"));
+        const run = try f.store.prepare("SELECT state,revision FROM runs", &.{});
+        defer run.deinit();
+        try std.testing.expect(try run.step());
+        try std.testing.expectEqualStrings(state, try run.bytes(0));
+        try std.testing.expectEqual(@as(i64, 1), run.integer(1));
+        try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE id='unresolved-effect' AND revision=1 AND state='unknown'"));
+    }
 }
 
 test "sidebar move swaps global neighbors atomically and reports both revisions" {
@@ -822,6 +845,7 @@ test "public Host consumer streams approves cancels pages and reopens durable st
     const project = (try consumer.command(.{ .command_id = .{ .value = "host-project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "consumer" } } })).entity_ids.project.?;
     const workspace = (try consumer.command(.{ .command_id = .{ .value = "host-workspace" }, .target = .absent, .expected_revision = .absent, .payload = .{ .workspace_register = .{ .project = project, .binding = try domain.workspace_binding.capture(consumer.arena.allocator(), std.testing.io, path_buffer[0..n]) } } })).entity_ids.workspace.?;
     const thread = (try consumer.command(.{ .command_id = .{ .value = "host-thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+    try std.testing.expect((try consumer.query(.{ .thread = thread })).items[0].thread.can_snooze);
     const selection: t.adapter.Selection = .{ .workspace = workspace, .model_provider = "fake", .model_id = "fixture", .effort = "none", .account_ref = "fixture" };
     const send: t.CommandEnvelope = .{ .command_id = .{ .value = "host-send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "Hello 世界", .selection = selection } } };
     const sent = try consumer.command(send);
@@ -830,6 +854,7 @@ test "public Host consumer streams approves cancels pages and reopens durable st
     try std.testing.expectEqual(@as(usize, 1), approvals.items.len);
     const approval = approvals.items[0].approval;
     try std.testing.expect(approval.live);
+    try std.testing.expect(!(try consumer.query(.{ .thread = thread })).items[0].thread.can_snooze);
     const messages = try consumer.query(.{ .messages = .{ .thread = thread, .page = .{ .limit = 1 } } });
     try std.testing.expectEqual(@as(usize, 1), messages.items.len);
     const continuation = try consumer.query(.{ .messages = .{ .thread = thread, .page = .{ .limit = 1, .snapshot = messages.snapshot_id, .cursor = messages.next_cursor.? } } });
@@ -1629,6 +1654,109 @@ const FollowupTurn = struct {
         try owner.observe(allocator, .{ .correlation = self.start.request.start.correlation, .upstream_event = "natural-completion", .body = .completed });
     }
 };
+
+test "fresh failure and raised input wake snooze atomically while completion and retries retain it" {
+    for (0..4) |scenario| {
+        var f = try Fixture.init();
+        defer f.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "snooze-attention", .utc_ms = 1000 };
+        const turn = try FollowupTurn.begin(&owner, allocator);
+        var correlation = turn.start.request.start.correlation;
+        if (scenario == 1) {
+            correlation.tool = .{ .value = "attention-tool" };
+            correlation.upstream_tool = "attention-upstream-tool";
+            try owner.observe(allocator, .{ .correlation = correlation, .upstream_event = "attention-tool", .body = .{ .tool_started = .{ .name = "read", .action_digest = "attention-digest" } } });
+            correlation.approval = .{ .value = "attention-approval" };
+            correlation.upstream_request = "attention-request";
+        }
+        if (scenario == 2) correlation.question = .{ .value = "attention-question" };
+        const snoozed = try owner.command(allocator, .{ .command_id = .{ .value = "snooze-before-attention" }, .target = .{ .thread = turn.conversation.thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_sidebar_set = .{ .snoozed_until = 5000 } } });
+        try std.testing.expectEqual(.accepted, snoozed.outcome);
+        const attention: t.adapter.Observation = .{ .correlation = correlation, .upstream_event = "fresh-attention", .body = switch (scenario) {
+            0 => .{ .failure = .{ .code = "failed", .detail = "fresh failure" } },
+            1 => .{ .approval = .{ .correlation = correlation, .workspace = turn.conversation.workspace, .action_digest = "attention-digest", .scope = "one read" } },
+            2 => .{ .question = .{ .id = correlation.question.?, .correlation = correlation, .prompt = "Choose a direction", .allow_freeform = true } },
+            3 => .completed,
+            else => unreachable,
+        } };
+        try owner.observe(allocator, attention);
+        try std.testing.expectEqual(@as(i64, if (scenario == 3) 5000 else 0), try f.store.scalar("SELECT snoozed_until FROM threads"));
+        try std.testing.expectEqual(@as(i64, if (scenario == 3) 3 else 4), try f.store.scalar("SELECT revision FROM threads"));
+        try std.testing.expectEqual(@as(i64, if (scenario == 3) 0 else 1), try f.store.scalar("SELECT count(*) FROM events WHERE kind='ThreadWoke' AND revision=4 AND json_extract(CAST(aggregate AS TEXT),'$.thread.value')=(SELECT id FROM threads)"));
+        const position = try f.store.position();
+        try owner.observe(allocator, attention);
+        try std.testing.expectEqual(position, try f.store.position());
+        if (scenario == 1 or scenario == 2) {
+            // Nonblocking input still forbids snooze even if the provider's
+            // independent run lifecycle is currently streaming.
+            try f.store.exec("UPDATE runs SET state='streaming'");
+            const refused = try owner.command(allocator, .{ .command_id = .{ .value = "pending-input-snooze" }, .target = .{ .thread = turn.conversation.thread }, .expected_revision = .{ .revision = 4 }, .payload = .{ .thread_sidebar_set = .{ .snoozed_until = 6000 } } });
+            try std.testing.expectEqual(t.Reason.busy, refused.reason.?);
+            try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT snoozed_until FROM threads"));
+        } else {
+            const resnoozed = try owner.command(allocator, .{ .command_id = .{ .value = "snooze-after-seen" }, .target = .{ .thread = turn.conversation.thread }, .expected_revision = .{ .revision = if (scenario == 3) 3 else 4 }, .payload = .{ .thread_sidebar_set = .{ .snoozed_until = 6000 } } });
+            try std.testing.expectEqual(.accepted, resnoozed.outcome);
+            const resnoozed_position = try f.store.position();
+            try owner.observe(allocator, attention);
+            try std.testing.expectEqual(resnoozed_position, try f.store.position());
+            var old_failure = attention;
+            old_failure.upstream_event = "terminal-late-failure";
+            old_failure.body = .{ .failure = .{ .code = "old", .detail = "terminal run already seen" } };
+            try owner.observe(allocator, old_failure);
+            try std.testing.expectEqual(@as(i64, 6000), try f.store.scalar("SELECT snoozed_until FROM threads"));
+            try std.testing.expectEqual(@as(i64, if (scenario == 3) 0 else 1), try f.store.scalar("SELECT count(*) FROM events WHERE kind='ThreadWoke'"));
+        }
+    }
+}
+
+test "attention wake revision exhaustion rolls back the entire fresh observation" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "wake-exhaustion", .utc_ms = 1000 };
+    const turn = try FollowupTurn.begin(&owner, allocator);
+    try f.store.exec("UPDATE threads SET revision=9223372036854775807,snoozed_until=5000");
+    const position = try f.store.position();
+    const revision = try f.store.scalar("SELECT revision FROM runs");
+    try std.testing.expectError(error.Limit, owner.observe(allocator, .{ .correlation = turn.start.request.start.correlation, .upstream_event = "exhausted-attention", .body = .{ .failure = .{ .code = "failure", .detail = "cannot increment thread" } } }));
+    try std.testing.expectEqual(position, try f.store.position());
+    try std.testing.expectEqual(revision, try f.store.scalar("SELECT revision FROM runs"));
+    try std.testing.expectEqual(@as(i64, 5000), try f.store.scalar("SELECT snoozed_until FROM threads"));
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM observations WHERE upstream_event LIKE '%exhausted-attention'"));
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM events WHERE kind='ThreadWoke'"));
+}
+
+test "fresh rejected Start delivery wakes snooze without replay waking a re-snoozed failure" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "snooze-delivery", .utc_ms = 1000 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const sent = try owner.command(allocator, conversation.send("delivery-send", "first", 1));
+    const open = (try owner.claimNext(allocator)).?;
+    try owner.delivered(allocator, open.id, .{ .outcome = .acknowledged, .session = .{ .id = sent.entity_ids.session.?, .instance = .{ .value = "delivery-instance" }, .upstream = .{ .value = "delivery-session" } } });
+    const start = (try owner.claimNext(allocator)).?;
+    // Streaming can precede the dispatch receipt. This still represents one
+    // live Start, rather than manufacturing a second provider effect.
+    try owner.observe(allocator, .{ .correlation = start.request.start.correlation, .upstream_event = "delivery-early-chunk", .body = .{ .chunk = .{ .message = sent.entity_ids.assistant_message.?, .block = sent.entity_ids.assistant_block.?, .offset = 0, .text = "early" } } });
+    _ = try owner.command(allocator, .{ .command_id = .{ .value = "delivery-snooze" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 2 }, .payload = .{ .thread_sidebar_set = .{ .snoozed_until = 5000 } } });
+    const rejected: t.adapter.Receipt = .{ .outcome = .rejected, .detail = "Start refused" };
+    try owner.delivered(allocator, start.id, rejected);
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT snoozed_until FROM threads"));
+    _ = try owner.command(allocator, .{ .command_id = .{ .value = "delivery-resnooze" }, .target = .{ .thread = conversation.thread }, .expected_revision = .{ .revision = 4 }, .payload = .{ .thread_sidebar_set = .{ .snoozed_until = 6000 } } });
+    const position = try f.store.position();
+    try owner.delivered(allocator, start.id, rejected);
+    try std.testing.expectEqual(position, try f.store.position());
+    try std.testing.expectEqual(@as(i64, 6000), try f.store.scalar("SELECT snoozed_until FROM threads"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM events WHERE kind='ThreadWoke' AND revision=4 AND json_extract(CAST(aggregate AS TEXT),'$.thread.value')=(SELECT id FROM threads)"));
+}
 
 test "message delivery outcomes preserve streaming Start and persist unknown without replay" {
     for ([_]t.adapter.Receipt{ .{ .outcome = .acknowledged }, .{ .outcome = .rejected, .detail = "request refused" }, .{ .outcome = .unknown, .detail = "delivery result lost" } }) |receipt| {

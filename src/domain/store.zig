@@ -180,6 +180,7 @@ pub const Store = struct {
         // The implicit rowid suffix supports latest selection/status lookups
         // without scanning completed runs from other threads.
         try result.exec("CREATE INDEX IF NOT EXISTS runs_by_thread ON runs(thread_id)");
+        try result.exec("CREATE INDEX IF NOT EXISTS runs_snooze_pending ON runs(thread_id) WHERE state IN('queued','starting','awaiting_approval','awaiting_question'); CREATE INDEX IF NOT EXISTS approvals_pending_run ON approvals(run_id) WHERE state='pending'; CREATE INDEX IF NOT EXISTS questions_pending_run ON questions(run_id) WHERE state='pending'");
         // Only diagnostic observations enter this index; streamed content never
         // accumulates in the run-status lookup. Correlation was normalized by Owner.
         try result.exec("CREATE INDEX IF NOT EXISTS observation_diagnostics ON observations(session_id,json_extract(CAST(correlation AS TEXT),'$.run.value'),commit_sequence DESC) WHERE evidence IS NOT NULL");

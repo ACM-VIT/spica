@@ -64,7 +64,9 @@ fn canonicalEnvelope(allocator: std.mem.Allocator, envelope: t.CommandEnvelope) 
 
 // Every nested lookup is a point/range lookup on an existing primary/unique
 // index (plus runs_by_thread). The preview reads only a prefix of one chunk.
-const thread_columns = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)),coalesce((SELECT substr(bytes,1,163) FROM chunks WHERE block_id=(SELECT id FROM blocks WHERE message_id=(SELECT id FROM messages WHERE thread_id=threads.id AND ordinal=0 AND role='user') AND ordinal=0) AND byte_offset=0),''),(SELECT state FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1),coalesce((SELECT substr(display_name,1,256) FROM projects WHERE id=threads.project_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.expected_branch') FROM workspaces WHERE id=threads.workspace_id),''),coalesce(title,''),pinned,settled,snoozed_until,sort_order,created_at_ms,last_user_message_at_ms,updated_at_ms FROM threads ";
+const snooze_blockers = "EXISTS(SELECT 1 FROM runs r WHERE r.thread_id=threads.id AND r.state IN('queued','starting','awaiting_approval','awaiting_question')) OR EXISTS(SELECT 1 FROM approvals a INDEXED BY approvals_pending_run CROSS JOIN runs r ON r.id=a.run_id WHERE a.state='pending' AND r.thread_id=threads.id) OR EXISTS(SELECT 1 FROM questions q INDEXED BY questions_pending_run CROSS JOIN runs r ON r.id=q.run_id WHERE q.state='pending' AND r.thread_id=threads.id)";
+
+const thread_columns = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)),coalesce((SELECT substr(bytes,1,163) FROM chunks WHERE block_id=(SELECT id FROM blocks WHERE message_id=(SELECT id FROM messages WHERE thread_id=threads.id AND ordinal=0 AND role='user') AND ordinal=0) AND byte_offset=0),''),(SELECT state FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1),coalesce((SELECT substr(display_name,1,256) FROM projects WHERE id=threads.project_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.expected_branch') FROM workspaces WHERE id=threads.workspace_id),''),coalesce(title,''),pinned,settled,snoozed_until,sort_order,created_at_ms,last_user_message_at_ms,updated_at_ms,NOT(" ++ snooze_blockers ++ ") FROM threads ";
 
 /// Internal single-thread reducer. Every returned slice belongs to the operation
 /// allocator; callers must copy before resetting it. Never call from the UI.
@@ -286,6 +288,20 @@ pub const Owner = struct {
         defer statement.deinit();
         if (try statement.step()) return error.Limit;
     }
+    /// Attention is recorded in the same observation/delivery transaction.
+    /// Call only after deduplication and accepted fresh attention evidence.
+    fn wakeSnoozed(self: *Owner, allocator: std.mem.Allocator, sequence: u64, effect: ?a.EffectId, run: []const u8) !void {
+        const now = self.utc_ms orelse return;
+        if (now > std.math.maxInt(i64)) return error.Limit;
+        const statement = try self.database.prepare("SELECT t.id,t.revision FROM threads t JOIN runs r ON r.thread_id=t.id WHERE r.id=? AND t.snoozed_until>?", &.{ .{ .text = run }, .{ .integer = @intCast(now) } });
+        defer statement.deinit();
+        if (!try statement.step()) return;
+        if (statement.integer(1) == std.math.maxInt(i64)) return error.Limit;
+        const thread = try allocator.dupe(u8, try statement.bytes(0));
+        const revision_value: u64 = @intCast(statement.integer(1) + 1);
+        try self.database.execute("UPDATE threads SET snoozed_until=0,revision=revision+1,updated_at_ms=coalesce(?,updated_at_ms) WHERE id=?", &.{ self.timeValue(), .{ .text = thread } });
+        try self.event(allocator, sequence, 0, .{ .thread = .{ .value = thread } }, revision_value, "ThreadWoke", null, effect, "");
+    }
     fn touchMessage(self: *Owner, message: []const u8) !void {
         const s = try self.database.prepare("SELECT revision FROM messages WHERE id=?", &.{.{ .text = message }});
         defer s.deinit();
@@ -374,7 +390,7 @@ pub const Owner = struct {
                     if (deadline <= 0) return .invalid_command;
                     const now = self.utc_ms orelse return .authority_unavailable;
                     if (@as(u64, @intCast(deadline)) <= now) return .invalid_command;
-                    if (try self.field(allocator, "SELECT id FROM runs WHERE thread_id=? AND state NOT IN('completed','cancelled','failed','interrupted') LIMIT 1", &.{.{ .text = e.target.thread.value }}) != null) return .busy;
+                    if (try self.field(allocator, "SELECT id FROM threads WHERE id=? AND (" ++ snooze_blockers ++ ")", &.{.{ .text = e.target.thread.value }}) != null) return .busy;
                 }
                 var order = p.sort_order;
                 if (p.pinned == true and order == null) {
@@ -1050,6 +1066,7 @@ pub const Owner = struct {
         if (!std.mem.eql(u8, kind, "message") and !(std.mem.eql(u8, current, "completed") or std.mem.eql(u8, current, "cancelled") or std.mem.eql(u8, current, "failed") or std.mem.eql(u8, current, "unknown") or std.mem.eql(u8, current, "interrupted"))) {
             const applied_state = if (std.mem.eql(u8, current, "cancel_requested") and std.mem.eql(u8, kind, "create_session")) current else next_state;
             try db.execute("UPDATE runs SET state=?,revision=revision+1 WHERE id=?", &.{ .{ .text = applied_state }, .{ .text = run } });
+            if (std.mem.eql(u8, applied_state, "failed")) try self.wakeSnoozed(allocator, sequence, effect, run);
             try self.event(allocator, sequence, 2, .{ .run = .{ .value = run } }, @intCast(revision_statement.integer(0) + 1), "RunDelivery", null, effect, "");
         }
         if (opening_session and receipt.outcome == .rejected)
@@ -1205,6 +1222,7 @@ pub const Owner = struct {
                 if (approval.expires_at) |expiry| if (expiry > std.math.maxInt(i64)) return error.Limit;
                 try db.execute("INSERT INTO approvals(id,revision,run_id,session_id,tool_id,workspace_id,upstream_request,action_digest,scope,expires_at,state,live_epoch) VALUES(?,1,?,?,?,?,?,?,?,?,'pending',?)", &.{ .{ .text = approval_id.value }, .{ .text = run.value }, .{ .text = session.value }, .{ .text = tool_id.value }, .{ .text = workspace }, .{ .text = request }, .{ .blob = approval.action_digest }, .{ .blob = approval.scope }, if (approval.expires_at) |v| .{ .integer = @intCast(v) } else .null, .{ .text = self.epoch } });
                 next_state = "awaiting_approval";
+                try self.wakeSnoozed(allocator, sequence, observation.correlation.effect, run.value);
                 try self.event(allocator, sequence, index, .{ .approval = approval_id }, 1, "ApprovalPending", null, observation.correlation.effect, "");
                 index += 1;
             },
@@ -1220,6 +1238,7 @@ pub const Owner = struct {
                 } else V.null;
                 try db.execute("INSERT INTO questions(id,revision,run_id,session_id,question,expires_at,state,live_epoch) VALUES(?,1,?,?,?,?, 'pending',?)", &.{ .{ .text = question_id.value }, .{ .text = run.value }, .{ .text = session.value }, .{ .blob = try encoded(allocator, question) }, expires, .{ .text = self.epoch } });
                 next_state = "awaiting_question";
+                try self.wakeSnoozed(allocator, sequence, observation.correlation.effect, run.value);
                 try self.event(allocator, sequence, index, .{ .question = question_id }, 1, "QuestionPending", null, observation.correlation.effect, "");
                 index += 1;
             },
@@ -1251,6 +1270,7 @@ pub const Owner = struct {
                 }
                 try db.execute("UPDATE effects SET state='withdrawn',revision=revision+1 WHERE run_id=? AND state='planned'", &.{.{ .text = run.value }});
                 next_state = "failed";
+                try self.wakeSnoozed(allocator, sequence, observation.correlation.effect, run.value);
             },
             .disconnect, .ambiguous => if (!terminal) {
                 // Unknown tools/requests remain unreplayed after process loss.
@@ -2538,7 +2558,7 @@ pub const Host = struct {
                 .threads, .thread => blk: {
                     const explicit_title = try allocator.dupe(u8, @import("text/utf8.zig").prefix(try s.bytes(12), t.max_title_bytes));
                     const prompt_preview = @import("text/utf8.zig").prefix(try s.bytes(7), t.max_title_bytes);
-                    break :blk .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator), .title_preview = if (explicit_title.len != 0) explicit_title else try allocator.dupe(u8, prompt_preview), .title = explicit_title, .latest_run_state = if (s.isNull(8)) null else try enumeration(t.RunState, s, 8), .project_name = try text(allocator, s, 9), .workspace_root = try text(allocator, s, 10), .workspace_branch = try text(allocator, s, 11), .pinned = s.integer(13) != 0, .settled = s.integer(14) != 0, .snoozed_until = s.integer(15), .sort_order = s.integer(16), .created_at_ms = s.integer(17), .last_user_message_at_ms = s.integer(18), .updated_at_ms = s.integer(19) } };
+                    break :blk .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator), .title_preview = if (explicit_title.len != 0) explicit_title else try allocator.dupe(u8, prompt_preview), .title = explicit_title, .latest_run_state = if (s.isNull(8)) null else try enumeration(t.RunState, s, 8), .project_name = try text(allocator, s, 9), .workspace_root = try text(allocator, s, 10), .workspace_branch = try text(allocator, s, 11), .pinned = s.integer(13) != 0, .settled = s.integer(14) != 0, .snoozed_until = s.integer(15), .sort_order = s.integer(16), .created_at_ms = s.integer(17), .last_user_message_at_ms = s.integer(18), .updated_at_ms = s.integer(19), .can_snooze = s.integer(20) != 0 } };
                 },
                 .blocks => .{ .block = try descriptor(allocator, s) },
                 .attachments => .{ .attachment = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .thread = .{ .value = try text(allocator, s, 3) }, .name = try text(allocator, s, 4), .media_type = try text(allocator, s, 5), .byte_length = try number(s, 6), .digest = try text(allocator, s, 7), .kind = try enumeration(a.AttachmentKind, s, 8) } },

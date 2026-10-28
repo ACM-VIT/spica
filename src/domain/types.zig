@@ -267,6 +267,7 @@ pub const Row = union(enum) {
         created_at_ms: i64 = 0,
         last_user_message_at_ms: i64 = 0,
         updated_at_ms: i64 = 0,
+        can_snooze: bool = false,
     },
     message: struct {
         message_id: adapter.MessageId,
