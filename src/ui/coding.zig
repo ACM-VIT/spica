@@ -214,6 +214,7 @@ pub const View = struct {
     scope_project: transcript.Id = .{},
     scope_open: bool = false,
     scope_scroll: f32 = 0,
+    scope_hover: usize = 0,
     sidebar_hover: ?usize = null,
     new_project_bounds: c.SDL_FRect = zero_rect,
     new_thread_bounds: c.SDL_FRect = zero_rect,
@@ -313,7 +314,8 @@ pub const View = struct {
     search_more_bounds: c.SDL_FRect = zero_rect,
     const zero_rect: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     pub const picker_row_height: f32 = 48;
-    pub const sidebar_card_stride: f32 = 83;
+    pub const sidebar_card_stride: f32 = 82;
+    pub const sidebar_search_stride: f32 = 37;
 
     const SetupDraft = struct {
         fields: [4][512]u8 = undefined,
@@ -998,6 +1000,19 @@ pub const View = struct {
         return count;
     }
 
+    fn sidebarStride(self: *const View) f32 {
+        return if (self.search_len != 0) sidebar_search_stride else sidebar_card_stride;
+    }
+
+    fn openScope(self: *View) void {
+        self.scope_open = true;
+        self.scope_hover = 0;
+        for (self.projects[0..self.project_count], 0..) |entry, index| {
+            if (entry.id.eql(self.scope_project.slice())) self.scope_hover = index + 1;
+        }
+        self.scope_scroll = 0;
+    }
+
     fn sidebarChanged(self: *View) void {
         self.thread_search_revision +%= 1;
         self.thread_search_busy = false;
@@ -1241,7 +1256,7 @@ pub const View = struct {
                     }
                     self.search_focused = false;
                     if (widgets.contains(self.scope_bounds, x, y)) {
-                        self.scope_open = true;
+                        self.openScope();
                         return true;
                     }
                     if (widgets.contains(self.picker_bounds, x, y)) {
@@ -1356,11 +1371,23 @@ pub const View = struct {
                     return true;
                 }
 
+                if (self.custom_root == null and self.scope_open) {
+                    if (widgets.contains(self.scope_all_bounds, event.motion.x, event.motion.y)) self.scope_hover = 0;
+                    for (self.project_bounds[0..self.project_count], 0..) |row, index| {
+                        if (widgets.contains(row, event.motion.x, event.motion.y)) self.scope_hover = index + 1;
+                    }
+                    return true;
+                }
                 if (self.custom_root == null) {
                     const previous = self.sidebar_hover;
                     self.sidebar_hover = null;
                     for (0..self.thread_count) |index| if (widgets.contains(self.threadRowBounds(index), event.motion.x, event.motion.y)) {
                         self.sidebar_hover = index;
+                        if (self.search_len != 0) {
+                            for (0..self.visibleThreadCount()) |ordinal| {
+                                if (self.searchResult(ordinal) == index) self.search_hover = ordinal;
+                            }
+                        }
                     };
                     if (!self.dragging and self.transcript_drag == null and previous != self.sidebar_hover) return true;
                 }
@@ -1397,7 +1424,7 @@ pub const View = struct {
                         const height = @as(f32, @floatFromInt(self.project_count + 1)) * 28;
                         self.scope_scroll = std.math.clamp(self.scope_scroll - event.wheel.y * wheel_direction * 28, 0, @max(0, height - self.scope_menu.h + 8));
                     } else {
-                        const height = @as(f32, @floatFromInt(self.visibleThreadCount())) * sidebar_card_stride;
+                        const height = @as(f32, @floatFromInt(self.visibleThreadCount())) * self.sidebarStride();
                         self.sidebar_scroll = std.math.clamp(self.sidebar_scroll - event.wheel.y * wheel_direction * 36, 0, @max(0, height - self.sidebar_rows.h));
                     }
                     return true;
@@ -1445,7 +1472,7 @@ pub const View = struct {
                     try self.titleInsert(std.mem.span(event.text.text));
                     return true;
                 }
-                if (self.workspace_open and self.custom_root == null) return true;
+                if ((self.workspace_open or self.scope_open) and self.custom_root == null) return true;
                 if (self.custom_root == null and self.search_focused) {
                     if (!self.window_active) return false;
                     try self.searchInsert(std.mem.span(event.text.text));
@@ -1605,7 +1632,23 @@ pub const View = struct {
                     return true;
                 }
                 if (self.scope_open and self.custom_root == null) {
-                    if (key == c.SDLK_ESCAPE) self.scope_open = false;
+                    if (!self.window_active) return false;
+                    switch (key) {
+                        c.SDLK_ESCAPE => self.scope_open = false,
+                        c.SDLK_UP => self.scope_hover -|= 1,
+                        c.SDLK_DOWN => self.scope_hover = @min(self.project_count, self.scope_hover + 1),
+                        c.SDLK_HOME => self.scope_hover = 0,
+                        c.SDLK_END => self.scope_hover = self.project_count,
+                        c.SDLK_RETURN, c.SDLK_KP_ENTER => {
+                            self.scope_project = if (self.scope_hover == 0) .{} else self.projects[self.scope_hover - 1].id;
+                            self.sidebarChanged();
+                            self.scope_open = false;
+                        },
+                        else => {},
+                    }
+                    const top = @as(f32, @floatFromInt(self.scope_hover)) * 28;
+                    if (top < self.scope_scroll) self.scope_scroll = top;
+                    if (top + 28 > self.scope_scroll + self.scope_menu.h - 8) self.scope_scroll = @max(0, top + 36 - self.scope_menu.h);
                     return true;
                 }
                 if (self.workspace_open and self.custom_root == null) {
@@ -1643,9 +1686,9 @@ pub const View = struct {
                     if (key == c.SDLK_UP) self.search_hover -|= 1;
                     if (key == c.SDLK_DOWN) self.search_hover = @min(self.visibleThreadCount() -| 1, self.search_hover + 1);
                     if (key == c.SDLK_UP or key == c.SDLK_DOWN) {
-                        const top = @as(f32, @floatFromInt(self.search_hover)) * sidebar_card_stride;
+                        const top = @as(f32, @floatFromInt(self.search_hover)) * self.sidebarStride();
                         if (top < self.sidebar_scroll) self.sidebar_scroll = top;
-                        if (top + sidebar_card_stride > self.sidebar_scroll + self.sidebar_rows.h) self.sidebar_scroll = @max(0, top + sidebar_card_stride - self.sidebar_rows.h);
+                        if (top + self.sidebarStride() > self.sidebar_scroll + self.sidebar_rows.h) self.sidebar_scroll = @max(0, top + self.sidebarStride() - self.sidebar_rows.h);
                     }
                     if ((key == c.SDLK_RETURN or key == c.SDLK_KP_ENTER) and self.navigation_enabled) {
                         if (self.searchResult(self.search_hover)) |index| {
@@ -1972,7 +2015,7 @@ pub const View = struct {
         self.search_more_bounds = if (more_height != 0) .{ .x = 8, .y = row_top + 36, .w = sidebar - 16, .h = more_height } else zero_rect;
         if (more_height != 0) try self.labels.drawFitted(renderer, text, "More matches · Ctrl+PgDn", 18, row_top + 40, sidebar - 36, 12, sidebar_muted);
         self.sidebar_rows = .{ .x = 8, .y = row_top + 40 + more_height, .w = sidebar - 16, .h = @max(0, height - row_top - 84 - more_height) };
-        const rows_height = @as(f32, @floatFromInt(self.visibleThreadCount())) * sidebar_card_stride;
+        const rows_height = @as(f32, @floatFromInt(self.visibleThreadCount())) * self.sidebarStride();
         self.sidebar_scroll = std.math.clamp(self.sidebar_scroll, 0, @max(0, rows_height - self.sidebar_rows.h));
         self.project_bounds = @splat(zero_rect);
         self.thread_bounds = @splat(zero_rect);
@@ -2043,11 +2086,13 @@ pub const View = struct {
         defer clip.restore(renderer);
         var y = self.scope_menu.y + 4 - self.scope_scroll;
         self.scope_all_bounds = clippedRect(.{ .x = 12, .y = y, .w = self.scope_menu.w - 8, .h = 28 }, self.scope_menu);
+        if (self.scope_hover == 0) try widgets.panel(renderer, self.scope_all_bounds, 4, self.design.colors.sidebar_hover);
         if (self.scope_project.len == 0) try widgets.panel(renderer, self.scope_all_bounds, 4, self.design.colors.sidebar_active);
         try self.labels.drawFitted(renderer, text, "All projects", 20, y + 7, self.scope_menu.w - 24, 12, foreground);
         y += 28;
         for (self.projects[0..self.project_count], 0..) |*entry, index| {
             self.project_bounds[index] = clippedRect(.{ .x = 12, .y = y, .w = self.scope_menu.w - 8, .h = 28 }, self.scope_menu);
+            if (self.scope_hover == index + 1) try widgets.panel(renderer, self.project_bounds[index], 4, self.design.colors.sidebar_hover);
             if (self.scope_project.eql(entry.id.slice())) try widgets.panel(renderer, self.project_bounds[index], 4, self.design.colors.sidebar_active);
             try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], 20, y + 7, self.scope_menu.w - 24, 12, muted);
             y += 28;
@@ -2057,9 +2102,10 @@ pub const View = struct {
     fn drawThreads(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, foreground: Color, muted: Color) !void {
         var y = self.sidebar_rows.y - self.sidebar_scroll;
         var ordinal: usize = 0;
+        const searching = self.search_len != 0;
         for (self.threads[0..self.thread_count], 0..) |*entry, index| {
             if (!self.threadMatches(entry)) continue;
-            const row = c.SDL_FRect{ .x = self.sidebar_rows.x, .y = y + 2, .w = self.sidebar_rows.w, .h = 78 };
+            const row = c.SDL_FRect{ .x = self.sidebar_rows.x, .y = y + (if (searching) @as(f32, 0) else 2), .w = self.sidebar_rows.w, .h = if (searching) 36 else 78 };
             self.thread_bounds[index] = clippedRect(row, self.sidebar_rows);
             if (self.thread_bounds[index].h > 0) {
                 const active = entry.id.eql(self.active_thread.slice());
@@ -2070,6 +2116,13 @@ pub const View = struct {
                 }
                 const x = row.x + 10;
                 const width = row.w - 20;
+                if (searching) {
+                    try icon(renderer, .folder, x, row.y + 10, muted);
+                    try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], x + 26, row.y + 10, width - 26, 14, foreground);
+                    ordinal += 1;
+                    y += sidebar_search_stride;
+                    continue;
+                }
                 if (entry.project_name.len != 0) {
                     try icon(renderer, .folder, x, row.y + 9, muted);
                     try self.labels.drawFitted(renderer, text, entry.project_name.slice(), x + 22, row.y + 10, width - 22 - (if (entry.run_status == .idle) @as(f32, 0) else 72), 12, muted);
@@ -2093,7 +2146,7 @@ pub const View = struct {
                 }
             }
             ordinal += 1;
-            y += sidebar_card_stride;
+            y += self.sidebarStride();
         }
     }
 
@@ -3822,6 +3875,35 @@ test "search filtering preserves the active title editor when its card is absent
     try std.testing.expectEqualStrings("Pinned chat", view.title_buffer[0..view.title_len]);
 }
 
+test "sidebar project scope keyboard selection retains real identity and consumes modal input" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.project_count = 2;
+    view.projects[0].id = try transcript.Id.init("project-a");
+    view.projects[1].id = try transcript.Id.init("project-b");
+    view.scope_menu = .{ .x = 8, .y = 96, .w = 240, .h = 64 };
+    view.scope_project = view.projects[0].id;
+    view.openScope();
+    try std.testing.expectEqual(@as(usize, 1), view.scope_hover);
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_END;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqual(@as(usize, 2), view.scope_hover);
+    try std.testing.expect(view.scope_scroll > 0);
+    event.key.key = c.SDLK_RETURN;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expect(view.scope_project.eql("project-b"));
+    try std.testing.expect(!view.scope_open);
+    try std.testing.expect(view.navigation == null);
+    view.openScope();
+    event.key.key = c.SDLK_HOME;
+    _ = try view.handle(event, undefined, undefined);
+    event.key.key = c.SDLK_RETURN;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqual(@as(usize, 0), view.scope_project.len);
+}
+
 test "flat rendered sidebar cards clip hits filter real project IDs and use bundled chrome" {
     for ([_][2]f32{ .{ 720, 480 }, .{ 900, 650 }, .{ 1100, 740 }, .{ 1280, 800 } }) |size| {
         const surface = c.SDL_CreateSurface(@intFromFloat(size[0]), @intFromFloat(size[1]), c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
@@ -3862,7 +3944,7 @@ test "flat rendered sidebar cards clip hits filter real project IDs and use bund
         const first = view.threadRowBounds(0);
         const second = view.threadRowBounds(1);
         try std.testing.expectEqual(@as(f32, 78), first.h);
-        try std.testing.expectEqual(@as(f32, 83), second.y - first.y);
+        try std.testing.expectEqual(@as(f32, 82), second.y - first.y);
         try std.testing.expectEqual(view.sidebar_rows.x, first.x);
         try std.testing.expectEqual(view.sidebar_rows.w, first.w);
         try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(11));
@@ -3904,9 +3986,9 @@ test "flat rendered sidebar cards clip hits filter real project IDs and use bund
         try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(0));
         try view.drawChrome(renderer, text, bounds, fg, muted);
         const filtered = view.threadRowBounds(1);
-        try std.testing.expect(filtered.h == 78);
+        try std.testing.expectEqual(@as(f32, 36), filtered.h);
         event.button.x = filtered.x + 4;
-        event.button.y = filtered.y + 40;
+        event.button.y = filtered.y + 18;
         try std.testing.expect(try view.handle(event, undefined, undefined));
         try std.testing.expectEqual(@as(usize, 1), view.navigation.?.thread);
         try std.testing.expectEqual(@as(usize, 0), view.search_len);
@@ -3930,7 +4012,7 @@ test "flat rendered sidebar cards clip hits filter real project IDs and use bund
         try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(1));
         const a = view.threadRowBounds(0);
         const c_row = view.threadRowBounds(2);
-        try std.testing.expectEqual(@as(f32, 83), c_row.y - a.y);
+        try std.testing.expectEqual(@as(f32, 82), c_row.y - a.y);
         var stats: c.SpicaTextStats = undefined;
         try std.testing.expect(c.spica_text_get_stats(text, &stats));
         try std.testing.expectEqual(@as(c_uint, 1), stats.face_count);
