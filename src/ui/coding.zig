@@ -3071,7 +3071,11 @@ test "painted connection and composer controls fit minimum and regular windows" 
         // Both real short labels and bounded long catalog IDs must reserve
         // only their measured width and remain disjoint from primary actions.
         for ([_][]const u8{ "m", "catalog-" ++ "x" ** 200 }) |model_label| {
-            view.selected = try View.Identity.from(.{ .runtime_kind = "codex", .model_provider = "fixture", .model_id = model_label, .effort = "low", .account_ref = "isolated", .workspace = .{ .value = "checkout" } });
+            // Keep the short-label case genuinely compact; a provider prefix
+            // is deliberately visible for real catalog identities and makes
+            // the resulting label wider by design.
+            const provider = if (model_label.len == 1) "" else "fixture";
+            view.selected = try View.Identity.from(.{ .runtime_kind = "codex", .model_provider = provider, .model_id = model_label, .effort = "low", .account_ref = "isolated", .workspace = .{ .value = "checkout" } });
             view.can_cancel = false;
             view.can_approve = false;
             try view.drawComposerControls(renderer, text, panel, foreground, muted);
