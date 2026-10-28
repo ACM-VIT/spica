@@ -825,6 +825,18 @@ class Proof:
 
     def lifecycle_cases(self, alpha, bravo, charlie, identifiers, retained, draft):
         """Exercise archive browser, destructive confirmation, successor and Undo."""
+        # Setup ends on the newest project. Lifecycle fixtures intentionally
+        # span both projects, so reset to the all-project resident page before
+        # targeting the background Alpha row.
+        current = self.session.snapshot(self.args.timeout)
+        if not (identifiers <= rows(current).keys() and not current.get("sidebar_scope_project")):
+            self.click("sidebar.scope")
+            self.wait(lambda value: value.get("sidebar_scope_open"),
+                      "lifecycle all-project scope opens")
+            self.click("scope.all")
+            current = self.wait(lambda value: not value.get("sidebar_scope_project")
+                                and identifiers <= rows(value).keys(),
+                               "lifecycle all-project rows restored before actions")
         before = self.session.snapshot(self.args.timeout)
         lifecycle_rows(before)
         # Background archive preserves the exact active route, execution and draft.
