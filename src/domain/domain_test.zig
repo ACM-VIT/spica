@@ -779,6 +779,8 @@ test "opaque presentation state migrates independently and preserves execution p
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT revision FROM threads WHERE id='h'"));
     try std.testing.expectError(error.Limit, f.store.savePresentation("", "value"));
     try std.testing.expectError(error.Limit, f.store.savePresentation("k", &(@as([4097]u8, @splat('x')))));
+    try std.testing.expectError(error.InvalidText, f.store.savePresentation("workspace-\xff", "value"));
+    try std.testing.expectError(error.InvalidText, f.store.savePresentation("workspace", "bad\xffvalue"));
     try f.store.close();
     f.store = try storage.Store.open(std.testing.io, path);
     const reopened = (try f.store.loadPresentation(std.testing.allocator, "workspace-b")).?;
@@ -786,6 +788,8 @@ test "opaque presentation state migrates independently and preserves execution p
     try std.testing.expectEqualStrings("opaque\x00value", reopened);
     try f.store.exec("PRAGMA ignore_check_constraints=ON; UPDATE presentation_state SET value=zeroblob(4097) WHERE key='workspace-a'");
     try std.testing.expectError(error.Corrupt, f.store.loadPresentation(std.testing.allocator, "workspace-a"));
+    try f.store.exec("UPDATE presentation_state SET value=CAST(X'62FF' AS BLOB) WHERE key='workspace-a'");
+    try std.testing.expectError(error.InvalidText, f.store.loadPresentation(std.testing.allocator, "workspace-a"));
 }
 
 test "Host presentation state copies request buffers and reopens without snapshot invalidation" {
@@ -811,6 +815,8 @@ test "Host presentation state copies request buffers and reopens without snapsho
     try std.testing.expectEqualDeep(first.snapshot_position, next.snapshot_position);
     try std.testing.expectEqualStrings("B", next.items[0].project.display_name);
     try std.testing.expectError(error.TooLarge, consumer.host.savePresentation("workspace", &(@as([4097]u8, @splat('x')))));
+    try std.testing.expectError(error.InvalidText, consumer.host.savePresentation("workspace", "bad\xffvalue"));
+    try std.testing.expectError(error.InvalidText, consumer.host.retainFinalPresentation("workspace", "bad\xffvalue"));
     consumer.host.destroy();
     live = false;
     consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .wake = Consumer.wake, .wake_context = &consumer });

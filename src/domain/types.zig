@@ -369,7 +369,7 @@ pub const Output = union(enum) {
     failure: struct { ticket: Ticket, failure: Failure },
 };
 pub const DrainResult = struct { output_count: usize, bytes_used: usize, more_pending: bool, required_bytes_for_next: usize = 0 };
-pub const AdmissionError = error{ Full, TooLarge, Closed, Busy };
+pub const AdmissionError = error{ Full, TooLarge, InvalidText, Closed, Busy };
 pub const Limits = struct {
     command_bytes: usize = 64 * 1024,
     page_bytes: usize = 64 * 1024,

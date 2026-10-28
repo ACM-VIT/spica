@@ -1764,10 +1764,12 @@ pub const Host = struct {
     }
     pub fn loadPresentation(self: *Host, key: []const u8) t.AdmissionError!t.Ticket {
         if (key.len == 0 or key.len > 128) return error.TooLarge;
+        if (!std.unicode.utf8ValidateSlice(key) or std.mem.indexOfScalar(u8, key, 0) != null) return error.InvalidText;
         return self.admit(.{ .presentation_load = key });
     }
     pub fn savePresentation(self: *Host, key: []const u8, value: []const u8) t.AdmissionError!t.Ticket {
         if (key.len == 0 or key.len > 128 or value.len > 4096) return error.TooLarge;
+        if (!std.unicode.utf8ValidateSlice(key) or std.mem.indexOfScalar(u8, key, 0) != null or !std.unicode.utf8ValidateSlice(value)) return error.InvalidText;
         return self.admit(.{ .presentation_save = .{ .key = key, .value = value } });
     }
     /// Reserve the latest final UI snapshot independently of request/result
@@ -1775,6 +1777,7 @@ pub const Host = struct {
     /// not replay pending commands or extend provider lifetimes.
     pub fn retainFinalPresentation(self: *Host, key: []const u8, value: []const u8) t.AdmissionError!void {
         if (key.len == 0 or key.len > 128 or value.len > 4096) return error.TooLarge;
+        if (!std.unicode.utf8ValidateSlice(key) or std.mem.indexOfScalar(u8, key, 0) != null or !std.unicode.utf8ValidateSlice(value)) return error.InvalidText;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.closed) return error.Closed;

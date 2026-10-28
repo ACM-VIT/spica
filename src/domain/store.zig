@@ -8,7 +8,7 @@ extern fn spica_database_bind_text(?*c.sqlite3_stmt, c_int, [*]const u8, c_int) 
 extern fn spica_database_bind_blob(?*c.sqlite3_stmt, c_int, [*]const u8, c_int) c_int;
 extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
-pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, Closed };
+pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, InvalidText, Closed };
 pub const application_id = 0x53504334;
 pub const schema_version = 12;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
@@ -216,15 +216,18 @@ pub const Store = struct {
     /// Opaque UI-owned values, deliberately outside the execution journal.
     pub fn savePresentation(self: *Store, key: []const u8, value: []const u8) Error!void {
         if (key.len == 0 or key.len > 128 or value.len > 4096) return error.Limit;
+        if (!std.unicode.utf8ValidateSlice(key) or std.mem.indexOfScalar(u8, key, 0) != null or !std.unicode.utf8ValidateSlice(value)) return error.InvalidText;
         try self.execute("INSERT INTO presentation_state VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", &.{ .{ .text = key }, .{ .blob = value } });
     }
     pub fn loadPresentation(self: *Store, allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {
         if (key.len == 0 or key.len > 128) return error.Limit;
+        if (!std.unicode.utf8ValidateSlice(key) or std.mem.indexOfScalar(u8, key, 0) != null) return error.InvalidText;
         const statement = try self.prepare("SELECT value FROM presentation_state WHERE key=?", &.{.{ .text = key }});
         defer statement.deinit();
         if (!try statement.step()) return null;
         const bytes = try statement.bytes(0);
         if (bytes.len > 4096) return error.Corrupt;
+        if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidText;
         return try allocator.dupe(u8, bytes);
     }
     pub fn close(self: *Store) Error!void {
