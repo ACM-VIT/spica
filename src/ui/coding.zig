@@ -5,6 +5,7 @@ const LineEdit = @import("../text/line_edit.zig").LineEdit;
 const LineView = @import("line_view.zig").LineView;
 const SidebarMenu = @import("sidebar_menu.zig");
 const SidebarTime = @import("../platform/sidebar_time.zig");
+const SidebarSnooze = @import("sidebar_snooze.zig");
 const EditorView = @import("editor_view.zig").EditorView;
 const LabelCache = @import("label_cache.zig").LabelCache;
 const widgets = @import("widgets.zig");
@@ -236,6 +237,13 @@ pub const View = struct {
     sidebar_snooze_deadlines: [5]i64 = @splat(0),
     sidebar_snooze_when: [5]SidebarTime.Text = @splat(.{}),
     sidebar_snooze_count: usize = 0,
+    custom_snooze: ?SidebarSnooze.State = null,
+    custom_snooze_thread: transcript.Id = .{},
+    custom_snooze_focus: enum { date_mode, duration_mode, date, time, calendar, amount, unit, cancel, submit } = .date,
+    custom_snooze_bounds: [9]c.SDL_FRect = @splat(zero_rect),
+    custom_snooze_days: [42]c.SDL_FRect = @splat(zero_rect),
+    custom_snooze_month_bounds: [2]c.SDL_FRect = @splat(zero_rect),
+    custom_snooze_calendar_bounds: c.SDL_FRect = zero_rect,
     sidebar_action_bounds: [32][2]c.SDL_FRect = @splat(@splat(zero_rect)),
     search_bounds: c.SDL_FRect = zero_rect,
     search_clear_bounds: c.SDL_FRect = zero_rect,
@@ -1000,7 +1008,7 @@ pub const View = struct {
 
     /// Original source index, even when search/scope remove preceding cards.
     pub fn threadRowBounds(self: *const View, index: usize) c.SDL_FRect {
-        if (self.sidebar_collapsed or self.scope_open or self.sidebar_menu_thread.len != 0 or index >= self.thread_count or !self.threadMatches(&self.threads[index]) or !self.sidebarShelfVisible(&self.threads[index])) return zero_rect;
+        if (self.custom_snooze != null or self.sidebar_collapsed or self.scope_open or self.sidebar_menu_thread.len != 0 or index >= self.thread_count or !self.threadMatches(&self.threads[index]) or !self.sidebarShelfVisible(&self.threads[index])) return zero_rect;
         return clippedRect(self.thread_bounds[index], self.sidebar_rows);
     }
 
@@ -1243,7 +1251,14 @@ pub const View = struct {
                     self.navigation = .{ .sidebar = .{ .index = index, .action = .snooze, .snoozed_until = deadline } };
                 },
                 .custom => {
-                    self.notice = "Custom snooze is not available in this native build";
+                    self.custom_snooze = SidebarSnooze.State.init(wallTimeMs()) catch {
+                        self.notice = "Local calendar is unavailable";
+                        return;
+                    };
+                    self.custom_snooze_thread = entry.id;
+                    self.custom_snooze_focus = .date;
+                    self.sidebar_menu_thread = .{};
+                    self.line_view.reset();
                     return;
                 },
                 else => return,
@@ -1282,6 +1297,34 @@ pub const View = struct {
         self.sidebar_menu_thread = .{};
         self.sidebar_menu_count = 0;
         self.sidebar_menu_mode = .main;
+    }
+
+    pub const CustomSnoozeRequest = struct { id: transcript.Id, snoozed_until: i64 };
+    pub fn customSnoozeOpen(self: *const View) bool {
+        return self.custom_snooze != null;
+    }
+    pub fn customSnoozePending(self: *const View) bool {
+        return if (self.custom_snooze) |state| state.pending else false;
+    }
+    pub fn takeCustomSnoozeRequest(self: *View) ?CustomSnoozeRequest {
+        const state = if (self.custom_snooze) |*state| state else return null;
+        if (!state.requested or state.pending) return null;
+        state.requested = false;
+        state.pending = true;
+        return .{ .id = self.custom_snooze_thread, .snoozed_until = state.deadline };
+    }
+    pub fn finishCustomSnooze(self: *View, failure: ?[]const u8) void {
+        if (failure) |message| {
+            if (self.custom_snooze) |*state| {
+                state.pending = false;
+                state.requested = false;
+                state.setError(message);
+            }
+        } else {
+            self.custom_snooze = null;
+            self.custom_snooze_thread = .{};
+            self.line_view.reset();
+        }
     }
 
     fn beginSidebarRename(self: *View, index: usize) void {
@@ -1436,13 +1479,14 @@ pub const View = struct {
         return requested;
     }
 
-    const LineField = enum { search, rename, title };
+    const LineField = enum { search, rename, title, snooze_date, snooze_time, snooze_amount };
     const LineParts = struct { buffer: []u8, len: *usize, select: *bool, edit: *LineEdit };
     pub fn inputErrorNotice(self: *const View, err: anyerror) ?[]const u8 {
         return switch (err) {
             error.TextTooLarge => if (self.activeLine()) |field| switch (field) {
                 .search => "Search is limited to 160 UTF-8 bytes. Existing text retained.",
                 .rename, .title => "Titles are limited to 160 UTF-8 bytes. Existing text retained.",
+                .snooze_date, .snooze_time, .snooze_amount => "This field is limited to 32 UTF-8 bytes. Existing text retained.",
             } else "Text exceeds this editor's limit. Existing text retained.",
             error.PieceLimit => "The editor has reached its limit. Existing text retained.",
             error.InvalidUtf8 => "Text is not valid UTF-8. Existing text retained.",
@@ -1459,9 +1503,28 @@ pub const View = struct {
             .search => .{ .buffer = &self.search_query, .len = &self.search_len, .select = &self.search_select_all, .edit = &self.search_edit },
             .rename => .{ .buffer = &self.sidebar_rename_buffer, .len = &self.sidebar_rename_len, .select = &self.sidebar_rename_select_all, .edit = &self.rename_edit },
             .title => .{ .buffer = &self.title_buffer, .len = &self.title_len, .select = &self.title_select_all, .edit = &self.title_line_edit },
+            .snooze_date, .snooze_time, .snooze_amount => blk: {
+                const state = &self.custom_snooze.?;
+                const value = switch (field) {
+                    .snooze_date => &state.date,
+                    .snooze_time => &state.time,
+                    .snooze_amount => &state.amount,
+                    else => unreachable,
+                };
+                break :blk .{ .buffer = &value.bytes, .len = &value.len, .select = &value.select, .edit = &value.edit };
+            },
         };
     }
     fn activeLine(self: *const View) ?LineField {
+        if (self.custom_snooze) |state| {
+            if (state.pending or state.calendar_open) return null;
+            return switch (self.custom_snooze_focus) {
+                .date => .snooze_date,
+                .time => .snooze_time,
+                .amount => .snooze_amount,
+                else => null,
+            };
+        }
         if (self.custom_root != null or self.setup_open or self.workflow_open or self.workspace_open or self.scope_open or self.picker_open or self.effort_open or self.sidebar_menu_thread.len != 0) return null;
         if (self.sidebar_rename_thread.len != 0) return .rename;
         if (self.title_editing) return .title;
@@ -1544,7 +1607,163 @@ pub const View = struct {
         return false;
     }
 
+    fn customSnoozeActivate(self: *View, target: usize) void {
+        const state = &(self.custom_snooze orelse return);
+        if (state.pending) return;
+        self.custom_snooze_focus = @enumFromInt(target);
+        switch (self.custom_snooze_focus) {
+            .date_mode => {
+                self.custom_snooze.?.mode = .date;
+                self.custom_snooze.?.calendar_open = false;
+            },
+            .duration_mode => {
+                self.custom_snooze.?.mode = .duration;
+                self.custom_snooze.?.calendar_open = false;
+            },
+            .calendar => {
+                self.custom_snooze.?.calendar_open = !state.calendar_open;
+                if (state.date.len == 10) self.custom_snooze.?.calendar = SidebarMenu.Calendar.init(state.date.bytes[0..10].*, state.calendar.today) catch state.calendar;
+                for (0..self.custom_snooze.?.calendar.count()) |index| {
+                    const cell = self.custom_snooze.?.calendar.cell(index) orelse continue;
+                    if (std.mem.eql(u8, &cell.date, &self.custom_snooze.?.calendar.selected)) self.custom_snooze.?.calendar_cursor = index;
+                }
+            },
+            .unit => self.custom_snooze.?.unit = switch (state.unit) {
+                .minutes => .hours,
+                .hours => .days,
+                .days => .minutes,
+            },
+            .cancel => {
+                self.custom_snooze = null;
+                self.line_view.reset();
+            },
+            .submit => {
+                _ = self.custom_snooze.?.submit(wallTimeMs());
+            },
+            else => {
+                self.custom_snooze.?.calendar_open = false;
+            },
+        }
+        self.line_view.reset();
+        if (self.custom_snooze) |*value| value.error_len = if (self.custom_snooze_focus == .submit) value.error_len else 0;
+    }
+
+    fn handleCustomSnooze(self: *View, event: c.SDL_Event, window: *c.SDL_Window) !bool {
+        const state = if (self.custom_snooze) |*value| value else return false;
+        if (state.pending) return true;
+        switch (event.type) {
+            c.SDL_EVENT_KEY_DOWN => {
+                if (!self.window_active) return true;
+                const key = event.key.key;
+                const ctrl = event.key.mod & c.SDL_KMOD_CTRL != 0;
+                const shift = event.key.mod & c.SDL_KMOD_SHIFT != 0;
+                if (self.line_view.preedit_len != 0) {
+                    if (key == c.SDLK_ESCAPE) self.line_view.preedit_len = 0;
+                    return true;
+                }
+                if (key == c.SDLK_ESCAPE) {
+                    if (state.calendar_open) state.calendar_open = false else self.custom_snooze = null;
+                    self.line_view.reset();
+                    return true;
+                }
+                if (key == c.SDLK_TAB) {
+                    const stops: []const usize = if (state.mode == .date) &[_]usize{ 0, 1, 2, 3, 4, 7, 8 } else &[_]usize{ 0, 1, 5, 6, 7, 8 };
+                    var at: usize = 0;
+                    for (stops, 0..) |target, index| if (target == @intFromEnum(self.custom_snooze_focus)) {
+                        at = index;
+                        break;
+                    };
+                    at = if (shift) (at + stops.len - 1) % stops.len else (at + 1) % stops.len;
+                    self.custom_snooze_focus = @enumFromInt(stops[at]);
+                    state.calendar_open = false;
+                    self.line_view.reset();
+                    try self.focus(window, true);
+                    return true;
+                }
+                if (state.calendar_open) {
+                    switch (key) {
+                        c.SDLK_LEFT => state.moveCalendar(-1),
+                        c.SDLK_RIGHT => state.moveCalendar(1),
+                        c.SDLK_UP => state.moveCalendar(-7),
+                        c.SDLK_DOWN => state.moveCalendar(7),
+                        c.SDLK_PAGEUP, c.SDLK_PAGEDOWN => {
+                            _ = state.calendar.shift(key == c.SDLK_PAGEDOWN);
+                            state.calendar_cursor = @min(state.calendar_cursor, state.calendar.count() - 1);
+                        },
+                        c.SDLK_RETURN, c.SDLK_KP_ENTER, c.SDLK_SPACE => {
+                            _ = state.chooseDate(state.calendar_cursor);
+                        },
+                        else => {},
+                    }
+                    return true;
+                }
+                if (key == c.SDLK_RETURN or key == c.SDLK_KP_ENTER) {
+                    if (self.activeLine() != null) {
+                        _ = state.submit(wallTimeMs());
+                    } else self.customSnoozeActivate(@intFromEnum(self.custom_snooze_focus));
+                    return true;
+                }
+                if (self.activeLine()) |field| {
+                    _ = self.lineKey(field, key, ctrl, shift) catch |err| {
+                        state.setError(self.inputErrorNotice(err) orelse "Unable to edit this value.");
+                        return true;
+                    };
+                    state.error_len = 0;
+                } else if (key == c.SDLK_SPACE) self.customSnoozeActivate(@intFromEnum(self.custom_snooze_focus));
+            },
+            c.SDL_EVENT_TEXT_INPUT => if (self.activeLine()) |field| {
+                if (self.window_active) self.lineInsert(field, std.mem.span(event.text.text)) catch |err| {
+                    state.setError(self.inputErrorNotice(err) orelse "Unable to edit this value.");
+                    return true;
+                };
+                state.error_len = 0;
+            },
+            c.SDL_EVENT_TEXT_EDITING => if (self.activeLine() != null and self.window_active) {
+                try self.line_view.compose(std.mem.span(event.edit.text));
+            },
+            c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
+                if (event.button.button != c.SDL_BUTTON_LEFT) return true;
+                const x = event.button.x;
+                const y = event.button.y;
+                if (state.calendar_open) {
+                    for (self.custom_snooze_month_bounds, 0..) |rect, index| if (widgets.contains(rect, x, y)) {
+                        _ = state.calendar.shift(index == 1);
+                        return true;
+                    };
+                    for (self.custom_snooze_days, 0..) |rect, index| if (rect.w > 0 and widgets.contains(rect, x, y)) {
+                        _ = state.chooseDate(index);
+                        self.custom_snooze_focus = .date;
+                        return true;
+                    };
+                    if (!widgets.contains(self.custom_snooze_calendar_bounds, x, y)) state.calendar_open = false;
+                    return true;
+                }
+                for (self.custom_snooze_bounds, 0..) |rect, index| if (rect.w > 0 and widgets.contains(rect, x, y)) {
+                    const was_field = self.activeLine();
+                    const same_focus = @intFromEnum(self.custom_snooze_focus) == index;
+                    if (!same_focus or (index != 2 and index != 3 and index != 5)) self.customSnoozeActivate(index);
+                    if (self.activeLine()) |field| {
+                        if (was_field == field) {
+                            const parts = self.lineParts(field);
+                            parts.edit.sync(parts.len.*, parts.select.*);
+                            parts.edit.set(self.line_view.hit(x, y) orelse parts.len.*, c.SDL_GetModState() & c.SDL_KMOD_SHIFT != 0);
+                            parts.select.* = false;
+                        }
+                        try self.focus(window, true);
+                    }
+                    return true;
+                };
+            },
+            else => {},
+        }
+        return true;
+    }
+
     pub fn handle(self: *View, event: c.SDL_Event, window: *c.SDL_Window, text: *c.SpicaText) !bool {
+        if (self.custom_snooze != null) switch (event.type) {
+            c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_KEY_UP, c.SDL_EVENT_TEXT_INPUT, c.SDL_EVENT_TEXT_EDITING, c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_BUTTON_UP, c.SDL_EVENT_MOUSE_MOTION, c.SDL_EVENT_MOUSE_WHEEL => return self.handleCustomSnooze(event, window),
+            else => {},
+        };
         switch (event.type) {
             c.SDL_EVENT_WINDOW_FOCUS_LOST => {
                 self.releasePointer();
@@ -1601,7 +1820,7 @@ pub const View = struct {
                             }
                         }
                         if (!hit and !widgets.contains(self.sidebar_menu_bounds, x, y)) self.sidebar_menu_thread = .{};
-                        if (self.sidebar_rename_thread.len != 0) try self.focus(window, true);
+                        if (self.sidebar_rename_thread.len != 0 or self.custom_snooze != null) try self.focus(window, true);
                         return true;
                     }
                     if (widgets.contains(self.sidebar_toggle_bounds, x, y)) {
@@ -2079,6 +2298,10 @@ pub const View = struct {
                             self.sidebar_menu_panel.move(true);
                             self.sidebar_menu_hover = self.sidebar_menu_panel.selected orelse self.sidebar_menu_hover;
                         },
+                        c.SDLK_HOME, c.SDLK_END => {
+                            self.sidebar_menu_panel.edge(key == c.SDLK_END);
+                            self.sidebar_menu_hover = self.sidebar_menu_panel.selected orelse self.sidebar_menu_hover;
+                        },
                         c.SDLK_LEFT => if (self.sidebar_menu_mode != .main) {
                             const parent_action: SidebarMenu.Action = if (self.sidebar_menu_mode == .copy) .copy else .snooze;
                             self.sidebar_menu_mode = .main;
@@ -2099,7 +2322,7 @@ pub const View = struct {
                         },
                         c.SDLK_RETURN, c.SDLK_KP_ENTER => {
                             self.activateSidebarMenu(self.sidebar_menu_hover);
-                            if (self.sidebar_rename_thread.len != 0) try self.focus(window, true);
+                            if (self.sidebar_rename_thread.len != 0 or self.custom_snooze != null) try self.focus(window, true);
                         },
                         else => {},
                     }
@@ -2943,6 +3166,101 @@ pub const View = struct {
         }
     }
 
+    fn drawCustomSnooze(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, width: f32, height: f32) !void {
+        const state = if (self.custom_snooze) |*value| value else return;
+        self.navigation_targets.clear();
+        self.custom_snooze_bounds = @splat(zero_rect);
+        self.custom_snooze_days = @splat(zero_rect);
+        self.custom_snooze_month_bounds = @splat(zero_rect);
+        self.custom_snooze_calendar_bounds = zero_rect;
+        const palette = self.design.colors;
+        const w = @min(384, @max(0, width - 24));
+        const h: f32 = @min(350, @max(0, height - 24));
+        const panel = c.SDL_FRect{ .x = (width - w) / 2, .y = (height - h) / 2, .w = w, .h = h };
+        if (!c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_BLEND) or !c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 160) or !c.SDL_RenderFillRect(renderer, null)) return error.ModalDraw;
+        try widgets.panel(renderer, panel, 10, palette.border);
+        try widgets.panel(renderer, .{ .x = panel.x + 1, .y = panel.y + 1, .w = w - 2, .h = h - 2 }, 9, palette.raised);
+        _ = self.navigation_targets.add("sidebar.custom_snooze", "dialog", panel, true) catch {};
+        try self.labels.draw(text, "Custom snooze", panel.x + 20, panel.y + 20, 16, palette.foreground);
+        try self.labels.drawFitted(renderer, text, "Choose when snoozed threads return to your inbox.", panel.x + 20, panel.y + 48, w - 40, 12, palette.muted);
+        const half = (w - 48) / 2;
+        self.custom_snooze_bounds[0] = .{ .x = panel.x + 20, .y = panel.y + 80, .w = half, .h = 32 };
+        self.custom_snooze_bounds[1] = .{ .x = panel.x + 28 + half, .y = panel.y + 80, .w = half, .h = 32 };
+        if (state.mode == .date) {
+            self.custom_snooze_bounds[2] = .{ .x = panel.x + 20, .y = panel.y + 148, .w = half - 30, .h = 32 };
+            self.custom_snooze_bounds[4] = .{ .x = panel.x + 20 + half - 28, .y = panel.y + 148, .w = 28, .h = 32 };
+            self.custom_snooze_bounds[3] = .{ .x = panel.x + 28 + half, .y = panel.y + 148, .w = half, .h = 32 };
+            try self.labels.draw(text, "Date", panel.x + 20, panel.y + 128, 12, palette.muted);
+            try self.labels.draw(text, "Time", panel.x + 28 + half, panel.y + 128, 12, palette.muted);
+        } else {
+            self.custom_snooze_bounds[5] = .{ .x = panel.x + 20, .y = panel.y + 148, .w = half, .h = 32 };
+            self.custom_snooze_bounds[6] = .{ .x = panel.x + 28 + half, .y = panel.y + 148, .w = half, .h = 32 };
+            try self.labels.draw(text, "Snooze for", panel.x + 20, panel.y + 128, 12, palette.muted);
+            try self.labels.draw(text, "Unit", panel.x + 28 + half, panel.y + 128, 12, palette.muted);
+        }
+        self.custom_snooze_bounds[7] = .{ .x = panel.x + w - 184, .y = panel.y + h - 52, .w = 76, .h = 32 };
+        self.custom_snooze_bounds[8] = .{ .x = panel.x + w - 100, .y = panel.y + h - 52, .w = 80, .h = 32 };
+        const ids = [_][]const u8{ "sidebar.custom_snooze.mode.date", "sidebar.custom_snooze.mode.duration", "sidebar.custom_snooze.date", "sidebar.custom_snooze.time", "sidebar.custom_snooze.calendar", "sidebar.custom_snooze.amount", "sidebar.custom_snooze.unit", "sidebar.custom_snooze.cancel", "sidebar.custom_snooze.submit" };
+        const unit_label: []const u8 = switch (state.unit) {
+            .minutes => "Minutes",
+            .hours => "Hours",
+            .days => "Days",
+        };
+        const labels = [_][]const u8{ "Date and time", "Duration", state.date.slice(), state.time.slice(), "▦", state.amount.slice(), unit_label, "Cancel", if (state.pending) "Snoozing…" else "Snooze" };
+        for (self.custom_snooze_bounds, 0..) |rect, index| {
+            if (rect.w <= 0) continue;
+            const field: ?LineField = switch (index) {
+                2 => .snooze_date,
+                3 => .snooze_time,
+                5 => .snooze_amount,
+                else => null,
+            };
+            const focused = @intFromEnum(self.custom_snooze_focus) == index;
+            const selected_mode = (index == 0 and state.mode == .date) or (index == 1 and state.mode == .duration);
+            try widgets.panel(renderer, rect, 5, if (focused or selected_mode) palette.selection else palette.surface);
+            _ = self.navigation_targets.add(ids[index], if (field != null) "textbox" else "button", rect, !state.pending) catch {};
+            if (field != null and self.activeLine() == field) {
+                const parts = self.lineParts(field.?);
+                parts.edit.sync(parts.len.*, parts.select.*);
+                try self.line_view.draw(renderer, text, parts.buffer[0..parts.len.*], parts.edit.*, .{ .x = rect.x + 7, .y = rect.y + 7, .w = rect.w - 14, .h = 20 }, palette.foreground, palette.selection, self.window_active);
+            } else try self.labels.drawFitted(renderer, text, labels[index], rect.x + 8, rect.y + 9, rect.w - 16, 12, if (state.pending) palette.muted else palette.foreground);
+        }
+        if (state.error_len != 0) try self.labels.drawFitted(renderer, text, state.error_bytes[0..state.error_len], panel.x + 20, panel.y + 200, w - 40, 12, palette.danger);
+        if (state.calendar_open) {
+            self.navigation_targets.clear();
+            // Keep the six-week grid inside the viewport even on short windows.
+            const cw = @min(280, width - 16);
+            const ch: f32 = 256;
+            const cx = std.math.clamp(panel.x + 20, 8, @max(8, width - cw - 8));
+            const cy = std.math.clamp(panel.y + 184, 8, @max(8, height - ch - 8));
+            const popup = c.SDL_FRect{ .x = cx, .y = cy, .w = cw, .h = ch };
+            self.custom_snooze_calendar_bounds = popup;
+            try widgets.panel(renderer, popup, 6, palette.border);
+            try widgets.panel(renderer, .{ .x = cx + 1, .y = cy + 1, .w = cw - 2, .h = ch - 2 }, 5, palette.raised);
+            var month: [32]u8 = undefined;
+            try self.labels.draw(text, try std.fmt.bufPrint(&month, "{d:0>4}-{d:0>2}", .{ @as(u32, state.calendar.year), @as(u32, state.calendar.month) }), cx + 78, cy + 12, 14, palette.foreground);
+            for (0..2) |index| {
+                const rect = c.SDL_FRect{ .x = cx + (if (index == 0) @as(f32, 8) else cw - 36), .y = cy + 6, .w = 28, .h = 28 };
+                self.custom_snooze_month_bounds[index] = rect;
+                _ = self.navigation_targets.add(if (index == 0) "sidebar.custom_snooze.calendar.previous" else "sidebar.custom_snooze.calendar.next", "button", rect, !state.pending) catch {};
+                try self.labels.draw(text, if (index == 0) "‹" else "›", rect.x + 8, rect.y + 4, 18, palette.foreground);
+            }
+            const day_width = (cw - 16) / 7;
+            for ([_][]const u8{ "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa" }, 0..) |name, index| try self.labels.draw(text, name, cx + 13 + @as(f32, @floatFromInt(index)) * day_width, cy + 40, 11, palette.muted);
+            for (0..state.calendar.count()) |index| {
+                const cell = state.calendar.cell(index) orelse continue;
+                const rect = c.SDL_FRect{ .x = cx + 8 + @as(f32, @floatFromInt(index % 7)) * day_width, .y = cy + 62 + @as(f32, @floatFromInt(index / 7)) * 30, .w = day_width, .h = 28 };
+                self.custom_snooze_days[index] = rect;
+                var id: [80]u8 = undefined;
+                _ = self.navigation_targets.add(try std.fmt.bufPrint(&id, "sidebar.custom_snooze.calendar.day.{d}", .{index}), "button", rect, !cell.disabled and !state.pending) catch {};
+                if (std.mem.eql(u8, &cell.date, &state.calendar.selected)) try widgets.panel(renderer, rect, 4, palette.selection);
+                if (index == state.calendar_cursor) try widgets.panel(renderer, .{ .x = rect.x + 2, .y = rect.y + rect.h - 2, .w = rect.w - 4, .h = 1 }, 0, palette.foreground);
+                var day: [4]u8 = undefined;
+                try self.labels.draw(text, try std.fmt.bufPrint(&day, "{d}", .{@as(u32, cell.day)}), rect.x + 8, rect.y + 7, 12, if (cell.disabled or !cell.current_month) palette.muted else palette.foreground);
+            }
+        }
+    }
+
     fn drawWorkspace(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
         const width = @min(760, @max(420, bounds.transcript.width * 0.82));
         const height = @min(bounds.transcript.height - 20, @max(260, bounds.transcript.height * 0.86));
@@ -3540,11 +3858,15 @@ pub const View = struct {
         if (self.custom_root == null and self.setup_open) try self.drawSetup(renderer, text, bounds, foreground, muted);
         if (self.custom_root == null and self.workspace_open and !self.setup_open) try self.drawWorkspace(renderer, text, bounds, foreground, muted);
         if (self.custom_root == null and self.sidebar_menu_thread.len != 0) try self.drawSidebarMenu(renderer, text, bounds.header.width, self.sidebar_bounds.h);
+        if (self.custom_snooze != null) try self.drawCustomSnooze(renderer, text, bounds.header.width, self.sidebar_bounds.h);
         if (self.window_active and self.focused) if (self.activeLine()) |field| {
             const fallback = switch (field) {
                 .search => self.search_bounds,
                 .rename => self.sidebar_rename_bounds,
                 .title => self.title_bounds,
+                .snooze_date => self.custom_snooze_bounds[2],
+                .snooze_time => self.custom_snooze_bounds[3],
+                .snooze_amount => self.custom_snooze_bounds[5],
             };
             const caret = self.line_view.caretArea() orelse fallback;
             if (caret.w > 0 and caret.h > 0) {
@@ -3554,6 +3876,61 @@ pub const View = struct {
         };
     }
 };
+
+test "sidebar custom snooze owns input and retains stable request values on rejection" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.insert("composer preserved", .typing);
+    view.custom_snooze = try SidebarSnooze.State.init(View.wallTimeMs());
+    view.custom_snooze_thread = try transcript.Id.init("stable-target");
+    view.custom_snooze.?.mode = .duration;
+    view.custom_snooze_focus = .amount;
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_TEXT_INPUT;
+    var entered = "1.5".* ++ .{@as(u8, 0)};
+    event.text.text = &entered;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqualStrings("1.5", view.custom_snooze.?.amount.slice());
+    const now = View.wallTimeMs();
+    try std.testing.expect(view.custom_snooze.?.submit(now));
+    const request = view.takeCustomSnoozeRequest().?;
+    try std.testing.expectEqualStrings("stable-target", request.id.slice());
+    try std.testing.expectEqual(now + 5_400_000, request.snoozed_until);
+    try std.testing.expect(view.customSnoozePending());
+    try std.testing.expect(view.takeCustomSnoozeRequest() == null);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_ESCAPE;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expect(view.customSnoozeOpen());
+    view.finishCustomSnooze("Busy");
+    try std.testing.expect(!view.customSnoozePending());
+    try std.testing.expectEqualStrings("1.5", view.custom_snooze.?.amount.slice());
+    try std.testing.expectEqualStrings("Busy", view.custom_snooze.?.error_bytes[0..view.custom_snooze.?.error_len]);
+    try std.testing.expectEqualStrings("composer preserved", view.editor.textBytes());
+    view.finishCustomSnooze(null);
+    try std.testing.expect(!view.customSnoozeOpen());
+}
+
+test "sidebar custom snooze renders only modal targets and a bounded calendar" {
+    const surface = c.SDL_CreateSurface(720, 480, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(text);
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.custom_snooze = try SidebarSnooze.State.init(View.wallTimeMs());
+    _ = try view.navigation_targets.add("underlying.send", "button", .{ .x = 1, .y = 1, .w = 50, .h = 50 }, true);
+    try view.drawCustomSnooze(renderer, text, 720, 480);
+    for (view.navigation_targets.slice()) |target| try std.testing.expect(std.mem.startsWith(u8, target.id[0..target.id_len], "sidebar.custom_snooze"));
+    view.customSnoozeActivate(4);
+    try std.testing.expect(view.custom_snooze.?.calendar_open);
+    try view.drawCustomSnooze(renderer, text, 720, 480);
+    for (view.custom_snooze_days) |rect| if (rect.w > 0) {
+        try std.testing.expect(rect.x >= 0 and rect.y >= 0 and rect.x + rect.w <= 720 and rect.y + rect.h <= 480);
+    };
+}
 
 test "root emits only enabled explicit intents and preserves draft until receipt" {
     var view = try View.init(std.testing.allocator);
