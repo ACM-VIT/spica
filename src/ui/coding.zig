@@ -224,6 +224,7 @@ pub const View = struct {
     sidebar_menu_actions: [16]SidebarAction = undefined,
     sidebar_menu_rows: [16]c.SDL_FRect = @splat(zero_rect),
     sidebar_rename_thread: transcript.Id = .{},
+    sidebar_rename_followup: ?RenameFollowup = null,
     sidebar_rename_buffer: [160]u8 = undefined,
     sidebar_rename_len: usize = 0,
     sidebar_rename_select_all: bool = false,
@@ -528,6 +529,7 @@ pub const View = struct {
     /// App/Host consumer for the next bounded page while retaining the draft,
     /// current thread and scroll state in this view.
     pub const SidebarAction = enum { pin, unpin, settle, unsettle, snooze, wake, move_up, move_down };
+    pub const RenameFollowup = union(enum) { thread: transcript.Id, new_thread, new_project };
     pub const Navigation = union(enum) {
         new_project,
         new_thread,
@@ -1206,6 +1208,7 @@ pub const View = struct {
         if (index >= self.thread_count or !self.navigation_enabled) return;
         const entry = &self.threads[index];
         self.title_editing = false;
+        self.sidebar_rename_followup = null;
         self.sidebar_rename_thread = entry.id;
         self.sidebar_rename_len = entry.len;
         @memcpy(self.sidebar_rename_buffer[0..entry.len], entry.label[0..entry.len]);
@@ -1217,6 +1220,12 @@ pub const View = struct {
 
     fn sidebarRenameInsert(self: *View, bytes: []const u8) !void {
         try self.lineInsert(.rename, bytes);
+    }
+
+    pub fn takeRenameFollowup(self: *View) ?RenameFollowup {
+        const action = self.sidebar_rename_followup;
+        self.sidebar_rename_followup = null;
+        return action;
     }
 
     fn commitSidebarRename(self: *View) void {
@@ -1472,6 +1481,7 @@ pub const View = struct {
                 if (self.custom_root == null) {
                     const x = event.button.x;
                     const y = event.button.y;
+                    var rename_blurred = false;
                     if (self.activeLine() == .rename) {
                         if (widgets.contains(self.sidebar_rename_bounds, x, y)) {
                             const parts = self.lineParts(.rename);
@@ -1482,7 +1492,7 @@ pub const View = struct {
                             return true;
                         }
                         self.commitSidebarRename();
-                        return true;
+                        rename_blurred = if (self.navigation) |action| std.meta.activeTag(action) == .rename else false;
                     }
                     if (self.sidebar_menu_thread.len != 0) {
                         for (self.sidebar_menu_rows[0..self.sidebar_menu_count], 0..) |row, index| {
@@ -1674,11 +1684,16 @@ pub const View = struct {
                         return true;
                     }
                     if (self.navigation_enabled and widgets.contains(self.sidebar_bounds, x, y)) {
-                        if (widgets.contains(self.new_project_bounds, x, y)) self.navigation = .new_project;
-                        if (widgets.contains(self.new_thread_bounds, x, y)) self.navigation = .new_thread;
+                        if (widgets.contains(self.new_project_bounds, x, y)) {
+                            if (rename_blurred) self.sidebar_rename_followup = .new_project else self.navigation = .new_project;
+                        }
+                        if (widgets.contains(self.new_thread_bounds, x, y)) {
+                            if (rename_blurred) self.sidebar_rename_followup = .new_thread else self.navigation = .new_thread;
+                        }
                         if (widgets.contains(self.sidebar_rows, x, y)) {
                             for (self.sidebar_action_bounds[0..self.thread_count], 0..) |actions, index| {
                                 if (widgets.contains(actions[0], x, y)) {
+                                    if (rename_blurred) return true;
                                     const entry = &self.threads[index];
                                     self.navigation = .{ .sidebar = .{ .index = index, .action = if (entry.snoozed_until > wallTimeMs()) .wake else if (entry.settled) .unsettle else .settle } };
                                     return true;
@@ -1692,12 +1707,12 @@ pub const View = struct {
                                 }
                             }
                             for (0..self.thread_count) |index| if (widgets.contains(self.threadRowBounds(index), x, y)) {
-                                if (event.button.clicks >= 2) {
+                                if (event.button.clicks >= 2 and !rename_blurred) {
                                     self.beginSidebarRename(index);
                                     try self.focus(window, true);
                                     return true;
                                 }
-                                self.navigation = .{ .thread = index };
+                                if (rename_blurred) self.sidebar_rename_followup = .{ .thread = self.threads[index].id } else self.navigation = .{ .thread = index };
                                 if (self.search_len != 0) {
                                     self.search_len = 0;
                                     self.search_select_all = false;
@@ -1928,6 +1943,7 @@ pub const View = struct {
                     if (field == .rename) {
                         if (key == c.SDLK_ESCAPE) {
                             self.sidebar_rename_thread = .{};
+                            self.sidebar_rename_followup = null;
                             self.line_view.reset();
                         }
                         if (key == c.SDLK_RETURN or key == c.SDLK_KP_ENTER) self.commitSidebarRename();
@@ -3353,6 +3369,18 @@ pub const View = struct {
         if (self.custom_root == null and self.setup_open) try self.drawSetup(renderer, text, bounds, foreground, muted);
         if (self.custom_root == null and self.workspace_open and !self.setup_open) try self.drawWorkspace(renderer, text, bounds, foreground, muted);
         if (self.custom_root == null and self.sidebar_menu_thread.len != 0) try self.drawSidebarMenu(renderer, text, bounds.header.width, self.sidebar_bounds.h);
+        if (self.window_active and self.focused) if (self.activeLine()) |field| {
+            const fallback = switch (field) {
+                .search => self.search_bounds,
+                .rename => self.sidebar_rename_bounds,
+                .title => self.title_bounds,
+            };
+            const caret = self.line_view.caretArea() orelse fallback;
+            if (caret.w > 0 and caret.h > 0) {
+                const area: c.SDL_Rect = .{ .x = @intFromFloat(caret.x), .y = @intFromFloat(caret.y), .w = @max(1, @as(c_int, @intFromFloat(caret.w))), .h = @max(1, @as(c_int, @intFromFloat(caret.h))) };
+                if (!c.SDL_SetTextInputArea(window, &area, 0)) return error.TextInputArea;
+            }
+        };
     }
 };
 
@@ -4962,6 +4990,7 @@ test "small fields own Unicode selection composition and trimmed blur without to
     view.sidebar_rename_select_all = true;
     try view.sidebarRenameInsert("  trimmed title  ");
     view.sidebar_rename_bounds = .{ .x = 10, .y = 10, .w = 100, .h = 22 };
+    view.sidebar_toggle_bounds = .{ .x = 200, .y = 100, .w = 20, .h = 20 };
     event = std.mem.zeroes(c.SDL_Event);
     event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
     event.button.button = c.SDL_BUTTON_LEFT;
@@ -5004,4 +5033,29 @@ test "modal input ownership protects covered title and sidebar fields" {
         try std.testing.expectEqualStrings("draft", view.editor.textBytes());
         @field(view, modal) = false;
     }
+}
+
+test "blur retains the clicked thread identity until rename receipt" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.navigation_enabled = true;
+    view.thread_count = 2;
+    view.threads[0].id = try transcript.Id.init("renamed");
+    view.threads[1].id = try transcript.Id.init("clicked");
+    view.sidebar_bounds = .{ .x = 0, .y = 0, .w = 256, .h = 300 };
+    view.sidebar_rows = view.sidebar_bounds;
+    view.thread_bounds[1] = .{ .x = 0, .y = 100, .w = 256, .h = 80 };
+    view.sidebar_rename_bounds = .{ .x = 10, .y = 10, .w = 100, .h = 22 };
+    view.beginSidebarRename(0);
+    try view.sidebarRenameInsert("name");
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    event.button.x = 120;
+    event.button.y = 120;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqualStrings("name", view.navigation.?.rename.title[0..view.navigation.?.rename.len]);
+    std.mem.swap(View.Entry, &view.threads[0], &view.threads[1]);
+    try std.testing.expect(view.takeRenameFollowup().?.thread.eql("clicked"));
+    try std.testing.expect(view.takeRenameFollowup() == null);
 }

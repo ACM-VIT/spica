@@ -81,6 +81,12 @@ pub const LineView = struct {
             }
         }
     }
+    pub fn caretArea(self: *const LineView) ?c.SDL_FRect {
+        const layout = self.layout orelse return null;
+        var caret: c.SDL_FRect = undefined;
+        if (!c.spica_text_layout_caret(layout, self.composition_at + self.preedit_len, &caret)) return null;
+        return .{ .x = std.math.clamp(self.bounds.x + caret.x - self.scroll, self.bounds.x, self.bounds.x + @max(0, self.bounds.w - 1)), .y = self.bounds.y + caret.y, .w = 1, .h = @max(1, caret.h) };
+    }
     pub fn hit(self: *const LineView, x: f32, y: f32) ?usize {
         const layout = self.layout orelse return null;
         const at = c.spica_text_layout_hit_test(layout, x - self.bounds.x + self.scroll, y - self.bounds.y);
@@ -119,6 +125,9 @@ test "single line shapes full Unicode titles once and scrolls selection caret" {
     };
     try std.testing.expect(painted_selection > 0);
     try std.testing.expect(line.scroll > 0);
+    const input_area = line.caretArea().?;
+    try std.testing.expect(input_area.x >= bounds.x and input_area.x < bounds.x + bounds.w);
+    try std.testing.expect(input_area.y >= bounds.y and input_area.h > 0);
     try std.testing.expectEqual(@as(usize, 160), line.len);
     const retained = line.layout.?;
     try line.draw(renderer, text, value, edit, bounds, fg, fg, true);
@@ -141,4 +150,7 @@ test "single line shapes full Unicode titles once and scrolls selection caret" {
     try line.compose("日本");
     try line.draw(renderer, text, bidi, edit, bounds, fg, selected_color, true);
     try std.testing.expectEqualStrings("a 日本 z", line.bytes[0..line.len]);
+    var expected_caret: c.SDL_FRect = undefined;
+    try std.testing.expect(c.spica_text_layout_caret(line.layout.?, "a 日本".len, &expected_caret));
+    try std.testing.expectApproxEqAbs(bounds.x + expected_caret.x - line.scroll, line.caretArea().?.x, 0.1);
 }

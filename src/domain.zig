@@ -1572,6 +1572,12 @@ pub const Host = struct {
     const Result = struct { len: usize = 0, bytes: [262144]u8 = undefined };
     const Snapshot = struct { generation: u64 = 0, database: ?*store.c.sqlite3 = null, position: t.EventPosition = .{}, deadline: u64 = 0 };
     const Subscription = struct { generation: u64 = 0, active: bool = false, scope: t.Scope = .all, after: t.EventPosition = .{}, max_bytes: usize = 65536, arena: std.heap.ArenaAllocator };
+    const FinalPresentation = struct {
+        key: [128]u8 = undefined,
+        key_len: usize = 0,
+        value: [4096]u8 = undefined,
+        value_len: usize = 0,
+    };
     allocator: std.mem.Allocator,
     io: std.Io,
     options: Options,
@@ -1584,6 +1590,7 @@ pub const Host = struct {
     changed: std.Io.Condition = .init,
     runtime_wake: std.Io.Event = .unset,
     closed: bool = false,
+    final_presentation: FinalPresentation = .{},
     next_ticket: u64 = 1,
     requests: [8]Frame = undefined,
     prompt_inbox: [prompts.max_bytes]u8 = undefined,
@@ -1741,6 +1748,19 @@ pub const Host = struct {
         if (key.len == 0 or key.len > 128 or value.len > 4096) return error.TooLarge;
         return self.admit(.{ .presentation_save = .{ .key = key, .value = value } });
     }
+    /// Reserve the latest final UI snapshot independently of request/result
+    /// capacity. Shutdown persists only this slot on the owning worker; it does
+    /// not replay pending commands or extend provider lifetimes.
+    pub fn retainFinalPresentation(self: *Host, key: []const u8, value: []const u8) t.AdmissionError!void {
+        if (key.len == 0 or key.len > 128 or value.len > 4096) return error.TooLarge;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.closed) return error.Closed;
+        @memcpy(self.final_presentation.key[0..key.len], key);
+        self.final_presentation.key_len = key.len;
+        @memcpy(self.final_presentation.value[0..value.len], value);
+        self.final_presentation.value_len = value.len;
+    }
     pub fn subscribe(self: *Host, request: t.Subscribe) t.AdmissionError!t.Ticket {
         return self.admit(.{ .subscribe = request });
     }
@@ -1826,7 +1846,11 @@ pub const Host = struct {
             self.mutex.lockUncancelable(self.io);
             while (!self.closed and self.request_count == 0 and self.options.factory == null and !self.setup_active) self.changed.waitUncancelable(self.io, &self.mutex);
             if (self.closed) {
+                const final = self.final_presentation;
                 self.mutex.unlock(self.io);
+                if (final.key_len != 0) self.persistPresentation(final.key[0..final.key_len], final.value[0..final.value_len]) catch |err| {
+                    std.log.err("Final sidebar settings could not be saved: {s}", .{@errorName(err)});
+                };
                 return;
             }
             const frame: ?Frame = if (self.request_count != 0) blk: {
@@ -2041,10 +2065,7 @@ pub const Host = struct {
         switch (request) {
             .presentation_load => |key| try self.publish(.{ .presentation_loaded = .{ .ticket = ticket, .value = try self.database.loadPresentation(allocator, key) } }),
             .presentation_save => |value| {
-                const used = try self.database.scalar("PRAGMA page_count");
-                const page_size = try self.database.scalar("PRAGMA page_size");
-                if (@as(u64, @intCast(used)) *| @as(u64, @intCast(page_size)) >= self.options.limits.durable_bytes) return error.Limit;
-                try self.database.savePresentation(value.key, value.value);
+                try self.persistPresentation(value.key, value.value);
                 try self.publish(.{ .presentation_saved = .{ .ticket = ticket } });
             },
             .command => |command| {
@@ -2120,6 +2141,13 @@ pub const Host = struct {
                 try self.publish(.{ .unsubscribed = .{ .ticket = ticket } });
             },
         }
+    }
+
+    fn persistPresentation(self: *Host, key: []const u8, value: []const u8) !void {
+        const used = try self.database.scalar("PRAGMA page_count");
+        const page_size = try self.database.scalar("PRAGMA page_size");
+        if (@as(u64, @intCast(used)) *| @as(u64, @intCast(page_size)) >= self.options.limits.durable_bytes) return error.Limit;
+        try self.database.savePresentation(key, value);
     }
 
     fn dispatch(self: *Host, owner: *Owner, allocator: std.mem.Allocator, effect: Owner.Claimed) !void {

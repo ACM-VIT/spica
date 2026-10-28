@@ -781,6 +781,33 @@ test "Host presentation writes honor durable store quota" {
     try std.testing.expect((try consumer.next()).presentation_loaded.value == null);
 }
 
+test "Host final presentation snapshot survives immediate shutdown and supersedes queued writes" {
+    const Host = @import("../domain.zig").Host;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    const host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .limits = .{ .result_slots = 1 } });
+    try std.testing.expectError(error.TooLarge, host.retainFinalPresentation("", "bad"));
+    try std.testing.expectError(error.TooLarge, host.retainFinalPresentation("key", "x" ** 4097));
+    _ = try host.savePresentation("workspace", "queued-old");
+    _ = try host.savePresentation("workspace", "queued-later");
+    try host.retainFinalPresentation("workspace", "outgoing-view");
+    var final = [_]u8{'z'} ** 4096;
+    try host.retainFinalPresentation("workspace", &final);
+    @memset(&final, 'q');
+    // No drain or sleep: final persistence is a worker-owned shutdown step,
+    // including when publication of a normal result is already backpressured.
+    host.destroy();
+    var reopened = try storage.Store.open(std.testing.io, path_buffer[0..n]);
+    defer reopened.close() catch {};
+    const saved = (try reopened.loadPresentation(std.testing.allocator, "workspace")).?;
+    defer std.testing.allocator.free(saved);
+    try std.testing.expectEqualStrings("z" ** 4096, saved);
+    try std.testing.expectEqual(@as(i64, 0), try reopened.scalar("SELECT count(*) FROM events"));
+    try std.testing.expectEqual(@as(i64, 0), try reopened.scalar("SELECT count(*) FROM commands"));
+}
+
 test "public Host consumer streams approves cancels pages and reopens durable state" {
     const Host = @import("../domain.zig").Host;
     var temporary = std.testing.tmpDir(.{});

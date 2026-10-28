@@ -282,7 +282,10 @@ pub const App = struct {
             self.view.allocator.destroy(bridge);
             self.lua = null;
         }
-        if (self.conversation) |conversation| conversation.destroy();
+        if (self.conversation) |conversation| {
+            conversation.retainFinalSidebarState(&self.view);
+            conversation.destroy();
+        }
         self.conversation = null;
     }
 
@@ -622,6 +625,9 @@ pub const App = struct {
         self.snapshot.sidebar_scope_open = self.view.scope_open;
         self.snapshot.sidebar_scope_project = self.view.scope_project.slice();
         self.snapshot.sidebar_collapsed = self.view.sidebar_collapsed;
+        self.snapshot.sidebar_width_override = self.view.sidebar_width_override;
+        self.snapshot.sidebar_working_shelf = self.view.sidebar_working_shelf;
+        self.snapshot.sidebar_shelf_expanded = self.view.sidebar_shelf_expanded;
         self.snapshot.sidebar_width = self.view.sidebar_bounds.w;
         self.snapshot.sidebar_menu_thread = self.view.sidebar_menu_thread.slice();
         self.snapshot.sidebar_rename_thread = self.view.sidebar_rename_thread.slice();
@@ -1043,6 +1049,7 @@ const Conversation = struct {
     sidebar_state_bytes: [4096]u8 = undefined,
     sidebar_state_len: usize = 0,
     sidebar_route_validated: bool = false,
+    sidebar_validated_route: Id = .{},
     sidebar_pending: ?SidebarPending = null,
     worker: *presentation.Worker,
     wake: *Wake,
@@ -1598,6 +1605,10 @@ const Conversation = struct {
     }
     fn navigateWorkspace(self: *Conversation, app: *App, navigation: Coding.Navigation) !void {
         if (!app.view.navigation_enabled) return error.WorkspaceBusy;
+        try self.applyWorkspaceNavigation(app, navigation);
+    }
+
+    fn applyWorkspaceNavigation(self: *Conversation, app: *App, navigation: Coding.Navigation) !void {
         if (std.meta.activeTag(navigation) == .new_thread or std.meta.activeTag(navigation) == .new_project) {
             var available = false;
             for (app.view.retained) |slot| if (slot.editor == null) {
@@ -1688,6 +1699,16 @@ const Conversation = struct {
                 app.view.search_more_available = false;
                 try self.ask(.cards, .{ .threads = .{ .page = page } });
             },
+        }
+    }
+
+    fn applyRenameFollowup(self: *Conversation, app: *App, followup: Coding.RenameFollowup) !void {
+        switch (followup) {
+            // The row can move or leave the resident page during the title
+            // write. Fresh thread projection resolves project and workspace.
+            .thread => |id| try self.selectThread(app, id),
+            .new_thread => try self.applyWorkspaceNavigation(app, .new_thread),
+            .new_project => try self.applyWorkspaceNavigation(app, .new_project),
         }
     }
 
@@ -1887,6 +1908,22 @@ const Conversation = struct {
         @memcpy(self.sidebar_state_bytes[0..bytes.len], bytes);
         self.sidebar_state_len = bytes.len;
         self.sidebar_save_ticket = ticket;
+    }
+
+    fn retainFinalSidebarState(self: *Conversation, view: *Coding) void {
+        if (!self.sidebar_state_loaded or !std.mem.eql(u8, &sidebarStateKey(self.workspace_root), &self.sidebar_state_key)) return;
+        var state = SidebarState.capture(view);
+        // Closing during navigation must not persist an unvalidated route.
+        // The most recent validated route still belongs to this workspace.
+        state.selected_thread = self.sidebar_validated_route.slice();
+        var buffer: [4096]u8 = undefined;
+        const bytes = types.encode(state, &buffer) catch |err| {
+            std.log.err("Final sidebar settings could not be encoded: {s}", .{@errorName(err)});
+            return;
+        };
+        self.host.retainFinalPresentation(&self.sidebar_state_key, bytes) catch |err| {
+            std.log.err("Final sidebar settings could not be retained: {s}", .{@errorName(err)});
+        };
     }
 
     fn clearHistoryRecoveryNotice(view: *Coding) void {
@@ -2427,6 +2464,8 @@ const Conversation = struct {
                 .failure => |value| {
                     if (self.sidebar_save_ticket) |ticket| if (ticket.value == value.ticket.value) {
                         self.sidebar_save_ticket = null;
+                        // Retain attempted bytes to avoid a retry loop. The
+                        // next preference change or final shutdown retries.
                         self.notice(&app.view, "Sidebar settings could not be saved. Conversation execution is still available.");
                         continue;
                     };
@@ -2482,6 +2521,7 @@ const Conversation = struct {
                         }
                     };
                     if (self.command) |pending| if (pending.ticket.value == value.ticket.value) {
+                        if (pending.kind == .sidebar_title) _ = app.view.takeRenameFollowup();
                         switch (pending.kind) {
                             .followup_enqueue, .followup_edit, .followup_cancel, .followup_order => {
                                 app.view.workflow_uncertain = true;
@@ -2727,6 +2767,7 @@ const Conversation = struct {
         if (workflow_command and (!self.workflow_pending.thread.eql(self.thread.slice()) or !self.workflow_pending.run.eql(self.run.slice()))) return error.StaleWorkflowReceipt;
         if (value.outcome == .rejected) {
             if (pending.kind == .sidebar or pending.kind == .sidebar_title) {
+                if (pending.kind == .sidebar_title) _ = app.view.takeRenameFollowup();
                 self.sidebar_pending = null;
                 app.view.thread_search_revision +%= 1;
                 self.thread_search_started = true;
@@ -2778,6 +2819,9 @@ const Conversation = struct {
                 app.view.thread_search_revision +%= 1;
                 self.thread_search_started = true;
                 self.notice(&app.view, "Sidebar updated.");
+                if (pending.kind == .sidebar_title) if (app.view.takeRenameFollowup()) |followup| {
+                    self.applyRenameFollowup(app, followup) catch |err| self.notice(&app.view, @errorName(err));
+                };
             },
             .title => {
                 app.view.title_editing = false;
@@ -3105,6 +3149,7 @@ const Conversation = struct {
                     self.sidebar_state_loaded = false;
                     self.sidebar_state_len = 0;
                     self.sidebar_route_validated = false;
+                    self.sidebar_validated_route = .{};
                     self.sidebar_load_ticket = try self.host.loadPresentation(&self.sidebar_state_key);
                     return;
                 }
@@ -3213,7 +3258,9 @@ const Conversation = struct {
                 if (value.items.len != 1) return error.MissingThread;
                 if (!std.mem.eql(u8, value.items[0].thread.workspace_root, self.workspace_root)) return error.WrongCheckout;
                 self.sidebar_route_validated = true;
+                self.sidebar_validated_route = self.thread;
                 self.project = try Id.init(value.items[0].thread.project.value);
+                app.view.active_project = self.project;
                 try self.updateThreadCard(&app.view, value.items[0].thread);
                 self.thread_revision = value.items[0].thread.revision;
                 self.workspace = try Id.init(value.items[0].thread.workspace.value);
@@ -4183,6 +4230,68 @@ test "sidebar receipt updates active neighbor revision while retaining execution
     try std.testing.expect(conversation.command == null);
     try std.testing.expect(conversation.sidebar_pending == null);
     try std.testing.expect(conversation.thread_search_started);
+}
+
+test "accepted rename releases stable route followup and rejection discards it" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    try app.view.editor.setText("outgoing café draft");
+    app.view.active_thread = try Id.init("old-active");
+    app.view.sidebar_rename_followup = .{ .thread = try Id.init("clicked-target") };
+    app.view.thread_count = 1;
+    app.view.threads[0].id = try Id.init("unrelated-after-reorder");
+    const command_id = [_]u8{'b'} ** 32;
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/rename-followup") };
+    conversation.thread = app.view.active_thread;
+    conversation.run = try Id.init("outgoing-run");
+    conversation.command = .{ .ticket = .{ .value = 42 }, .kind = .sidebar_title, .draft_revision = 0, .id = command_id };
+    conversation.sidebar_pending = .{ .id = try Id.init("background-renamed"), .revision = 3 };
+    try conversation.receipt(&app, .{ .value = 42 }, .{ .command_id = .{ .value = &command_id }, .outcome = .accepted, .commit_sequence = 9 });
+    try std.testing.expectEqualStrings("clicked-target", conversation.thread.slice());
+    try std.testing.expectEqualStrings("clicked-target", app.view.active_thread.slice());
+    try std.testing.expect(app.view.sidebar_rename_followup == null);
+    try std.testing.expectEqual(@as(usize, 0), app.view.editor.textBytes().len);
+    try app.view.selectThread(try Id.init("old-active"));
+    try std.testing.expectEqualStrings("outgoing café draft", app.view.editor.textBytes());
+    app.view.sidebar_rename_followup = .{ .thread = try Id.init("must-not-open") };
+    conversation.command = .{ .ticket = .{ .value = 43 }, .kind = .sidebar_title, .draft_revision = 0, .id = command_id };
+    conversation.sidebar_pending = .{ .id = try Id.init("background-renamed"), .revision = 3 };
+    try conversation.receipt(&app, .{ .value = 43 }, .{ .command_id = .{ .value = &command_id }, .outcome = .rejected, .reason = .revision_conflict, .commit_sequence = 10 });
+    try std.testing.expect(app.view.sidebar_rename_followup == null);
+    try std.testing.expectEqualStrings("clicked-target", conversation.thread.slice());
+    try std.testing.expectEqualStrings("outgoing café draft", app.view.editor.textBytes());
+}
+
+test "final sidebar capture saves latest preferences with only a validated workspace route" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path);
+    const host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path[0..n] });
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    view.active_thread = try Id.init("unvalidated-new-route");
+    view.sidebar_collapsed = true;
+    view.sidebar_width_override = 348;
+    view.sidebar_shelf_expanded = .{ true, false, true };
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = host, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/final-sidebar") };
+    conversation.sidebar_state_loaded = true;
+    conversation.sidebar_state_key = Conversation.sidebarStateKey(conversation.workspace_root);
+    conversation.sidebar_validated_route = try Id.init("validated-old-route");
+    conversation.retainFinalSidebarState(&view);
+    host.destroy();
+    var store = try @import("domain/store.zig").Store.open(std.testing.io, path[0..n]);
+    defer store.close() catch {};
+    const bytes = (try store.loadPresentation(std.testing.allocator, &conversation.sidebar_state_key)).?;
+    defer std.testing.allocator.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const state = try Conversation.SidebarState.decode(bytes, arena.allocator());
+    try std.testing.expectEqualStrings("validated-old-route", state.selected_thread);
+    try std.testing.expect(state.collapsed);
+    try std.testing.expectEqual(@as(?f32, 348), state.width);
+    try std.testing.expectEqualDeep([3]bool{ true, false, true }, state.expanded);
 }
 
 test "sidebar saved settings validate bounds and preserve script default width" {
