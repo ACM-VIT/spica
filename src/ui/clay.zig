@@ -102,9 +102,18 @@ pub const Layout = struct {
         return sidebarWidthWith(design, width);
     }
 
+    /// T3 Code threadSidebarWidth.ts: minimum208px and640px main area.
+    /// An explicitly narrower script design remains a supported customization.
+    pub fn sidebarMinimumWith(design: @import("design.zig").Config) f32 {
+        return @min(208, design.layout.sidebar_width);
+    }
+
+    pub fn sidebarMaximumWith(design: @import("design.zig").Config, width: f32) f32 {
+        return @min(@max(0, width), @max(sidebarMinimumWith(design), @floor(width) - 640));
+    }
+
     pub fn sidebarWidthWith(design: @import("design.zig").Config, width: f32) f32 {
-        const preferred = design.layout.sidebar_width;
-        return @min(@max(0, width * 0.4), if (width <= 700) @min(preferred, 148) else preferred);
+        return @min(sidebarMaximumWith(design, width), @max(sidebarMinimumWith(design), design.layout.sidebar_width));
     }
 
     pub fn coding(self: *Layout, width: f32) Coding {
@@ -240,15 +249,17 @@ test "configured native geometry keeps responsive sidebar and bounded centered c
         const boxes = layout.coding(width);
         try std.testing.expectEqual(@as(f32, 80), boxes.header.height);
         try std.testing.expectApproxEqAbs(@as(f32, 208), boxes.composer.height, 0.1);
-        try std.testing.expect(layout.sidebarWidthFor(width) <= width * 0.4);
+        const expected_width = @min(@as(f32, 360), @max(@as(f32, 208), width - 640));
+        try std.testing.expectEqual(expected_width, layout.sidebarWidthFor(width));
         try std.testing.expect(boxes.composer.x >= layout.sidebarWidthFor(width));
         try std.testing.expect(boxes.composer.width <= 640);
         try std.testing.expect(boxes.composer.x + boxes.composer.width <= width);
         try std.testing.expectApproxEqAbs(boxes.transcript.x, boxes.composer.x, 0.1);
         try std.testing.expectApproxEqAbs(boxes.transcript.width, boxes.composer.width, 0.1);
         try std.testing.expect(boxes.transcript.y + boxes.transcript.height + 19.9 <= boxes.composer.y);
-        try std.testing.expectApproxEqAbs(@as(f32, 688), boxes.composer.y + boxes.composer.height, 0.1);
-        if (width == 700) try std.testing.expectEqual(@as(f32, 148), layout.sidebarWidthFor(width));
+        const gutter = @min(@as(f32, 32), (width - expected_width) / 4);
+        try std.testing.expectApproxEqAbs(720 - gutter, boxes.composer.y + boxes.composer.height, 0.1);
+        if (width == 700) try std.testing.expectEqual(@as(f32, 208), layout.sidebarWidthFor(width));
         if (width == 1000) try std.testing.expectEqual(@as(f32, 360), layout.sidebarWidthFor(width));
         if (width == 1280) try std.testing.expectEqual(@as(f32, 360), layout.sidebarWidthFor(width));
     }
@@ -274,4 +285,14 @@ test "custom node dimensions padding and gap reach Clay and preserve action indi
     try std.testing.expectEqualDeep(output[3], boxes.composer);
     try std.testing.expectApproxEqAbs(@as(f32, 180), boxes.composer.height, 0.1);
     try std.testing.expectEqualStrings("send", root.nodes[2].action.bytes[0..root.nodes[2].action.len]);
+}
+
+test "sidebar source width clamp preserves main area and explicit narrow scripts" {
+    for ([_][2]f32{ .{ 720, 208 }, .{ 900, 256 }, .{ 1280, 256 } }) |sample| {
+        try std.testing.expectEqual(sample[1], Layout.sidebarWidth(sample[0]));
+    }
+    try std.testing.expectEqual(@as(f32, 640), Layout.sidebarMaximumWith(.{}, 1280));
+    var custom: @import("design.zig").Config = .{};
+    custom.layout.sidebar_width = 148;
+    try std.testing.expectEqual(@as(f32, 148), Layout.sidebarWidthWith(custom, 720));
 }

@@ -13,6 +13,9 @@ const presentation = @import("../content/presentation.zig");
 const contract = @import("../contract.zig");
 const attachment_text = @import("../text/attachments.zig");
 const script_api = @import("../script.zig");
+const fuzzy = @cImport({
+    @cInclude("fuzzy.h");
+});
 
 // Visual reference: T3 Code eb1510d (MIT), apps/marketing/src/assets/app-desktop.webp;
 // apps/web/src/components/sidebar/{SidebarThreadHeader,SidebarThreadRow}.tsx and
@@ -203,6 +206,7 @@ pub const View = struct {
     sidebar_scroll: f32 = 0,
     sidebar_collapsed: bool = false,
     sidebar_width_override: ?f32 = null,
+    sidebar_window_width: f32 = 1280,
     sidebar_resizing: bool = false,
     sidebar_toggle_bounds: c.SDL_FRect = zero_rect,
     sidebar_resize_bounds: c.SDL_FRect = zero_rect,
@@ -1029,12 +1033,48 @@ pub const View = struct {
         if (self.scope_project.len != 0 and !entry.project_id.eql(self.scope_project.slice())) return false;
         const query = std.mem.trim(u8, self.search_query[0..self.search_len], " \t\r\n");
         if (query.len == 0) return true;
-        // Literal Unicode with ASCII case-insensitivity; no history decode,
-        // provider requests, allocation or unbounded indexing on the UI thread.
+        // Reuse the retained Unicode fold table. Both the source metadata and
+        // query are bounded, and ASCII candidates keep the short fast path.
         for ([_][]const u8{ entry.label[0..entry.len], entry.project_name.slice(), entry.workspace_name.slice(), entry.branch.slice() }) |value| {
-            if (std.ascii.indexOfIgnoreCase(value, query) != null) return true;
+            if (searchContains(value, query)) return true;
         }
         return false;
+    }
+
+    fn foldedSearch(bytes: []const u8, output: []u32) ?[]const u32 {
+        const input = std.unicode.Utf8View.init(bytes) catch return null;
+        var iterator = input.iterator();
+        var length: usize = 0;
+        while (iterator.nextCodepoint()) |scalar| {
+            var folded: [3]u32 = undefined;
+            const count = fuzzy.spica_fuzzy_case_fold(scalar, &folded);
+            if (count > folded.len or length + count > output.len) return null;
+            @memcpy(output[length..][0..count], folded[0..count]);
+            length += count;
+        }
+        return output[0..length];
+    }
+
+    fn searchContains(value: []const u8, query: []const u8) bool {
+        var ascii = true;
+        for (value) |byte| {
+            if (byte >= 0x80) {
+                ascii = false;
+                break;
+            }
+        }
+        if (ascii) for (query) |byte| {
+            if (byte >= 0x80) {
+                ascii = false;
+                break;
+            }
+        };
+        if (ascii) return std.ascii.indexOfIgnoreCase(value, query) != null;
+        var query_buffer: [160 * 3]u32 = undefined;
+        var value_buffer: [transcript.id_bytes * 3]u32 = undefined;
+        const folded_query = foldedSearch(query, &query_buffer) orelse return false;
+        const folded_value = foldedSearch(value, &value_buffer) orelse return false;
+        return std.mem.indexOf(u32, folded_value, folded_query) != null;
     }
 
     pub fn visibleThreadCount(self: *const View) usize {
@@ -1177,7 +1217,7 @@ pub const View = struct {
         if (entry.id.eql(self.sidebar_rename_thread.slice())) {
             self.sidebar_rename_bounds = .{ .x = x - 2, .y = y - 2, .w = @max(0, width + 4), .h = 22 };
             try widgets.panel(renderer, self.sidebar_rename_bounds, 3, self.design.colors.border);
-            if (self.sidebar_rename_select_all) try widgets.panel(renderer, .{ .x = x, .y = y, .w = @min(width, try self.labels.width(text, self.sidebar_rename_buffer[0..self.sidebar_rename_len], 14)), .h = 18 }, 1, self.design.colors.selection);
+            if (self.sidebar_rename_select_all) try widgets.panel(renderer, .{ .x = x, .y = y, .w = @min(width, try self.labels.width(text, @import("../text/utf8.zig").prefix(self.sidebar_rename_buffer[0..self.sidebar_rename_len], @import("label_cache.zig").max_bytes), 14)), .h = 18 }, 1, self.design.colors.selection);
             try self.labels.drawFitted(renderer, text, self.sidebar_rename_buffer[0..self.sidebar_rename_len], x, y, width, 14, foreground);
             _ = self.navigation_targets.add("sidebar.rename", "textbox", self.sidebar_rename_bounds, true) catch {};
         } else try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], x, y, width, 14, foreground);
@@ -1610,7 +1650,7 @@ pub const View = struct {
             },
             c.SDL_EVENT_MOUSE_MOTION => {
                 if (self.custom_root == null and self.sidebar_resizing) {
-                    self.sidebar_width_override = std.math.clamp(event.motion.x, @min(256, self.design.layout.sidebar_width), @import("design.zig").metric_max[0]);
+                    if (std.math.isFinite(event.motion.x)) self.sidebar_width_override = std.math.clamp(event.motion.x, Layout.sidebarMinimumWith(self.design), Layout.sidebarMaximumWith(self.design, self.sidebar_window_width));
                     return true;
                 }
                 if (self.custom_root == null and self.sidebar_menu_thread.len != 0) {
@@ -2307,6 +2347,7 @@ pub const View = struct {
         const metrics = self.design.layout;
         const palette = self.design.colors;
         self.sidebar_now_ms = wallTimeMs();
+        self.sidebar_window_width = bounds.header.width;
         const sidebar = self.sidebarWidth(bounds.header.width);
         const height = bounds.composer.y + bounds.composer.height + metrics.gutter;
         const inset = @min(metrics.gutter, 20);
@@ -2550,8 +2591,9 @@ pub const View = struct {
                 try self.drawSidebarTitle(renderer, text, entry, x, row.y + 32, width, foreground);
                 if (entry.runtime_kind.len != 0) {
                     const provider = if (entry.runtime_kind.eql("codex")) "Codex" else if (entry.runtime_kind.eql("opencode")) "OpenCode" else entry.runtime_kind.slice();
-                    const provider_width = try self.labels.width(text, provider, 10);
-                    try self.labels.draw(text, provider, row.x + row.w - 10 - provider_width, row.y + 58, 10, muted);
+                    const provider_label = @import("../text/utf8.zig").prefix(provider, @import("label_cache.zig").max_bytes);
+                    const provider_width = try self.labels.width(text, provider_label, 10);
+                    try self.labels.draw(text, provider_label, row.x + row.w - 10 - provider_width, row.y + 58, 10, muted);
                 }
                 const metadata = if (entry.branch.len != 0) entry.branch.slice() else entry.workspace_name.slice();
                 if (metadata.len != 0) {
@@ -4389,6 +4431,16 @@ test "sidebar project scope keyboard selection retains real identity and consume
     try std.testing.expectEqual(@as(usize, 0), view.scope_project.len);
 }
 
+test "sidebar Unicode search folds accents sharp s and Greek without allocating" {
+    for ([_][2][]const u8{ .{ "CAFÉ", "café" }, .{ "Straße", "STRASSE" }, .{ "Σίσυφος", "ΣΊΣΥΦΟΣ" }, .{ "naïve", "NAÏVE" } }) |pair| {
+        try std.testing.expect(View.searchContains(pair[0], pair[1]));
+        try std.testing.expect(View.searchContains(pair[1], pair[0]));
+    }
+    try std.testing.expect(!View.searchContains("café", "cafe"));
+    try std.testing.expect(!View.searchContains("🎮", "🎧"));
+    try std.testing.expect(!View.searchContains("\xff", "query"));
+}
+
 test "sidebar inline rename targets an unselected Unicode row without changing the active draft" {
     var view = try View.init(std.testing.allocator);
     defer view.deinit();
@@ -4449,9 +4501,14 @@ test "sidebar shelves retain selected rows and context actions keep stable threa
     view.threads[3].snoozed_until = View.wallTimeMs() + 3_600_000;
     view.threads[4].settled = true;
     view.active_thread = view.threads[1].id;
+    @memcpy(view.threads[0].label[0..160], "🎮" ** 40);
+    view.threads[0].len = 160;
+    view.beginSidebarRename(0);
     const bounds = layout.coding(1280);
     try view.drawChrome(renderer, text, bounds, view.design.colors.foreground, view.design.colors.muted);
     try std.testing.expectEqual(@as(f32, 78), view.threadRowBounds(0).h);
+    try std.testing.expectEqualStrings("🎮" ** 40, view.sidebar_rename_buffer[0..view.sidebar_rename_len]);
+    view.sidebar_rename_thread = .{};
     try std.testing.expectEqual(@as(f32, 78), view.threadRowBounds(2).h);
     try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(3));
     try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(4));
