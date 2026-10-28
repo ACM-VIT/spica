@@ -6,6 +6,7 @@ const LineView = @import("line_view.zig").LineView;
 const SidebarMenu = @import("sidebar_menu.zig");
 const SidebarTime = @import("../platform/sidebar_time.zig");
 const SidebarSnooze = @import("sidebar_snooze.zig");
+const SidebarLifecycle = @import("sidebar_lifecycle.zig");
 const EditorView = @import("editor_view.zig").EditorView;
 const LabelCache = @import("label_cache.zig").LabelCache;
 const widgets = @import("widgets.zig");
@@ -244,6 +245,15 @@ pub const View = struct {
     custom_snooze_days: [42]c.SDL_FRect = @splat(zero_rect),
     custom_snooze_month_bounds: [2]c.SDL_FRect = @splat(zero_rect),
     custom_snooze_calendar_bounds: c.SDL_FRect = zero_rect,
+    sidebar_lifecycle: SidebarLifecycle.State = .{},
+    sidebar_archived: bool = false,
+    sidebar_archive_request: ?bool = null,
+    sidebar_undo_bounds: c.SDL_FRect = zero_rect,
+    sidebar_archive_bounds: c.SDL_FRect = zero_rect,
+    sidebar_undo_label: [32]u8 = @splat(0),
+    sidebar_undo_len: usize = 0,
+    sidebar_undo_request: ?SidebarLifecycle.UndoOperation = null,
+    sidebar_lifecycle_bounds: [2]c.SDL_FRect = @splat(zero_rect),
     sidebar_action_bounds: [32][2]c.SDL_FRect = @splat(@splat(zero_rect)),
     search_bounds: c.SDL_FRect = zero_rect,
     search_clear_bounds: c.SDL_FRect = zero_rect,
@@ -582,6 +592,9 @@ pub const View = struct {
         settled: bool = false,
         snoozed_until: i64 = 0,
         sort_order: i64 = 0,
+        archived: bool = false,
+        can_archive: bool = false,
+        can_delete: bool = false,
     };
 
     pub const WorkflowAction = union(enum) { cleanup_prompt, add, remove: usize, enqueue, edit: usize, cancel: usize, up: usize, down: usize, question_choice: usize, question_submit };
@@ -1146,6 +1159,7 @@ pub const View = struct {
     const SidebarSection = enum(u8) { pinned, active, working, snoozed, settled };
 
     fn sidebarSection(self: *const View, entry: *const Entry) SidebarSection {
+        if (entry.archived) return .settled;
         if (entry.snoozed_until > self.sidebar_now_ms) return .snoozed;
         if (entry.settled) return .settled;
         if (entry.pinned) return .pinned;
@@ -1291,6 +1305,15 @@ pub const View = struct {
                     self.openSidebarSnooze();
                     return;
                 },
+                .archive, .restore, .delete => |action| {
+                    self.requestSidebarLifecycle(entry.id, switch (action) {
+                        .archive => .archive,
+                        .restore => .restore,
+                        .delete => .delete,
+                        else => unreachable,
+                    });
+                    return;
+                },
                 else => return,
             },
         }
@@ -1325,6 +1348,88 @@ pub const View = struct {
             self.custom_snooze_thread = .{};
             self.line_view.reset();
         }
+    }
+
+    pub const SidebarLifecycleRequest = SidebarLifecycle.Request;
+    pub const SidebarUndoOperation = SidebarLifecycle.UndoOperation;
+    pub fn takeSidebarLifecycleRequest(self: *View) ?SidebarLifecycleRequest {
+        return self.sidebar_lifecycle.take();
+    }
+    pub fn sidebarLifecycleConfirmOpen(self: *const View) bool {
+        return self.sidebar_lifecycle.confirming != null;
+    }
+    pub fn sidebarLifecyclePending(self: *const View) bool {
+        return self.sidebar_lifecycle.pending;
+    }
+    pub fn finishSidebarLifecycle(self: *View, failure: ?[]const u8) void {
+        self.sidebar_lifecycle.finish(failure);
+    }
+    pub fn requestSidebarLifecycle(self: *View, id: transcript.Id, action: SidebarLifecycle.Action) void {
+        self.sidebar_lifecycle.request(id, action);
+    }
+    pub fn confirmSidebarDelete(self: *View) void {
+        self.sidebar_lifecycle.confirmDelete();
+    }
+    pub fn offerSidebarUndo(self: *View, operation: SidebarUndoOperation, label: []const u8) void {
+        self.sidebar_lifecycle.offerUndo(operation, label, wallTimeMs());
+    }
+    pub fn takeSidebarUndoRequest(self: *View) ?SidebarUndoOperation {
+        const undo_request = self.sidebar_undo_request;
+        self.sidebar_undo_request = null;
+        return undo_request orelse self.sidebar_lifecycle.takeUndo(wallTimeMs());
+    }
+    pub fn invalidateSidebarUndo(self: *View, id: transcript.Id) void {
+        self.sidebar_lifecycle.invalidateUndo(id);
+    }
+
+    fn claimSidebarUndo(self: *View) void {
+        if (self.sidebar_undo_request == null) self.sidebar_undo_request = self.sidebar_lifecycle.takeUndo(wallTimeMs());
+    }
+    pub fn takeSidebarArchiveBrowserRequest(self: *View) ?bool {
+        const archive_request = self.sidebar_archive_request;
+        self.sidebar_archive_request = null;
+        return archive_request;
+    }
+    pub fn discardSidebarThreadDraft(self: *View, id: transcript.Id) void {
+        if (self.active_thread.eql(id.slice())) {
+            self.editor.setText("") catch {};
+            self.active_thread = .{};
+            self.active_project = .{};
+        }
+    }
+
+    fn handleSidebarLifecycle(self: *View, event: c.SDL_Event) bool {
+        if (self.sidebar_lifecycle.confirming == null) return false;
+        if (event.type == c.SDL_EVENT_KEY_DOWN) {
+            if (event.key.key == c.SDLK_ESCAPE) {
+                self.sidebar_lifecycle.confirming = null;
+                return true;
+            }
+            if (event.key.key == c.SDLK_RETURN or event.key.key == c.SDLK_KP_ENTER) {
+                if (self.sidebar_lifecycle.confirm_delete_selected) {
+                    self.confirmSidebarDelete();
+                } else {
+                    self.sidebar_lifecycle.confirming = null;
+                }
+                return true;
+            }
+            if (event.key.key == c.SDLK_TAB or event.key.key == c.SDLK_LEFT or event.key.key == c.SDLK_RIGHT) {
+                self.sidebar_lifecycle.confirm_delete_selected = !self.sidebar_lifecycle.confirm_delete_selected;
+                return true;
+            }
+        } else if (event.type == c.SDL_EVENT_MOUSE_BUTTON_DOWN and event.button.button == c.SDL_BUTTON_LEFT) {
+            if (widgets.contains(self.sidebar_lifecycle_bounds[0], event.button.x, event.button.y)) {
+                self.sidebar_lifecycle.confirm_delete_selected = false;
+                self.sidebar_lifecycle.confirming = null;
+                return true;
+            }
+            if (widgets.contains(self.sidebar_lifecycle_bounds[1], event.button.x, event.button.y)) {
+                self.sidebar_lifecycle.confirm_delete_selected = true;
+                self.confirmSidebarDelete();
+                return true;
+            }
+        }
+        return true;
     }
 
     fn beginSidebarRename(self: *View, index: usize) void {
@@ -1760,10 +1865,19 @@ pub const View = struct {
     }
 
     pub fn handle(self: *View, event: c.SDL_Event, window: *c.SDL_Window, text: *c.SpicaText) !bool {
+        if (self.handleSidebarLifecycle(event)) return true;
         if (self.custom_snooze != null) switch (event.type) {
             c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_KEY_UP, c.SDL_EVENT_TEXT_INPUT, c.SDL_EVENT_TEXT_EDITING, c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_BUTTON_UP, c.SDL_EVENT_MOUSE_MOTION, c.SDL_EVENT_MOUSE_WHEEL => return self.handleCustomSnooze(event, window),
             else => {},
         };
+        if (event.type == c.SDL_EVENT_KEY_DOWN) {
+            const undo_mod = event.key.mod & c.SDL_KMOD_CTRL != 0 or event.key.mod & c.SDL_KMOD_GUI != 0;
+            if (undo_mod and event.key.key == c.SDLK_Z and self.sidebar_lifecycle.shortcut_claimed) {
+                self.claimSidebarUndo();
+                return true;
+            }
+            if (!(undo_mod and event.key.key == c.SDLK_Z)) self.sidebar_lifecycle.shortcut_claimed = false;
+        } else if (event.type == c.SDL_EVENT_TEXT_INPUT or event.type == c.SDL_EVENT_TEXT_EDITING) self.sidebar_lifecycle.shortcut_claimed = false;
         switch (event.type) {
             c.SDL_EVENT_WINDOW_FOCUS_LOST => {
                 self.releasePointer();
@@ -1827,6 +1941,16 @@ pub const View = struct {
                         self.sidebar_collapsed = !self.sidebar_collapsed;
                         self.scope_open = false;
                         self.search_focused = false;
+                        return true;
+                    }
+                    if (widgets.contains(self.sidebar_archive_bounds, x, y)) {
+                        self.sidebar_archived = !self.sidebar_archived;
+                        self.sidebar_archive_request = self.sidebar_archived;
+                        self.sidebarChanged();
+                        return true;
+                    }
+                    if (widgets.contains(self.sidebar_undo_bounds, x, y)) {
+                        self.claimSidebarUndo();
                         return true;
                     }
                     if (widgets.contains(self.sidebar_resize_bounds, x, y)) {
@@ -2875,11 +2999,14 @@ pub const View = struct {
             // Make the actual connection entry point legible. A settings glyph
             // alone left first-time users guessing where provider setup lived;
             // the whole status row is now one painted, clickable target.
-            self.setup_bounds = .{ .x = 8, .y = height - 36, .w = sidebar - 16, .h = 32 };
+            self.setup_bounds = .{ .x = 8, .y = height - 36, .w = @max(0, sidebar - 120), .h = 32 };
+            self.sidebar_archive_bounds = .{ .x = @max(8, sidebar - 112), .y = height - 36, .w = 96, .h = 32 };
             if (self.setup_open) try widgets.panel(renderer, self.setup_bounds, 6, palette.sidebar_active);
             try icon(renderer, .settings, 16, height - 28, sidebar_muted);
             try self.labels.draw(text, "Connection", 40, height - 29, 12, foreground);
             try self.labels.drawFitted(renderer, text, self.status, 40, height - 16, sidebar - 56, 10, sidebar_muted);
+            _ = self.navigation_targets.add("sidebar.archived.toggle", "button", self.sidebar_archive_bounds, true) catch {};
+            try self.labels.drawFitted(renderer, text, if (self.sidebar_archived) "Active threads" else "Archived", self.sidebar_archive_bounds.x + 8, height - 28, self.sidebar_archive_bounds.w - 8, 11, sidebar_muted);
             if (self.scope_open) try self.drawScope(renderer, text, foreground, sidebar_muted);
         }
         try icon(renderer, .sidebar, self.sidebar_toggle_bounds.x + 6, self.sidebar_toggle_bounds.y + 6, muted);
@@ -3077,7 +3204,7 @@ pub const View = struct {
 
     fn sidebarActionStart(entry: *const Entry, row: c.SDL_FRect, slim: bool) f32 {
         const action_width: f32 = if (entry.settled) 68 else 54;
-        return row.x + row.w - action_width - 6 - (if (slim) @as(f32, 0) else 24);
+        return row.x + row.w - action_width - 6 - (if (slim or !entry.can_snooze) @as(f32, 0) else 24);
     }
 
     fn drawSidebarRowActions(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, index: usize, row: c.SDL_FRect, slim: bool, color: Color) !void {
@@ -3091,7 +3218,7 @@ pub const View = struct {
         try self.labels.draw(text, label, action.x + 4, top + 4, 11, color);
         var id: [96]u8 = undefined;
         _ = self.navigation_targets.add(try std.fmt.bufPrint(&id, "sidebar.thread.{d}.settle", .{index}), "button", action, action.h > 0) catch {};
-        if (!slim) {
+        if (!slim and entry.can_snooze) {
             self.sidebar_action_bounds[index][1] = clippedRect(.{ .x = action.x - 24, .y = top, .w = 24, .h = 22 }, self.sidebar_rows);
             const snooze = self.sidebar_action_bounds[index][1];
             try icon(renderer, .clock, snooze.x + 4, top + 3, if (entry.can_snooze) color else self.design.colors.muted);
@@ -3121,7 +3248,7 @@ pub const View = struct {
         const entry = self.threads[index];
         const snoozed = entry.snoozed_until > wallTimeMs();
         if (self.sidebar_menu_mode == .main) {
-            self.sidebar_menu_panel = SidebarMenu.main(.{ .can_operate = self.navigation_enabled, .pinned = entry.pinned, .settled = entry.settled, .snoozed = snoozed, .can_snooze = entry.can_snooze, .filter_active = self.scope_project.eql(entry.project_id.slice()) });
+            self.sidebar_menu_panel = SidebarMenu.main(.{ .can_operate = self.navigation_enabled, .pinned = entry.pinned, .settled = entry.settled, .snoozed = snoozed, .can_snooze = entry.can_snooze, .filter_active = self.scope_project.eql(entry.project_id.slice()), .archived = entry.archived, .can_archive = entry.can_archive, .can_delete = entry.can_delete });
         } else if (self.sidebar_menu_mode == .copy) {
             self.sidebar_menu_panel = SidebarMenu.copy(entry.workspace_path_len != 0, entry.branch.len != 0);
         }
@@ -3259,6 +3386,47 @@ pub const View = struct {
                 try self.labels.draw(text, try std.fmt.bufPrint(&day, "{d}", .{@as(u32, cell.day)}), rect.x + 8, rect.y + 7, 12, if (cell.disabled or !cell.current_month) palette.muted else palette.foreground);
             }
         }
+    }
+
+    fn drawSidebarLifecycle(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, width: f32, height: f32) !void {
+        const id = self.sidebar_lifecycle.confirming orelse return;
+        _ = id;
+        self.navigation_targets.clear();
+        const palette = self.design.colors;
+        const w: f32 = @min(360, width - 24);
+        const h: f32 = 170;
+        const panel = c.SDL_FRect{ .x = (width - w) / 2, .y = (height - h) / 2, .w = w, .h = h };
+        if (!c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_BLEND) or !c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 160) or !c.SDL_RenderFillRect(renderer, null)) return error.ModalDraw;
+        try widgets.panel(renderer, panel, 10, palette.border);
+        try widgets.panel(renderer, .{ .x = panel.x + 1, .y = panel.y + 1, .w = w - 2, .h = h - 2 }, 9, palette.raised);
+        try self.labels.draw(text, "Delete thread?", panel.x + 20, panel.y + 22, 16, palette.foreground);
+        try self.labels.drawFitted(renderer, text, "This permanently removes the thread from the workspace.", panel.x + 20, panel.y + 52, w - 40, 12, palette.muted);
+        self.sidebar_lifecycle_bounds[0] = .{ .x = panel.x + w - 180, .y = panel.y + h - 48, .w = 76, .h = 32 };
+        self.sidebar_lifecycle_bounds[1] = .{ .x = panel.x + w - 96, .y = panel.y + h - 48, .w = 76, .h = 32 };
+        const labels = [_][]const u8{ "Cancel", "Delete" };
+        for (self.sidebar_lifecycle_bounds, 0..) |rect, index| {
+            try widgets.panel(renderer, rect, 5, if ((index == 1) == self.sidebar_lifecycle.confirm_delete_selected) palette.selection else palette.surface);
+            _ = self.navigation_targets.add(if (index == 0) "sidebar.delete.cancel" else "sidebar.delete.confirm", "button", rect, !self.sidebar_lifecycle.pending) catch {};
+            try self.labels.draw(text, labels[index], rect.x + 12, rect.y + 9, 12, if (index == 1) palette.danger else palette.foreground);
+        }
+    }
+
+    fn drawSidebarUndo(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, width: f32, height: f32) !void {
+        const undo = self.sidebar_lifecycle.undo orelse return;
+        if (wallTimeMs() >= undo.expires_at) {
+            self.sidebar_lifecycle.undo = null;
+            self.sidebar_lifecycle.shortcut_claimed = false;
+            return;
+        }
+        self.sidebar_undo_label = undo.label;
+        self.sidebar_undo_len = undo.label_len;
+        const w: f32 = @min(300, width - 24);
+        self.sidebar_undo_bounds = .{ .x = width - w - 16, .y = height - 74, .w = w, .h = 34 };
+        try widgets.panel(renderer, self.sidebar_undo_bounds, 6, self.design.colors.raised);
+        const label = undo.label[0..undo.label_len];
+        try self.labels.drawFitted(renderer, text, label, self.sidebar_undo_bounds.x + 10, self.sidebar_undo_bounds.y + 10, w - 90, 11, self.design.colors.foreground);
+        _ = self.navigation_targets.add("sidebar.undo", "button", .{ .x = self.sidebar_undo_bounds.x + w - 72, .y = self.sidebar_undo_bounds.y + 4, .w = 64, .h = 26 }, true) catch {};
+        try self.labels.draw(text, "Undo", self.sidebar_undo_bounds.x + w - 64, self.sidebar_undo_bounds.y + 10, 11, self.design.colors.accent_text);
     }
 
     fn drawWorkspace(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
@@ -3859,6 +4027,8 @@ pub const View = struct {
         if (self.custom_root == null and self.workspace_open and !self.setup_open) try self.drawWorkspace(renderer, text, bounds, foreground, muted);
         if (self.custom_root == null and self.sidebar_menu_thread.len != 0) try self.drawSidebarMenu(renderer, text, bounds.header.width, self.sidebar_bounds.h);
         if (self.custom_snooze != null) try self.drawCustomSnooze(renderer, text, bounds.header.width, self.sidebar_bounds.h);
+        if (self.sidebar_lifecycle.confirming != null) try self.drawSidebarLifecycle(renderer, text, bounds.header.width, self.sidebar_bounds.h);
+        if (self.sidebar_lifecycle.undo != null and self.sidebar_lifecycle.confirming == null and self.custom_snooze == null) try self.drawSidebarUndo(renderer, text, bounds.header.width, self.sidebar_bounds.h);
         if (self.window_active and self.focused) if (self.activeLine()) |field| {
             const fallback = switch (field) {
                 .search => self.search_bounds,

@@ -18,6 +18,9 @@ pub const Action = enum {
     copy_id,
     preset,
     custom,
+    archive,
+    restore,
+    delete,
 };
 pub const Item = struct {
     action: Action,
@@ -90,15 +93,24 @@ pub const MainState = struct {
     snoozed: bool,
     can_snooze: bool,
     filter_active: bool,
+    archived: bool = false,
+    can_archive: bool = false,
+    can_delete: bool = false,
 };
 pub fn main(state: MainState) Panel {
     var panel: Panel = .{};
-    panel.append(.{ .action = if (state.pinned) .unpin else .pin, .id = "sidebar.menu.pin", .label = if (state.pinned) "Unpin thread" else "Pin thread", .enabled = state.can_operate });
+    if (state.archived) {
+        panel.append(.{ .action = .restore, .id = "sidebar.menu.restore", .label = "Restore thread", .enabled = state.can_operate });
+    } else {
+        panel.append(.{ .action = if (state.pinned) .unpin else .pin, .id = "sidebar.menu.pin", .label = if (state.pinned) "Unpin thread" else "Pin thread", .enabled = state.can_operate });
+    }
     panel.append(.{ .action = if (state.settled) .unsettle else .settle, .id = "sidebar.menu.settle", .label = if (state.settled) "Un-settle thread" else "Settle thread", .enabled = state.can_operate });
     panel.append(.{ .action = if (state.snoozed) .wake else .snooze, .id = if (state.snoozed) "sidebar.menu.wake" else "sidebar.menu.snooze", .label = if (state.snoozed) "Wake thread" else "Snooze", .enabled = state.can_operate and (state.snoozed or state.can_snooze) });
     panel.append(.{ .action = .rename, .id = "sidebar.menu.rename", .label = "Rename thread", .separator_before = true });
     panel.append(.{ .action = .filter, .id = "sidebar.menu.filter", .label = if (state.filter_active) "Show all projects" else "Filter by project" });
     panel.append(.{ .action = .copy, .id = "sidebar.menu.copy", .label = "Copy", .separator_before = true });
+    panel.append(.{ .action = .archive, .id = "sidebar.menu.archive", .label = "Archive thread", .separator_before = true, .enabled = state.can_archive });
+    panel.append(.{ .action = .delete, .id = "sidebar.menu.delete", .label = "Delete", .enabled = state.can_delete });
     return panel;
 }
 pub fn copy(has_path: bool, has_branch: bool) Panel {
@@ -221,6 +233,9 @@ test "menus keep local utilities available and skip disabled items with wrapped 
     panel = .{};
     panel.move(true);
     try std.testing.expect(panel.current() == null);
+    const archived = main(.{ .can_operate = true, .pinned = false, .settled = false, .snoozed = false, .can_snooze = false, .filter_active = false, .archived = true, .can_archive = false, .can_delete = true });
+    try std.testing.expectEqual(Action.restore, archived.items[0].action);
+    try std.testing.expectEqual(Action.delete, archived.items[7].action);
 }
 
 test "snooze omits unavailable calendar choices while retaining stable deadline slots" {
