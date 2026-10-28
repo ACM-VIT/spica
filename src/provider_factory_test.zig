@@ -383,9 +383,9 @@ test "Codex 0.164 catalog records the installed revision and authorizes compatib
     try factory.runtimeAction(std.testing.allocator, std.testing.io, .refresh);
     try std.testing.expectEqual(@as(usize, 1), factory.models().len);
     const discovered = factory.models()[0];
-    try std.testing.expectEqualStrings("0.164.0", discovered.selection.required_runtime_version);
+    try std.testing.expectEqualStrings(chosen.required_runtime_version, discovered.selection.required_runtime_version);
     try std.testing.expectEqual(.ready, factory.resolveSelection(discovered.selection).readiness);
-    try std.testing.expectEqualStrings("0.164.0", factory.discover(discovered.selection).runtime_version);
+    try std.testing.expectEqualStrings(chosen.required_runtime_version, factory.discover(discovered.selection).runtime_version);
     try std.testing.expect(std.mem.startsWith(u8, factory.runtimeStatus().reason, "ChatGPT account signed in"));
     const instance = try factory.create(std.testing.allocator, discovered.selection, root, .{ .value = "newer-supported-runtime" }, null);
     defer factory.destroy(std.testing.allocator, instance);

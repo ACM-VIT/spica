@@ -106,7 +106,7 @@ pub fn codex(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire: *t
 }
 pub fn codexWithDiagnostic(allocator: std.mem.Allocator, retained: std.mem.Allocator, wire: *transport.Transport, selection: c.Selection, output: []c.Model, diagnostic: *RpcDiagnostic) !usize {
     const init = try call(wire, allocator, diagnostic, 1, "initialize", .{ .clientInfo = .{ .name = "spica", .version = "1" }, .capabilities = .{ .experimentalApi = true } });
-    const version = try codexRuntimeVersion(text(field(init, "userAgent")));
+    _ = try codexRuntimeVersion(text(field(init, "userAgent")));
     try wire.send("{\"method\":\"initialized\",\"params\":{}}");
     const account = try call(wire, allocator, diagnostic, 2, "account/read", .{ .refreshToken = false });
     const readiness = codexAccountReadiness(account);
@@ -119,9 +119,11 @@ pub fn codexWithDiagnostic(allocator: std.mem.Allocator, retained: std.mem.Alloc
         if (data != .array) return error.InvalidCatalog;
         for (data.array.items) |model| {
             if (count == output.len) return error.CatalogLimit;
-            var actual = selection;
-            actual.required_runtime_version = version;
-            output[count] = try codexModel(retained, actual, model, readiness);
+            // Keep the tested compatibility requirement stable across CLI
+            // updates. Sessions compare selection identities exactly; replacing
+            // this with the observed build would strand an existing chat.
+            // The adapter records its actual build on every observation.
+            output[count] = try codexModel(retained, selection, model, readiness);
             output[count].reason = codexAccountReason(account);
             count += 1;
         }
