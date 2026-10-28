@@ -73,7 +73,7 @@ const NativeProvider = struct {
             return error.AccountStatusFailed;
         }
         if (mode == .status) {
-            try std.Io.File.stdout().writeStreamingAll(io, if (runtime.readiness == .ready) "ChatGPT account ready in selected isolated state.\n" else "ChatGPT sign-in required in selected isolated state.\n");
+            try std.Io.File.stdout().writeStreamingAll(io, if (runtime.readiness == .ready) "Selected Codex account is ready.\n" else "Selected Codex account requires sign-in.\n");
             return;
         }
         try runtime.startLogin(mode == .device);

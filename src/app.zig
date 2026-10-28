@@ -110,6 +110,8 @@ pub const App = struct {
     snapshot: automation.Snapshot = .{},
     conversation: ?*Conversation = null,
     live: ?*Live = null,
+    folder_dialog: ?*@import("platform/folder_dialog.zig").Request = null,
+    folder_runtime: contract.RuntimeKind = .codex,
 
     lua: ?*LuaBridge = null,
 
@@ -285,6 +287,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.folder_dialog) |request| request.release();
         if (self.live) |live| {
             live.file.close(live.io);
             self.view.allocator.destroy(live);
@@ -310,6 +313,7 @@ pub const App = struct {
                 self.snapshot.close_reason = "deadline";
                 break;
             };
+            self.pollFolderDialog();
             if (self.conversation) |conversation| try conversation.pump(self);
             if (self.lua) |bridge| try bridge.pump(self);
             if (self.dirty and !self.minimized) {
@@ -335,6 +339,26 @@ pub const App = struct {
             while (c.SDL_PollEvent(&event)) try self.handle(event);
         }
         std.log.info("Spica foundation stopped; frames={d}", .{self.frames});
+    }
+
+    fn pollFolderDialog(self: *App) void {
+        const request = self.folder_dialog orelse return;
+        const result = request.result() orelse return;
+        defer request.release();
+        self.folder_dialog = null;
+        self.view.setup_folder_pending = false;
+        self.dirty = true;
+        switch (result) {
+            .selected => |path| {
+                if (self.view.setup_runtime != self.folder_runtime) {
+                    self.view.notice = "Connection changed while choosing a folder. Choose the folder again for this provider.";
+                } else if (!self.view.setWorkspaceFolder(path)) {
+                    self.view.notice = "This folder path cannot fit in the connection form. Choose a shorter path (up to 512 UTF-8 bytes).";
+                } else self.view.notice = "Project folder selected. Connect to use it.";
+            },
+            .failed => self.view.notice = "Could not open the system folder chooser. Enter the project folder in the Workspace field above.",
+            .cancelled => {},
+        }
     }
 
     fn handle(self: *App, event: c.SDL_Event) !void {
@@ -439,7 +463,14 @@ pub const App = struct {
         if (self.view.takeWorkspaceRefreshRequest()) if (self.conversation) |conversation| if (conversation.inspection_binding) |binding| conversation.requestInspectionStatus(&self.view, binding);
         if (self.view.setup_action) |action| {
             self.view.setup_action = null;
-            if (self.conversation) |conversation| conversation.setup(self, action) catch |err| {
+            if (action == .choose_workspace) {
+                if (self.folder_dialog == null) {
+                    self.folder_runtime = self.view.setup_runtime;
+                    self.folder_dialog = @import("platform/folder_dialog.zig").Request.open(std.heap.page_allocator, self.window, self.view.setup_fields[2][0..self.view.setup_lengths[2]]) catch null;
+                    self.view.setup_folder_pending = self.folder_dialog != null;
+                    if (self.folder_dialog == null) self.view.notice = "Could not open the folder chooser. Enter the Workspace path above.";
+                }
+            } else if (self.conversation) |conversation| conversation.setup(self, action) catch |err| {
                 self.view.notice = @errorName(err);
             };
         }
@@ -705,6 +736,7 @@ pub const App = struct {
         for (self.view.setup_field_bounds, 0..) |bounds, index| self.snapshot.setup_field_targets[index] = setupTarget(([_][]const u8{ "runtime.executable", "runtime.account", "runtime.workspace", "runtime.model_provider" })[index], "textbox", bounds, self.view.setup_open);
         self.snapshot.setup_advanced_target = setupTarget("runtime.advanced", "button", self.view.setup_advanced_bounds, self.view.setup_open);
         self.snapshot.setup_existing_target = setupTarget("runtime.existing_codex", "button", self.view.setup_existing_bounds, self.view.setup_open and self.view.existingCodexEnabled());
+        self.snapshot.setup_folder_target = setupTarget("runtime.choose_workspace", "button", self.view.setup_folder_bounds, self.view.setup_open and self.view.chooseWorkspaceEnabled());
         self.snapshot.setup_login_target = setupTarget("runtime.open_login", "button", self.view.setup_login_bounds, self.view.setup_open and self.view.login_url_len != 0);
         const setup_ids = [_][]const u8{ "runtime.configure", "runtime.browser", "runtime.device", "runtime.refresh" };
         for (self.view.setup_button_bounds, 0..) |bounds, index| {
@@ -1463,7 +1495,7 @@ const Conversation = struct {
                     try self.configureSetup(configuration, login);
                 } else try self.submit(.login, .absent, .absent, .{ .runtime_login = login }, 0);
             },
-            .open_login => unreachable,
+            .open_login, .choose_workspace => unreachable,
             .configure => {
                 self.invalidateSelectionForConfiguration(&app.view, configuration);
                 try self.configureSetup(configuration, null);
@@ -1930,6 +1962,13 @@ const Conversation = struct {
     /// queue admission and its concrete provider-frame check remain authoritative.
     fn sendIdentified(self: *Conversation, app: *App, target: types.Target, revision: types.Precondition, prompt: []const u8, selection: contract.Selection, draft_revision: u64, id: [32]u8) !void {
         if (self.command != null) return error.CommandPending;
+        // Custom roots also enter here. A retained action must never bypass the
+        // visible connection's routing boundary with a previous provider.
+        if (!selectionMatchesConfiguration(selection, setupConfiguration(&app.view))) {
+            app.view.send_diagnostic.stage = .disabled;
+            self.notice(&app.view, "Connection changed. Connect and choose a model for this provider before sending. Your draft is retained.");
+            return;
+        }
         if (self.unknown_send) |*pending| {
             if (self.query == null) {
                 try self.ask(.send_receipt, .{ .command_receipt = .{ .value = &pending.id } });
@@ -3568,6 +3607,20 @@ test "switching to OpenCode invalidates a saved Codex selection before Send" {
     conversation.invalidateSelectionForConfiguration(&app.view, opencode);
     try std.testing.expect(app.view.selected == null);
     try std.testing.expect(conversation.durable_selection == null);
+}
+
+test "custom Send refuses a stale Codex action after selecting OpenCode" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    const codex = contract.Selection{ .runtime_kind = "codex", .required_runtime_version = "0.163.0", .model_provider = "openai", .model_id = "gpt", .effort = "low", .account_ref = "/accounts/codex", .workspace = .{ .value = "workspace" } };
+    try std.testing.expect(app.view.configureSetup(.{ .runtime_kind = .opencode, .executable = "/bin/opencode", .account_directory = "/accounts/opencode", .workspace_root = "/project", .model_provider = "auto" }));
+    try app.view.insert("keep this draft", .paste);
+    try conversation.sendIdentified(&app, .{ .thread = .{ .value = "thread" } }, .{ .revision = 1 }, "keep this draft", codex, app.view.revision, @splat('a'));
+    try std.testing.expect(conversation.command == null);
+    try std.testing.expectEqual(.disabled, app.view.send_diagnostic.stage);
+    try std.testing.expectEqualStrings("keep this draft", app.view.editor.textBytes());
 }
 
 test "Send is disabled while the connection form still names another runtime" {

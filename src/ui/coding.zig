@@ -248,7 +248,9 @@ pub const View = struct {
     setup_close_bounds: c.SDL_FRect = zero_rect,
     setup_field_bounds: [4]c.SDL_FRect = @splat(zero_rect),
     setup_button_bounds: [4]c.SDL_FRect = @splat(zero_rect),
-    setup_action: ?enum { configure, browser, device, status, refresh, open_login } = null,
+    setup_action: ?enum { configure, browser, device, status, refresh, open_login, choose_workspace } = null,
+    setup_folder_bounds: c.SDL_FRect = zero_rect,
+    setup_folder_pending: bool = false,
     login_url: [2048]u8 = undefined,
     login_url_len: usize = 0,
     login_code: [128]u8 = undefined,
@@ -350,6 +352,20 @@ pub const View = struct {
         return self.setup_runtime == .codex and self.setup_existing_account_len != 0 and self.setupActionEnabled(0);
     }
 
+    pub fn chooseWorkspaceEnabled(self: *const View) bool {
+        return !self.setup_folder_pending and !self.setup_busy and !self.setup_login_pending;
+    }
+
+    pub fn setWorkspaceFolder(self: *View, path: []const u8) bool {
+        if (path.len == 0 or path.len > self.setup_fields[2].len or !std.fs.path.isAbsolute(path) or
+            !std.unicode.utf8ValidateSlice(path) or std.mem.indexOfScalar(u8, path, 0) != null) return false;
+        @memcpy(self.setup_fields[2][0..path.len], path);
+        self.setup_lengths[2] = path.len;
+        self.setup_field = 2;
+        self.setup_select_all = false;
+        return true;
+    }
+
     /// Explicitly choose the launch Codex home; saved/custom drafts never migrate
     /// implicitly. Configure/discovery uses the ordinary Host command path.
     pub fn useExistingCodex(self: *View) void {
@@ -390,7 +406,7 @@ pub const View = struct {
     /// Public button order: configure/browser/device/refresh. Opening the
     /// returned login URL is independent of command/query/auth availability.
     pub fn setupActionEnabled(self: *const View, index: usize) bool {
-        if (index >= self.setup_button_bounds.len or self.setup_busy or self.setup_login_pending) return false;
+        if (index >= self.setup_button_bounds.len or self.setup_busy or self.setup_login_pending or self.setup_folder_pending) return false;
         return self.setup_runtime == .codex or (index != 1 and index != 2);
     }
 
@@ -1167,6 +1183,7 @@ pub const View = struct {
                         if (widgets.contains(self.setup_existing_bounds, x, y)) self.useExistingCodex();
                         if (widgets.contains(self.setup_advanced_bounds, x, y)) self.toggleSetupAdvanced();
                         if (self.setup_runtime == .codex and self.login_url_len != 0 and widgets.contains(self.setup_login_bounds, x, y)) self.setup_action = .open_login;
+                        if (self.chooseWorkspaceEnabled() and widgets.contains(self.setup_folder_bounds, x, y)) self.setup_action = .choose_workspace;
                         for (self.setup_field_bounds, 0..) |box, index| if (widgets.contains(box, x, y)) {
                             self.setup_field = index;
                             self.setup_select_all = true;
@@ -1523,6 +1540,7 @@ pub const View = struct {
                     if (alt and key == c.SDLK_1) self.selectSetupProvider(.codex);
                     if (alt and key == c.SDLK_2) self.selectSetupProvider(.opencode);
                     if (alt and key == c.SDLK_A) self.toggleSetupAdvanced();
+                    if (ctrl and key == c.SDLK_O and self.chooseWorkspaceEnabled()) self.setup_action = .choose_workspace;
                     if (ctrl and key == c.SDLK_L and self.setup_runtime == .codex and self.login_url_len != 0) self.setup_action = .open_login;
                     if (key == c.SDLK_TAB) {
                         if (self.setup_advanced_open) {
@@ -2251,7 +2269,7 @@ pub const View = struct {
             return;
         }
         try self.labels.drawFitted(renderer, text, "Questions appear here when the provider needs a bounded answer.", box.x + 12, box.y + 38, box.w - 24, 12, muted);
-        try self.labels.drawFitted(renderer, text, "Files stay in this draft. Delivery is unavailable; remove them before Send.", box.x + 12, box.y + 58, box.w - 24, 12, muted);
+        try self.labels.drawFitted(renderer, text, "Files in this draft are sent with your next message when the provider supports them.", box.x + 12, box.y + 58, box.w - 24, 12, muted);
         const path_rect = c.SDL_FRect{ .x = box.x + 12, .y = box.y + 82, .w = @max(60, box.w - 104), .h = 28 };
         try self.workflowControl(renderer, text, "attachment.path", if (self.workflow_path_len == 0) "Absolute file path…" else self.workflow_path[0..self.workflow_path_len], path_rect, true, foreground);
         try self.workflowControl(renderer, text, "attachment.add", "Add", .{ .x = box.x + box.w - 84, .y = path_rect.y, .w = 72, .h = 28 }, !self.workflow_busy, foreground);
@@ -2266,7 +2284,7 @@ pub const View = struct {
         for (0..attachment_text.max_count) |i| if (self.attachments.get(i)) |file| {
             defer ordinal += 1;
             if (ordinal != self.workflow_page) continue;
-            const label = try std.fmt.bufPrint(&buffer, "{s} · {d} bytes · local only", .{ file.metadata.name, file.content.len });
+            const label = try std.fmt.bufPrint(&buffer, "{s} · {d} bytes · attached to draft", .{ file.metadata.name, file.content.len });
             try self.labels.drawFitted(renderer, text, label, box.x + 12, y + 6, box.w - 106, 12, foreground);
             try self.workflowControl(renderer, text, try std.fmt.bufPrint(&id_buffer, "attachment.remove.{d}", .{i}), "Remove", .{ .x = box.x + box.w - 84, .y = y, .w = 72, .h = 28 }, !self.workflow_busy, foreground);
         };
@@ -2354,6 +2372,8 @@ pub const View = struct {
             self.setup_existing_bounds = .{ .x = self.setup_advanced_bounds.x + self.setup_advanced_bounds.w + 8, .y = geometry.advanced.y, .w = self.setup_advanced_bounds.w, .h = geometry.advanced.h };
         }
         self.setup_field_bounds = geometry.fields;
+        self.setup_field_bounds[2].w -= 120;
+        self.setup_folder_bounds = .{ .x = self.setup_field_bounds[2].x + self.setup_field_bounds[2].w + 8, .y = self.setup_field_bounds[2].y, .w = 112, .h = self.setup_field_bounds[2].h };
         self.setup_button_bounds = geometry.buttons;
         self.setup_login_bounds = zero_rect;
         try widgets.panel(renderer, menu, @min(self.design.layout.radius, 8), self.design.colors.raised);
@@ -2367,16 +2387,18 @@ pub const View = struct {
             const selected = self.setupIndex() == index;
             try widgets.panel(renderer, box, @min(self.design.layout.radius, 6), if (selected) self.design.colors.selection else self.design.colors.surface);
             try self.labels.draw(text, if (index == 0) "Codex" else "OpenCode", box.x + 12, box.y + 6, 13, foreground);
-            try self.labels.draw(text, if (index == 0) "Existing Codex login  ·  Alt+1" else "Preauthorized account  ·  Alt+2", box.x + 12, box.y + 23, 10, if (selected) foreground else muted);
+            try self.labels.draw(text, if (index == 0) "ChatGPT sign-in  ·  Alt+1" else "OpenCode models  ·  Alt+2", box.x + 12, box.y + 23, 10, if (selected) foreground else muted);
         }
         try self.labels.draw(text, "Workspace · existing project folder", menu.x + 16, menu.y + 104, 11, muted);
         try self.drawSetupField(renderer, text, 2, foreground, muted);
+        try widgets.panel(renderer, self.setup_folder_bounds, 4, self.design.colors.surface);
+        try self.labels.drawFitted(renderer, text, if (self.setup_folder_pending) "Choosing…" else "Choose folder…", self.setup_folder_bounds.x + 10, self.setup_folder_bounds.y + 9, self.setup_folder_bounds.w - 20, 11, if (self.chooseWorkspaceEnabled()) foreground else muted);
         try widgets.panel(renderer, self.setup_advanced_bounds, @min(self.design.layout.radius, 4), self.design.colors.surface);
         try icon(renderer, .chevron, self.setup_advanced_bounds.x + 8, self.setup_advanced_bounds.y + 6, muted);
         try self.labels.drawFitted(renderer, text, if (self.setup_advanced_open) "Hide Advanced · Alt+A" else "Advanced · Alt+A", self.setup_advanced_bounds.x + 30, self.setup_advanced_bounds.y + 7, self.setup_advanced_bounds.w - 36, 11, muted);
         if (self.setup_existing_bounds.w != 0) {
             try widgets.panel(renderer, self.setup_existing_bounds, @min(self.design.layout.radius, 4), self.design.colors.surface);
-            try self.labels.drawFitted(renderer, text, "Use existing Codex", self.setup_existing_bounds.x + 12, self.setup_existing_bounds.y + 7, self.setup_existing_bounds.w - 24, 11, if (self.existingCodexEnabled()) foreground else muted);
+            try self.labels.drawFitted(renderer, text, "Use my ChatGPT login", self.setup_existing_bounds.x + 12, self.setup_existing_bounds.y + 7, self.setup_existing_bounds.w - 24, 11, if (self.existingCodexEnabled()) foreground else muted);
         }
         if (self.setup_advanced_open) {
             const names = [_][]const u8{ "Executable", "Account folder", "Model provider" };
@@ -2405,7 +2427,7 @@ pub const View = struct {
             const guidance = if (self.setup_runtime == .codex)
                 "Connect reuses the selected Codex login. Sign in only if it has expired or is missing."
             else
-                "OpenCode sign-in is not supported here. Select a preauthorized account in Advanced.";
+                "Connect discovers OpenCode's free models. For a paid provider, choose its account folder in Advanced.";
             try self.labels.drawFitted(renderer, text, guidance, menu.x + 16, geometry.guidance_y, menu.w - 32, 11, muted);
             try self.labels.drawFitted(renderer, text, "Choose a model beside the composer after connecting. No model is selected for you.", menu.x + 16, geometry.guidance_y + 17, menu.w - 32, 11, muted);
         }
@@ -3042,6 +3064,7 @@ test "painted connection and composer controls fit minimum and regular windows" 
                 .refresh => 3,
                 .status => 4,
                 .open_login => 5,
+                .choose_workspace => 6,
             });
         }
         try std.testing.expect(view.picker_bounds.x + view.picker_bounds.w <= view.effort_bounds.x);
@@ -3172,6 +3195,28 @@ test "connection configuration empties oversized fields without truncation and o
     configuration.account_directory = "\xff";
     try std.testing.expect(!view.configureSetup(configuration));
     try std.testing.expectEqual(@as(usize, 0), view.setup_lengths[1]);
+}
+
+test "workspace chooser updates exact Unicode paths and leaves invalid selections untouched" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try std.testing.expect(view.setSetupDefaults(setup_fixture_defaults));
+    try std.testing.expect(view.setWorkspaceFolder("/tmp/project 世界"));
+    try std.testing.expect(!view.setWorkspaceFolder("relative/project"));
+    try std.testing.expect(!view.setWorkspaceFolder("/" ++ ("x" ** 512)));
+    try std.testing.expectEqualStrings("/tmp/project 世界", view.setup_fields[2][0..view.setup_lengths[2]]);
+    view.setup_open = true;
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_O;
+    event.key.mod = c.SDL_KMOD_CTRL;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqual(.choose_workspace, view.setup_action.?);
+    view.setup_action = null;
+    view.setup_folder_pending = true;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expect(view.setup_action == null);
+    try std.testing.expect(!view.setupActionEnabled(0));
 }
 
 test "connection keyboard navigates visible fields and deletes whole Unicode characters" {
