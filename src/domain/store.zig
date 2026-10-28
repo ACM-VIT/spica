@@ -10,7 +10,7 @@ extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, InvalidText, Closed };
 pub const application_id = 0x53504334;
-pub const schema_version = 13;
+pub const schema_version = 14;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
 
 pub const Statement = struct {
@@ -205,6 +205,20 @@ pub const Store = struct {
             if (try result.scalar("SELECT count(*) FROM threads WHERE root_key IS NULL OR length(root_key)<>32") != 0) return error.Corrupt;
             try result.exec("UPDATE meta SET schema_version=13 WHERE singleton=1; PRAGMA user_version=13; COMMIT; PRAGMA foreign_keys=ON");
         } else if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name='root_key'") != 1 or try result.scalar("SELECT count(*) FROM threads WHERE root_key IS NULL OR length(root_key)<>32") != 0) return error.Corrupt;
+        if (fresh or version < 14) {
+            try result.exec("BEGIN IMMEDIATE");
+            errdefer result.exec("ROLLBACK") catch {};
+            if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name='archived'") == 0)
+                try result.exec("ALTER TABLE threads ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN(0,1))");
+            if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name='deleted'") == 0)
+                try result.exec("ALTER TABLE threads ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN(0,1))");
+            try result.exec("UPDATE meta SET schema_version=14 WHERE singleton=1; PRAGMA user_version=14; COMMIT");
+        } else if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name IN('archived','deleted')") != 2) return error.Corrupt;
+        // Visibility is the first equality partition; hidden history cannot
+        // accumulate ahead of a bounded active/archive page in these indexes.
+        try result.exec("CREATE INDEX IF NOT EXISTS threads_visibility ON threads(deleted,archived); CREATE INDEX IF NOT EXISTS threads_visibility_project ON threads(deleted,archived,project_id); CREATE INDEX IF NOT EXISTS threads_visibility_root ON threads(deleted,archived,root_key); CREATE INDEX IF NOT EXISTS threads_visibility_root_project ON threads(deleted,archived,root_key,project_id); CREATE INDEX IF NOT EXISTS threads_visible_root_move ON threads(deleted,archived,root_key,sort_order,id); CREATE INDEX IF NOT EXISTS threads_visible_order ON threads(deleted,archived,-pinned,sort_order,id); CREATE INDEX IF NOT EXISTS threads_visible_project_order ON threads(deleted,archived,project_id,-pinned,sort_order,id); CREATE INDEX IF NOT EXISTS threads_visible_root_order ON threads(deleted,archived,root_key,-pinned,sort_order,id); CREATE INDEX IF NOT EXISTS threads_visible_root_project_order ON threads(deleted,archived,root_key,project_id,-pinned,sort_order,id)");
+        try result.exec("CREATE INDEX IF NOT EXISTS runs_lifecycle_pending ON runs(thread_id) WHERE state NOT IN('completed','cancelled','failed'); CREATE INDEX IF NOT EXISTS effects_lifecycle_pending ON effects(run_id) WHERE state IN('planned','in_flight','unknown')");
+        try result.exec("CREATE TRIGGER IF NOT EXISTS threads_deleted_permanent BEFORE UPDATE OF deleted ON threads WHEN OLD.deleted=1 AND NEW.deleted<>1 BEGIN SELECT RAISE(ABORT,'thread tombstone permanent'); END");
         // Staging budgets exclude sent history; lookup by attachment must not
         // scan all message refs for every historical row in the thread.
         try result.exec("CREATE INDEX IF NOT EXISTS attachment_refs_by_attachment ON attachment_refs(attachment_id)");

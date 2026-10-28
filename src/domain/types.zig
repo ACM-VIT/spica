@@ -91,6 +91,11 @@ pub const Payload = union(enum) {
     },
     /// Atomically swap with the nearest row in the same sidebar section.
     thread_sidebar_move: struct { direction: enum { up, down } },
+    /// Durable sidebar lifecycle; provider ownership must already be quiescent.
+    thread_archive: void,
+    thread_restore: void,
+    /// Permanent tombstone retains command/event and content referential integrity.
+    thread_delete: void,
     thread_send: struct { text: []const u8, selection: adapter.Selection, attachments: []const AttachmentId = &.{} },
     thread_send_staged: struct { prompt: PromptRef, selection: adapter.Selection, attachments: []const AttachmentId = &.{} },
     /// Explicitly discard one bounded orphan upload. Never affects a sent prompt.
@@ -203,7 +208,7 @@ pub const Query = union(enum) {
     models: struct { workspace: adapter.WorkspaceId, page: Page = .{} },
     runtime_status: void,
     workspaces: struct { project: ProjectId, page: Page = .{} },
-    threads: struct { project: ?ProjectId = null, canonical_root: ?[]const u8 = null, anchor: ?ThreadId = null, sidebar_order: bool = false, page: Page = .{} },
+    threads: struct { project: ?ProjectId = null, canonical_root: ?[]const u8 = null, anchor: ?ThreadId = null, sidebar_order: bool = false, archived: bool = false, page: Page = .{} },
     thread_sidebar_next: struct { canonical_root: []const u8, project: ?ProjectId = null, after: ?ThreadId = null, page: Page = .{ .limit = 1, .max_bytes = 16 * 1024 } },
     thread: ThreadId,
     messages: struct { thread: ThreadId, anchor: ?adapter.MessageId = null, direction: Direction = .newer, page: Page = .{} },
@@ -261,6 +266,7 @@ pub const Row = union(enum) {
         project_name: []const u8 = "",
         workspace_root: []const u8 = "",
         workspace_branch: []const u8 = "",
+        archived: bool = false,
         pinned: bool = false,
         settled: bool = false,
         snoozed_until: i64 = 0,

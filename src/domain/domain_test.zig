@@ -520,7 +520,7 @@ test "sidebar schema eight migration preserves execution revisions and creates o
     var f = try Fixture.init();
     defer f.deinit();
     try seed(&f.store);
-    try f.store.exec("DROP INDEX threads_sidebar_order; DROP INDEX threads_project_sidebar_order; DROP INDEX threads_sidebar_move; DROP INDEX threads_root_order; DROP INDEX threads_root_project_order; DROP TRIGGER threads_root_immutable; ALTER TABLE threads DROP COLUMN pinned; ALTER TABLE threads DROP COLUMN settled; ALTER TABLE threads DROP COLUMN snoozed_until; ALTER TABLE threads DROP COLUMN sort_order; UPDATE meta SET schema_version=8; PRAGMA user_version=8");
+    try f.store.exec("DROP INDEX threads_visible_root_move; DROP INDEX threads_visible_order; DROP INDEX threads_visible_project_order; DROP INDEX threads_visible_root_order; DROP INDEX threads_visible_root_project_order; DROP INDEX threads_sidebar_order; DROP INDEX threads_project_sidebar_order; DROP INDEX threads_sidebar_move; DROP INDEX threads_root_order; DROP INDEX threads_root_project_order; DROP TRIGGER threads_root_immutable; ALTER TABLE threads DROP COLUMN pinned; ALTER TABLE threads DROP COLUMN settled; ALTER TABLE threads DROP COLUMN snoozed_until; ALTER TABLE threads DROP COLUMN sort_order; UPDATE meta SET schema_version=8; PRAGMA user_version=8");
     try f.store.close();
     var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
     f.store = try storage.Store.open(std.testing.io, try f.path(&directory));
@@ -2331,4 +2331,284 @@ test "attachment schema v6 migration preserves prior data and reopens with durab
     try f.store.close();
     f.store = try storage.Store.open(std.testing.io, path);
     try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM attachments JOIN attachment_refs ON attachment_id=id WHERE content=X'616263'"));
+}
+
+fn lifecycleCommand(id: []const u8, thread: t.ThreadId, revision: u64, payload: t.Payload) t.CommandEnvelope {
+    return .{ .command_id = .{ .value = id }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = revision }, .payload = payload };
+}
+
+test "thread archive restore and permanent deletion preserve journal and exact durable receipts" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "lifecycle", .utc_ms = 1000 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const sent_command = conversation.send("lifecycle-send", "保持 history café", 1);
+    const sent = try owner.command(allocator, sent_command);
+    const cancelled = try owner.command(allocator, .{ .command_id = .{ .value = "lifecycle-cancel" }, .target = .{ .run = sent.entity_ids.run.? }, .expected_revision = .{ .revision = 1 }, .payload = .{ .run_cancel = .{ .reason = "before dispatch" } } });
+    try std.testing.expectEqual(.accepted, cancelled.outcome);
+    const messages = try f.store.scalar("SELECT count(*) FROM messages");
+    const chunks = try f.store.scalar("SELECT count(*) FROM chunks");
+    const archive_command = lifecycleCommand("archive", conversation.thread, 2, .thread_archive);
+    const archived = try owner.command(allocator, archive_command);
+    try std.testing.expectEqual(.accepted, archived.outcome);
+    try std.testing.expectEqual(@as(u64, 3), archived.committed_revisions[0].revision);
+    try std.testing.expectEqualStrings(conversation.thread.value, archived.entity_ids.thread.?.value);
+    try expectRevisionEvents(&f.store, archived.committed_revisions, archived.commit_sequence);
+    try std.testing.expectEqualSlices(u8, try t.encode(archived, try allocator.alloc(u8, 4096)), try t.encode(try owner.command(allocator, archive_command), try allocator.alloc(u8, 4096)));
+    var conflict = archive_command;
+    conflict.payload = .thread_delete;
+    try std.testing.expectEqual(.command_id_conflict, (try owner.command(allocator, conflict)).reason.?);
+    const stale_command = lifecycleCommand("stale-restore", conversation.thread, 2, .thread_restore);
+    const stale = try owner.command(allocator, stale_command);
+    try std.testing.expectEqual(.revision_conflict, stale.reason.?);
+    try std.testing.expectEqual(.invalid_command, (try owner.command(allocator, conversation.send("archived-send", "must restore first", 3))).reason.?);
+    try std.testing.expectEqual(.invalid_command, (try owner.command(allocator, lifecycleCommand("archive-again", conversation.thread, 3, .thread_archive))).reason.?);
+    try std.testing.expectEqual(.invalid_command, (try owner.command(allocator, lifecycleCommand("archived-title", conversation.thread, 3, .{ .thread_title_set = .{ .title = "hidden" } }))).reason.?);
+    var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, try f.path(&directory));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM threads WHERE archived=1 AND revision=3"));
+    const restored = try owner.command(allocator, lifecycleCommand("restore", conversation.thread, 3, .thread_restore));
+    try std.testing.expectEqual(.accepted, restored.outcome);
+    try std.testing.expectEqual(@as(u64, 4), restored.committed_revisions[0].revision);
+    try std.testing.expectEqual(stale.commit_sequence, (try owner.command(allocator, stale_command)).commit_sequence);
+    const delete_command = lifecycleCommand("delete", conversation.thread, 4, .thread_delete);
+    const deleted = try owner.command(allocator, delete_command);
+    try std.testing.expectEqual(.accepted, deleted.outcome);
+    try std.testing.expectEqual(@as(u64, 5), deleted.committed_revisions[0].revision);
+    try expectRevisionEvents(&f.store, deleted.committed_revisions, deleted.commit_sequence);
+    try std.testing.expectEqual(messages, try f.store.scalar("SELECT count(*) FROM messages"));
+    try std.testing.expectEqual(chunks, try f.store.scalar("SELECT count(*) FROM chunks"));
+    try std.testing.expectEqual(@as(i64, 3), try f.store.scalar("SELECT count(*) FROM events WHERE kind IN('ThreadArchived','ThreadRestored','ThreadDeleted')"));
+    try std.testing.expectError(error.Conflict, f.store.exec("UPDATE threads SET deleted=0 WHERE deleted=1"));
+    try std.testing.expectEqual(.not_found, (try owner.command(allocator, lifecycleCommand("deleted-restore", conversation.thread, 5, .thread_restore))).reason.?);
+    try std.testing.expectEqual(.not_found, (try owner.command(allocator, .{ .command_id = .{ .value = "deleted-run" }, .target = .{ .run = sent.entity_ids.run.? }, .expected_revision = .{ .revision = 2 }, .payload = .{ .run_cancel = .{ .reason = "again" } } })).reason.?);
+    try f.store.close();
+    f.store = try storage.Store.open(std.testing.io, try f.path(&directory));
+    try std.testing.expectEqualSlices(u8, try t.encode(deleted, try allocator.alloc(u8, 4096)), try t.encode(try owner.command(allocator, delete_command), try allocator.alloc(u8, 4096)));
+    try std.testing.expectEqual(sent.commit_sequence, (try owner.command(allocator, sent_command)).commit_sequence);
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM pragma_foreign_key_check"));
+}
+
+test "thread lifecycle refuses attached running and unresolved execution without side effects" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try seed(&f.store);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "lifecycle-busy", .utc_ms = 1000 };
+    for ([_][]const u8{ "queued", "starting", "streaming", "awaiting_approval", "awaiting_question", "cancel_requested", "unknown", "interrupted" }, 0..) |state, i| {
+        try f.store.execute("UPDATE runs SET state=? WHERE id='r'", &.{.{ .text = state }});
+        for ([_]t.Payload{ .thread_archive, .thread_delete }, 0..) |payload, j| {
+            const receipt = try owner.command(allocator, lifecycleCommand(try std.fmt.allocPrint(allocator, "live-{d}-{d}", .{ i, j }), .{ .value = "h" }, 1, payload));
+            try std.testing.expectEqual(.busy, receipt.reason.?);
+            try std.testing.expectEqual(@as(usize, 0), receipt.committed_revisions.len);
+        }
+    }
+    try f.store.exec("UPDATE runs SET state='completed' WHERE id='r'");
+    try effect(&f.store, "pending-effect", "planned", "start");
+    for ([_][]const u8{ "planned", "in_flight", "unknown" }, 0..) |state, i| {
+        try f.store.execute("UPDATE effects SET state=? WHERE id='pending-effect'", &.{.{ .text = state }});
+        for ([_]t.Payload{ .thread_archive, .thread_delete }, 0..) |payload, j| {
+            try std.testing.expectEqual(.busy, (try owner.command(allocator, lifecycleCommand(try std.fmt.allocPrint(allocator, "effect-{d}-{d}", .{ i, j }), .{ .value = "h" }, 1, payload))).reason.?);
+        }
+    }
+    try f.store.exec("UPDATE effects SET state='confirmed' WHERE id='pending-effect'");
+    try f.store.exec("INSERT INTO tools VALUES('tool',1,'r','s','upstream','fixture',X'616263','succeeded','b'); INSERT INTO approvals(id,revision,run_id,thread_id,session_id,tool_id,workspace_id,upstream_request,action_digest,scope,state) VALUES('approval',1,'r','h','s','tool','w','upstream',X'616263',X'7b7d','pending')");
+    for ([_]t.Payload{ .thread_archive, .thread_delete }, 0..) |payload, i| {
+        try std.testing.expectEqual(.busy, (try owner.command(allocator, lifecycleCommand(try std.fmt.allocPrint(allocator, "approval-{d}", .{i}), .{ .value = "h" }, 1, payload))).reason.?);
+    }
+    try f.store.exec("UPDATE approvals SET state='resolved'; INSERT INTO questions(id,revision,run_id,thread_id,session_id,question,state,live_epoch) VALUES('question',1,'r','h','s',X'7b7d','pending','fixture')");
+    for ([_]t.Payload{ .thread_archive, .thread_delete }, 0..) |payload, i| {
+        try std.testing.expectEqual(.busy, (try owner.command(allocator, lifecycleCommand(try std.fmt.allocPrint(allocator, "question-{d}", .{i}), .{ .value = "h" }, 1, payload))).reason.?);
+    }
+    try f.store.exec("UPDATE questions SET state='resolved'");
+    var probe: AsyncAdapter = .{};
+    var registry: @import("registry.zig").Registry = .{ .allocator = allocator, .factory = probe.factory() };
+    registry.entries[0] = .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .session = .{ .value = "s" }, .selection = t.adapter.fakeSelection(.{ .value = "w" }), .adapter = probe.handle(), .pending_open = null, .created_ms = 0 };
+    defer registry.entries[0].?.arena.deinit();
+    owner.runtime_registry = &registry;
+    for ([_]t.Payload{ .thread_archive, .thread_delete }, 0..) |payload, i| {
+        try std.testing.expectEqual(.busy, (try owner.command(allocator, lifecycleCommand(try std.fmt.allocPrint(allocator, "attached-{d}", .{i}), .{ .value = "h" }, 1, payload))).reason.?);
+    }
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM threads WHERE revision=1 AND archived=0 AND deleted=0"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE revision=1 AND state='completed'"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM effects WHERE revision=1 AND state='confirmed'"));
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT count(*) FROM events"));
+}
+
+test "schema thirteen lifecycle migration preserves execution history and revisions" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try seed(&f.store);
+    try f.store.exec("DROP TRIGGER threads_deleted_permanent; DROP INDEX threads_visibility; DROP INDEX threads_visibility_project; DROP INDEX threads_visibility_root; DROP INDEX threads_visibility_root_project; DROP INDEX threads_visible_root_move; DROP INDEX threads_visible_order; DROP INDEX threads_visible_project_order; DROP INDEX threads_visible_root_order; DROP INDEX threads_visible_root_project_order; ALTER TABLE threads DROP COLUMN archived; ALTER TABLE threads DROP COLUMN deleted; UPDATE meta SET schema_version=13; PRAGMA user_version=13");
+    try f.store.close();
+    var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    f.store = try storage.Store.open(std.testing.io, try f.path(&directory));
+    try std.testing.expectEqual(@as(i64, 14), try f.store.scalar("PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM threads WHERE revision=1 AND archived=0 AND deleted=0"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM runs WHERE revision=1 AND state='queued'"));
+    try std.testing.expectEqual(@as(i64, 1), try f.store.scalar("SELECT count(*) FROM blocks"));
+}
+
+test "archive paging is root scoped and tombstones exclude every descendant projection" {
+    const Host = @import("../domain.zig").Host;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = path_buffer[0..try temporary.dir.realPath(std.testing.io, &path_buffer)];
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    {
+        var database = try storage.Store.open(std.testing.io, path);
+        defer database.close() catch @panic("close");
+        try seed(&database);
+        try database.exec("UPDATE runs SET state='completed'; INSERT INTO chunks VALUES('b',0,X'616263'); UPDATE blocks SET committed_bytes=3;" ++
+            "INSERT INTO tools VALUES('tool',1,'r','s','upstream','fixture',X'616263','succeeded','b');" ++
+            "INSERT INTO approvals(id,revision,run_id,thread_id,session_id,tool_id,workspace_id,upstream_request,action_digest,scope,state) VALUES('approval',1,'r','h','s','tool','w','upstream',X'616263',X'7b7d','resolved');" ++
+            "INSERT INTO questions(id,revision,run_id,thread_id,session_id,question,state,live_epoch) VALUES('question',1,'r','h','s',X'7b7d','resolved','fixture');" ++
+            "INSERT INTO attachments VALUES('attachment',1,'h','fixture.txt','text/plain',3,'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad','file',X'616263');" ++
+            "INSERT INTO attachment_refs VALUES('m','attachment',0)");
+        try effect(&database, "confirmed", "confirmed", "start");
+        var owner: domain.Owner = .{ .database = &database, .io = std.testing.io, .epoch = "query-lifecycle", .utc_ms = 1000 };
+        try std.testing.expectEqual(.accepted, (try owner.command(allocator, lifecycleCommand("delete-hidden", .{ .value = "h" }, 1, .thread_delete))).outcome);
+        for (0..11) |i| {
+            try database.execute("INSERT INTO threads(id,revision,project_id,workspace_id,root_key,sort_order,archived) SELECT ?,1,'p','w',root_key,?,1 FROM threads WHERE id='h'", &.{ .{ .text = try std.fmt.allocPrint(allocator, "archive-{d:0>2}", .{i}) }, .{ .integer = @intCast(i) } });
+        }
+        // Expired UTC snoozes are eligible even when awake-clock time is smaller.
+        const expired = @as(i64, @intCast(@max(1, std.Io.Clock.real.now(std.testing.io).toMilliseconds() - 1000)));
+        try database.execute("INSERT INTO threads(id,revision,project_id,workspace_id,root_key,sort_order,snoozed_until) SELECT 'active',1,'p','w',root_key,-1000,? FROM threads WHERE id='h'", &.{.{ .integer = expired }});
+        const foreign_binding: t.WorkspaceBinding = .{ .canonical_root = "/different-root", .filesystem_identity = "", .repository_identity = "", .checkout_identity = "", .expected_branch = "", .base_revision = "", .non_git = true };
+        var encoded_binding: [4096]u8 = undefined;
+        try database.execute("INSERT INTO workspaces VALUES('foreign-workspace',1,'p',?)", &.{.{ .blob = try t.encode(foreign_binding, &encoded_binding) }});
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(foreign_binding.canonical_root, &digest, .{});
+        try database.execute("INSERT INTO threads(id,revision,project_id,workspace_id,root_key,archived) VALUES('foreign-archive',1,'p','foreign-workspace',?,1),('foreign-active',1,'p','foreign-workspace',?,0)", &.{ .{ .blob = &digest }, .{ .blob = &digest } });
+        // Exercise a large hidden partition without loading it into the query page.
+        try database.exec("WITH RECURSIVE n(i) AS(VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1024) INSERT INTO threads(id,revision,project_id,workspace_id,root_key,archived,deleted) SELECT 'deleted-'||i,1,'p','w',(SELECT root_key FROM threads WHERE id='h'),1,1 FROM n");
+        std.crypto.hash.sha2.Sha256.hash("/tmp", &digest, .{});
+        const plan = try database.prepare("EXPLAIN QUERY PLAN SELECT id FROM threads WHERE deleted=0 AND archived=1 AND root_key=? AND (-pinned,sort_order,id)>(-2,0,'') ORDER BY -pinned,sort_order,id LIMIT 3", &.{.{ .blob = &digest }});
+        defer plan.deinit();
+        try std.testing.expect(try plan.step());
+        try std.testing.expect(std.mem.indexOf(u8, try plan.bytes(3), "threads_visible_root_order") != null);
+    }
+    var consumer: Consumer = .{ .host = undefined, .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer consumer.arena.deinit();
+    consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path, .wake = Consumer.wake, .wake_context = &consumer });
+    defer consumer.host.destroy();
+    const active = try consumer.query(.{ .threads = .{ .canonical_root = "/tmp" } });
+    try std.testing.expectEqual(@as(usize, 1), active.items.len);
+    try std.testing.expectEqualStrings("active", active.items[0].thread.id.value);
+    const next = try consumer.query(.{ .thread_sidebar_next = .{ .canonical_root = "/tmp" } });
+    try std.testing.expectEqual(@as(usize, 1), next.items.len);
+    try std.testing.expectEqualStrings("active", next.items[0].thread.id.value);
+    var request: t.Query = .{ .threads = .{ .canonical_root = "/tmp", .archived = true, .sidebar_order = true, .page = .{ .limit = 3, .max_bytes = 8192 } } };
+    var seen: usize = 0;
+    while (true) {
+        const page = try consumer.query(request);
+        try std.testing.expect(page.items.len <= 3);
+        for (page.items) |row| {
+            try std.testing.expect(row.thread.archived);
+            try std.testing.expectEqualStrings("/tmp", row.thread.workspace_root);
+            try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "archive-{d:0>2}", .{seen}), row.thread.id.value);
+            seen += 1;
+        }
+        request.threads.page.snapshot = page.snapshot_id;
+        request.threads.page.cursor = page.next_cursor;
+        if (page.next_cursor == null) break;
+    }
+    try std.testing.expectEqual(@as(usize, 11), seen);
+    const archive_classic = try consumer.query(.{ .threads = .{ .canonical_root = "/tmp", .archived = true } });
+    try std.testing.expectEqual(@as(usize, 11), archive_classic.items.len);
+    _ = try consumer.host.query(.{ .threads = .{ .archived = true } });
+    try std.testing.expectEqual(.invalid_query, (try consumer.next()).failure.failure.reason);
+    const direct = try consumer.query(.{ .thread = .{ .value = "archive-00" } });
+    try std.testing.expect(direct.items[0].thread.archived);
+    const stale_page = try consumer.query(.{ .threads = .{ .canonical_root = "/tmp", .archived = true, .sidebar_order = true, .page = .{ .limit = 3, .max_bytes = 8192 } } });
+    _ = try consumer.command(lifecycleCommand("archive-delete", .{ .value = "archive-00" }, 1, .thread_delete));
+    _ = try consumer.host.query(.{ .threads = .{ .canonical_root = "/tmp", .archived = true, .sidebar_order = true, .page = .{ .limit = 3, .max_bytes = 8192, .snapshot = stale_page.snapshot_id, .cursor = stale_page.next_cursor } } });
+    try std.testing.expectEqual(.cursor_invalid, (try consumer.next()).failure.failure.reason);
+    _ = try consumer.host.query(.{ .thread = .{ .value = "h" } });
+    try std.testing.expectEqual(.not_found, (try consumer.next()).failure.failure.reason);
+    for ([_]t.Query{
+        .{ .messages = .{ .thread = .{ .value = "h" } } },
+        .{ .messages = .{ .thread = .{ .value = "h" }, .direction = .older } },
+        .{ .blocks = .{ .message = .{ .value = "m" } } },
+        .{ .attachments = .{ .thread = .{ .value = "h" } } },
+        .{ .runs = .{ .thread = .{ .value = "h" } } },
+        .{ .effects = .{ .run = .{ .value = "r" } } },
+        .{ .tools = .{ .run = .{ .value = "r" } } },
+        .{ .approvals = .{ .run = .{ .value = "r" } } },
+        .{ .questions = .{ .run = .{ .value = "r" } } },
+    }) |q| {
+        _ = try consumer.host.query(q);
+        const output = try consumer.next();
+        if (output != .query_page) {
+            std.debug.print("deleted projection {s}: {s}\n", .{ @tagName(q), @tagName(output.failure.failure.reason) });
+            return error.ExpectedPage;
+        }
+        try std.testing.expectEqual(@as(usize, 0), output.query_page.page.items.len);
+    }
+    _ = try consumer.host.query(.{ .content = .{ .block = .{ .value = "b" }, .start_byte = 0, .end_byte = 3 } });
+    try std.testing.expectEqual(.not_found, (try consumer.next()).failure.failure.reason);
+    const receipt = try consumer.query(.{ .command_receipt = .{ .value = "delete-hidden" } });
+    try std.testing.expectEqual(.accepted, receipt.items[0].command_receipt.?.outcome);
+}
+
+test "sidebar movement isolates canonical roots and ignores forged root partitions" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try seed(&f.store);
+    try f.store.exec("UPDATE threads SET sort_order=0 WHERE id='h'; INSERT INTO threads(id,revision,project_id,workspace_id,root_key,sort_order) SELECT 'local',1,'p','w',root_key,-10 FROM threads WHERE id='h'");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const binding: t.WorkspaceBinding = .{ .canonical_root = "/different-root", .filesystem_identity = "", .repository_identity = "", .checkout_identity = "", .expected_branch = "", .base_revision = "", .non_git = true };
+    var bytes: [4096]u8 = undefined;
+    try f.store.execute("INSERT INTO workspaces VALUES('foreign-workspace',1,'p',?)", &.{.{ .blob = try t.encode(binding, &bytes) }});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(binding.canonical_root, &digest, .{});
+    try f.store.execute("INSERT INTO threads(id,revision,project_id,workspace_id,root_key,sort_order) VALUES('foreign',1,'p','foreign-workspace',?,-5)", &.{.{ .blob = &digest }});
+    // A forged hash must not pass the authoritative binding equality check.
+    try f.store.exec("INSERT INTO threads(id,revision,project_id,workspace_id,root_key,sort_order) SELECT 'forged',1,'p','foreign-workspace',root_key,-1 FROM threads WHERE id='h'");
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "move-root", .utc_ms = 1000 };
+    const moved = try owner.command(allocator, lifecycleCommand("root-move", .{ .value = "h" }, 1, .{ .thread_sidebar_move = .{ .direction = .up } }));
+    try std.testing.expectEqual(.accepted, moved.outcome);
+    try std.testing.expectEqual(@as(usize, 2), moved.committed_revisions.len);
+    try std.testing.expectEqual(@as(i64, -10), try f.store.scalar("SELECT sort_order FROM threads WHERE id='h'"));
+    try std.testing.expectEqual(@as(i64, 0), try f.store.scalar("SELECT sort_order FROM threads WHERE id='local'"));
+    try std.testing.expectEqual(@as(i64, 2), try f.store.scalar("SELECT count(*) FROM threads WHERE id IN('foreign','forged') AND revision=1"));
+    try expectRevisionEvents(&f.store, moved.committed_revisions, moved.commit_sequence);
+}
+
+test "archive and restore retain sidebar flags snooze deadline and placement" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var owner: domain.Owner = .{ .database = &f.store, .io = std.testing.io, .epoch = "archive-metadata", .utc_ms = 1000 };
+    const conversation = try Conversation.create(&owner, allocator);
+    const metadata = try owner.command(allocator, lifecycleCommand("archive-metadata", conversation.thread, 1, .{ .thread_sidebar_set = .{ .pinned = true, .settled = true, .snoozed_until = 5000, .sort_order = 42 } }));
+    try std.testing.expectEqual(.accepted, metadata.outcome);
+    for ([_]t.CommandEnvelope{
+        lifecycleCommand("preserving-archive", conversation.thread, 2, .thread_archive),
+        lifecycleCommand("preserving-restore", conversation.thread, 3, .thread_restore),
+    }, 0..) |command, index| {
+        const accepted = try owner.command(allocator, command);
+        try std.testing.expectEqual(.accepted, accepted.outcome);
+        const row = try f.store.prepare("SELECT pinned,settled,snoozed_until,sort_order,archived FROM threads WHERE id=?", &.{.{ .text = conversation.thread.value }});
+        defer row.deinit();
+        try std.testing.expect(try row.step());
+        try std.testing.expectEqual(@as(i64, 1), row.integer(0));
+        try std.testing.expectEqual(@as(i64, 1), row.integer(1));
+        try std.testing.expectEqual(@as(i64, 5000), row.integer(2));
+        try std.testing.expectEqual(@as(i64, 42), row.integer(3));
+        try std.testing.expectEqual(@as(i64, if (index == 0) 1 else 0), row.integer(4));
+    }
 }

@@ -66,7 +66,7 @@ fn canonicalEnvelope(allocator: std.mem.Allocator, envelope: t.CommandEnvelope) 
 // index (plus runs_by_thread). The preview reads only a prefix of one chunk.
 const snooze_blockers = "EXISTS(SELECT 1 FROM runs r WHERE r.thread_id=threads.id AND r.state IN('queued','starting','awaiting_approval','awaiting_question')) OR EXISTS(SELECT 1 FROM approvals a INDEXED BY approvals_pending_thread WHERE a.state='pending' AND a.thread_id=threads.id) OR EXISTS(SELECT 1 FROM questions q INDEXED BY questions_pending_thread WHERE q.state='pending' AND q.thread_id=threads.id)";
 
-const thread_columns = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)),coalesce((SELECT substr(bytes,1,163) FROM chunks WHERE block_id=(SELECT id FROM blocks WHERE message_id=(SELECT id FROM messages WHERE thread_id=threads.id AND ordinal=0 AND role='user') AND ordinal=0) AND byte_offset=0),''),(SELECT state FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1),coalesce((SELECT substr(display_name,1,256) FROM projects WHERE id=threads.project_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.expected_branch') FROM workspaces WHERE id=threads.workspace_id),''),coalesce(title,''),pinned,settled,snoozed_until,sort_order,created_at_ms,last_user_message_at_ms,updated_at_ms,NOT(" ++ snooze_blockers ++ ") FROM threads ";
+const thread_columns = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)),coalesce((SELECT substr(bytes,1,163) FROM chunks WHERE block_id=(SELECT id FROM blocks WHERE message_id=(SELECT id FROM messages WHERE thread_id=threads.id AND ordinal=0 AND role='user') AND ordinal=0) AND byte_offset=0),''),(SELECT state FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1),coalesce((SELECT substr(display_name,1,256) FROM projects WHERE id=threads.project_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.expected_branch') FROM workspaces WHERE id=threads.workspace_id),''),coalesce(title,''),pinned,settled,snoozed_until,sort_order,created_at_ms,last_user_message_at_ms,updated_at_ms,NOT(" ++ snooze_blockers ++ "),archived FROM threads ";
 
 fn canonicalRootKey(root: []const u8) [32]u8 {
     var digest: [32]u8 = undefined;
@@ -126,11 +126,11 @@ pub const Owner = struct {
             .absent => return null,
             .project => |v| .{ "SELECT revision FROM projects WHERE id=?", v.value },
             .workspace => |v| .{ "SELECT revision FROM workspaces WHERE id=?", v.value },
-            .thread => |v| .{ "SELECT revision FROM threads WHERE id=?", v.value },
-            .run => |v| .{ "SELECT revision FROM runs WHERE id=?", v.value },
-            .approval => |v| .{ "SELECT revision FROM approvals WHERE id=?", v.value },
-            .effect => |v| .{ "SELECT revision FROM effects WHERE id=?", v.value },
-            .question => |v| .{ "SELECT revision FROM questions WHERE id=?", v.value },
+            .thread => |v| .{ "SELECT revision FROM threads WHERE id=? AND deleted=0", v.value },
+            .run => |v| .{ "SELECT revision FROM runs WHERE id=? AND EXISTS(SELECT 1 FROM threads WHERE id=runs.thread_id AND deleted=0)", v.value },
+            .approval => |v| .{ "SELECT revision FROM approvals WHERE id=? AND EXISTS(SELECT 1 FROM threads WHERE id=(SELECT thread_id FROM runs WHERE id=approvals.run_id) AND deleted=0)", v.value },
+            .effect => |v| .{ "SELECT revision FROM effects WHERE id=? AND EXISTS(SELECT 1 FROM threads WHERE id=(SELECT thread_id FROM runs WHERE id=effects.run_id) AND deleted=0)", v.value },
+            .question => |v| .{ "SELECT revision FROM questions WHERE id=? AND EXISTS(SELECT 1 FROM threads WHERE id=(SELECT thread_id FROM runs WHERE id=questions.run_id) AND deleted=0)", v.value },
             // Follow-up and attachment commands target effects/threads and
             // carry their own bounded revision checks in reduce.
             .followup, .attachment => return null,
@@ -331,6 +331,20 @@ pub const Owner = struct {
         var aggregate: t.AggregateRef = undefined;
         var revision_value: u64 = 1;
         var event_payload: []const u8 = "";
+        const visibility_sql: ?[:0]const u8, const visibility_key: []const u8 = switch (e.target) {
+            .thread => |v| .{ "SELECT archived FROM threads WHERE id=? AND deleted=0", v.value },
+            .run => |v| .{ "SELECT archived FROM threads WHERE id=(SELECT thread_id FROM runs WHERE id=?) AND deleted=0", v.value },
+            .effect => |v| .{ "SELECT archived FROM threads WHERE id=(SELECT thread_id FROM runs WHERE id=(SELECT run_id FROM effects WHERE id=?)) AND deleted=0", v.value },
+            .approval => |v| .{ "SELECT archived FROM threads WHERE id=(SELECT thread_id FROM approvals WHERE id=?) AND deleted=0", v.value },
+            .question => |v| .{ "SELECT archived FROM threads WHERE id=(SELECT thread_id FROM questions WHERE id=?) AND deleted=0", v.value },
+            else => .{ null, "" },
+        };
+        if (visibility_sql) |sql| {
+            const visible = try db.prepare(sql, &.{.{ .text = visibility_key }});
+            defer visible.deinit();
+            if (!try visible.step()) return .not_found;
+            if (visible.integer(0) != 0 and e.payload != .thread_restore and e.payload != .thread_delete) return .invalid_command;
+        }
         switch (e.payload) {
             .unsupported => return .unsupported_kind,
             .runtime_configure, .runtime_refresh, .runtime_login => {
@@ -377,6 +391,35 @@ pub const Owner = struct {
                 r.entity_ids.thread = .{ .value = key };
                 aggregate = .{ .thread = r.entity_ids.thread.? };
             },
+            .thread_archive, .thread_restore, .thread_delete => {
+                if (e.target != .thread or e.expected_revision != .revision) return .invalid_command;
+                const thread = e.target.thread.value;
+                const row = try db.prepare("SELECT archived,session_id FROM threads WHERE id=? AND deleted=0", &.{.{ .text = thread }});
+                defer row.deinit();
+                if (!try row.step()) return .not_found;
+                if (e.payload == .thread_restore and row.integer(0) == 0) return .invalid_command;
+                if (e.payload != .thread_restore) {
+                    // A sidebar mutation never shuts down a process or guesses
+                    // whether an uncertain effect executed. The domain rejects
+                    // until execution ownership has explicitly been resolved.
+                    if (self.runtime_registry) |registry| for (registry.entries) |entry| {
+                        if (entry) |live| {
+                            if ((!row.isNull(1) and std.mem.eql(u8, try row.bytes(1), live.session.value)) or
+                                try self.scalar("SELECT EXISTS(SELECT 1 FROM runs WHERE thread_id=? AND session_id=?)", &.{ .{ .text = thread }, .{ .text = live.session.value } }) != 0) return .busy;
+                        }
+                    };
+                    if (try self.scalar("SELECT EXISTS(SELECT 1 FROM runs WHERE thread_id=? AND state NOT IN('completed','cancelled','failed')) OR EXISTS(SELECT 1 FROM runs r JOIN effects e ON e.run_id=r.id WHERE r.thread_id=? AND e.state IN('planned','in_flight','unknown')) OR EXISTS(SELECT 1 FROM approvals WHERE thread_id=? AND state='pending') OR EXISTS(SELECT 1 FROM questions WHERE thread_id=? AND state='pending')", &.{ .{ .text = thread }, .{ .text = thread }, .{ .text = thread }, .{ .text = thread } }) != 0) return .busy;
+                }
+                try db.execute(switch (e.payload) {
+                    .thread_archive => "UPDATE threads SET archived=1,revision=revision+1,updated_at_ms=coalesce(?,updated_at_ms) WHERE id=?",
+                    .thread_restore => "UPDATE threads SET archived=0,revision=revision+1,updated_at_ms=coalesce(?,updated_at_ms) WHERE id=?",
+                    .thread_delete => "UPDATE threads SET deleted=1,revision=revision+1,updated_at_ms=coalesce(?,updated_at_ms) WHERE id=?",
+                    else => unreachable,
+                }, &.{ self.timeValue(), .{ .text = thread } });
+                r.entity_ids.thread = e.target.thread;
+                aggregate = .{ .thread = e.target.thread };
+                revision_value = e.expected_revision.revision + 1;
+            },
             .thread_title_set => |p| {
                 if (e.target != .thread or e.expected_revision != .revision or
                     p.title.len == 0 or p.title.len > t.max_title_bytes or
@@ -408,7 +451,7 @@ pub const Owner = struct {
                     defer existing.deinit();
                     if (!try existing.step()) return .not_found;
                     if (existing.integer(0) == 0) {
-                        const first = try db.scalar("SELECT coalesce(min(sort_order),0) FROM threads WHERE pinned=1");
+                        const first = try db.scalar("SELECT coalesce(min(sort_order),0) FROM threads WHERE pinned=1 AND archived=0 AND deleted=0");
                         order = std.math.sub(i64, first, 1024) catch return .admission_limit;
                     }
                 }
@@ -430,14 +473,19 @@ pub const Owner = struct {
                 if (e.target != .thread or e.expected_revision != .revision) return .invalid_command;
                 const now = self.utc_ms orelse return .authority_unavailable;
                 if (now > std.math.maxInt(i64)) return .authority_unavailable;
-                const source = try db.prepare("SELECT pinned,settled,snoozed_until,sort_order FROM threads WHERE id=?", &.{.{ .text = e.target.thread.value }});
+                const source = try db.prepare("SELECT pinned,settled,snoozed_until,sort_order,root_key,(SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id) FROM threads WHERE id=?", &.{.{ .text = e.target.thread.value }});
                 defer source.deinit();
                 if (!try source.step()) return .not_found;
                 const original_order = source.integer(3);
+                const source_root = try source.bytes(5);
+                const source_digest = canonicalRootKey(source_root);
+                if (!std.mem.eql(u8, &source_digest, try source.bytes(4))) return .workspace_mismatch;
                 const neighbor = try db.prepare(if (p.direction == .up)
-                    "SELECT id,revision,sort_order FROM threads WHERE (CASE WHEN snoozed_until>? THEN 3 WHEN settled=1 THEN 2 WHEN pinned=1 THEN 1 ELSE 0 END)=? AND (sort_order,id)<(?,?) ORDER BY sort_order DESC,id DESC LIMIT 1"
+                    "SELECT id,revision,sort_order FROM threads WHERE archived=0 AND deleted=0 AND root_key=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=threads.workspace_id AND json_extract(CAST(w.binding AS TEXT),'$.canonical_root')=?) AND (CASE WHEN snoozed_until>? THEN 3 WHEN settled=1 THEN 2 WHEN pinned=1 THEN 1 ELSE 0 END)=? AND (sort_order,id)<(?,?) ORDER BY sort_order DESC,id DESC LIMIT 1"
                 else
-                    "SELECT id,revision,sort_order FROM threads WHERE (CASE WHEN snoozed_until>? THEN 3 WHEN settled=1 THEN 2 WHEN pinned=1 THEN 1 ELSE 0 END)=? AND (sort_order,id)>(?,?) ORDER BY sort_order,id LIMIT 1", &.{
+                    "SELECT id,revision,sort_order FROM threads WHERE archived=0 AND deleted=0 AND root_key=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=threads.workspace_id AND json_extract(CAST(w.binding AS TEXT),'$.canonical_root')=?) AND (CASE WHEN snoozed_until>? THEN 3 WHEN settled=1 THEN 2 WHEN pinned=1 THEN 1 ELSE 0 END)=? AND (sort_order,id)>(?,?) ORDER BY sort_order,id LIMIT 1", &.{
+                    .{ .blob = &source_digest },
+                    .{ .text = source_root },
                     .{ .integer = @intCast(now) },
                     .{ .integer = if (source.integer(2) > @as(i64, @intCast(now))) 3 else if (source.integer(1) != 0) 2 else if (source.integer(0) != 0) 1 else 0 },
                     .{ .integer = original_order },
@@ -877,6 +925,9 @@ pub const Owner = struct {
             .task_delegate, .task_send, .task_cancel, .task_result, .task_review => return self.taskCommand(allocator, e, r),
         }
         const event_kind = switch (e.payload) {
+            .thread_archive => "ThreadArchived",
+            .thread_restore => "ThreadRestored",
+            .thread_delete => "ThreadDeleted",
             .thread_title_set => "ThreadTitleChanged",
             .thread_sidebar_set => "ThreadSidebarChanged",
             .followup_enqueue => "FollowupQueued",
@@ -2121,6 +2172,8 @@ pub const Host = struct {
                     break :blk try owner.command(allocator, command);
                 };
                 if (receipt.outcome == .accepted and receipt.commit_sequence >= before_sequence) {
+                    if (command.payload == .thread_archive or command.payload == .thread_restore or command.payload == .thread_delete)
+                        for (&self.snapshots) |*snapshot| self.closeSnapshot(snapshot);
                     const action: ?a.RuntimeAction = switch (command.payload) {
                         .runtime_configure => |v| .{ .configure = v },
                         .runtime_refresh => .refresh,
@@ -2359,6 +2412,7 @@ pub const Host = struct {
         }
         var sql: [:0]const u8 = undefined;
         var values: [8]V = undefined;
+        var query_root_digest: [32]u8 = undefined;
         var n: usize = 0;
         switch (q) {
             .command_receipt => |id_value| {
@@ -2418,12 +2472,12 @@ pub const Host = struct {
                 return result;
             },
             .task_list => |v| {
-                sql = "SELECT t.rowid,t.run_id,t.parent_run,t.packet,t.requests,t.input_tokens,t.output_tokens,t.cached_tokens,t.result,t.review,r.state,r.revision FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.parent_run=? AND t.rowid>? ORDER BY t.rowid LIMIT ?";
+                sql = "SELECT t.rowid,t.run_id,t.parent_run,t.packet,t.requests,t.input_tokens,t.output_tokens,t.cached_tokens,t.result,t.review,r.state,r.revision FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.parent_run=? AND EXISTS(SELECT 1 FROM threads WHERE id=r.thread_id AND deleted=0) AND EXISTS(SELECT 1 FROM runs p JOIN threads h ON h.id=p.thread_id WHERE p.id=t.parent_run AND h.deleted=0) AND t.rowid>? ORDER BY t.rowid LIMIT ?";
                 values[0] = .{ .text = v.parent.value };
                 n = 1;
             },
             .task_wait => |v| {
-                sql = "SELECT t.rowid,t.run_id,t.parent_run,t.packet,t.requests,t.input_tokens,t.output_tokens,t.cached_tokens,t.result,t.review,r.state,r.revision FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.run_id=? AND t.rowid>? LIMIT ?";
+                sql = "SELECT t.rowid,t.run_id,t.parent_run,t.packet,t.requests,t.input_tokens,t.output_tokens,t.cached_tokens,t.result,t.review,r.state,r.revision FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.run_id=? AND EXISTS(SELECT 1 FROM threads WHERE id=r.thread_id AND deleted=0) AND EXISTS(SELECT 1 FROM runs p JOIN threads h ON h.id=p.thread_id WHERE p.id=t.parent_run AND h.deleted=0) AND t.rowid>? LIMIT ?";
                 values[0] = .{ .text = v.value };
                 n = 1;
             },
@@ -2434,45 +2488,57 @@ pub const Host = struct {
                 n = 1;
             },
             .threads => |v| {
-                const root_key = if (v.canonical_root) |root| canonicalRootKey(root) else null;
+                if (v.archived and (v.canonical_root == null or v.canonical_root.?.len == 0)) return error.InvalidQuery;
+                const has_root = v.canonical_root != null;
+                if (v.canonical_root) |root| query_root_digest = canonicalRootKey(root);
+                var anchor_rowid: i64 = 0;
+                if (page.cursor == null) if (v.anchor) |anchor| {
+                    const boundary = try reader.prepare("SELECT rowid,-pinned,sort_order,id,project_id,root_key,(SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id) FROM threads WHERE id=? AND deleted=0 AND archived=?", &.{ .{ .text = anchor.value }, .{ .integer = @intFromBool(v.archived) } });
+                    defer boundary.deinit();
+                    if (!try boundary.step()) return error.NotFound;
+                    if (v.project) |project_id| if (!std.mem.eql(u8, project_id.value, try boundary.bytes(4))) return error.NotFound;
+                    if (v.canonical_root) |root| if (!std.mem.eql(u8, &query_root_digest, try boundary.bytes(5)) or !std.mem.eql(u8, root, try boundary.bytes(6))) return error.NotFound;
+                    anchor_rowid = boundary.integer(0);
+                    order_pin = boundary.integer(1);
+                    order_sort = boundary.integer(2);
+                    order_id = try allocator.dupe(u8, try boundary.bytes(3));
+                };
+                values[0] = .{ .integer = @intFromBool(v.archived) };
+                n = 1;
+                if (has_root) {
+                    values[n] = .{ .blob = &query_root_digest };
+                    values[n + 1] = .{ .text = v.canonical_root.? };
+                    n += 2;
+                }
+                const visible = "WHERE deleted=0 AND archived=? ";
+                const root_scope = "AND root_key=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=threads.workspace_id AND json_extract(CAST(w.binding AS TEXT),'$.canonical_root')=?) ";
+                const project_scope = "AND project_id=? ";
+                const ordered = "AND (-pinned,sort_order,id)>(?,?,?) ORDER BY -pinned,sort_order,id LIMIT ?";
+                const classic = "AND rowid>max(?,?) ORDER BY rowid LIMIT ?";
+                if (v.project) |scoped_project| {
+                    sql = if (has_root)
+                        (if (v.sidebar_order) thread_columns ++ visible ++ root_scope ++ project_scope ++ ordered else thread_columns ++ visible ++ root_scope ++ project_scope ++ classic)
+                    else
+                        (if (v.sidebar_order) thread_columns ++ visible ++ project_scope ++ ordered else thread_columns ++ visible ++ project_scope ++ classic);
+                    values[n] = .{ .text = scoped_project.value };
+                    n += 1;
+                } else sql = if (has_root)
+                    (if (v.sidebar_order) thread_columns ++ visible ++ root_scope ++ ordered else thread_columns ++ visible ++ root_scope ++ classic)
+                else
+                    (if (v.sidebar_order) thread_columns ++ visible ++ ordered else thread_columns ++ visible ++ classic);
                 if (v.sidebar_order) {
-                    if (page.cursor == null) if (v.anchor) |anchor| {
-                        const boundary = try reader.prepare("SELECT -pinned,sort_order,id FROM threads WHERE id=?", &.{.{ .text = anchor.value }});
-                        defer boundary.deinit();
-                        if (!try boundary.step()) return error.NotFound;
-                        order_pin = boundary.integer(0);
-                        order_sort = boundary.integer(1);
-                        order_id = try allocator.dupe(u8, try boundary.bytes(2));
-                    };
-                    if (root_key) |digest| {
-                        values[0] = .{ .blob = &digest };
-                        values[1] = .{ .text = v.canonical_root.? };
-                        n = 2;
-                    }
-                    if (v.project) |scoped_project| {
-                        sql = if (root_key != null) thread_columns ++ "WHERE root_key=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=threads.workspace_id AND json_extract(CAST(w.binding AS TEXT),'$.canonical_root')=?) AND project_id=? AND (-pinned,sort_order,id)>(?,?,?) ORDER BY -pinned,sort_order,id LIMIT ?" else thread_columns ++ "WHERE project_id=? AND (-pinned,sort_order,id)>(?,?,?) ORDER BY -pinned,sort_order,id LIMIT ?";
-                        values[n] = .{ .text = scoped_project.value };
-                        n += 1;
-                    } else sql = if (root_key != null) thread_columns ++ "WHERE root_key=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=threads.workspace_id AND json_extract(CAST(w.binding AS TEXT),'$.canonical_root')=?) AND (-pinned,sort_order,id)>(?,?,?) ORDER BY -pinned,sort_order,id LIMIT ?" else thread_columns ++ "WHERE (-pinned,sort_order,id)>(?,?,?) ORDER BY -pinned,sort_order,id LIMIT ?";
                     values[n] = .{ .integer = order_pin };
                     values[n + 1] = .{ .integer = order_sort };
                     values[n + 2] = .{ .text = order_id };
                     n += 3;
-                } else if (v.project) |scoped_project| {
-                    sql = thread_columns ++ "WHERE project_id=? AND rowid>max(?,coalesce((SELECT rowid FROM threads WHERE id=?),0)) ORDER BY rowid LIMIT ?";
-                    values[0] = .{ .text = scoped_project.value };
-                    n = 1;
                 } else {
-                    sql = thread_columns ++ "WHERE rowid>max(?,coalesce((SELECT rowid FROM threads WHERE id=?),0)) ORDER BY rowid LIMIT ?";
-                }
-                if (!v.sidebar_order) {
                     values[n] = .{ .integer = @intCast(cursor) };
-                    values[n + 1] = if (v.anchor) |anchor| .{ .text = anchor.value } else .null;
+                    values[n + 1] = .{ .integer = anchor_rowid };
                     n += 2;
                 }
             },
             .thread_sidebar_next => |v| {
-                const digest = canonicalRootKey(v.canonical_root);
+                query_root_digest = canonicalRootKey(v.canonical_root);
                 var boundary_pin: i64 = 0;
                 var boundary_sort: i64 = 0;
                 var boundary_id: []const u8 = "";
@@ -2481,7 +2547,7 @@ pub const Host = struct {
                     // partition and its authoritative binding match this
                     // request. A hash match alone is insufficient: a corrupt
                     // or colliding row must fail closed.
-                    const b = try reader.prepare("SELECT -pinned,sort_order,id FROM threads WHERE id=? AND root_key=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=threads.workspace_id AND json_extract(CAST(w.binding AS TEXT),'$.canonical_root')=?)", &.{ .{ .text = after.value }, .{ .blob = &digest }, .{ .text = v.canonical_root } });
+                    const b = try reader.prepare("SELECT -pinned,sort_order,id FROM threads WHERE id=? AND deleted=0 AND archived=0 AND root_key=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=threads.workspace_id AND json_extract(CAST(w.binding AS TEXT),'$.canonical_root')=?)", &.{ .{ .text = after.value }, .{ .blob = &query_root_digest }, .{ .text = v.canonical_root } });
                     defer b.deinit();
                     if (!try b.step()) return error.CursorInvalid;
                     boundary_pin = b.integer(0);
@@ -2492,8 +2558,8 @@ pub const Host = struct {
                 // strictly after the anchor and wrap to the first eligible row
                 // when the tail is exhausted. The candidate CTEs are bounded
                 // by the root indexes and the outer projection fetches one row.
-                const eligible_prefix = "WITH eligible AS (SELECT id,pinned,sort_order FROM threads WHERE root_key=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=threads.workspace_id AND json_extract(CAST(w.binding AS TEXT),'$.canonical_root')=?)";
-                values[0] = .{ .blob = &digest };
+                const eligible_prefix = "WITH eligible AS (SELECT id,pinned,sort_order FROM threads WHERE deleted=0 AND archived=0 AND root_key=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=threads.workspace_id AND json_extract(CAST(w.binding AS TEXT),'$.canonical_root')=?)";
+                values[0] = .{ .blob = &query_root_digest };
                 values[1] = .{ .text = v.canonical_root };
                 if (v.project) |scoped_project| {
                     values[2] = .{ .text = scoped_project.value };
@@ -2501,7 +2567,7 @@ pub const Host = struct {
                 } else {
                     n = 2;
                 }
-                values[n] = .{ .integer = @intCast(self.now()) };
+                values[n] = .{ .integer = @intCast(@max(0, std.Io.Clock.real.now(self.io).toMilliseconds())) };
                 n += 1;
                 const eligible_project = " AND project_id=?";
                 const eligible_live = " AND settled=0 AND snoozed_until<=?), candidate AS (SELECT id,pinned,sort_order FROM eligible";
@@ -2524,7 +2590,7 @@ pub const Host = struct {
                     (if (v.after != null) root_after else root_first);
             },
             .thread => |v| {
-                sql = thread_columns ++ "WHERE id=? AND rowid>? LIMIT ?";
+                sql = thread_columns ++ "WHERE id=? AND deleted=0 AND rowid>? LIMIT ?";
                 values[0] = .{ .text = v.value };
                 n = 1;
             },
@@ -2534,7 +2600,7 @@ pub const Host = struct {
                     defer existing.deinit();
                     if (!try existing.step()) return error.NotFound;
                 }
-                sql = if (v.direction == .newer) "SELECT ordinal+1,id,revision,ordinal,role,incomplete,run_id FROM messages WHERE thread_id=? AND ordinal>=max(?,coalesce((SELECT ordinal+1 FROM messages WHERE id=? AND thread_id=?),0)) ORDER BY ordinal LIMIT ?" else "SELECT ordinal+1,id,revision,ordinal,role,incomplete,run_id FROM messages WHERE thread_id=? AND ordinal<min(?-1,coalesce((SELECT ordinal FROM messages WHERE id=? AND thread_id=?),9223372036854775807)) ORDER BY ordinal DESC LIMIT ?";
+                sql = if (v.direction == .newer) "SELECT ordinal+1,id,revision,ordinal,role,incomplete,run_id FROM messages WHERE thread_id=? AND EXISTS(SELECT 1 FROM threads WHERE id=messages.thread_id AND deleted=0) AND ordinal>=max(?,coalesce((SELECT ordinal+1 FROM messages WHERE id=? AND thread_id=?),0)) ORDER BY ordinal LIMIT ?" else "SELECT ordinal+1,id,revision,ordinal,role,incomplete,run_id FROM messages WHERE thread_id=? AND EXISTS(SELECT 1 FROM threads WHERE id=messages.thread_id AND deleted=0) AND ordinal<min(?-1,coalesce((SELECT ordinal FROM messages WHERE id=? AND thread_id=?),9223372036854775807)) ORDER BY ordinal DESC LIMIT ?";
                 if (v.direction == .older and cursor == 0) cursor = std.math.maxInt(i64);
                 values[0] = .{ .text = v.thread.value };
                 values[1] = .{ .integer = @intCast(cursor) };
@@ -2543,43 +2609,43 @@ pub const Host = struct {
                 n = 4;
             },
             .blocks => |v| {
-                sql = "SELECT ordinal+1,id,revision,ordinal,kind,committed_bytes,tool_id FROM blocks WHERE message_id=? AND ordinal+1>? ORDER BY ordinal LIMIT ?";
+                sql = "SELECT ordinal+1,id,revision,ordinal,kind,committed_bytes,tool_id FROM blocks WHERE message_id=? AND EXISTS(SELECT 1 FROM messages m JOIN threads t ON t.id=m.thread_id WHERE m.id=blocks.message_id AND t.deleted=0) AND ordinal+1>? ORDER BY ordinal LIMIT ?";
                 values[0] = .{ .text = v.message.value };
                 n = 1;
             },
             .attachments => |v| {
-                sql = "SELECT rowid,id,revision,thread_id,name,media_type,byte_length,digest,kind FROM attachments WHERE thread_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                sql = "SELECT rowid,id,revision,thread_id,name,media_type,byte_length,digest,kind FROM attachments WHERE thread_id=? AND EXISTS(SELECT 1 FROM threads WHERE id=attachments.thread_id AND deleted=0) AND rowid>? ORDER BY rowid LIMIT ?";
                 values[0] = .{ .text = v.thread.value };
                 n = 1;
             },
             .runs => |v| {
-                sql = "SELECT rowid,id,revision,thread_id,session_id,state,requested,effective,coalesce((SELECT evidence FROM observations WHERE session_id=runs.session_id AND json_extract(CAST(correlation AS TEXT),'$.run.value')=runs.id AND evidence IS NOT NULL ORDER BY commit_sequence DESC LIMIT 1),'') FROM runs WHERE thread_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                sql = "SELECT rowid,id,revision,thread_id,session_id,state,requested,effective,coalesce((SELECT evidence FROM observations WHERE session_id=runs.session_id AND json_extract(CAST(correlation AS TEXT),'$.run.value')=runs.id AND evidence IS NOT NULL ORDER BY commit_sequence DESC LIMIT 1),'') FROM runs WHERE thread_id=? AND EXISTS(SELECT 1 FROM threads WHERE id=runs.thread_id AND deleted=0) AND rowid>? ORDER BY rowid LIMIT ?";
                 values[0] = .{ .text = v.thread.value };
                 n = 1;
             },
             .effects => |v| {
-                sql = "SELECT rowid,id,revision,run_id,kind,state,outcome FROM effects WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                sql = "SELECT rowid,id,revision,run_id,kind,state,outcome FROM effects WHERE run_id=? AND EXISTS(SELECT 1 FROM runs r JOIN threads t ON t.id=r.thread_id WHERE r.id=effects.run_id AND t.deleted=0) AND rowid>? ORDER BY rowid LIMIT ?";
                 values[0] = .{ .text = v.run.value };
                 n = 1;
             },
             .tools => |v| {
-                sql = "SELECT rowid,id,revision,run_id,name,action_digest,outcome,result_block FROM tools WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                sql = "SELECT rowid,id,revision,run_id,name,action_digest,outcome,result_block FROM tools WHERE run_id=? AND EXISTS(SELECT 1 FROM runs r JOIN threads t ON t.id=r.thread_id WHERE r.id=tools.run_id AND t.deleted=0) AND rowid>? ORDER BY rowid LIMIT ?";
                 values[0] = .{ .text = v.run.value };
                 n = 1;
             },
             .approvals => |v| {
-                sql = "SELECT rowid,id,revision,run_id,state,session_id,tool_id,workspace_id,upstream_request,action_digest,scope,expires_at,live_epoch FROM approvals WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                sql = "SELECT rowid,id,revision,run_id,state,session_id,tool_id,workspace_id,upstream_request,action_digest,scope,expires_at,live_epoch FROM approvals WHERE run_id=? AND EXISTS(SELECT 1 FROM runs r JOIN threads t ON t.id=r.thread_id WHERE r.id=approvals.run_id AND t.deleted=0) AND rowid>? ORDER BY rowid LIMIT ?";
                 values[0] = .{ .text = v.run.value };
                 n = 1;
             },
             .questions => |v| {
-                sql = "SELECT rowid,id,revision,run_id,state,question,expires_at,live_epoch FROM questions WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?";
+                sql = "SELECT rowid,id,revision,run_id,state,question,expires_at,live_epoch FROM questions WHERE run_id=? AND EXISTS(SELECT 1 FROM runs r JOIN threads t ON t.id=r.thread_id WHERE r.id=questions.run_id AND t.deleted=0) AND rowid>? ORDER BY rowid LIMIT ?";
                 values[0] = .{ .text = v.run.value };
                 n = 1;
             },
             .content => |v| {
                 if (v.start_byte > v.end_byte or v.end_byte > std.math.maxInt(i64) or v.end_byte - v.start_byte > page.max_bytes) return error.InvalidQuery;
-                const s = try reader.prepare("SELECT revision,committed_bytes FROM blocks WHERE id=?", &.{.{ .text = v.block.value }});
+                const s = try reader.prepare("SELECT revision,committed_bytes FROM blocks WHERE id=? AND EXISTS(SELECT 1 FROM messages m JOIN threads t ON t.id=m.thread_id WHERE m.id=blocks.message_id AND t.deleted=0)", &.{.{ .text = v.block.value }});
                 defer s.deinit();
                 if (!try s.step()) return error.NotFound;
                 const committed = try number(s, 1);
@@ -2636,7 +2702,7 @@ pub const Host = struct {
                 .threads, .thread, .thread_sidebar_next => blk: {
                     const explicit_title = try allocator.dupe(u8, @import("text/utf8.zig").prefix(try s.bytes(12), t.max_title_bytes));
                     const prompt_preview = @import("text/utf8.zig").prefix(try s.bytes(7), t.max_title_bytes);
-                    break :blk .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator), .title_preview = if (explicit_title.len != 0) explicit_title else try allocator.dupe(u8, prompt_preview), .title = explicit_title, .latest_run_state = if (s.isNull(8)) null else try enumeration(t.RunState, s, 8), .project_name = try text(allocator, s, 9), .workspace_root = try text(allocator, s, 10), .workspace_branch = try text(allocator, s, 11), .pinned = s.integer(13) != 0, .settled = s.integer(14) != 0, .snoozed_until = s.integer(15), .sort_order = s.integer(16), .created_at_ms = s.integer(17), .last_user_message_at_ms = s.integer(18), .updated_at_ms = s.integer(19), .can_snooze = s.integer(20) != 0 } };
+                    break :blk .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator), .title_preview = if (explicit_title.len != 0) explicit_title else try allocator.dupe(u8, prompt_preview), .title = explicit_title, .latest_run_state = if (s.isNull(8)) null else try enumeration(t.RunState, s, 8), .project_name = try text(allocator, s, 9), .workspace_root = try text(allocator, s, 10), .workspace_branch = try text(allocator, s, 11), .pinned = s.integer(13) != 0, .settled = s.integer(14) != 0, .snoozed_until = s.integer(15), .sort_order = s.integer(16), .created_at_ms = s.integer(17), .last_user_message_at_ms = s.integer(18), .updated_at_ms = s.integer(19), .can_snooze = s.integer(20) != 0, .archived = s.integer(21) != 0 } };
                 },
                 .blocks => .{ .block = try descriptor(allocator, s) },
                 .attachments => .{ .attachment = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .thread = .{ .value = try text(allocator, s, 3) }, .name = try text(allocator, s, 4), .media_type = try text(allocator, s, 5), .byte_length = try number(s, 6), .digest = try text(allocator, s, 7), .kind = try enumeration(a.AttachmentKind, s, 8) } },
