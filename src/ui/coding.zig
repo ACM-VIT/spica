@@ -416,6 +416,11 @@ pub const View = struct {
         self.saveSetupDraft();
         self.setup_runtime = runtime;
         self.loadSetupDraft();
+        // Provider selection is a routing boundary. A model identity from the
+        // previous runtime must never remain sendable while the user edits a
+        // different connection; the next catalog refresh will repopulate it.
+        self.selected = null;
+        self.model_count = 0;
         self.setup_field = 2;
     }
 
@@ -3101,7 +3106,9 @@ test "connection defaults own both provider drafts and never substitute another 
     try std.testing.expectEqual(@as(usize, 2), view.setup_field);
     view.setup_select_all = true;
     try view.setupInsert("/fixture/café/新");
+    view.selected = try View.Identity.from(.{ .runtime_kind = "codex", .required_runtime_version = "0.163.0", .model_provider = "openai", .model_id = "gpt", .effort = "low", .account_ref = "/fixture/accounts/codex", .workspace = .{ .value = "/fixture/project" } });
     view.selectSetupProvider(.opencode);
+    try std.testing.expect(view.selected == null);
     try std.testing.expectEqualStrings("/fixture/bin/opencode", view.setup_fields[0][0..view.setup_lengths[0]]);
     try std.testing.expectEqualStrings("/fixture/accounts/opencode", view.setup_fields[1][0..view.setup_lengths[1]]);
     try std.testing.expectEqualStrings("opencode", view.setup_fields[3][0..view.setup_lengths[3]]);

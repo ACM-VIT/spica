@@ -1218,6 +1218,32 @@ const Conversation = struct {
         return !self.runtime_configured or !std.mem.eql(u8, &applied, &setupKey(configuration));
     }
 
+    fn selectionMatchesConfiguration(selection: contract.Selection, configuration: contract.RuntimeSetup) bool {
+        if (configuration.executable.len == 0 or configuration.account_directory.len == 0 or configuration.workspace_root.len == 0 or configuration.model_provider.len == 0) return true;
+        if (!std.mem.eql(u8, selection.runtime_kind, @tagName(configuration.runtime_kind)) or
+            !std.mem.eql(u8, selection.account_ref, configuration.account_directory)) return false;
+        return std.mem.eql(u8, selection.model_provider, configuration.model_provider) or
+            (configuration.runtime_kind == .opencode and std.mem.eql(u8, configuration.model_provider, "auto") and selection.model_provider.len != 0);
+    }
+
+    /// A connection change is a routing boundary. Do not let a durable thread
+    /// selection from Codex survive an explicit switch to OpenCode (or vice
+    /// versa), where the next Send would otherwise target the old runtime.
+    fn invalidateSelectionForConfiguration(self: *Conversation, view: *Coding, configuration: contract.RuntimeSetup) void {
+        if (view.selected) |selected| {
+            if (!selectionMatchesConfiguration(selected.selection(), configuration)) view.selected = null;
+        }
+        if (self.durable_selection) |selection| {
+            if (!selectionMatchesConfiguration(selection.selection(), configuration)) self.durable_selection = null;
+        }
+        if (self.launch_selection) |selection| {
+            if (!selectionMatchesConfiguration(selection.selection(), configuration)) self.launch_selection = null;
+        }
+        if (self.attempted_selection) |selection| {
+            if (!selectionMatchesConfiguration(selection.selection(), configuration)) self.attempted_selection = null;
+        }
+    }
+
     fn configureSetup(self: *Conversation, configuration: contract.RuntimeSetup, login: ?contract.RuntimeLogin) !void {
         try self.submit(.configure, .absent, .absent, .{ .runtime_configure = configuration }, 0);
         self.submitted_setup_key = setupKey(configuration);
@@ -1228,11 +1254,11 @@ const Conversation = struct {
         self.durable_selection = if (durable) |selection| try Coding.Identity.from(selection) else null;
         if (view.selected != null) return;
         if (self.durable_selection) |selection| {
-            view.selected = selection;
+            if (selectionMatchesConfiguration(selection.selection(), setupConfiguration(view))) view.selected = selection else self.durable_selection = null;
         } else if (self.launch_selection) |launch| {
             // The launch path stays owned by Conversation. Explicit connection
             // changes clear this fallback before registering another workspace.
-            if (launch.model_id.len != 0 and launch.effort.len != 0) {
+            if (launch.model_id.len != 0 and launch.effort.len != 0 and selectionMatchesConfiguration(launch.selection(), setupConfiguration(view))) {
                 var bound = launch;
                 bound.workspace = self.workspace;
                 view.selected = bound;
@@ -1415,6 +1441,7 @@ const Conversation = struct {
             .status => try self.ask(.runtime_status, .{ .runtime_status = {} }),
             .refresh => {
                 if (self.setupNeedsConfigure(configuration)) {
+                    self.invalidateSelectionForConfiguration(&app.view, configuration);
                     try self.configureSetup(configuration, null);
                 } else {
                     try self.submit(.refresh_models, .absent, .absent, .{ .runtime_refresh = {} }, 0);
@@ -1429,7 +1456,10 @@ const Conversation = struct {
                 } else try self.submit(.login, .absent, .absent, .{ .runtime_login = login }, 0);
             },
             .open_login => unreachable,
-            .configure => try self.configureSetup(configuration, null),
+            .configure => {
+                self.invalidateSelectionForConfiguration(&app.view, configuration);
+                try self.configureSetup(configuration, null);
+            },
         }
         app.view.notice = null;
     }
@@ -3516,6 +3546,20 @@ test "durable and retained choices take precedence over launch and survive catal
     try conversation.restoreSelection(&view, usability_selection);
     try std.testing.expectEqualStrings("explicit-model", view.selected.?.model_id.slice());
     try std.testing.expectEqualStrings("medium", view.selected.?.effort.slice());
+}
+
+test "switching to OpenCode invalidates a saved Codex selection before Send" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    const codex = contract.Selection{ .runtime_kind = "codex", .required_runtime_version = "0.163.0", .model_provider = "openai", .model_id = "gpt", .effort = "low", .account_ref = "/accounts/codex", .workspace = .{ .value = "/workspace" } };
+    app.view.selected = try Coding.Identity.from(codex);
+    conversation.durable_selection = try Coding.Identity.from(codex);
+    const opencode = contract.RuntimeSetup{ .runtime_kind = .opencode, .executable = "/bin/opencode", .account_directory = "/accounts/opencode", .workspace_root = "/workspace", .model_provider = "auto" };
+    conversation.invalidateSelectionForConfiguration(&app.view, opencode);
+    try std.testing.expect(app.view.selected == null);
+    try std.testing.expect(conversation.durable_selection == null);
 }
 
 test "rejected selection persistence does not spin or overwrite the exact user choice" {

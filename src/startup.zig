@@ -9,7 +9,11 @@ pub fn defaults(allocator: std.mem.Allocator, io: std.Io, state_directory: []con
     const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
     return .{
         .{ .runtime_kind = .codex, .executable = try executable(allocator, io, .codex, path, home), .account_directory = try codexAccount(allocator, state_directory, workspace, home, codex_home), .workspace_root = workspace, .model_provider = "openai" },
-        .{ .runtime_kind = .opencode, .executable = try executable(allocator, io, .opencode, path, home), .account_directory = try std.fs.path.join(allocator, &.{ state_directory, "accounts", "opencode" }), .workspace_root = workspace, .model_provider = "opencode" },
+        // OpenCode provider namespaces are installation-specific (for example
+        // opencode-free). `auto` discovers the exact negotiated prefix and
+        // keeps it in each model identity; users can replace it with a strict
+        // prefix when they need to pin one provider.
+        .{ .runtime_kind = .opencode, .executable = try executable(allocator, io, .opencode, path, home), .account_directory = try std.fs.path.join(allocator, &.{ state_directory, "accounts", "opencode" }), .workspace_root = workspace, .model_provider = "auto" },
     };
 }
 
@@ -65,6 +69,7 @@ test "startup defaults preserve canonical cwd and separate managed Unicode accou
     const setups = try defaults(allocator, std.testing.io, state, "", null, null);
     try std.testing.expectEqual(.codex, setups[0].runtime_kind);
     try std.testing.expectEqual(.opencode, setups[1].runtime_kind);
+    try std.testing.expectEqualStrings("auto", setups[1].model_provider);
     try std.testing.expectEqualStrings(try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator), setups[0].workspace_root);
     try std.testing.expectEqualStrings(setups[0].workspace_root, setups[1].workspace_root);
     try std.testing.expectEqualStrings(try std.fs.path.join(allocator, &.{ state, "accounts", "codex" }), setups[0].account_directory);
@@ -106,4 +111,5 @@ test "Codex auth home precedence resolves Unicode overrides without reading or c
     const setups = try defaults(a, std.testing.io, "/state", "", "/user", "/custom/账号");
     try std.testing.expectEqualStrings("/custom/账号", setups[0].account_directory);
     try std.testing.expectEqualStrings("/state/accounts/opencode", setups[1].account_directory);
+    try std.testing.expectEqualStrings("auto", setups[1].model_provider);
 }

@@ -228,10 +228,13 @@ fn appendOpenCode(allocator: std.mem.Allocator, input: c.Selection, model: Value
     const value = text(field(model, "value"));
     const slash = std.mem.indexOfScalar(u8, value, '/') orelse return error.InvalidCatalog;
     if (slash == 0 or slash + 1 == value.len or value.len > 512) return error.InvalidCatalog;
-    // Authorization is provider-specific; a negotiated other-provider item is not authorized.
-    if (!eq(value[0..slash], input.model_provider)) return;
+    // An explicit provider prefix is strict. `auto` is an explicit discovery
+    // mode for installations such as opencode-free where the negotiated
+    // provider namespace is not known before session/new.
+    if (!eq(input.model_provider, "auto") and !eq(value[0..slash], input.model_provider)) return;
     if (count.* == output.len) return error.CatalogLimit;
     var selection = input;
+    if (eq(input.model_provider, "auto")) selection.model_provider = value[0..slash];
     selection.model_id = value[slash + 1 ..];
     selection.effort = "default";
     output[count.*] = .{ .selection = try common.clone(allocator, selection), .supported_efforts = &.{"default"}, .display_name = try allocator.dupe(u8, text(field(model, "name"))), .readiness = .unknown, .reason = "OpenCode negotiated catalog; account entitlement unverified; per-model variants require exact session negotiation" };
@@ -261,6 +264,19 @@ test "OpenCode grouped catalog filters unauthorized provider and bounds rows" {
     try std.testing.expectEqualStrings("one", output[0].selection.model_id);
     try std.testing.expectEqual(c.Readiness.unknown, output[0].readiness);
     try std.testing.expectError(error.CatalogLimit, opencodeModels(allocator, input, parsed.value, output[0..0]));
+}
+
+test "OpenCode auto catalog preserves the negotiated provider prefix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const parsed = try std.json.parseFromSlice(Value, allocator, "{\"configOptions\":[{\"id\":\"model\",\"options\":[{\"value\":\"opencode-free/glm-5.3-flash\",\"name\":\"GLM 5.3 Flash\"},{\"value\":\"openai-codex/gpt-5\",\"name\":\"Codex\"}]}]}", .{});
+    const input: c.Selection = .{ .runtime_kind = "opencode", .required_runtime_version = "2.1.4", .model_provider = "auto", .model_id = "", .effort = "", .account_ref = "/isolated/opencode", .workspace = .{ .value = "w" } };
+    var output: [2]c.Model = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try opencodeModels(allocator, input, parsed.value, &output));
+    try std.testing.expectEqualStrings("opencode-free", output[0].selection.model_provider);
+    try std.testing.expectEqualStrings("glm-5.3-flash", output[0].selection.model_id);
+    try std.testing.expectEqualStrings("openai-codex", output[1].selection.model_provider);
 }
 
 test "one mismatched OpenCode catalog row cannot poison exact selections or efforts" {
