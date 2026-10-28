@@ -27,6 +27,12 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     binary = args.binary.resolve()
     workspace = Path(tempfile.mkdtemp(prefix='spica-setup-project-'))
+    m.run('git', '-C', str(workspace), 'init', '--initial-branch=fixture')
+    def commit_workspace(message):
+        m.run('git', '-C', str(workspace), '-c', 'user.name=Spica fixture',
+              '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-m', message)
+        return m.run('git', '-C', str(workspace), 'rev-parse', 'HEAD')
+    initial_head = commit_workspace('Initial isolated fixture')
     home = output / 'home'
     home.mkdir()
     manifest = dict(revision=m.run('git', 'rev-parse', 'HEAD'), source_sha256=m.source_fingerprint(),
@@ -143,6 +149,23 @@ def main():
         shot('completed')
         thread = current['thread_id']
         completed_thread = thread
+        first_run = current['run_id']
+        advanced_head = commit_workspace('Advance the same fixture branch')
+        assert advanced_head != initial_head and m.run('git', '-C', str(workspace), 'branch', '--show-current') == 'fixture'
+        m.run('vd', 'text', session, window, 'Continue in the same chat after committing café 世界')
+        current = observe(lambda s: s['draft'] == 'Continue in the same chat after committing café 世界' and s['send_ready'], 'post-commit-draft')
+        key('Return')
+        current = observe(lambda s: s['thread_id'] == thread and s['run_id'] != first_run and
+                          s['run_status'] == 'completed' and s['send_receipt'] == 'accepted', 'post-commit-completed')
+        assert not current['send_rejection'] and current['selected_runtime'] == 'codex'
+        database = output / 'data/spica-native/conversation/conversation.sqlite3'
+        with sqlite3.connect(database) as db:
+            requested = json.loads(db.execute('SELECT requested FROM runs WHERE id=?', (current['run_id'],)).fetchone()[0])
+            assert requested['runtime_kind'] == 'codex' and requested['model_provider'] == 'openai'
+            assert db.execute("SELECT count(*) FROM commands WHERE json_extract(receipt, '$.reason')='workspace_mismatch'").fetchone()[0] == 0
+        manifest['workspace_commit'] = dict(branch='fixture', initial_head=initial_head, advanced_head=advanced_head,
+                                          thread=thread, run=current['run_id'], same_thread=True, runtime=requested['runtime_kind'])
+        shot('post-commit-completed')
         key('ctrl+q')
         m.wait_windows(session, False)
         shutil.copyfile(output / 'metrics.json', output / 'first-metrics.json')
@@ -260,7 +283,7 @@ def main():
             # fixture construction, separate from the real input below.
             database = output / 'data/spica-native/conversation/conversation.sqlite3'
             with sqlite3.connect(database) as db:
-                run = db.execute('SELECT id FROM runs WHERE thread_id=?', (completed_thread,)).fetchone()[0]
+                run = db.execute('SELECT id FROM runs WHERE thread_id=? ORDER BY rowid DESC LIMIT 1', (completed_thread,)).fetchone()[0]
                 db.execute("UPDATE runs SET state='streaming' WHERE id=?", (run,))
                 db.execute("UPDATE effects SET state='in_flight' WHERE run_id=? AND kind='start'", (run,))
             manifest['recovery_fixture'] = dict(run=run, thread=completed_thread,

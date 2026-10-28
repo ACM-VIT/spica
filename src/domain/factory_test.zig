@@ -485,6 +485,82 @@ test "real workspace Git capture rejects changed checkouts aliases and shared me
     try std.testing.expect(!try domain.workspace_binding.verify(allocator, std.testing.io, binding));
 }
 
+test "workspace checkout continuity allows branch commits but rejects other checkout identities" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try temporary.dir.createDir(std.testing.io, "repo", .default_dir);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    const root = try std.fmt.allocPrint(allocator, "{s}/repo", .{path_buffer[0..n]});
+    const linked = try std.fmt.allocPrint(allocator, "{s}/linked", .{path_buffer[0..n]});
+    try gitFixture(allocator, root, &.{ "init", "--initial-branch=fixture" });
+    const unborn = try domain.workspace_binding.capture(allocator, std.testing.io, root);
+    try std.testing.expect(try domain.workspace_binding.verifyCheckout(allocator, std.testing.io, unborn));
+    try gitFixture(allocator, root, &.{ "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "first" });
+    const first = try domain.workspace_binding.capture(allocator, std.testing.io, root);
+    try std.testing.expect(!try domain.workspace_binding.verify(allocator, std.testing.io, unborn));
+    try std.testing.expect(try domain.workspace_binding.verifyCheckout(allocator, std.testing.io, unborn));
+    try gitFixture(allocator, root, &.{ "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "second" });
+    try std.testing.expect(!try domain.workspace_binding.verify(allocator, std.testing.io, first));
+    try std.testing.expect(try domain.workspace_binding.verifyCheckout(allocator, std.testing.io, first));
+    try std.testing.expect(try domain.workspace_binding.verifyCheckout(allocator, std.testing.io, unborn));
+    try gitFixture(allocator, root, &.{ "switch", "-c", "replacement" });
+    try std.testing.expect(!try domain.workspace_binding.verifyCheckout(allocator, std.testing.io, first));
+    try gitFixture(allocator, root, &.{ "switch", "fixture" });
+    try std.testing.expect(try domain.workspace_binding.verifyCheckout(allocator, std.testing.io, first));
+    try gitFixture(allocator, root, &.{ "worktree", "add", "-b", "linked-fixture", linked });
+    var substituted = first;
+    substituted.canonical_root = linked;
+    try std.testing.expect(!try domain.workspace_binding.verifyCheckout(allocator, std.testing.io, substituted));
+    try gitFixture(allocator, root, &.{ "checkout", "--detach" });
+    const detached = try domain.workspace_binding.capture(allocator, std.testing.io, root);
+    try std.testing.expect(try domain.workspace_binding.verifyCheckout(allocator, std.testing.io, detached));
+    try std.testing.expect(!try domain.workspace_binding.verifyCheckout(allocator, std.testing.io, first));
+    try gitFixture(allocator, root, &.{ "checkout", "--detach", "HEAD^" });
+    try std.testing.expect(!try domain.workspace_binding.verifyCheckout(allocator, std.testing.io, detached));
+
+    try temporary.dir.rename("repo", temporary.dir, "old-repo", std.testing.io);
+    try temporary.dir.createDir(std.testing.io, "repo", .default_dir);
+    try gitFixture(allocator, root, &.{ "init", "--initial-branch=fixture" });
+    try std.testing.expect(!try domain.workspace_binding.verifyCheckout(allocator, std.testing.io, first));
+}
+
+test "public factory Host sends after first and later commits without reconnecting" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDir(std.testing.io, "repo", .default_dir);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    var consumer: Consumer = .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer consumer.arena.deinit();
+    const allocator = consumer.arena.allocator();
+    const root = try std.fmt.allocPrint(allocator, "{s}/repo", .{path_buffer[0..n]});
+    var factory: Factory = .{ .auto_ready = true };
+    consumer.host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .factory = factory.handle(), .selection = sampleSelection(""), .workspace_root = root, .wake = Consumer.wake, .wake_context = &consumer });
+    defer consumer.host.destroy();
+    try gitFixture(allocator, root, &.{ "init", "--initial-branch=fixture" });
+    const project = (try consumer.command(.{ .command_id = .{ .value = "project" }, .target = .absent, .expected_revision = .absent, .payload = .{ .project_create = .{ .display_name = "committing workspace" } } })).entity_ids.project.?;
+    const workspace = try consumer.register(project, root, "workspace");
+    for ([_][]const u8{ "first", "second" }, 0..) |commit, index| {
+        try gitFixture(allocator, root, &.{ "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", commit });
+        const thread = (try consumer.command(.{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "thread-{s}", .{commit}) }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+        const sent = try consumer.command(.{ .command_id = .{ .value = try std.fmt.allocPrint(allocator, "send-{s}", .{commit}) }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = commit, .selection = sampleSelection(workspace.value) } } });
+        try std.testing.expectEqual(.accepted, sent.outcome);
+        const runs = try consumer.query(.{ .runs = .{ .thread = thread } });
+        try std.testing.expectEqual(.streaming, runs.items[0].run.state);
+        try std.testing.expectEqual(@as(u32, @intCast(index + 1)), factory.start_calls.load(.acquire));
+    }
+    try gitFixture(allocator, root, &.{ "switch", "-c", "replacement" });
+    const thread = (try consumer.command(.{ .command_id = .{ .value = "wrong-branch-thread" }, .target = .absent, .expected_revision = .absent, .payload = .{ .thread_create = .{ .project = project, .workspace = workspace } } })).entity_ids.thread.?;
+    const rejected = try consumer.command(.{ .command_id = .{ .value = "wrong-branch-send" }, .target = .{ .thread = thread }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = "wrong checkout", .selection = sampleSelection(workspace.value) } } });
+    try std.testing.expectEqual(.rejected, rejected.outcome);
+    try std.testing.expectEqual(t.Reason.workspace_mismatch, rejected.reason.?);
+    try std.testing.expectEqual(@as(u32, 2), factory.start_calls.load(.acquire));
+}
+
 test "Host large Send verifies exact bytes and never repeats definitive or unknown Start receipts" {
     for ([_]@FieldType(c.Receipt, "outcome"){ .acknowledged, .rejected, .unknown }) |outcome| {
         var temporary = std.testing.tmpDir(.{});

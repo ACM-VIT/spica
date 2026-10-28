@@ -106,6 +106,18 @@ pub fn verify(allocator: std.mem.Allocator, io: std.Io, binding: t.WorkspaceBind
     return t.adapter.equal(actual, binding);
 }
 
+/// Continued execution belongs to the checkout and symbolic branch, rather
+/// than the revision captured when the workspace was registered. Snapshot
+/// consumers retain strict verify; detached HEAD remains revision-bound.
+pub fn verifyCheckout(allocator: std.mem.Allocator, io: std.Io, binding: t.WorkspaceBinding) !bool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var actual = try capture(arena.allocator(), io, binding.canonical_root);
+    if (!binding.non_git and !actual.non_git and binding.expected_branch.len != 0 and
+        !std.mem.eql(u8, binding.expected_branch, "HEAD")) actual.base_revision = binding.base_revision;
+    return t.adapter.equal(actual, binding);
+}
+
 /// Ownership paths are canonical relative names. Existing symlink components
 /// cannot turn an admitted path into authority outside the registered checkout.
 pub fn validOwnedPath(allocator: std.mem.Allocator, binding: t.WorkspaceBinding, path: []const u8) !bool {

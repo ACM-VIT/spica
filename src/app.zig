@@ -1067,6 +1067,7 @@ const Conversation = struct {
     catalog_truncated: bool = false,
     durable_selection: ?Coding.Identity = null,
     attempted_selection: ?Coding.Identity = null,
+    rejected_workspace: Id = .{},
     notice_storage: [1024]u8 = undefined,
     diagnostic_storage: [1024]u8 = undefined,
     diagnostic_display: [1024]u8 = undefined,
@@ -1314,6 +1315,7 @@ const Conversation = struct {
 
     fn selectionDisabledReason(self: *const Conversation, view: *const Coding) ?[]const u8 {
         if (self.normal_startup and !self.runtime_configured) return "Choose a provider in Connection to get started.";
+        if (self.rejected_workspace.len != 0 and self.rejected_workspace.eql(self.workspace.slice())) return rejectionMessage(.workspace_mismatch);
         if (self.login_inflight) return "Complete provider sign-in in Connection before sending.";
         if (self.catalog_refresh_pending or self.catalog_refresh_inflight) return "Loading configured provider models…";
         if (self.run_state) |state| if (state == .unknown or state == .interrupted)
@@ -1976,6 +1978,10 @@ const Conversation = struct {
             self.notice(&app.view, "Connection changed. Connect and choose a model for this provider before sending. Your draft is retained.");
             return;
         }
+        if (self.rejected_workspace.len != 0 and self.rejected_workspace.eql(selection.workspace.value)) {
+            self.notice(&app.view, rejectionMessage(.workspace_mismatch));
+            return;
+        }
         if (self.unknown_send) |*pending| {
             if (self.query == null) {
                 try self.ask(.send_receipt, .{ .command_receipt = .{ .value = &pending.id } });
@@ -2524,6 +2530,11 @@ const Conversation = struct {
             }
             if (pending.kind == .send) {
                 app.view.send_diagnostic.setReceipt(.rejected, if (value.reason) |reason| @tagName(reason) else "command_rejected");
+                if (value.reason == .workspace_mismatch) {
+                    self.rejected_workspace = self.workspace;
+                    app.view.can_send = false;
+                    app.view.send_disabled_reason = rejectionMessage(.workspace_mismatch);
+                }
             }
             if (pending.kind == .title) {
                 app.view.title_editing = true;
@@ -2771,6 +2782,7 @@ const Conversation = struct {
                         self.allocator.free(self.workspace_root);
                         self.workspace_root = root;
                         self.runtime_configured = true;
+                        self.rejected_workspace = .{};
                         try self.retainInspectionBinding(status.binding.?);
                         self.inspection_workspace = .{};
                         app.view.workspace_checkout_len = 0;
@@ -3513,6 +3525,27 @@ test "send receipts preserve rejection and newer drafts while exposing accepted 
         try std.testing.expect(std.mem.indexOf(u8, report, "sent €") == null);
         try std.testing.expect(std.mem.indexOf(u8, report, "\"turn_id\":null") != null);
     }
+}
+
+test "workspace rejection disables repeated Send and preserves the draft until reconnect" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    conversation.workspace = try Id.init(usability_selection.workspace.value);
+    try app.view.insert("hi", .paste);
+    app.view.can_send = true;
+    const id: [32]u8 = @splat('a');
+    conversation.command = .{ .ticket = .{ .value = 1 }, .kind = .send, .draft_revision = app.view.revision, .id = id };
+    try conversation.receipt(&app, .{ .value = 1 }, .{ .command_id = .{ .value = &id }, .outcome = .rejected, .reason = .workspace_mismatch, .commit_sequence = 0 });
+    try std.testing.expect(!app.view.can_send);
+    try std.testing.expectEqualStrings(Conversation.rejectionMessage(.workspace_mismatch), app.view.send_disabled_reason.?);
+    try std.testing.expectEqualStrings(Conversation.rejectionMessage(.workspace_mismatch), conversation.selectionDisabledReason(&app.view).?);
+    try conversation.sendIdentified(&app, .absent, .absent, "hi", usability_selection, app.view.revision, id);
+    try std.testing.expect(conversation.command == null);
+    try std.testing.expectEqualStrings("hi", app.view.editor.textBytes());
+    conversation.workspace = try Id.init("another-workspace");
+    try std.testing.expectEqualStrings("No models loaded. Open Connection and Refresh models.", conversation.selectionDisabledReason(&app.view).?);
 }
 
 test "send requires complete catalog identity and negotiated effort without claiming entitlement" {

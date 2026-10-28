@@ -601,7 +601,7 @@ pub const Owner = struct {
                 if (self.factory != null or self.workspace_root != null) {
                     const binding_bytes = try self.field(allocator, "SELECT binding FROM workspaces WHERE id=?", &.{.{ .text = workspace }}) orelse return .workspace_mismatch;
                     const binding = try t.decode(t.WorkspaceBinding, binding_bytes, allocator);
-                    if (!(workspace_binding.verify(allocator, self.io, binding) catch false)) return .workspace_mismatch;
+                    if (!(workspace_binding.verifyCheckout(allocator, self.io, binding) catch false)) return .workspace_mismatch;
                     if (self.workspace_root) |root| if (!std.mem.eql(u8, binding.canonical_root, root)) return .workspace_mismatch;
                 }
                 if (p.selection.account_ref.len == 0 or p.selection.model_id.len == 0 or p.selection.model_provider.len == 0) return .capability_unavailable;
@@ -2032,7 +2032,7 @@ pub const Host = struct {
             const selection = try t.decode(a.Selection, try metadata.bytes(1), allocator);
             const binding = try t.decode(t.WorkspaceBinding, try metadata.bytes(2), allocator);
             if (effect.request == .open or effect.request == .start or effect.request == .message or effect.request == .answer_question) {
-                if (!(workspace_binding.verify(allocator, self.io, binding) catch false)) {
+                if (!(workspace_binding.verifyCheckout(allocator, self.io, binding) catch false)) {
                     try owner.delivered(allocator, effect.id, .{ .outcome = .rejected, .detail = "Workspace identity changed before dispatch" });
                     return;
                 }
