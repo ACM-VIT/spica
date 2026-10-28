@@ -984,6 +984,39 @@ const LuaBridge = struct {
 /// One query, one mutation, one parse and one visible-tile request at a time.
 /// Every borrowed output is consumed/copied before drain storage is reused.
 const Conversation = struct {
+    const SidebarState = struct {
+        version: u8 = 1,
+        selected_thread: []const u8 = "",
+        scope_project: []const u8 = "",
+        collapsed: bool = false,
+        width: ?f32 = null,
+        working_shelf: bool = false,
+        expanded: [3]bool = @splat(false),
+
+        fn capture(view: *const Coding) SidebarState {
+            return .{ .selected_thread = view.active_thread.slice(), .scope_project = view.scope_project.slice(), .collapsed = view.sidebar_collapsed, .width = view.sidebar_width_override, .working_shelf = view.sidebar_working_shelf, .expanded = view.sidebar_shelf_expanded };
+        }
+        fn decode(bytes: []const u8, allocator: std.mem.Allocator) !SidebarState {
+            if (bytes.len > 4096) return error.InvalidSidebarState;
+            const state = try types.decode(SidebarState, bytes, allocator);
+            if (state.version != 1 or state.selected_thread.len > 256 or state.scope_project.len > 256 or
+                !std.unicode.utf8ValidateSlice(state.selected_thread) or !std.unicode.utf8ValidateSlice(state.scope_project)) return error.InvalidSidebarState;
+            for (state.selected_thread) |byte| if (std.ascii.isControl(byte)) return error.InvalidSidebarState;
+            for (state.scope_project) |byte| if (std.ascii.isControl(byte)) return error.InvalidSidebarState;
+            // The viewport/layout clamps a finite preferred width. The byte
+            // limit on this record is unrelated to physical display size.
+            if (state.width) |width| if (!std.math.isFinite(width) or width < 0) return error.InvalidSidebarState;
+            return state;
+        }
+        fn restore(self: SidebarState, view: *Coding) !Id {
+            view.scope_project = if (self.scope_project.len == 0) .{} else try Id.init(self.scope_project);
+            view.sidebar_collapsed = self.collapsed;
+            view.sidebar_width_override = self.width;
+            view.sidebar_working_shelf = self.working_shelf;
+            view.sidebar_shelf_expanded = self.expanded;
+            return if (self.selected_thread.len == 0) .{} else try Id.init(self.selected_thread);
+        }
+    };
     const PendingCommand = struct { ticket: types.Ticket, kind: CommandKind, draft_revision: u64, id: [32]u8 };
     const SidebarPending = struct { id: Id, revision: u64 };
     const ThreadCursor = struct {
@@ -1003,6 +1036,13 @@ const Conversation = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     host: *domain.Host,
+    sidebar_state_key: [64]u8 = undefined,
+    sidebar_state_loaded: bool = false,
+    sidebar_load_ticket: ?types.Ticket = null,
+    sidebar_save_ticket: ?types.Ticket = null,
+    sidebar_state_bytes: [4096]u8 = undefined,
+    sidebar_state_len: usize = 0,
+    sidebar_route_validated: bool = false,
     sidebar_pending: ?SidebarPending = null,
     worker: *presentation.Worker,
     wake: *Wake,
@@ -1655,6 +1695,7 @@ const Conversation = struct {
         const changed_thread = app.view.active_thread.len != 0 and !app.view.active_thread.eql(id.slice());
         try app.view.selectThread(id);
         self.thread = id;
+        self.sidebar_route_validated = false;
         self.run = .{};
         self.run_state = null;
         app.view.send_diagnostic = .{};
@@ -1819,6 +1860,41 @@ const Conversation = struct {
         return self.askMessages();
     }
 
+    fn sidebarStateKey(root: []const u8) [64]u8 {
+        var digest: [32]u8 = undefined;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("spica-sidebar-v1\x00");
+        hash.update(root);
+        hash.final(&digest);
+        return std.fmt.bytesToHex(digest, .lower);
+    }
+
+    fn saveSidebarState(self: *Conversation, view: *Coding) void {
+        if (!self.sidebar_state_loaded or !self.sidebar_route_validated or self.sidebar_save_ticket != null or view.sidebar_resizing) return;
+        if (!std.mem.eql(u8, &sidebarStateKey(self.workspace_root), &self.sidebar_state_key)) return;
+        var buffer: [4096]u8 = undefined;
+        const bytes = types.encode(SidebarState.capture(view), &buffer) catch {
+            self.notice(view, "Sidebar settings exceed the saved-state limit.");
+            return;
+        };
+        if (std.mem.eql(u8, bytes, self.sidebar_state_bytes[0..self.sidebar_state_len])) return;
+        const ticket = self.host.savePresentation(&self.sidebar_state_key, bytes) catch |err| {
+            if (err != error.Full and err != error.Busy) self.notice(view, "Sidebar settings could not be saved.");
+            return;
+        };
+        // One asynchronous write at a time. The next pump after its receipt
+        // compares against the latest view, coalescing changes while in flight.
+        @memcpy(self.sidebar_state_bytes[0..bytes.len], bytes);
+        self.sidebar_state_len = bytes.len;
+        self.sidebar_save_ticket = ticket;
+    }
+
+    fn clearHistoryRecoveryNotice(view: *Coding) void {
+        if (view.notice) |notice_text| if (std.mem.eql(u8, notice_text, "History snapshot expired; restoring stable anchor")) {
+            view.notice = null;
+        };
+    }
+
     fn recoveryQuery(self: *Conversation, kind: QueryKind) ?struct { kind: QueryKind, value: types.Query } {
         if (self.history_retrying or self.message_count == 0) return null;
         switch (kind) {
@@ -1932,7 +2008,7 @@ const Conversation = struct {
         }
     }
 
-    const QueryKind = enum { send_receipt, capabilities, projects, workspaces, inspection_workspace, threads, cards, thread_search, thread, models, runtime_status, startup_status, runs, effects, approvals, questions, tasks, messages, blocks, content };
+    const QueryKind = enum { send_receipt, capabilities, projects, startup_thread, workspaces, inspection_workspace, threads, cards, thread_search, thread, models, runtime_status, startup_status, runs, effects, approvals, questions, tasks, messages, blocks, content };
     const CommandKind = enum { prompt_cleanup, followup_enqueue, followup_edit, followup_cancel, followup_order, attachment_add, attachment_remove, question, project, workspace, thread, title, sidebar_title, sidebar, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
@@ -2284,12 +2360,35 @@ const Conversation = struct {
     }
 
     fn pump(self: *Conversation, app: *App) !void {
+        defer self.saveSidebarState(&app.view);
         var outputs: [8]types.Output = undefined;
         const drained = self.host.drain(&outputs, &self.drain_storage);
         if (drained.required_bytes_for_next != 0) return error.DomainOutputBudget;
         for (outputs[0..drained.output_count]) |output| {
             app.dirty = true;
             switch (output) {
+                .presentation_loaded => |value| {
+                    const pending = self.sidebar_load_ticket orelse return error.UnexpectedQueryTicket;
+                    if (pending.value != value.ticket.value) return error.UnexpectedQueryTicket;
+                    self.sidebar_load_ticket = null;
+                    self.sidebar_state_loaded = true;
+                    var route: Id = .{};
+                    if (value.value) |bytes| {
+                        var storage: [8192]u8 = undefined;
+                        var fixed = std.heap.FixedBufferAllocator.init(&storage);
+                        if (SidebarState.decode(bytes, fixed.allocator())) |saved| {
+                            route = try saved.restore(&app.view);
+                        } else |_| self.notice(&app.view, "Saved sidebar settings were invalid; using defaults.");
+                    }
+                    if (route.len != 0) {
+                        self.thread = route;
+                        try self.ask(.startup_thread, .{ .thread = .{ .value = route.slice() } });
+                    } else try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
+                },
+                .presentation_saved => |value| {
+                    if (self.sidebar_save_ticket == null or self.sidebar_save_ticket.?.value != value.ticket.value) return error.UnexpectedCommandReceipt;
+                    self.sidebar_save_ticket = null;
+                },
                 .command_receipt => |value| try self.receipt(app, value.ticket, value.receipt),
                 .query_page => |value| {
                     const pending = self.query orelse continue;
@@ -2326,8 +2425,25 @@ const Conversation = struct {
                 },
                 .unsubscribed => {},
                 .failure => |value| {
+                    if (self.sidebar_save_ticket) |ticket| if (ticket.value == value.ticket.value) {
+                        self.sidebar_save_ticket = null;
+                        self.notice(&app.view, "Sidebar settings could not be saved. Conversation execution is still available.");
+                        continue;
+                    };
+                    if (self.sidebar_load_ticket) |ticket| if (ticket.value == value.ticket.value) {
+                        self.sidebar_load_ticket = null;
+                        self.sidebar_state_loaded = true;
+                        self.notice(&app.view, "Sidebar settings could not be restored; using defaults.");
+                        try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
+                        continue;
+                    };
                     if (self.query) |pending| if (pending.ticket.value == value.ticket.value) {
                         self.query = null;
+                        if (pending.kind == .startup_thread and value.failure.reason == .not_found) {
+                            self.thread = .{};
+                            try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
+                            continue;
+                        }
                         if (pending.kind == .thread_search) {
                             app.view.thread_search_busy = false;
                             app.view.search_more_available = false;
@@ -2396,6 +2512,11 @@ const Conversation = struct {
                 },
             }
         }
+        if (self.sidebar_load_ticket != null) {
+            app.view.navigation_enabled = false;
+            app.view.can_send = false;
+            return;
+        }
         if (self.query == null and self.unknown_send != null and !self.receipt_lookup_attempted) {
             try self.ask(.send_receipt, .{ .command_receipt = .{ .value = &self.unknown_send.?.id } });
             self.receipt_lookup_attempted = true;
@@ -2424,6 +2545,7 @@ const Conversation = struct {
                 },
                 .tile => |*tile| if (self.worker_key) |key| {
                     if (std.meta.eql(tile.key, key)) {
+                        clearHistoryRecoveryNotice(&app.view);
                         self.history_retrying = false;
                         self.recovery_block = null;
                         if (self.history_first == null) self.history_first = .{ .key = tile.key, .cursor = .{ .block = tile.block.index, .byte = tile.start_byte }, .ordinal = self.blocks[self.block_index].ordinal };
@@ -2954,13 +3076,38 @@ const Conversation = struct {
                     try self.ask(.capabilities, .{ .capabilities = {} });
                 }
             },
+            .startup_thread => {
+                if (value.items.len == 1 and std.mem.eql(u8, value.items[0].thread.workspace_root, self.workspace_root)) {
+                    self.project = try Id.init(value.items[0].thread.project.value);
+                    self.workspace = try Id.init(value.items[0].thread.workspace.value);
+                    // Saved routing is checked against a fresh thread query,
+                    // never against the first bounded page of sidebar cards.
+                    self.startup_runtime = null;
+                    try self.selectThread(app, try Id.init(value.items[0].thread.id.value));
+                    self.resetThreadCards(&app.view);
+                    self.refresh = false;
+                    try self.ask(.cards, .{ .threads = .{ .page = page } });
+                } else {
+                    self.thread = .{};
+                    try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
+                }
+            },
             .projects => {
                 if (self.startup_probe_pending) {
                     self.startup_probe_pending = false;
                     try self.ask(.startup_status, .{ .runtime_status = {} });
                     return;
                 }
+                const key = sidebarStateKey(self.workspace_root);
                 for (value.items) |row| try addEntry(&app.view.projects, &app.view.project_count, row.project.id.value, row.project.display_name);
+                if (!self.sidebar_state_loaded or !std.mem.eql(u8, &key, &self.sidebar_state_key)) {
+                    self.sidebar_state_key = key;
+                    self.sidebar_state_loaded = false;
+                    self.sidebar_state_len = 0;
+                    self.sidebar_route_validated = false;
+                    self.sidebar_load_ticket = try self.host.loadPresentation(&self.sidebar_state_key);
+                    return;
+                }
                 if (value.items.len == 0) try self.submit(.project, .absent, .absent, .{ .project_create = .{ .display_name = "Native coding workspace" } }, 0) else {
                     self.project = try Id.init(value.items[0].project.id.value);
                     try self.ask(.workspaces, .{ .workspaces = .{ .project = .{ .value = self.project.slice() }, .page = page } });
@@ -3065,6 +3212,7 @@ const Conversation = struct {
             .thread => {
                 if (value.items.len != 1) return error.MissingThread;
                 if (!std.mem.eql(u8, value.items[0].thread.workspace_root, self.workspace_root)) return error.WrongCheckout;
+                self.sidebar_route_validated = true;
                 self.project = try Id.init(value.items[0].thread.project.value);
                 try self.updateThreadCard(&app.view, value.items[0].thread);
                 self.thread_revision = value.items[0].thread.revision;
@@ -4035,6 +4183,125 @@ test "sidebar receipt updates active neighbor revision while retaining execution
     try std.testing.expect(conversation.command == null);
     try std.testing.expect(conversation.sidebar_pending == null);
     try std.testing.expect(conversation.thread_search_started);
+}
+
+test "sidebar saved settings validate bounds and preserve script default width" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    view.active_thread = try Id.init("selected-in-second-project");
+    view.scope_project = try Id.init("second-project");
+    view.sidebar_collapsed = true;
+    view.sidebar_working_shelf = true;
+    view.sidebar_shelf_expanded = .{ true, false, true };
+    var bytes: [4096]u8 = undefined;
+    const encoded = try types.encode(Conversation.SidebarState.capture(&view), &bytes);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const saved = try Conversation.SidebarState.decode(encoded, arena.allocator());
+    view.sidebar_width_override = 333;
+    view.active_thread = .{};
+    const route = try saved.restore(&view);
+    try std.testing.expectEqualStrings("selected-in-second-project", route.slice());
+    try std.testing.expectEqualStrings("second-project", view.scope_project.slice());
+    try std.testing.expect(view.sidebar_width_override == null);
+    try std.testing.expect(view.sidebar_collapsed and view.sidebar_working_shelf);
+    try std.testing.expectEqualDeep([3]bool{ true, false, true }, view.sidebar_shelf_expanded);
+    try std.testing.expectError(error.InvalidSidebarState, Conversation.SidebarState.decode("x" ** 4097, arena.allocator()));
+    try std.testing.expectError(error.InvalidSidebarState, Conversation.SidebarState.decode(try types.encode(Conversation.SidebarState{ .version = 2 }, &bytes), arena.allocator()));
+    try std.testing.expectError(error.InvalidSidebarState, Conversation.SidebarState.decode(try types.encode(Conversation.SidebarState{ .width = -1 }, &bytes), arena.allocator()));
+    try std.testing.expectError(error.InvalidSidebarState, Conversation.SidebarState.decode(try types.encode(Conversation.SidebarState{ .selected_thread = "bad\x00id" }, &bytes), arena.allocator()));
+    try std.testing.expectError(error.InvalidSidebarState, Conversation.SidebarState.decode(try types.encode(Conversation.SidebarState{ .scope_project = "bad\nproject" }, &bytes), arena.allocator()));
+    try std.testing.expectEqual(@as(?f32, 8192), (try Conversation.SidebarState.decode(try types.encode(Conversation.SidebarState{ .width = 8192 }, &bytes), arena.allocator())).width);
+    try std.testing.expectError(error.InvalidSidebarState, Conversation.SidebarState.decode(try types.encode(Conversation.SidebarState{ .selected_thread = "x" ** 257 }, &bytes), arena.allocator()));
+    try std.testing.expect(!std.mem.eql(u8, &Conversation.sidebarStateKey("/checkout/a"), &Conversation.sidebarStateKey("/checkout/b")));
+    view.notice = "History snapshot expired; restoring stable anchor";
+    Conversation.clearHistoryRecoveryNotice(&view);
+    try std.testing.expect(view.notice == null);
+    view.notice = "History snapshot expired again; navigate to retry";
+    Conversation.clearHistoryRecoveryNotice(&view);
+    try std.testing.expect(view.notice != null);
+    view.notice = "Keep meaningful errors";
+    Conversation.clearHistoryRecoveryNotice(&view);
+    try std.testing.expectEqualStrings("Keep meaningful errors", view.notice.?);
+}
+
+test "sidebar persistence coalesces in flight edits and validates restored routes" {
+    const Sink = struct {
+        host: *domain.Host,
+        event: std.Io.Event = .unset,
+        fn wake(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.event.set(std.testing.io);
+        }
+        fn next(self: *@This(), storage: []u8) !types.Output {
+            var output: [1]types.Output = undefined;
+            while (true) {
+                self.event.reset();
+                const result = self.host.drain(&output, storage);
+                if (result.output_count != 0) return output[0];
+                if (result.required_bytes_for_next != 0) return error.OutputTooLarge;
+                self.event.waitUncancelable(std.testing.io);
+            }
+        }
+    };
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path);
+    var sink: Sink = .{ .host = undefined };
+    sink.host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path[0..n], .wake = Sink.wake, .wake_context = &sink });
+    defer sink.host.destroy();
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = sink.host, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/sidebar-route") };
+    conversation.sidebar_state_key = Conversation.sidebarStateKey(conversation.workspace_root);
+    conversation.sidebar_state_loaded = true;
+    conversation.sidebar_route_validated = true;
+    app.view.active_thread = try Id.init("first");
+    app.view.sidebar_resizing = true;
+    conversation.saveSidebarState(&app.view);
+    try std.testing.expect(conversation.sidebar_save_ticket == null);
+    app.view.sidebar_resizing = false;
+    conversation.saveSidebarState(&app.view);
+    const initial = conversation.sidebar_save_ticket.?;
+    app.view.active_thread = try Id.init("latest");
+    app.view.sidebar_width_override = 343;
+    conversation.saveSidebarState(&app.view);
+    try std.testing.expectEqual(initial.value, conversation.sidebar_save_ticket.?.value);
+    var storage_bytes: [65536]u8 = undefined;
+    try std.testing.expectEqual(initial.value, (try sink.next(&storage_bytes)).presentation_saved.ticket.value);
+    conversation.sidebar_save_ticket = null;
+    conversation.saveSidebarState(&app.view);
+    const latest = conversation.sidebar_save_ticket.?;
+    try std.testing.expect(latest.value > initial.value);
+    try std.testing.expectEqual(latest.value, (try sink.next(&storage_bytes)).presentation_saved.ticket.value);
+    conversation.sidebar_save_ticket = null;
+    conversation.saveSidebarState(&app.view);
+    try std.testing.expect(conversation.sidebar_save_ticket == null);
+    _ = try sink.host.loadPresentation(&conversation.sidebar_state_key);
+    const loaded = (try sink.next(&storage_bytes)).presentation_loaded.value.?;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const saved = try Conversation.SidebarState.decode(loaded, arena.allocator());
+    try std.testing.expectEqualStrings("latest", saved.selected_thread);
+    try std.testing.expectEqual(@as(?f32, 343), saved.width);
+    // A missing/deleted saved route takes the ordinary deterministic startup
+    // fallback. A route for another checkout must do the same.
+    const empty: types.QueryPage = .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{}, .items = &.{}, .expires_at = 0 };
+    conversation.thread = try Id.init("missing");
+    try conversation.consume(&app, .startup_thread, empty);
+    try std.testing.expectEqual(Conversation.QueryKind.projects, conversation.query.?.kind);
+    try std.testing.expectEqual(@as(u16, 0), conversation.thread.len);
+    _ = try sink.next(&storage_bytes);
+    conversation.query = null;
+    var wrong_root = [_]types.Row{.{ .thread = .{ .id = .{ .value = "foreign" }, .revision = 1, .project = .{ .value = "p" }, .workspace = .{ .value = "w" }, .session = null, .workspace_root = "/other/checkout" } }};
+    var foreign_page = empty;
+    foreign_page.items = &wrong_root;
+    try conversation.consume(&app, .startup_thread, foreign_page);
+    try std.testing.expectEqual(Conversation.QueryKind.projects, conversation.query.?.kind);
+    try std.testing.expectEqual(@as(u16, 0), conversation.thread.len);
+    _ = try sink.next(&storage_bytes);
 }
 
 test "sidebar opaque cursors retain composite query identity beyond transcript ID capacity" {
