@@ -1963,11 +1963,14 @@ pub const View = struct {
         try self.drawThreads(renderer, text, foreground, sidebar_muted);
         if (self.visibleThreadCount() == 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0 and self.thread_search_busy) "Searching older threads…" else if (self.search_len != 0 and self.search_more_available) "No match here · Enter searches older threads" else if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
         clip.restore(renderer);
-        // Connection is the implemented utility. Do not imitate unavailable
-        // Usage, Pull Requests or Settings destinations from the reference.
-        self.setup_bounds = .{ .x = 8, .y = height - 36, .w = 32, .h = 32 };
+        // Make the actual connection entry point legible. A settings glyph
+        // alone left first-time users guessing where provider setup lived;
+        // the whole status row is now one painted, clickable target.
+        self.setup_bounds = .{ .x = 8, .y = height - 36, .w = sidebar - 16, .h = 32 };
+        if (self.setup_open) try widgets.panel(renderer, self.setup_bounds, 6, palette.sidebar_active);
         try icon(renderer, .settings, 16, height - 28, sidebar_muted);
-        try self.labels.drawFitted(renderer, text, self.status, 48, height - 25, sidebar - 60, 11, sidebar_muted);
+        try self.labels.draw(text, "Connection", 40, height - 29, 12, foreground);
+        try self.labels.drawFitted(renderer, text, self.status, 40, height - 16, sidebar - 56, 10, sidebar_muted);
         if (self.scope_open) try self.drawScope(renderer, text, foreground, sidebar_muted);
         const header_x = sidebar + metrics.gutter;
         var project_name: []const u8 = "Workspace";
