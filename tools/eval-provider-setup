@@ -171,6 +171,14 @@ def main():
         current = observe(lambda s: s['setup_field_targets'][1]['enabled'], 'first-account-advanced')
         click(current, 'runtime.existing_codex')
         current = observe(lambda s: not s['setup_open'] and s['model_count'] == 1 and not s['pending_command'], 'first-account-restored')
+        click(current, 'models.picker')
+        current = observe(lambda s: s['picker_open'], 'retained-codex-picker')
+        key('Return')
+        current = observe(lambda s: s['selected_runtime'] == 'codex' and s['send_ready'], 'retained-codex-selected')
+        retained_codex_thread = current['thread_id']
+        retained_draft = 'Keep this Codex draft café 世界'
+        m.run('vd', 'text', session, window, retained_draft)
+        current = observe(lambda s: s['draft'] == retained_draft, 'retained-codex-draft')
         click(current, 'runtime.setup')
         current = observe(lambda s: s['setup_open'], 'connection-before-opencode')
         click(current, 'runtime.opencode')
@@ -181,14 +189,35 @@ def main():
         current = observe(lambda s: s['setup_field_targets'][0]['enabled'], 'opencode-advanced')
         current = edit(current, 'runtime.executable', str(ROOT / 'build/provider_setup_fixture.py'))
         click(current, 'runtime.configure')
-        current = observe(lambda s: not s['setup_open'] and s['model_count'] >= 1 and not s['pending_command'], 'opencode-discovered')
+        current = observe(lambda s: not s['setup_open'] and s['model_count'] == 1 and not s['pending_command'], 'opencode-discovered')
+        assert current['thread_id'] != retained_codex_thread
         click(current, 'models.picker')
         current = observe(lambda s: s['picker_open'], 'opencode-picker')
-        # Active-first catalog order is a runtime contract; choose its first row.
+        # Walk past the active row: an inactive Codex row used to remain here.
+        for _ in range(current['model_count'] + 2):
+            key('Down')
         key('Return')
         current = observe(lambda s: s['selected_runtime'] == 'opencode' and s['send_ready'], 'selected-opencode')
+        assert current['selected_provider'] == 'opencode' and current['selected_model'] == 'setup-opencode'
         thread = current['thread_id']
         shot('selected-opencode')
+        click(current, retained_codex_thread)
+        current = observe(lambda s: s['thread_id'] == retained_codex_thread and s['draft'] == retained_draft and
+                          s['model_count'] == 1 and next(t for t in s['targets'] if t['id'] == 'workspace.new_thread')['enabled'],
+                          'retained-codex-under-opencode')
+        assert current['setup_runtime'] == 'opencode' and current['selected_runtime'] != 'codex'
+        assert not current['send_ready']
+        click(current, 'models.picker')
+        current = observe(lambda s: s['picker_open'], 'retained-draft-opencode-picker')
+        for _ in range(current['model_count'] + 2):
+            key('Down')
+        key('Return')
+        current = observe(lambda s: s['selected_runtime'] == 'opencode' and s['send_ready'], 'retained-draft-opencode-selected')
+        assert current['draft'] == retained_draft and current['selected_model'] == 'setup-opencode'
+        shot('retained-draft-opencode-selected')
+        click(current, thread)
+        current = observe(lambda s: s['thread_id'] == thread and s['selected_runtime'] == 'opencode' and s['send_ready'], 'returned-opencode')
+        assert not current['draft']
         key('ctrl+q')
         m.wait_windows(session, False)
         window = launch()
@@ -237,7 +266,7 @@ def main():
             manifest['recovery_fixture'] = dict(run=run, thread=completed_thread,
                 construction='Offline stopped-app SQL fixture; streaming run with in-flight start. No external effect replay.')
             window = launch()
-            current = observe(lambda s: s['model_count'] >= 2 and not s['pending_command'] and not s['notice'], 'recovered-catalog')
+            current = observe(lambda s: s['model_count'] == 1 and not s['pending_command'] and not s['notice'], 'recovered-catalog')
             with sqlite3.connect(database) as db:
                 recovered = db.execute('SELECT state,revision FROM runs WHERE id=?', (run,)).fetchone()
                 effects = db.execute('SELECT id,state,revision,outcome FROM effects WHERE run_id=? ORDER BY id', (run,)).fetchall()
@@ -245,16 +274,16 @@ def main():
             click(current, 'runtime.setup')
             current = observe(lambda s: s['setup_open'], 'recovered-connection')
             click(current, 'runtime.refresh')
-            current = observe(lambda s: s['model_count'] >= 2 and not s['pending_command'] and not s['notice'], 'recovered-refresh')
+            current = observe(lambda s: s['model_count'] == 1 and not s['pending_command'] and not s['notice'], 'recovered-refresh')
             click(current, 'runtime.configure')
-            current = observe(lambda s: not s['setup_open'] and s['model_count'] >= 2 and not s['pending_command'], 'recovered-configure')
+            current = observe(lambda s: not s['setup_open'] and s['model_count'] == 1 and not s['pending_command'], 'recovered-configure')
             click(current, 'runtime.setup')
             current = observe(lambda s: s['setup_open'], 'recovered-login-setup')
             click(current, 'runtime.codex')
             current = observe(lambda s: s['setup_runtime'] == 'codex', 'recovered-codex')
             click(current, 'runtime.device')
             current = observe(lambda s: s['login_pending'] and s['login_code'] == 'TEST-1234', 'recovered-login')
-            current = observe(lambda s: not s['login_pending'] and not s['setup_open'] and s['model_count'] >= 2, 'recovered-login-complete')
+            current = observe(lambda s: not s['login_pending'] and not s['setup_open'] and s['model_count'] == 1, 'recovered-login-complete')
             click(current, completed_thread)
             current = observe(lambda s: s['thread_id'] == completed_thread and s['run_status'] == 'unknown' and not s['send_ready'], 'unresolved-chat')
             assert 'new chat' in current['send_disabled_reason'].lower()

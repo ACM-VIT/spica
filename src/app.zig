@@ -1295,6 +1295,9 @@ const Conversation = struct {
 
     fn restoreSelection(self: *Conversation, view: *Coding, durable: ?contract.Selection) !void {
         self.durable_selection = if (durable) |selection| try Coding.Identity.from(selection) else null;
+        // selectThread can restore a retained draft from another connection.
+        // Validate it before giving that unsent choice precedence over history.
+        self.invalidateSelectionForConfiguration(view, setupConfiguration(view));
         if (view.selected != null) return;
         if (self.durable_selection) |selection| {
             if (selectionMatchesConfiguration(selection.selection(), setupConfiguration(view))) view.selected = selection else self.durable_selection = null;
@@ -2806,6 +2809,9 @@ const Conversation = struct {
                     if (app.view.model_count == app.view.models.len) break;
                     const model = row.model;
                     if (self.normal_startup and model.synthetic) continue;
+                    // Host keeps both catalogs for domain execution, but this
+                    // composer can only route through the displayed connection.
+                    if (!selectionMatchesConfiguration(model.selection, setupConfiguration(&app.view))) continue;
                     const target = &app.view.models[app.view.model_count];
                     target.* = .{ .identity = try Coding.Identity.from(model.selection), .readiness = model.readiness, .synthetic = model.synthetic };
                     target.reason_len = @import("text/utf8.zig").prefix(model.reason, target.reason.len).len;
@@ -3611,6 +3617,29 @@ test "switching to OpenCode invalidates a saved Codex selection before Send" {
     conversation.invalidateSelectionForConfiguration(&app.view, opencode);
     try std.testing.expect(app.view.selected == null);
     try std.testing.expect(conversation.durable_selection == null);
+}
+
+test "reopening a retained Codex draft under OpenCode preserves text without restoring its route" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    const codex = contract.Selection{ .runtime_kind = "codex", .required_runtime_version = "0.163.0", .model_provider = "openai", .model_id = "gpt-6-luna", .effort = "medium", .account_ref = "/accounts/codex", .workspace = .{ .value = "workspace" } };
+    try view.selectThread(try Id.init("codex-thread"));
+    view.selected = try Coding.Identity.from(codex);
+    try view.insert("retained café 世界", .paste);
+    try view.selectThread(try Id.init("opencode-thread"));
+    try std.testing.expect(view.configureSetup(.{ .runtime_kind = .opencode, .executable = "/bin/opencode", .account_directory = "/accounts/opencode", .workspace_root = "/project", .model_provider = "auto" }));
+    try view.selectThread(try Id.init("codex-thread"));
+    try std.testing.expectEqualStrings("codex", view.selected.?.runtime_kind.slice());
+    try conversation.restoreSelection(&view, codex);
+    try std.testing.expect(view.selected == null);
+    try std.testing.expect(conversation.durable_selection == null);
+    try std.testing.expectEqualStrings("retained café 世界", view.editor.textBytes());
+    var opencode = usability_selection;
+    opencode.account_ref = "/accounts/opencode";
+    try conversation.restoreSelection(&view, opencode);
+    try std.testing.expectEqualStrings("opencode", view.selected.?.runtime_kind.slice());
+    try std.testing.expectEqualStrings("retained café 世界", view.editor.textBytes());
 }
 
 test "custom Send refuses a stale Codex action after selecting OpenCode" {
