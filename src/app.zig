@@ -1276,6 +1276,7 @@ const Conversation = struct {
             "No models loaded. Open Connection and Refresh models."
         else
             "Choose a model and effort before sending.";
+        if (!selectionMatchesConfiguration(selected.selection(), setupConfiguration(view))) return "Connection changed. Connect and refresh models before sending.";
         if (!selected.workspace.eql(self.workspace.slice())) return "Selection belongs to another workspace. Choose a model again.";
         for (view.models[0..view.model_count]) |*model| {
             var candidate = model.identity;
@@ -3560,6 +3561,20 @@ test "switching to OpenCode invalidates a saved Codex selection before Send" {
     conversation.invalidateSelectionForConfiguration(&app.view, opencode);
     try std.testing.expect(app.view.selected == null);
     try std.testing.expect(conversation.durable_selection == null);
+}
+
+test "Send is disabled while the connection form still names another runtime" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = undefined };
+    conversation.workspace = try Id.init("/workspace");
+    view.selected = try Coding.Identity.from(.{ .runtime_kind = "codex", .required_runtime_version = "0.163.0", .model_provider = "openai", .model_id = "gpt", .effort = "low", .account_ref = "/accounts/codex", .workspace = .{ .value = "/workspace" } });
+    view.models[0] = .{ .identity = view.selected.?, .readiness = .unknown, .efforts = @splat(.{}), .effort_count = 1 };
+    view.models[0].efforts[0] = try Id.init("low");
+    view.model_count = 1;
+    try std.testing.expect(conversation.selectionDisabledReason(&view) == null);
+    try std.testing.expect(view.configureSetup(.{ .runtime_kind = .opencode, .executable = "/bin/opencode", .account_directory = "/accounts/opencode", .workspace_root = "/workspace", .model_provider = "auto" }));
+    try std.testing.expectEqualStrings("Connection changed. Connect and refresh models before sending.", conversation.selectionDisabledReason(&view).?);
 }
 
 test "rejected selection persistence does not spin or overwrite the exact user choice" {
