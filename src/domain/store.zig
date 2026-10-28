@@ -10,7 +10,7 @@ extern fn spica_store_sync_ancestry([*:0]const u8) c_int;
 
 pub const Error = error{ Busy, Full, OutOfMemory, Corrupt, UnsupportedStore, Storage, Limit, Conflict, InvalidText, Closed };
 pub const application_id = 0x53504334;
-pub const schema_version = 12;
+pub const schema_version = 13;
 pub const Value = union(enum) { null, integer: i64, text: []const u8, blob: []const u8 };
 
 pub const Statement = struct {
@@ -184,6 +184,27 @@ pub const Store = struct {
             try result.exec(input_owner_migration);
             try result.exec("UPDATE meta SET schema_version=12 WHERE singleton=1; PRAGMA user_version=12; COMMIT; PRAGMA foreign_keys=ON");
         } else if (try result.scalar("SELECT count(*) FROM pragma_table_info('approvals') WHERE name='thread_id'") != 1 or try result.scalar("SELECT count(*) FROM pragma_table_info('questions') WHERE name='thread_id'") != 1) return error.Corrupt;
+        if (fresh or version < 13) {
+            try result.exec("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE");
+            errdefer result.exec("ROLLBACK; PRAGMA foreign_keys=ON") catch {};
+            if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name='root_key'") == 0) try result.exec("ALTER TABLE threads ADD COLUMN root_key BLOB");
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const rows = try result.prepare("SELECT t.id,w.binding FROM threads t JOIN workspaces w ON w.id=t.workspace_id", &.{});
+            defer rows.deinit();
+            var seen: i64 = 0;
+            while (try rows.step()) {
+                const binding = t.decode(t.WorkspaceBinding, try rows.bytes(1), arena.allocator()) catch return error.Corrupt;
+                if (binding.canonical_root.len == 0 or !std.unicode.utf8ValidateSlice(binding.canonical_root)) return error.Corrupt;
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(binding.canonical_root, &digest, .{});
+                try result.execute("UPDATE threads SET root_key=? WHERE id=?", &.{ .{ .blob = &digest }, .{ .text = try rows.bytes(0) } });
+                seen += 1;
+            }
+            if (seen != try result.scalar("SELECT count(*) FROM threads")) return error.Corrupt;
+            if (try result.scalar("SELECT count(*) FROM threads WHERE root_key IS NULL OR length(root_key)<>32") != 0) return error.Corrupt;
+            try result.exec("UPDATE meta SET schema_version=13 WHERE singleton=1; PRAGMA user_version=13; COMMIT; PRAGMA foreign_keys=ON");
+        } else if (try result.scalar("SELECT count(*) FROM pragma_table_info('threads') WHERE name='root_key'") != 1 or try result.scalar("SELECT count(*) FROM threads WHERE root_key IS NULL OR length(root_key)<>32") != 0) return error.Corrupt;
         // Staging budgets exclude sent history; lookup by attachment must not
         // scan all message refs for every historical row in the thread.
         try result.exec("CREATE INDEX IF NOT EXISTS attachment_refs_by_attachment ON attachment_refs(attachment_id)");
@@ -191,6 +212,8 @@ pub const Store = struct {
         // The implicit rowid suffix supports latest selection/status lookups
         // without scanning completed runs from other threads.
         try result.exec("CREATE INDEX IF NOT EXISTS runs_by_thread ON runs(thread_id)");
+        try result.exec("CREATE INDEX IF NOT EXISTS threads_root_order ON threads(root_key,-pinned,sort_order,id); CREATE INDEX IF NOT EXISTS threads_root_project_order ON threads(root_key,project_id,-pinned,sort_order,id)");
+        try result.exec("CREATE TRIGGER IF NOT EXISTS threads_root_immutable BEFORE UPDATE OF root_key ON threads WHEN NEW.root_key IS NULL OR length(NEW.root_key)<>32 OR NEW.root_key<>OLD.root_key BEGIN SELECT RAISE(ABORT,'thread root key immutable'); END;");
         try result.exec("CREATE INDEX IF NOT EXISTS runs_snooze_pending ON runs(thread_id) WHERE state IN('queued','starting','awaiting_approval','awaiting_question'); CREATE INDEX IF NOT EXISTS approvals_pending_thread ON approvals(thread_id) WHERE state='pending'; CREATE INDEX IF NOT EXISTS questions_pending_thread ON questions(thread_id) WHERE state='pending'; CREATE INDEX IF NOT EXISTS approvals_by_run ON approvals(run_id,id); CREATE INDEX IF NOT EXISTS questions_by_run ON questions(run_id,id)");
         try result.exec("CREATE TRIGGER IF NOT EXISTS approvals_owner_insert BEFORE INSERT ON approvals WHEN (SELECT thread_id FROM runs WHERE id=NEW.run_id) IS NULL OR NEW.thread_id<>(SELECT thread_id FROM runs WHERE id=NEW.run_id) BEGIN SELECT RAISE(ABORT,'approval thread owner mismatch'); END; CREATE TRIGGER IF NOT EXISTS questions_owner_insert BEFORE INSERT ON questions WHEN (SELECT thread_id FROM runs WHERE id=NEW.run_id) IS NULL OR NEW.thread_id<>(SELECT thread_id FROM runs WHERE id=NEW.run_id) BEGIN SELECT RAISE(ABORT,'question thread owner mismatch'); END; CREATE TRIGGER IF NOT EXISTS approvals_owner_immutable BEFORE UPDATE OF run_id,thread_id ON approvals WHEN NEW.run_id<>OLD.run_id OR NEW.thread_id<>OLD.thread_id OR NEW.thread_id<>(SELECT thread_id FROM runs WHERE id=NEW.run_id) BEGIN SELECT RAISE(ABORT,'approval thread owner immutable'); END; CREATE TRIGGER IF NOT EXISTS questions_owner_immutable BEFORE UPDATE OF run_id,thread_id ON questions WHEN NEW.run_id<>OLD.run_id OR NEW.thread_id<>OLD.thread_id OR NEW.thread_id<>(SELECT thread_id FROM runs WHERE id=NEW.run_id) BEGIN SELECT RAISE(ABORT,'question thread owner immutable'); END;");
         // Only diagnostic observations enter this index; streamed content never
@@ -499,7 +522,7 @@ const schema =
     \\CREATE TABLE projects(id TEXT PRIMARY KEY,revision INTEGER NOT NULL CHECK(revision>0),display_name TEXT NOT NULL);
     \\CREATE TABLE workspaces(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,project_id TEXT NOT NULL REFERENCES projects(id),binding BLOB NOT NULL);
     \\CREATE TABLE sessions(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,workspace_id TEXT NOT NULL REFERENCES workspaces(id),selection BLOB NOT NULL,instance_id TEXT,upstream_session TEXT,cursor BLOB,continuity TEXT NOT NULL DEFAULT 'unknown');
-    \\CREATE TABLE threads(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,project_id TEXT NOT NULL REFERENCES projects(id),workspace_id TEXT NOT NULL REFERENCES workspaces(id),session_id TEXT REFERENCES sessions(id),next_ordinal INTEGER NOT NULL DEFAULT 0);
+    \\CREATE TABLE threads(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,project_id TEXT NOT NULL REFERENCES projects(id),workspace_id TEXT NOT NULL REFERENCES workspaces(id),session_id TEXT REFERENCES sessions(id),root_key BLOB CHECK(root_key IS NULL OR length(root_key)=32),next_ordinal INTEGER NOT NULL DEFAULT 0);
     \\CREATE TABLE runs(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,thread_id TEXT NOT NULL REFERENCES threads(id),session_id TEXT NOT NULL REFERENCES sessions(id),state TEXT NOT NULL CHECK(state IN('queued','starting','streaming','awaiting_approval','awaiting_question','cancel_requested','completed','cancelled','failed','interrupted','unknown')),requested BLOB NOT NULL,effective BLOB,upstream_turn TEXT,cancel_cause TEXT,unresolved_tools INTEGER NOT NULL DEFAULT 0);
     \\CREATE UNIQUE INDEX one_active_run ON runs(thread_id) WHERE state IN('queued','starting','streaming','awaiting_approval','awaiting_question','cancel_requested');
     \\CREATE TABLE messages(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,thread_id TEXT NOT NULL REFERENCES threads(id),run_id TEXT NOT NULL REFERENCES runs(id),ordinal INTEGER NOT NULL,role TEXT NOT NULL CHECK(role IN('user','assistant','tool')),incomplete INTEGER NOT NULL,UNIQUE(thread_id,ordinal));

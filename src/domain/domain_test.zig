@@ -23,9 +23,9 @@ const Fixture = struct {
 };
 fn seed(store: *storage.Store) !void {
     try store.exec("INSERT INTO projects VALUES('p',1,'synthetic');" ++
-        "INSERT INTO workspaces VALUES('w',1,'p',X'7b7d');" ++
+        "INSERT INTO workspaces VALUES('w',1,'p',X'7b2263616e6f6e6963616c5f726f6f74223a222f746d70222c2266696c6573797374656d5f6964656e74697479223a22222c227265706f7369746f72795f6964656e74697479223a22222c22636865636b6f75745f6964656e74697479223a22222c2265787065637465645f6272616e6368223a22222c22626173655f7265766973696f6e223a22222c226e6f6e5f676974223a747275657d');" ++
         "INSERT INTO sessions(id,revision,workspace_id,selection) VALUES('s',1,'w',X'7b7d');" ++
-        "INSERT INTO threads(id,revision,project_id,workspace_id,session_id) VALUES('h',1,'p','w','s');" ++
+        "INSERT INTO threads(id,revision,project_id,workspace_id,session_id,root_key) VALUES('h',1,'p','w','s',X'e9671acd244849c57167c658fa2f969752048f7ab184a3dcf5c46cb4d56ae124');" ++
         "INSERT INTO runs(id,revision,thread_id,session_id,state,requested) VALUES('r',1,'h','s','queued',X'7b7d');" ++
         "INSERT INTO messages VALUES('m',1,'h','r',0,'assistant',1);" ++
         "INSERT INTO blocks(id,revision,message_id,ordinal,kind) VALUES('b',1,'m',0,'text');");
@@ -478,7 +478,7 @@ test "pending input ownership is immutable and rejects cross-thread inserts" {
     var f = try Fixture.init();
     defer f.deinit();
     try seed(&f.store);
-    try f.store.exec("INSERT INTO projects VALUES('p2',1,'second'); INSERT INTO threads(id,revision,project_id,workspace_id,session_id,sort_order) VALUES('h2',1,'p2','w','s',-2048)");
+    try f.store.exec("INSERT INTO projects VALUES('p2',1,'second'); INSERT INTO threads(id,revision,project_id,workspace_id,session_id,root_key,sort_order) VALUES('h2',1,'p2','w','s',X'e9671acd244849c57167c658fa2f969752048f7ab184a3dcf5c46cb4d56ae124',-2048)");
     try f.store.execute("INSERT INTO questions(id,revision,run_id,thread_id,session_id,question,state,live_epoch) VALUES(?,1,?,?,?,?,?,?)", &.{ .{ .text = "q-owner" }, .{ .text = "r" }, .{ .text = "h" }, .{ .text = "s" }, .{ .blob = "{}" }, .{ .text = "pending" }, .{ .text = "epoch" } });
     try std.testing.expectError(storage.Error.Conflict, f.store.execute("UPDATE questions SET thread_id='h2' WHERE id='q-owner'", &.{}));
     try std.testing.expectError(storage.Error.Conflict, f.store.execute("INSERT INTO questions(id,revision,run_id,thread_id,session_id,question,state,live_epoch) VALUES('q-bad',1,'r','h2','s',X'7b7d','pending','epoch')", &.{}));
@@ -520,7 +520,7 @@ test "sidebar schema eight migration preserves execution revisions and creates o
     var f = try Fixture.init();
     defer f.deinit();
     try seed(&f.store);
-    try f.store.exec("DROP INDEX threads_sidebar_order; DROP INDEX threads_project_sidebar_order; DROP INDEX threads_sidebar_move; ALTER TABLE threads DROP COLUMN pinned; ALTER TABLE threads DROP COLUMN settled; ALTER TABLE threads DROP COLUMN snoozed_until; ALTER TABLE threads DROP COLUMN sort_order; UPDATE meta SET schema_version=8; PRAGMA user_version=8");
+    try f.store.exec("DROP INDEX threads_sidebar_order; DROP INDEX threads_project_sidebar_order; DROP INDEX threads_sidebar_move; DROP INDEX threads_root_order; DROP INDEX threads_root_project_order; DROP TRIGGER threads_root_immutable; ALTER TABLE threads DROP COLUMN pinned; ALTER TABLE threads DROP COLUMN settled; ALTER TABLE threads DROP COLUMN snoozed_until; ALTER TABLE threads DROP COLUMN sort_order; UPDATE meta SET schema_version=8; PRAGMA user_version=8");
     try f.store.close();
     var directory: [std.Io.Dir.max_path_bytes]u8 = undefined;
     f.store = try storage.Store.open(std.testing.io, try f.path(&directory));
@@ -755,6 +755,50 @@ const Consumer = struct {
         return output.query_page.page;
     }
 };
+
+test "root scoped sidebar navigation is bounded cyclic and fail closed" {
+    const Host = @import("../domain.zig").Host;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    {
+        var database = try storage.Store.open(std.testing.io, path_buffer[0..n]);
+        defer database.close() catch @panic("close");
+        try database.exec(
+            "INSERT INTO projects VALUES('p1',1,'one'); INSERT INTO projects VALUES('p2',1,'two');" ++
+            "INSERT INTO workspaces VALUES('w1',1,'p1',X'7b2263616e6f6e6963616c5f726f6f74223a222f746d70222c2266696c6573797374656d5f6964656e74697479223a22222c227265706f7369746f72795f6964656e74697479223a22222c22636865636b6f75745f6964656e74697479223a22222c2265787065637465645f6272616e6368223a22222c22626173655f7265766973696f6e223a22222c226e6f6e5f676974223a747275657d');" ++
+            "INSERT INTO workspaces VALUES('w2',1,'p2',X'7b2263616e6f6e6963616c5f726f6f74223a222f746d70222c2266696c6573797374656d5f6964656e74697479223a22222c227265706f7369746f72795f6964656e74697479223a22222c22636865636b6f75745f6964656e74697479223a22222c2265787065637465645f6272616e6368223a22222c22626173655f7265766973696f6e223a22222c226e6f6e5f676974223a747275657d');" ++
+            "INSERT INTO workspaces VALUES('w3',1,'p1',X'7b2263616e6f6e6963616c5f726f6f74223a222f666f726569676e222c2266696c6573797374656d5f6964656e74697479223a22222c227265706f7369746f72795f6964656e74697479223a22222c22636865636b6f75745f6964656e74697479223a22222c2265787065637465645f6272616e6368223a22222c22626173655f7265766973696f6e223a22222c226e6f6e5f676974223a747275657d');" ++
+            "INSERT INTO threads(id,revision,project_id,workspace_id,root_key,sort_order) VALUES" ++
+            "('t1',1,'p1','w1',X'e9671acd244849c57167c658fa2f969752048f7ab184a3dcf5c46cb4d56ae124',-300)," ++
+            "('t2',1,'p2','w2',X'e9671acd244849c57167c658fa2f969752048f7ab184a3dcf5c46cb4d56ae124',-200)," ++
+            "('t3',1,'p1','w3',X'025d361730b4940c503ee92c96a7ef773ba7f05b0828d466fa55ce9c5deae97c',-100)," ++
+            "('t4',1,'p1','w1',X'e9671acd244849c57167c658fa2f969752048f7ab184a3dcf5c46cb4d56ae124',-50);" ++
+            "UPDATE threads SET settled=1 WHERE id='t4';",
+        );
+    }
+    var consumer: Consumer = .{ .host = undefined, .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer consumer.arena.deinit();
+    consumer.host = try Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path_buffer[0..n], .wake = Consumer.wake, .wake_context = &consumer });
+    defer consumer.host.destroy();
+    const root = "/tmp";
+    const first = try consumer.query(.{ .thread_sidebar_next = .{ .canonical_root = root } });
+    try std.testing.expectEqual(@as(usize, 1), first.items.len);
+    try std.testing.expectEqualStrings("t1", first.items[0].thread.id.value);
+    const second = try consumer.query(.{ .thread_sidebar_next = .{ .canonical_root = root, .after = .{ .value = "t1" } } });
+    try std.testing.expectEqual(@as(usize, 1), second.items.len);
+    try std.testing.expectEqualStrings("t2", second.items[0].thread.id.value);
+    const wrapped = try consumer.query(.{ .thread_sidebar_next = .{ .canonical_root = root, .after = .{ .value = "t2" } } });
+    try std.testing.expectEqual(@as(usize, 1), wrapped.items.len);
+    try std.testing.expectEqualStrings("t1", wrapped.items[0].thread.id.value);
+    const project = try consumer.query(.{ .thread_sidebar_next = .{ .canonical_root = root, .project = .{ .value = "p1" }, .after = .{ .value = "t1" } } });
+    try std.testing.expectEqual(@as(usize, 1), project.items.len);
+    try std.testing.expectEqualStrings("t1", project.items[0].thread.id.value);
+    _ = try consumer.host.query(.{ .thread_sidebar_next = .{ .canonical_root = root, .after = .{ .value = "t3" } } });
+    const wrong_root = try consumer.next();
+    try std.testing.expectEqual(.cursor_invalid, wrong_root.failure.failure.reason);
+}
 
 test "opaque presentation state migrates independently and preserves execution position" {
     var f = try Fixture.init();

@@ -2102,6 +2102,7 @@ const Conversation = struct {
         if (request == .threads) {
             if (request.threads.page.cursor == null) self.thread_page_sidebar_order = kind != .threads or self.thread.len != 0;
             request.threads.sidebar_order = self.thread_page_sidebar_order;
+            if (self.workspace_root.len != 0) request.threads.canonical_root = self.workspace_root;
         }
         self.query = .{ .ticket = try self.host.query(request), .kind = kind, .search_revision = self.thread_search_revision };
     }

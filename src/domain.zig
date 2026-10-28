@@ -68,6 +68,12 @@ const snooze_blockers = "EXISTS(SELECT 1 FROM runs r WHERE r.thread_id=threads.i
 
 const thread_columns = "SELECT rowid,id,revision,project_id,workspace_id,session_id,coalesce((SELECT selection FROM thread_selections WHERE thread_id=threads.id),(SELECT requested FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1)),coalesce((SELECT substr(bytes,1,163) FROM chunks WHERE block_id=(SELECT id FROM blocks WHERE message_id=(SELECT id FROM messages WHERE thread_id=threads.id AND ordinal=0 AND role='user') AND ordinal=0) AND byte_offset=0),''),(SELECT state FROM runs WHERE thread_id=threads.id ORDER BY rowid DESC LIMIT 1),coalesce((SELECT substr(display_name,1,256) FROM projects WHERE id=threads.project_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.canonical_root') FROM workspaces WHERE id=threads.workspace_id),''),coalesce((SELECT json_extract(CAST(binding AS TEXT),'$.expected_branch') FROM workspaces WHERE id=threads.workspace_id),''),coalesce(title,''),pinned,settled,snoozed_until,sort_order,created_at_ms,last_user_message_at_ms,updated_at_ms,NOT(" ++ snooze_blockers ++ ") FROM threads ";
 
+fn canonicalRootKey(root: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(root, &digest, .{});
+    return digest;
+}
+
 /// Internal single-thread reducer. Every returned slice belongs to the operation
 /// allocator; callers must copy before resetting it. Never call from the UI.
 pub const Owner = struct {
@@ -359,11 +365,15 @@ pub const Owner = struct {
                 if (e.target != .absent or e.expected_revision != .absent) return .invalid_command;
                 const project = try self.field(allocator, "SELECT project_id FROM workspaces WHERE id=?", &.{.{ .text = p.workspace.value }}) orelse return .not_found;
                 if (!std.mem.eql(u8, project, p.project.value)) return .workspace_mismatch;
+                const binding_bytes = try self.field(allocator, "SELECT binding FROM workspaces WHERE id=?", &.{.{ .text = p.workspace.value }}) orelse return .workspace_mismatch;
+                const binding = t.decode(t.WorkspaceBinding, binding_bytes, allocator) catch return .workspace_mismatch;
+                if (binding.canonical_root.len == 0) return .workspace_mismatch;
+                const root_key = canonicalRootKey(binding.canonical_root);
                 const key = try self.id(allocator);
                 const creation = try db.scalar("SELECT coalesce(max(rowid),0) FROM threads");
                 const ordinal = std.math.add(i64, creation, 1) catch return .admission_limit;
                 const order = std.math.mul(i64, ordinal, -1024) catch return .admission_limit;
-                try db.execute("INSERT INTO threads(id,revision,project_id,workspace_id,sort_order,created_at_ms,updated_at_ms) VALUES(?,1,?,?,?,coalesce(?,0),coalesce(?,0))", &.{ .{ .text = key }, .{ .text = p.project.value }, .{ .text = p.workspace.value }, .{ .integer = order }, self.timeValue(), self.timeValue() });
+                try db.execute("INSERT INTO threads(id,revision,project_id,workspace_id,root_key,sort_order,created_at_ms,updated_at_ms) VALUES(?,1,?,?,?, ?,coalesce(?,0),coalesce(?,0))", &.{ .{ .text = key }, .{ .text = p.project.value }, .{ .text = p.workspace.value }, .{ .blob = &root_key }, .{ .integer = order }, self.timeValue(), self.timeValue() });
                 r.entity_ids.thread = .{ .value = key };
                 aggregate = .{ .thread = r.entity_ids.thread.? };
             },
@@ -918,10 +928,11 @@ pub const Owner = struct {
                     };
                 }
                 const thread = try self.id(allocator);
+                const root_key = canonicalRootKey(binding.canonical_root);
                 const creation = try db.scalar("SELECT coalesce(max(rowid),0) FROM threads");
                 const ordinal = std.math.add(i64, creation, 1) catch return .admission_limit;
                 const order = std.math.mul(i64, ordinal, -1024) catch return .admission_limit;
-                try db.execute("INSERT INTO threads(id,revision,project_id,workspace_id,sort_order,created_at_ms,updated_at_ms) VALUES(?,1,?,?,?,coalesce(?,0),coalesce(?,0))", &.{ .{ .text = thread }, .{ .text = project }, .{ .text = packet.selection.workspace.value }, .{ .integer = order }, self.timeValue(), self.timeValue() });
+                try db.execute("INSERT INTO threads(id,revision,project_id,workspace_id,root_key,sort_order,created_at_ms,updated_at_ms) VALUES(?,1,?,?,?, ?,coalesce(?,0),coalesce(?,0))", &.{ .{ .text = thread }, .{ .text = project }, .{ .text = packet.selection.workspace.value }, .{ .blob = &root_key }, .{ .integer = order }, self.timeValue(), self.timeValue() });
                 var child_owner = self.*;
                 child_owner.workspace_root = null;
                 const reason = try child_owner.reduce(allocator, .{ .command_id = e.command_id, .target = .{ .thread = .{ .value = thread } }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_send = .{ .text = packet.prompt, .selection = packet.selection } } }, r);
@@ -2289,6 +2300,7 @@ pub const Host = struct {
             .models => |v| v.page,
             .workspaces => |v| v.page,
             .threads => |v| v.page,
+            .thread_sidebar_next => |v| v.page,
             .messages => |v| v.page,
             .blocks => |v| v.page,
             .attachments => |v| v.page,
@@ -2317,6 +2329,7 @@ pub const Host = struct {
             .models => |*v| v.page = .{},
             .workspaces => |*v| v.page = .{},
             .threads => |*v| v.page = .{},
+            .thread_sidebar_next => |*v| v.page = .{},
             .messages => |*v| v.page = .{},
             .blocks => |*v| v.page = .{},
             .attachments => |*v| v.page = .{},
@@ -2421,6 +2434,7 @@ pub const Host = struct {
                 n = 1;
             },
             .threads => |v| {
+                const root_key = if (v.canonical_root) |root| canonicalRootKey(root) else null;
                 if (v.sidebar_order) {
                     if (page.cursor == null) if (v.anchor) |anchor| {
                         const boundary = try reader.prepare("SELECT -pinned,sort_order,id FROM threads WHERE id=?", &.{.{ .text = anchor.value }});
@@ -2430,11 +2444,16 @@ pub const Host = struct {
                         order_sort = boundary.integer(1);
                         order_id = try allocator.dupe(u8, try boundary.bytes(2));
                     };
+                    if (root_key) |digest| {
+                        values[0] = .{ .blob = &digest };
+                        values[1] = .{ .text = v.canonical_root.? };
+                        n = 2;
+                    }
                     if (v.project) |scoped_project| {
-                        sql = thread_columns ++ "WHERE project_id=? AND (-pinned,sort_order,id)>(?,?,?) ORDER BY -pinned,sort_order,id LIMIT ?";
-                        values[0] = .{ .text = scoped_project.value };
-                        n = 1;
-                    } else sql = thread_columns ++ "WHERE (-pinned,sort_order,id)>(?,?,?) ORDER BY -pinned,sort_order,id LIMIT ?";
+                        sql = if (root_key != null) thread_columns ++ "WHERE root_key=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=threads.workspace_id AND json_extract(CAST(w.binding AS TEXT),'$.canonical_root')=?) AND project_id=? AND (-pinned,sort_order,id)>(?,?,?) ORDER BY -pinned,sort_order,id LIMIT ?" else thread_columns ++ "WHERE project_id=? AND (-pinned,sort_order,id)>(?,?,?) ORDER BY -pinned,sort_order,id LIMIT ?";
+                        values[n] = .{ .text = scoped_project.value };
+                        n += 1;
+                    } else sql = if (root_key != null) thread_columns ++ "WHERE root_key=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=threads.workspace_id AND json_extract(CAST(w.binding AS TEXT),'$.canonical_root')=?) AND (-pinned,sort_order,id)>(?,?,?) ORDER BY -pinned,sort_order,id LIMIT ?" else thread_columns ++ "WHERE (-pinned,sort_order,id)>(?,?,?) ORDER BY -pinned,sort_order,id LIMIT ?";
                     values[n] = .{ .integer = order_pin };
                     values[n + 1] = .{ .integer = order_sort };
                     values[n + 2] = .{ .text = order_id };
@@ -2451,6 +2470,58 @@ pub const Host = struct {
                     values[n + 1] = if (v.anchor) |anchor| .{ .text = anchor.value } else .null;
                     n += 2;
                 }
+            },
+            .thread_sidebar_next => |v| {
+                const digest = canonicalRootKey(v.canonical_root);
+                var boundary_pin: i64 = 0;
+                var boundary_sort: i64 = 0;
+                var boundary_id: []const u8 = "";
+                if (v.after) |after| {
+                    // The anchor is valid only when both its immutable root
+                    // partition and its authoritative binding match this
+                    // request. A hash match alone is insufficient: a corrupt
+                    // or colliding row must fail closed.
+                    const b = try reader.prepare("SELECT -pinned,sort_order,id FROM threads WHERE id=? AND root_key=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=threads.workspace_id AND json_extract(CAST(w.binding AS TEXT),'$.canonical_root')=?)", &.{ .{ .text = after.value }, .{ .blob = &digest }, .{ .text = v.canonical_root } });
+                    defer b.deinit();
+                    if (!try b.step()) return error.CursorInvalid;
+                    boundary_pin = b.integer(0);
+                    boundary_sort = b.integer(1);
+                    boundary_id = try allocator.dupe(u8, try b.bytes(2));
+                }
+                // Filter the root partition once, then choose the first row
+                // strictly after the anchor and wrap to the first eligible row
+                // when the tail is exhausted. The candidate CTEs are bounded
+                // by the root indexes and the outer projection fetches one row.
+                const eligible_prefix = "WITH eligible AS (SELECT id,pinned,sort_order FROM threads WHERE root_key=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=threads.workspace_id AND json_extract(CAST(w.binding AS TEXT),'$.canonical_root')=?)";
+                values[0] = .{ .blob = &digest };
+                values[1] = .{ .text = v.canonical_root };
+                if (v.project) |scoped_project| {
+                    values[2] = .{ .text = scoped_project.value };
+                    n = 3;
+                } else {
+                    n = 2;
+                }
+                values[n] = .{ .integer = @intCast(self.now()) };
+                n += 1;
+                const eligible_project = " AND project_id=?";
+                const eligible_live = " AND settled=0 AND snoozed_until<=?), candidate AS (SELECT id,pinned,sort_order FROM eligible";
+                const candidate_after = " WHERE (-pinned,sort_order,id)>(?,?,?) ORDER BY pinned DESC,sort_order,id LIMIT 1), chosen AS (SELECT id,pinned,sort_order FROM candidate UNION ALL SELECT id,pinned,sort_order FROM eligible WHERE NOT EXISTS(SELECT 1 FROM candidate) ORDER BY pinned DESC,sort_order,id LIMIT 1)";
+                const candidate_first = " WHERE 0 ORDER BY pinned DESC,sort_order,id LIMIT 1), chosen AS (SELECT id,pinned,sort_order FROM candidate UNION ALL SELECT id,pinned,sort_order FROM eligible WHERE NOT EXISTS(SELECT 1 FROM candidate) ORDER BY pinned DESC,sort_order,id LIMIT 1)";
+                const projection = thread_columns ++ "WHERE id=(SELECT id FROM chosen) LIMIT 1";
+                const project_after = eligible_prefix ++ eligible_project ++ eligible_live ++ candidate_after ++ projection;
+                const project_first = eligible_prefix ++ eligible_project ++ eligible_live ++ candidate_first ++ projection;
+                const root_after = eligible_prefix ++ eligible_live ++ candidate_after ++ projection;
+                const root_first = eligible_prefix ++ eligible_live ++ candidate_first ++ projection;
+                if (v.after) |_| {
+                    values[n] = .{ .integer = boundary_pin };
+                    values[n + 1] = .{ .integer = boundary_sort };
+                    values[n + 2] = .{ .text = boundary_id };
+                    n += 3;
+                }
+                sql = if (v.project != null)
+                    (if (v.after != null) project_after else project_first)
+                else
+                    (if (v.after != null) root_after else root_first);
             },
             .thread => |v| {
                 sql = thread_columns ++ "WHERE id=? AND rowid>? LIMIT ?";
@@ -2537,12 +2608,14 @@ pub const Host = struct {
                 return result;
             },
         }
-        if (q != .messages and q != .threads) {
+        if (q != .messages and q != .threads and q != .thread_sidebar_next) {
             values[n] = .{ .integer = @intCast(cursor) };
             n += 1;
         }
-        values[n] = .{ .integer = @as(i64, page.limit) + 1 };
-        n += 1;
+        if (q != .thread_sidebar_next) {
+            values[n] = .{ .integer = @as(i64, page.limit) + 1 };
+            n += 1;
+        }
         const statement = try reader.prepare(sql, values[0..n]);
         defer statement.deinit();
         var last_key: u64 = cursor;
@@ -2560,7 +2633,7 @@ pub const Host = struct {
             const row: t.Row = switch (q) {
                 .projects => .{ .project = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .display_name = try text(allocator, s, 3) } },
                 .workspaces => .{ .workspace = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .binding = try t.decode(t.WorkspaceBinding, try s.bytes(4), allocator) } },
-                .threads, .thread => blk: {
+                .threads, .thread, .thread_sidebar_next => blk: {
                     const explicit_title = try allocator.dupe(u8, @import("text/utf8.zig").prefix(try s.bytes(12), t.max_title_bytes));
                     const prompt_preview = @import("text/utf8.zig").prefix(try s.bytes(7), t.max_title_bytes);
                     break :blk .{ .thread = .{ .id = .{ .value = try text(allocator, s, 1) }, .revision = try number(s, 2), .project = .{ .value = try text(allocator, s, 3) }, .workspace = .{ .value = try text(allocator, s, 4) }, .session = if (s.isNull(5)) null else .{ .value = try text(allocator, s, 5) }, .selection = if (s.isNull(6)) null else try t.decode(a.Selection, try s.bytes(6), allocator), .title_preview = if (explicit_title.len != 0) explicit_title else try allocator.dupe(u8, prompt_preview), .title = explicit_title, .latest_run_state = if (s.isNull(8)) null else try enumeration(t.RunState, s, 8), .project_name = try text(allocator, s, 9), .workspace_root = try text(allocator, s, 10), .workspace_branch = try text(allocator, s, 11), .pinned = s.integer(13) != 0, .settled = s.integer(14) != 0, .snoozed_until = s.integer(15), .sort_order = s.integer(16), .created_at_ms = s.integer(17), .last_user_message_at_ms = s.integer(18), .updated_at_ms = s.integer(19), .can_snooze = s.integer(20) != 0 } };
@@ -2925,10 +2998,10 @@ test "sidebar ordering pages beyond resident capacity with composite snapshot cu
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    try database.exec("INSERT INTO projects VALUES('p',1,'Paging'); INSERT INTO workspaces VALUES('w',1,'p',X'7b7d')");
+    try database.exec("INSERT INTO projects VALUES('p',1,'Paging'); INSERT INTO workspaces VALUES('w',1,'p',X'7b2263616e6f6e6963616c5f726f6f74223a222f746d70222c2266696c6573797374656d5f6964656e74697479223a22222c227265706f7369746f72795f6964656e74697479223a22222c22636865636b6f75745f6964656e74697479223a22222c2265787065637465645f6272616e6368223a22222c22626173655f7265766973696f6e223a22222c226e6f6e5f676974223a747275657d')");
     for (0..70) |index| {
         const id_value = try std.fmt.allocPrint(allocator, "thread-{d:0>2}", .{index});
-        try database.execute("INSERT INTO threads(id,revision,project_id,workspace_id,sort_order) VALUES(?,1,'p','w',?)", &.{ .{ .text = id_value }, .{ .integer = -@as(i64, @intCast(index + 1)) * 1024 } });
+        try database.execute("INSERT INTO threads(id,revision,project_id,workspace_id,root_key,sort_order) VALUES(?,1,'p','w',X'e9671acd244849c57167c658fa2f969752048f7ab184a3dcf5c46cb4d56ae124',?)", &.{ .{ .text = id_value }, .{ .integer = -@as(i64, @intCast(index + 1)) * 1024 } });
     }
     var owner: Owner = .{ .database = &database, .io = std.testing.io, .epoch = "sidebar-pages", .utc_ms = 1000 };
     const pin = try owner.command(allocator, .{ .command_id = .{ .value = "paging-pin" }, .target = .{ .thread = .{ .value = "thread-00" } }, .expected_revision = .{ .revision = 1 }, .payload = .{ .thread_sidebar_set = .{ .pinned = true } } });
