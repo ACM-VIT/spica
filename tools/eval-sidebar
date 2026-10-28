@@ -21,6 +21,27 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Three real editor cohorts include hundreds of compositor roundtrips. The
+# observed private transport takes ~2.6s/action; bound fixture life with headroom.
+# This is process lifetime only; measured idle/active phases remain unchanged.
+SCENARIO_LIFETIME_MS = 30 * 60 * 1000
+
+
+def publish_clipboard(environment: dict[str, str], value: str, timeout: float) -> None:
+    # wl-copy forks a compositor-owned clipboard server. Captured stdout/stderr
+    # remain inherited by that child and make communicate wait until it exits.
+    # Detach every stdio FD so completion tracks the publisher parent only.
+    try:
+        result = subprocess.run(["wl-copy", "--", value], cwd=ROOT, env=environment,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True,
+                                timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("private clipboard publication timed out") from error
+    except OSError as error:
+        raise ValueError("private clipboard publisher unavailable") from error
+    if result.returncode:
+        raise ValueError("private clipboard publisher failed")
 
 
 def load_driver():
@@ -253,7 +274,7 @@ class Proof:
     def set_clipboard(self, value):
         self.session.require_live()
         environment = self.session.data["private_desktop"]["environment"]
-        self.ui.run_command(["wl-copy", "--", value], env=environment, private=True)
+        publish_clipboard(environment, value, self.args.timeout)
         if self.clipboard() != value:
             raise ValueError("owned private clipboard failed to retain exact synthetic input")
         self.session.journal("sidebar.editor.clipboard", None, self.session.snapshot(self.args.timeout),
@@ -538,7 +559,7 @@ class Proof:
         launch_args = argparse.Namespace(output=self.args.output, binary=self.args.binary,
                                         provider="fake", private=True, build=False,
                                         optimize="ReleaseSafe", scenario="sidebar",
-                                        width=1280, height=800, quit_after_ms=600000,
+                                        width=1280, height=800, quit_after_ms=SCENARIO_LIFETIME_MS,
                                         metrics_output=self.args.output / "native.json" if self.args.measure else None,
                                         timeout=self.args.timeout, dry_run=False)
         self.ui.launch(launch_args)
@@ -741,6 +762,7 @@ def main(argv=None):
         parser.error("measurement cycles must be between 12 and 50")
     if args.dry_run:
         print(json.dumps({"scenario": "sidebar", "provider": "fake", "build": False,
+                          "fixture_lifetime_ms": SCENARIO_LIFETIME_MS,
                           "steps": plan(), "limitations": ["No performance or physical latency claim."]}, indent=2))
         return 0
     if not args.private:

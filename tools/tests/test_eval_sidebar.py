@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,7 +26,25 @@ class SidebarEvidenceTests(unittest.TestCase):
                                     cwd=ROOT, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["build"], False)
+            self.assertEqual(json.loads(result.stdout)["fixture_lifetime_ms"], 1_800_000)
             self.assertFalse(output.exists())
+
+    def test_clipboard_daemon_stdio_is_detached_with_bounded_parent_timeout(self):
+        environment = {"WAYLAND_DISPLAY": "owned", "XDG_RUNTIME_DIR": "/private/runtime"}
+        with patch.object(MODULE.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            MODULE.publish_clipboard(environment, "café 世界", 20)
+        self.assertEqual(run.call_args.args[0], ["wl-copy", "--", "café 世界"])
+        self.assertEqual(run.call_args.kwargs["env"], environment)
+        for field in ("stdin", "stdout", "stderr"):
+            self.assertEqual(run.call_args.kwargs[field], subprocess.DEVNULL)
+        self.assertEqual(run.call_args.kwargs["timeout"], 20)
+        self.assertTrue(run.call_args.kwargs["start_new_session"])
+        with patch.object(MODULE.subprocess, "run", side_effect=subprocess.TimeoutExpired([], 20)):
+            with self.assertRaisesRegex(ValueError, "publication timed out"):
+                MODULE.publish_clipboard(environment, "private fixture", 20)
+        with patch.object(MODULE.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)):
+            with self.assertRaisesRegex(ValueError, "publisher failed"):
+                MODULE.publish_clipboard(environment, "private fixture", 20)
 
     def test_missing_duplicate_or_misaligned_metadata_cannot_pass(self):
         value = {"thread_targets": [{"id": "alpha"}, {"id": "bravo"}],
