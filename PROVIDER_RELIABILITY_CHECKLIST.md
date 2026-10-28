@@ -42,9 +42,22 @@ comment on each item with `pass`, `fail`, or a short correction.
 
 ## Current automated evidence
 
-- Debug native integration: `351 passed, 2 skipped`.
+- Debug and ReleaseSafe native integration: `354 passed, 2 skipped` per mode.
 - OpenCode prefix parsing regression: `src/runtime/catalog.zig`.
 - Runtime-switch stale-selection regression: `src/app.zig` and
   `src/ui/coding.zig`.
 - Live-provider acceptance is still pending human review; offline fixtures do
   not prove a real GLM request.
+
+## Interaction polish review
+
+- [ ] Before Send, the composer shows the exact provider/model identity (for
+  example `opencode-free / glm-5.3-flash`) without reopening the picker.
+- [ ] Opening the model picker shows the same provider prefix and a readable
+  readiness or sign-in reason for every row.
+- [ ] When Send is disabled, the guidance names the next action instead of
+  leaving the user with an inactive icon.
+- [ ] Switching runtime or account clears the old selection immediately and
+  keeps the composer focused on the new connection state.
+- [ ] A failed provider request leaves the draft in place and exposes a
+  copyable diagnostic that omits prompt contents and credentials.
