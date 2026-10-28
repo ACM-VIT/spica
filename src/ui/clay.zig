@@ -6,6 +6,8 @@ pub const Layout = struct {
     bytes: []u8,
     allocator: std.mem.Allocator,
     height: f32,
+    sidebar_collapsed: bool = false,
+    sidebar_width_override: ?f32 = null,
     design: @import("design.zig").Config = .{},
 
     pub fn init(allocator: std.mem.Allocator, width: f32, height: f32) !Layout {
@@ -94,7 +96,10 @@ pub const Layout = struct {
     }
 
     pub fn sidebarWidthFor(self: *const Layout, width: f32) f32 {
-        return sidebarWidthWith(self.design, width);
+        if (self.sidebar_collapsed) return 0;
+        var design = self.design;
+        if (self.sidebar_width_override) |preferred| design.layout.sidebar_width = preferred;
+        return sidebarWidthWith(design, width);
     }
 
     pub fn sidebarWidthWith(design: @import("design.zig").Config, width: f32) f32 {

@@ -201,6 +201,29 @@ pub const View = struct {
     sidebar_bounds: c.SDL_FRect = zero_rect,
     sidebar_rows: c.SDL_FRect = zero_rect,
     sidebar_scroll: f32 = 0,
+    sidebar_collapsed: bool = false,
+    sidebar_width_override: ?f32 = null,
+    sidebar_resizing: bool = false,
+    sidebar_toggle_bounds: c.SDL_FRect = zero_rect,
+    sidebar_resize_bounds: c.SDL_FRect = zero_rect,
+    sidebar_now_ms: i64 = 0,
+    sidebar_working_shelf: bool = false,
+    sidebar_shelf_expanded: [3]bool = @splat(false),
+    sidebar_shelf_bounds: [3]c.SDL_FRect = @splat(zero_rect),
+    sidebar_menu_thread: transcript.Id = .{},
+    sidebar_menu_bounds: c.SDL_FRect = zero_rect,
+    sidebar_menu_x: f32 = 0,
+    sidebar_menu_y: f32 = 0,
+    sidebar_menu_hover: usize = 0,
+    sidebar_menu_actions: [16]SidebarAction = undefined,
+    sidebar_menu_rows: [16]c.SDL_FRect = @splat(zero_rect),
+    sidebar_rename_thread: transcript.Id = .{},
+    sidebar_rename_buffer: [160]u8 = undefined,
+    sidebar_rename_len: usize = 0,
+    sidebar_rename_select_all: bool = false,
+    sidebar_rename_bounds: c.SDL_FRect = zero_rect,
+    sidebar_menu_count: usize = 0,
+    sidebar_action_bounds: [32][2]c.SDL_FRect = @splat(@splat(zero_rect)),
     search_bounds: c.SDL_FRect = zero_rect,
     search_clear_bounds: c.SDL_FRect = zero_rect,
     search_query: [160]u8 = undefined,
@@ -493,8 +516,18 @@ pub const View = struct {
     /// Sidebar navigation stays presentation-only. `search_more` asks the
     /// App/Host consumer for the next bounded page while retaining the draft,
     /// current thread and scroll state in this view.
-    pub const Navigation = union(enum) { new_project, new_thread, project: usize, thread: usize, search_more, search_reset };
-    pub const RunStatus = enum { idle, running, approval, failed, interrupted, unknown };
+    pub const SidebarAction = enum { pin, unpin, settle, unsettle, snooze, wake, move_up, move_down };
+    pub const Navigation = union(enum) {
+        new_project,
+        new_thread,
+        project: usize,
+        thread: usize,
+        search_more,
+        search_reset,
+        rename: struct { index: usize, title: [160]u8, len: usize },
+        sidebar: struct { index: usize, action: SidebarAction, snoozed_until: i64 = 0 },
+    };
+    pub const RunStatus = enum { idle, running, question, approval, failed, interrupted, unknown };
     pub const Entry = struct {
         id: transcript.Id = .{},
         label: [160]u8 = undefined,
@@ -504,6 +537,17 @@ pub const View = struct {
         workspace_name: transcript.Id = .{},
         branch: transcript.Id = .{},
         run_status: RunStatus = .idle,
+        runtime_kind: transcript.Id = .{},
+        model_provider: transcript.Id = .{},
+        model_id: transcript.Id = .{},
+        updated_at_ms: i64 = 0,
+        workspace_path: [1024]u8 = undefined,
+        workspace_path_len: usize = 0,
+        revision: u64 = 0,
+        pinned: bool = false,
+        settled: bool = false,
+        snoozed_until: i64 = 0,
+        sort_order: i64 = 0,
     };
 
     pub const WorkflowAction = union(enum) { cleanup_prompt, add, remove: usize, enqueue, edit: usize, cancel: usize, up: usize, down: usize, question_choice: usize, question_submit };
@@ -746,6 +790,7 @@ pub const View = struct {
 
     fn releasePointer(self: *View) void {
         self.dragging = false;
+        self.sidebar_resizing = false;
         self.transcript_drag = null;
         _ = c.SDL_CaptureMouse(false);
     }
@@ -928,7 +973,7 @@ pub const View = struct {
 
     /// Original source index, even when search/scope remove preceding cards.
     pub fn threadRowBounds(self: *const View, index: usize) c.SDL_FRect {
-        if (self.scope_open or index >= self.thread_count or !self.threadMatches(&self.threads[index])) return zero_rect;
+        if (self.sidebar_collapsed or self.scope_open or self.sidebar_menu_thread.len != 0 or index >= self.thread_count or !self.threadMatches(&self.threads[index]) or !self.sidebarShelfVisible(&self.threads[index])) return zero_rect;
         return clippedRect(self.thread_bounds[index], self.sidebar_rows);
     }
 
@@ -998,6 +1043,144 @@ pub const View = struct {
             count += 1;
         };
         return count;
+    }
+
+    pub fn wallTimeMs() i64 {
+        var time: c.SDL_Time = 0;
+        if (!c.SDL_GetCurrentTime(&time)) return 0;
+        return @divFloor(time, 1_000_000);
+    }
+
+    pub fn nextSidebarWakeMs(self: *const View, now: i64) ?i64 {
+        var next: ?i64 = null;
+        for (self.threads[0..self.thread_count]) |entry| {
+            if (entry.snoozed_until > now and (next == null or entry.snoozed_until < next.?)) next = entry.snoozed_until;
+        }
+        return next;
+    }
+
+    const SidebarSection = enum(u8) { pinned, active, working, snoozed, settled };
+
+    fn sidebarSection(self: *const View, entry: *const Entry) SidebarSection {
+        if (entry.snoozed_until > self.sidebar_now_ms) return .snoozed;
+        if (entry.settled) return .settled;
+        if (entry.pinned) return .pinned;
+        if (self.sidebar_working_shelf and entry.run_status == .running) return .working;
+        return .active;
+    }
+
+    fn sidebarSlim(self: *const View, entry: *const Entry) bool {
+        const section = self.sidebarSection(entry);
+        return self.search_len != 0 or section == .snoozed or section == .settled;
+    }
+
+    fn sidebarShelfVisible(self: *const View, entry: *const Entry) bool {
+        if (self.search_len != 0) return true;
+        const section = @intFromEnum(self.sidebarSection(entry));
+        return section < 2 or self.sidebar_shelf_expanded[section - 2] or entry.id.eql(self.active_thread.slice());
+    }
+
+    fn sidebarContentHeight(self: *const View) f32 {
+        var height: f32 = 0;
+        var counts: [5]usize = @splat(0);
+        for (self.threads[0..self.thread_count]) |*entry| {
+            if (!self.threadMatches(entry)) continue;
+            counts[@intFromEnum(self.sidebarSection(entry))] += 1;
+            if (self.sidebarShelfVisible(entry)) height += if (self.sidebarSlim(entry)) sidebar_search_stride else sidebar_card_stride;
+        }
+        if (self.search_len == 0 and self.visibleThreadCount() != 0) {
+            if (counts[2] != 0) height += 33;
+            if (counts[3] != 0) height += 33;
+            height += 33; // The settled shelf remains available when empty.
+        }
+        return height;
+    }
+
+    fn sidebarMenuIndex(self: *const View) ?usize {
+        if (self.sidebar_menu_thread.len == 0) return null;
+        for (self.threads[0..self.thread_count], 0..) |entry, index| {
+            if (entry.id.eql(self.sidebar_menu_thread.slice())) return index;
+        }
+        return null;
+    }
+
+    fn activateSidebarMenu(self: *View, row: usize) void {
+        const index = self.sidebarMenuIndex() orelse return;
+        if (!self.navigation_enabled or row >= self.sidebar_menu_count) return;
+        if (row >= 7) {
+            const entry = &self.threads[index];
+            if ((row == 10 and entry.branch.len == 0) or (row == 11 and entry.workspace_path_len == 0)) return;
+            switch (row) {
+                7 => self.beginSidebarRename(index),
+                8 => {
+                    self.scope_project = if (self.scope_project.eql(entry.project_id.slice())) .{} else entry.project_id;
+                    self.sidebarChanged();
+                },
+                9 => clipboard.copyBytes(entry.id.slice(), self.scratch) catch {
+                    self.notice = "Unable to copy thread ID";
+                },
+                10 => clipboard.copyBytes(entry.branch.slice(), self.scratch) catch {
+                    self.notice = "Unable to copy branch";
+                },
+                11 => clipboard.copyBytes(entry.workspace_path[0..entry.workspace_path_len], self.scratch) catch {
+                    self.notice = "Unable to copy workspace path";
+                },
+                else => {},
+            }
+            self.sidebar_menu_thread = .{};
+            return;
+        }
+        const action = self.sidebar_menu_actions[row];
+        const duration: i64 = switch (row) {
+            2 => 3_600_000,
+            3 => 14_400_000,
+            else => 86_400_000,
+        };
+        self.navigation = .{ .sidebar = .{ .index = index, .action = action, .snoozed_until = if (action == .snooze) wallTimeMs() + duration else 0 } };
+        self.sidebar_menu_thread = .{};
+        self.sidebar_menu_count = 0;
+    }
+
+    fn beginSidebarRename(self: *View, index: usize) void {
+        if (index >= self.thread_count or !self.navigation_enabled) return;
+        const entry = &self.threads[index];
+        self.sidebar_rename_thread = entry.id;
+        self.sidebar_rename_len = entry.len;
+        @memcpy(self.sidebar_rename_buffer[0..entry.len], entry.label[0..entry.len]);
+        self.sidebar_rename_select_all = true;
+        self.search_focused = false;
+    }
+
+    fn sidebarRenameInsert(self: *View, bytes: []const u8) !void {
+        if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
+        for (bytes) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidTitle;
+        const start = if (self.sidebar_rename_select_all) 0 else self.sidebar_rename_len;
+        if (start + bytes.len > self.sidebar_rename_buffer.len) return error.TextTooLarge;
+        @memcpy(self.sidebar_rename_buffer[start..][0..bytes.len], bytes);
+        self.sidebar_rename_len = start + bytes.len;
+        self.sidebar_rename_select_all = false;
+    }
+
+    fn commitSidebarRename(self: *View) void {
+        if (std.mem.trim(u8, self.sidebar_rename_buffer[0..self.sidebar_rename_len], " \t\r\n").len == 0) return;
+        for (self.threads[0..self.thread_count], 0..) |entry, index| {
+            if (entry.id.eql(self.sidebar_rename_thread.slice())) {
+                self.navigation = .{ .rename = .{ .index = index, .title = self.sidebar_rename_buffer, .len = self.sidebar_rename_len } };
+                self.sidebar_rename_thread = .{};
+                return;
+            }
+        }
+        self.sidebar_rename_thread = .{};
+    }
+
+    fn drawSidebarTitle(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, entry: *const Entry, x: f32, y: f32, width: f32, foreground: Color) !void {
+        if (entry.id.eql(self.sidebar_rename_thread.slice())) {
+            self.sidebar_rename_bounds = .{ .x = x - 2, .y = y - 2, .w = @max(0, width + 4), .h = 22 };
+            try widgets.panel(renderer, self.sidebar_rename_bounds, 3, self.design.colors.border);
+            if (self.sidebar_rename_select_all) try widgets.panel(renderer, .{ .x = x, .y = y, .w = @min(width, try self.labels.width(text, self.sidebar_rename_buffer[0..self.sidebar_rename_len], 14)), .h = 18 }, 1, self.design.colors.selection);
+            try self.labels.drawFitted(renderer, text, self.sidebar_rename_buffer[0..self.sidebar_rename_len], x, y, width, 14, foreground);
+            _ = self.navigation_targets.add("sidebar.rename", "textbox", self.sidebar_rename_bounds, true) catch {};
+        } else try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], x, y, width, 14, foreground);
     }
 
     fn sidebarStride(self: *const View) f32 {
@@ -1134,6 +1317,7 @@ pub const View = struct {
         switch (event.type) {
             c.SDL_EVENT_WINDOW_FOCUS_LOST => {
                 self.releasePointer();
+                self.sidebar_resizing = false;
                 self.window_active = false;
                 self.preedit_len = 0;
                 self.preedit_changed = true;
@@ -1146,10 +1330,51 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
+                if (event.button.button == c.SDL_BUTTON_RIGHT and self.custom_root == null and self.navigation_enabled and !self.setup_open and !self.workspace_open and !self.workflow_open and !self.scope_open and !self.picker_open and !self.effort_open) {
+                    self.sidebar_menu_thread = .{};
+                    for (0..self.thread_count) |index| if (widgets.contains(self.threadRowBounds(index), event.button.x, event.button.y)) {
+                        self.sidebar_menu_thread = self.threads[index].id;
+                        self.sidebar_menu_x = event.button.x;
+                        self.sidebar_menu_y = event.button.y;
+                        self.sidebar_menu_hover = 0;
+                    };
+                    return true;
+                }
                 if (event.button.button != c.SDL_BUTTON_LEFT) return false;
                 if (self.custom_root == null) {
                     const x = event.button.x;
                     const y = event.button.y;
+                    if (self.sidebar_rename_thread.len != 0 and !widgets.contains(self.sidebar_rename_bounds, x, y)) self.sidebar_rename_thread = .{};
+                    if (self.sidebar_menu_thread.len != 0) {
+                        for (self.sidebar_menu_rows[0..self.sidebar_menu_count], 0..) |row, index| {
+                            if (widgets.contains(row, x, y)) self.activateSidebarMenu(index);
+                        }
+                        self.sidebar_menu_thread = .{};
+                        if (self.sidebar_rename_thread.len != 0) try self.focus(window, true);
+                        return true;
+                    }
+                    if (widgets.contains(self.sidebar_toggle_bounds, x, y)) {
+                        self.sidebar_collapsed = !self.sidebar_collapsed;
+                        self.scope_open = false;
+                        self.search_focused = false;
+                        return true;
+                    }
+                    if (widgets.contains(self.sidebar_resize_bounds, x, y)) {
+                        if (event.button.clicks >= 2) {
+                            self.sidebar_width_override = null;
+                        } else {
+                            self.sidebar_resizing = true;
+                            _ = c.SDL_CaptureMouse(true);
+                        }
+                        return true;
+                    }
+                    for (self.sidebar_shelf_bounds, 0..) |row, index| {
+                        if (widgets.contains(row, x, y)) {
+                            self.sidebar_shelf_expanded[index] = !self.sidebar_shelf_expanded[index];
+                            self.thread_bounds = @splat(zero_rect);
+                            return true;
+                        }
+                    }
                     if (self.title_editing and !widgets.contains(self.title_bounds, x, y)) self.finishTitle(.cancel);
                     if (widgets.contains(self.title_bounds, x, y) and self.titleEditAvailable()) {
                         self.beginTitleEdit();
@@ -1250,7 +1475,7 @@ pub const View = struct {
                         if (!c.SDL_SetTextInputArea(window, &area, 0)) return error.TextInputArea;
                         return true;
                     }
-                    if (self.search_len != 0 and self.search_more_available and self.navigation_enabled and widgets.contains(self.search_more_bounds, x, y)) {
+                    if (self.search_more_available and self.navigation_enabled and widgets.contains(self.search_more_bounds, x, y)) {
                         self.navigation = .search_more;
                         return true;
                     }
@@ -1299,7 +1524,26 @@ pub const View = struct {
                         if (widgets.contains(self.new_project_bounds, x, y)) self.navigation = .new_project;
                         if (widgets.contains(self.new_thread_bounds, x, y)) self.navigation = .new_thread;
                         if (widgets.contains(self.sidebar_rows, x, y)) {
+                            for (self.sidebar_action_bounds[0..self.thread_count], 0..) |actions, index| {
+                                if (widgets.contains(actions[0], x, y)) {
+                                    const entry = &self.threads[index];
+                                    self.navigation = .{ .sidebar = .{ .index = index, .action = if (entry.snoozed_until > wallTimeMs()) .wake else if (entry.settled) .unsettle else .settle } };
+                                    return true;
+                                }
+                                if (widgets.contains(actions[1], x, y)) {
+                                    self.sidebar_menu_thread = self.threads[index].id;
+                                    self.sidebar_menu_x = actions[1].x;
+                                    self.sidebar_menu_y = actions[1].y + actions[1].h;
+                                    self.sidebar_menu_hover = 2;
+                                    return true;
+                                }
+                            }
                             for (0..self.thread_count) |index| if (widgets.contains(self.threadRowBounds(index), x, y)) {
+                                if (event.button.clicks >= 2) {
+                                    self.beginSidebarRename(index);
+                                    try self.focus(window, true);
+                                    return true;
+                                }
                                 self.navigation = .{ .thread = index };
                                 if (self.search_len != 0) {
                                     self.search_len = 0;
@@ -1355,11 +1599,26 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_MOUSE_BUTTON_UP => {
+                if (event.button.button == c.SDL_BUTTON_LEFT and self.sidebar_resizing) {
+                    self.sidebar_resizing = false;
+                    _ = c.SDL_CaptureMouse(false);
+                    return true;
+                }
                 if (event.button.button != c.SDL_BUTTON_LEFT or (!self.dragging and self.transcript_drag == null)) return false;
                 self.releasePointer();
                 return true;
             },
             c.SDL_EVENT_MOUSE_MOTION => {
+                if (self.custom_root == null and self.sidebar_resizing) {
+                    self.sidebar_width_override = std.math.clamp(event.motion.x, @min(256, self.design.layout.sidebar_width), @import("design.zig").metric_max[0]);
+                    return true;
+                }
+                if (self.custom_root == null and self.sidebar_menu_thread.len != 0) {
+                    for (self.sidebar_menu_rows[0..self.sidebar_menu_count], 0..) |row, index| {
+                        if (widgets.contains(row, event.motion.x, event.motion.y)) self.sidebar_menu_hover = index;
+                    }
+                    return true;
+                }
                 if (self.custom_root == null and self.effort_open) {
                     for (self.effort_rows, 0..) |row, index| if (widgets.contains(row, event.motion.x, event.motion.y)) {
                         self.effort_hover = index;
@@ -1424,7 +1683,7 @@ pub const View = struct {
                         const height = @as(f32, @floatFromInt(self.project_count + 1)) * 28;
                         self.scope_scroll = std.math.clamp(self.scope_scroll - event.wheel.y * wheel_direction * 28, 0, @max(0, height - self.scope_menu.h + 8));
                     } else {
-                        const height = @as(f32, @floatFromInt(self.visibleThreadCount())) * self.sidebarStride();
+                        const height = self.sidebarContentHeight();
                         self.sidebar_scroll = std.math.clamp(self.sidebar_scroll - event.wheel.y * wheel_direction * 36, 0, @max(0, height - self.sidebar_rows.h));
                     }
                     return true;
@@ -1458,6 +1717,11 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_TEXT_INPUT => {
+                if (self.custom_root == null and self.sidebar_rename_thread.len != 0) {
+                    if (self.window_active) try self.sidebarRenameInsert(std.mem.span(event.text.text));
+                    return true;
+                }
+                if (self.custom_root == null and self.sidebar_menu_thread.len != 0) return true;
                 if (self.workflow_open and self.custom_root == null) {
                     if (self.workflow_path_focus and self.window_active) try self.workflowInsert(std.mem.span(event.text.text));
                     return true;
@@ -1490,6 +1754,66 @@ pub const View = struct {
                 const mods = event.key.mod;
                 const ctrl = mods & c.SDL_KMOD_CTRL != 0;
                 const shift = mods & c.SDL_KMOD_SHIFT != 0;
+                if (self.custom_root == null and self.sidebar_rename_thread.len != 0) {
+                    if (!self.window_active) return false;
+                    switch (key) {
+                        c.SDLK_ESCAPE => self.sidebar_rename_thread = .{},
+                        c.SDLK_RETURN, c.SDLK_KP_ENTER => self.commitSidebarRename(),
+                        c.SDLK_A => {
+                            if (ctrl) self.sidebar_rename_select_all = true;
+                        },
+                        c.SDLK_BACKSPACE, c.SDLK_DELETE => {
+                            if (self.sidebar_rename_select_all) {
+                                self.sidebar_rename_len = 0;
+                            } else if (key == c.SDLK_BACKSPACE and self.sidebar_rename_len > 0) {
+                                self.sidebar_rename_len -= 1;
+                                while (self.sidebar_rename_len > 0 and self.sidebar_rename_buffer[self.sidebar_rename_len] & 0xc0 == 0x80) self.sidebar_rename_len -= 1;
+                            }
+                            self.sidebar_rename_select_all = false;
+                        },
+                        c.SDLK_V => {
+                            if (ctrl) {
+                                const value = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+                                defer c.SDL_free(value);
+                                try self.sidebarRenameInsert(std.mem.span(value));
+                            }
+                        },
+                        else => {},
+                    }
+                    return true;
+                }
+                if (self.custom_root == null and ctrl and key == c.SDLK_B and !self.setup_open and !self.workspace_open and !self.workflow_open) {
+                    self.sidebar_collapsed = !self.sidebar_collapsed;
+                    self.sidebar_menu_thread = .{};
+                    self.scope_open = false;
+                    self.search_focused = false;
+                    return true;
+                }
+                if (self.custom_root == null and self.sidebar_menu_thread.len != 0) {
+                    switch (key) {
+                        c.SDLK_ESCAPE => self.sidebar_menu_thread = .{},
+                        c.SDLK_UP => self.sidebar_menu_hover -|= 1,
+                        c.SDLK_DOWN => self.sidebar_menu_hover = @min(self.sidebar_menu_count -| 1, self.sidebar_menu_hover + 1),
+                        c.SDLK_RETURN, c.SDLK_KP_ENTER => {
+                            self.activateSidebarMenu(self.sidebar_menu_hover);
+                            if (self.sidebar_rename_thread.len != 0) try self.focus(window, true);
+                        },
+                        else => {},
+                    }
+                    return true;
+                }
+                if (self.custom_root == null and ((shift and key == c.SDLK_F10) or key == c.SDLK_MENU) and !self.setup_open and !self.workspace_open and !self.workflow_open) {
+                    for (self.threads[0..self.thread_count], 0..) |entry, index| {
+                        if (!entry.id.eql(self.active_thread.slice())) continue;
+                        const row = self.threadRowBounds(index);
+                        if (row.h == 0) return true;
+                        self.sidebar_menu_thread = entry.id;
+                        self.sidebar_menu_x = row.x + row.w / 2;
+                        self.sidebar_menu_y = row.y;
+                        self.sidebar_menu_hover = 0;
+                        return true;
+                    }
+                }
                 if (key == c.SDLK_F2 and self.titleEditAvailable()) {
                     self.beginTitleEdit();
                     try self.focus(window, true);
@@ -1889,7 +2213,10 @@ pub const View = struct {
     }
 
     pub fn sidebarWidth(self: *const View, width: f32) f32 {
-        return Layout.sidebarWidthWith(self.design, width);
+        if (self.sidebar_collapsed) return 0;
+        var design = self.design;
+        if (self.sidebar_width_override) |preferred| design.layout.sidebar_width = preferred;
+        return Layout.sidebarWidthWith(design, width);
     }
 
     fn workspaceName(self: *const View) []const u8 {
@@ -1947,13 +2274,20 @@ pub const View = struct {
 
     // Fixed native strokes: no decorative Unicode, face discovery or retained
     // icon textures. Coordinates use a 16-unit local grid.
-    const Icon = enum { plus, folder, pen, chevron, send, stop, settings, search, filter, branch, close };
+    const Icon = enum { plus, folder, pen, chevron, send, stop, settings, search, filter, branch, close, sidebar, chevron_up, working, alert, question, clock, pin };
     fn icon(renderer: *c.SDL_Renderer, kind: Icon, x: f32, y: f32, color: Color) !void {
         // ComposerPrimaryActions.tsx uses an 8px filled rounded square inside
         // its 12px Stop glyph, centered in the 32px action.
         if (kind == .stop) return widgets.panel(renderer, .{ .x = x + 4, .y = y + 4, .w = 8, .h = 8 }, 1.5, color);
         if (!c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, 255)) return error.IconDraw;
         const paths: []const [4]f32 = switch (kind) {
+            .pin => &.{ .{ 5, 1, 12, 1 }, .{ 6, 1, 6, 6 }, .{ 11, 1, 11, 6 }, .{ 6, 6, 3, 9 }, .{ 3, 9, 13, 9 }, .{ 13, 9, 11, 6 }, .{ 8, 9, 8, 15 } },
+            .clock => &.{ .{ 5, 1, 11, 1 }, .{ 11, 1, 15, 5 }, .{ 15, 5, 15, 11 }, .{ 15, 11, 11, 15 }, .{ 11, 15, 5, 15 }, .{ 5, 15, 1, 11 }, .{ 1, 11, 1, 5 }, .{ 1, 5, 5, 1 }, .{ 8, 4, 8, 8 }, .{ 8, 8, 11, 10 } },
+            .working => &.{ .{ 5, 1, 10, 1 }, .{ 13, 4, 15, 8 }, .{ 13, 12, 10, 15 }, .{ 6, 15, 2, 12 }, .{ 1, 8, 2, 4 } },
+            .alert => &.{ .{ 5, 1, 11, 1 }, .{ 11, 1, 15, 5 }, .{ 15, 5, 15, 11 }, .{ 15, 11, 11, 15 }, .{ 11, 15, 5, 15 }, .{ 5, 15, 1, 11 }, .{ 1, 11, 1, 5 }, .{ 1, 5, 5, 1 }, .{ 8, 4, 8, 9 }, .{ 8, 12, 8, 12 } },
+            .question => &.{ .{ 3, 4, 5, 2 }, .{ 5, 2, 10, 2 }, .{ 10, 2, 13, 5 }, .{ 13, 5, 13, 7 }, .{ 13, 7, 8, 10 }, .{ 8, 10, 8, 11 }, .{ 8, 14, 8, 14 } },
+            .sidebar => &.{ .{ 1, 2, 15, 2 }, .{ 15, 2, 15, 14 }, .{ 15, 14, 1, 14 }, .{ 1, 14, 1, 2 }, .{ 6, 2, 6, 14 } },
+            .chevron_up => &.{ .{ 4, 10, 8, 6 }, .{ 8, 6, 12, 10 } },
             .search => &.{ .{ 3, 2, 9, 2 }, .{ 9, 2, 12, 5 }, .{ 12, 5, 12, 9 }, .{ 12, 9, 9, 12 }, .{ 9, 12, 3, 12 }, .{ 3, 12, 1, 9 }, .{ 1, 9, 1, 5 }, .{ 1, 5, 3, 2 }, .{ 11, 11, 15, 15 } },
             .filter => &.{ .{ 1, 3, 15, 3 }, .{ 4, 8, 12, 8 }, .{ 6, 13, 10, 13 } },
             .branch => &.{ .{ 4, 2, 4, 13 }, .{ 4, 9, 11, 9 }, .{ 11, 9, 12, 7 }, .{ 12, 7, 12, 3 }, .{ 2, 1, 6, 1 }, .{ 10, 2, 14, 2 }, .{ 2, 14, 6, 14 } },
@@ -1972,68 +2306,87 @@ pub const View = struct {
     fn drawChrome(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
         const metrics = self.design.layout;
         const palette = self.design.colors;
+        self.sidebar_now_ms = wallTimeMs();
         const sidebar = self.sidebarWidth(bounds.header.width);
         const height = bounds.composer.y + bounds.composer.height + metrics.gutter;
         const inset = @min(metrics.gutter, 20);
         const radius = @min(metrics.radius, 8);
         self.sidebar_bounds = .{ .x = 0, .y = 0, .w = sidebar, .h = height };
-        try widgets.panel(renderer, self.sidebar_bounds, 0, palette.sidebar);
-        try widgets.panel(renderer, .{ .x = sidebar - 1, .y = 0, .w = 1, .h = height }, 0, palette.sidebar_border);
-        try self.labels.draw(text, "Spica", inset, (bounds.header.height - 16) / 2, 14, foreground);
-        // Current eb1510d source puts Search and all three icon actions on
-        // one 32px row. The older marketing image uses a separate scope row.
-        const row_top = bounds.header.height + 4;
-        const action_y = row_top + 2;
-        self.new_thread_bounds = .{ .x = sidebar - 36, .y = action_y, .w = 28, .h = 28 };
-        self.new_project_bounds = .{ .x = sidebar - 65, .y = action_y, .w = 28, .h = 28 };
-        self.scope_bounds = .{ .x = sidebar - 94, .y = action_y, .w = 28, .h = 28 };
-        self.search_bounds = .{ .x = 8, .y = row_top, .w = @max(0, self.scope_bounds.x - 9), .h = 32 };
-        self.search_clear_bounds = if (self.search_len == 0) zero_rect else .{ .x = self.search_bounds.x + self.search_bounds.w - 22, .y = action_y, .w = 22, .h = 28 };
-        const sidebar_muted = palette.sidebar_muted;
-        if (self.search_focused) try widgets.panel(renderer, self.search_bounds, 6, palette.raised);
-        try icon(renderer, .search, 16, row_top + 8, sidebar_muted);
-        const search_label = if (self.search_len == 0) "Search" else self.search_query[0..self.search_len];
-        try self.labels.drawFitted(renderer, text, search_label, 40, row_top + 8, self.search_bounds.w - 32 - (if (self.search_len == 0) @as(f32, 0) else 22), 14, if (self.search_len == 0) sidebar_muted else foreground);
-        if (self.search_focused and self.search_bounds.w > 40) {
-            var search_clip = widgets.Clip.push(renderer, .{ .x = 40, .y = row_top + 6, .w = @max(0, self.search_bounds.w - 54), .h = 20 });
-            defer search_clip.restore(renderer);
-            const text_width = try self.labels.width(text, @import("../text/utf8.zig").prefix(self.search_query[0..self.search_len], 128), 14);
-            if (self.search_select_all and self.search_len > 0) {
-                try widgets.panel(renderer, .{ .x = 40, .y = row_top + 6, .w = text_width, .h = 20 }, 2, palette.selection);
-                try self.labels.drawFitted(renderer, text, self.search_query[0..self.search_len], 40, row_top + 8, self.search_bounds.w - 54, 14, foreground);
-            } else {
-                try widgets.panel(renderer, .{ .x = 40 + @min(text_width, @max(0, self.search_bounds.w - 56)), .y = row_top + 8, .w = 1, .h = 16 }, 0, foreground);
-            }
-        }
-        if (self.search_len != 0) try icon(renderer, .close, self.search_clear_bounds.x + 3, row_top + 8, sidebar_muted);
-        if (self.scope_project.len != 0) try widgets.panel(renderer, self.scope_bounds, 6, palette.sidebar_active);
-        try icon(renderer, .filter, self.scope_bounds.x + 6, action_y + 6, sidebar_muted);
-        try icon(renderer, .folder, self.new_project_bounds.x + 6, action_y + 5, sidebar_muted);
-        try icon(renderer, .plus, self.new_project_bounds.x + 8, action_y + 7, sidebar_muted);
-        try icon(renderer, .pen, self.new_thread_bounds.x + 6, action_y + 6, sidebar_muted);
-        const more_height: f32 = if (self.search_len != 0 and self.search_more_available) 24 else 0;
-        self.search_more_bounds = if (more_height != 0) .{ .x = 8, .y = row_top + 36, .w = sidebar - 16, .h = more_height } else zero_rect;
-        if (more_height != 0) try self.labels.drawFitted(renderer, text, "More matches · Ctrl+PgDn", 18, row_top + 40, sidebar - 36, 12, sidebar_muted);
-        self.sidebar_rows = .{ .x = 8, .y = row_top + 40 + more_height, .w = sidebar - 16, .h = @max(0, height - row_top - 84 - more_height) };
-        const rows_height = @as(f32, @floatFromInt(self.visibleThreadCount())) * self.sidebarStride();
-        self.sidebar_scroll = std.math.clamp(self.sidebar_scroll, 0, @max(0, rows_height - self.sidebar_rows.h));
-        self.project_bounds = @splat(zero_rect);
+        self.sidebar_toggle_bounds = .{ .x = sidebar + 8, .y = 12, .w = 28, .h = 28 };
+        self.sidebar_resize_bounds = if (self.sidebar_collapsed) zero_rect else .{ .x = sidebar - 3, .y = 0, .w = 6, .h = height };
+        _ = self.navigation_targets.add("sidebar.toggle", "button", self.sidebar_toggle_bounds, true) catch {};
+        _ = self.navigation_targets.add("sidebar.resize", "separator", self.sidebar_resize_bounds, !self.sidebar_collapsed) catch {};
+        self.new_thread_bounds = zero_rect;
+        self.new_project_bounds = zero_rect;
+        self.search_bounds = zero_rect;
+        self.scope_bounds = zero_rect;
+        self.setup_bounds = zero_rect;
+        self.search_more_bounds = zero_rect;
+        self.sidebar_rows = zero_rect;
         self.thread_bounds = @splat(zero_rect);
-        var clip = widgets.Clip.push(renderer, self.sidebar_rows);
-        defer clip.restore(renderer);
-        try self.drawThreads(renderer, text, foreground, sidebar_muted);
-        if (self.visibleThreadCount() == 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0 and self.thread_search_busy) "Searching older threads…" else if (self.search_len != 0 and self.search_more_available) "No match here · Enter searches older threads" else if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
-        clip.restore(renderer);
-        // Make the actual connection entry point legible. A settings glyph
-        // alone left first-time users guessing where provider setup lived;
-        // the whole status row is now one painted, clickable target.
-        self.setup_bounds = .{ .x = 8, .y = height - 36, .w = sidebar - 16, .h = 32 };
-        if (self.setup_open) try widgets.panel(renderer, self.setup_bounds, 6, palette.sidebar_active);
-        try icon(renderer, .settings, 16, height - 28, sidebar_muted);
-        try self.labels.draw(text, "Connection", 40, height - 29, 12, foreground);
-        try self.labels.drawFitted(renderer, text, self.status, 40, height - 16, sidebar - 56, 10, sidebar_muted);
-        if (self.scope_open) try self.drawScope(renderer, text, foreground, sidebar_muted);
-        const header_x = sidebar + metrics.gutter;
+        self.project_bounds = @splat(zero_rect);
+        self.sidebar_shelf_bounds = @splat(zero_rect);
+        self.sidebar_action_bounds = @splat(@splat(zero_rect));
+        if (!self.sidebar_collapsed) {
+            try widgets.panel(renderer, self.sidebar_bounds, 0, palette.sidebar);
+            try widgets.panel(renderer, .{ .x = sidebar - 1, .y = 0, .w = 1, .h = height }, 0, palette.sidebar_border);
+            try self.labels.draw(text, "Spica", inset, (bounds.header.height - 16) / 2, 14, foreground);
+            // Current eb1510d source puts Search and all three icon actions on
+            // one 32px row. The older marketing image uses a separate scope row.
+            const row_top = bounds.header.height + 4;
+            const action_y = row_top + 2;
+            self.new_thread_bounds = .{ .x = sidebar - 36, .y = action_y, .w = 28, .h = 28 };
+            self.new_project_bounds = .{ .x = sidebar - 65, .y = action_y, .w = 28, .h = 28 };
+            self.scope_bounds = .{ .x = sidebar - 94, .y = action_y, .w = 28, .h = 28 };
+            self.search_bounds = .{ .x = 8, .y = row_top, .w = @max(0, self.scope_bounds.x - 9), .h = 32 };
+            self.search_clear_bounds = if (self.search_len == 0) zero_rect else .{ .x = self.search_bounds.x + self.search_bounds.w - 22, .y = action_y, .w = 22, .h = 28 };
+            const sidebar_muted = palette.sidebar_muted;
+            if (self.search_focused) try widgets.panel(renderer, self.search_bounds, 6, palette.raised);
+            try icon(renderer, .search, 16, row_top + 8, sidebar_muted);
+            const search_label = if (self.search_len == 0) "Search" else self.search_query[0..self.search_len];
+            try self.labels.drawFitted(renderer, text, search_label, 40, row_top + 8, self.search_bounds.w - 32 - (if (self.search_len == 0) @as(f32, 0) else 22), 14, if (self.search_len == 0) sidebar_muted else foreground);
+            if (self.search_focused and self.search_bounds.w > 40) {
+                var search_clip = widgets.Clip.push(renderer, .{ .x = 40, .y = row_top + 6, .w = @max(0, self.search_bounds.w - 54), .h = 20 });
+                defer search_clip.restore(renderer);
+                const text_width = try self.labels.width(text, @import("../text/utf8.zig").prefix(self.search_query[0..self.search_len], 128), 14);
+                if (self.search_select_all and self.search_len > 0) {
+                    try widgets.panel(renderer, .{ .x = 40, .y = row_top + 6, .w = text_width, .h = 20 }, 2, palette.selection);
+                    try self.labels.drawFitted(renderer, text, self.search_query[0..self.search_len], 40, row_top + 8, self.search_bounds.w - 54, 14, foreground);
+                } else {
+                    try widgets.panel(renderer, .{ .x = 40 + @min(text_width, @max(0, self.search_bounds.w - 56)), .y = row_top + 8, .w = 1, .h = 16 }, 0, foreground);
+                }
+            }
+            if (self.search_len != 0) try icon(renderer, .close, self.search_clear_bounds.x + 3, row_top + 8, sidebar_muted);
+            if (self.scope_project.len != 0) try widgets.panel(renderer, self.scope_bounds, 6, palette.sidebar_active);
+            try icon(renderer, .filter, self.scope_bounds.x + 6, action_y + 6, sidebar_muted);
+            try icon(renderer, .folder, self.new_project_bounds.x + 6, action_y + 5, sidebar_muted);
+            try icon(renderer, .plus, self.new_project_bounds.x + 8, action_y + 7, sidebar_muted);
+            try icon(renderer, .pen, self.new_thread_bounds.x + 6, action_y + 6, sidebar_muted);
+            const more_height: f32 = if (self.search_more_available) 24 else 0;
+            self.search_more_bounds = if (more_height != 0) .{ .x = 8, .y = row_top + 36, .w = sidebar - 16, .h = more_height } else zero_rect;
+            if (more_height != 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0) "More matches · Ctrl+PgDn" else "More threads", 18, row_top + 40, sidebar - 36, 12, sidebar_muted);
+            self.sidebar_rows = .{ .x = 8, .y = row_top + 40 + more_height, .w = sidebar - 16, .h = @max(0, height - row_top - 84 - more_height) };
+            const rows_height = self.sidebarContentHeight();
+            self.sidebar_scroll = std.math.clamp(self.sidebar_scroll, 0, @max(0, rows_height - self.sidebar_rows.h));
+            self.project_bounds = @splat(zero_rect);
+            self.thread_bounds = @splat(zero_rect);
+            var clip = widgets.Clip.push(renderer, self.sidebar_rows);
+            defer clip.restore(renderer);
+            try self.drawThreads(renderer, text, foreground, sidebar_muted);
+            if (self.visibleThreadCount() == 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0 and self.thread_search_busy) "Searching older threads…" else if (self.search_len != 0 and self.search_more_available) "No match here · Enter searches older threads" else if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
+            clip.restore(renderer);
+            // Make the actual connection entry point legible. A settings glyph
+            // alone left first-time users guessing where provider setup lived;
+            // the whole status row is now one painted, clickable target.
+            self.setup_bounds = .{ .x = 8, .y = height - 36, .w = sidebar - 16, .h = 32 };
+            if (self.setup_open) try widgets.panel(renderer, self.setup_bounds, 6, palette.sidebar_active);
+            try icon(renderer, .settings, 16, height - 28, sidebar_muted);
+            try self.labels.draw(text, "Connection", 40, height - 29, 12, foreground);
+            try self.labels.drawFitted(renderer, text, self.status, 40, height - 16, sidebar - 56, 10, sidebar_muted);
+            if (self.scope_open) try self.drawScope(renderer, text, foreground, sidebar_muted);
+        }
+        try icon(renderer, .sidebar, self.sidebar_toggle_bounds.x + 6, self.sidebar_toggle_bounds.y + 6, muted);
+        const header_x = sidebar + metrics.gutter + 32;
         var project_name: []const u8 = "Workspace";
         var thread_name: []const u8 = "New chat";
         for (self.projects[0..self.project_count]) |*entry| if (entry.id.eql(self.active_project.slice())) {
@@ -2103,9 +2456,49 @@ pub const View = struct {
         var y = self.sidebar_rows.y - self.sidebar_scroll;
         var ordinal: usize = 0;
         const searching = self.search_len != 0;
+        var ordered: [32]usize = undefined;
+        var count: usize = 0;
+        var section_counts: [5]usize = @splat(0);
         for (self.threads[0..self.thread_count], 0..) |*entry, index| {
             if (!self.threadMatches(entry)) continue;
-            const row = c.SDL_FRect{ .x = self.sidebar_rows.x, .y = y + (if (searching) @as(f32, 0) else 2), .w = self.sidebar_rows.w, .h = if (searching) 36 else 78 };
+            section_counts[@intFromEnum(self.sidebarSection(entry))] += 1;
+            ordered[count] = index;
+            count += 1;
+        }
+        if (!searching) {
+            // Fixed-capacity insertion sort retains original indices for commands.
+            for (1..@max(1, count)) |at| {
+                var cursor = at;
+                while (cursor > 0) : (cursor -= 1) {
+                    const left = &self.threads[ordered[cursor - 1]];
+                    const right = &self.threads[ordered[cursor]];
+                    const ls = @intFromEnum(self.sidebarSection(left));
+                    const rs = @intFromEnum(self.sidebarSection(right));
+                    if (ls < rs or (ls == rs and left.sort_order <= right.sort_order)) break;
+                    std.mem.swap(usize, &ordered[cursor - 1], &ordered[cursor]);
+                }
+            }
+        }
+        var section_cursor: usize = 0;
+        const shelf_gap = if (searching) @as(f32, 0) else @max(0, self.sidebar_rows.h - self.sidebarContentHeight());
+        var shelf_started = false;
+        for (ordered[0..count]) |index| {
+            const entry = &self.threads[index];
+            const section = @intFromEnum(self.sidebarSection(entry));
+            if (!searching and section >= 2) {
+                while (section_cursor <= section) : (section_cursor += 1) {
+                    if (section_cursor < 2 or (section_cursor < 4 and section_counts[section_cursor] == 0)) continue;
+                    if (!shelf_started) {
+                        y += shelf_gap;
+                        shelf_started = true;
+                    }
+                    try self.drawSidebarShelf(renderer, text, section_cursor - 2, section_counts[section_cursor], y, muted);
+                    y += 33;
+                }
+            }
+            if (!self.sidebarShelfVisible(entry)) continue;
+            const slim = self.sidebarSlim(entry);
+            const row = c.SDL_FRect{ .x = self.sidebar_rows.x, .y = y + (if (slim) @as(f32, 0) else 2), .w = self.sidebar_rows.w, .h = if (slim) 36 else 78 };
             self.thread_bounds[index] = clippedRect(row, self.sidebar_rows);
             if (self.thread_bounds[index].h > 0) {
                 const active = entry.id.eql(self.active_thread.slice());
@@ -2116,37 +2509,128 @@ pub const View = struct {
                 }
                 const x = row.x + 10;
                 const width = row.w - 20;
-                if (searching) {
+                if (slim) {
                     try icon(renderer, .folder, x, row.y + 10, muted);
-                    try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], x + 26, row.y + 10, width - 26, 14, foreground);
+                    const hovered = !searching and self.sidebar_hover == index and self.navigation_enabled;
+                    try self.drawSidebarTitle(renderer, text, entry, x + 26, row.y + 10, width - 26 - (if (hovered) @as(f32, 60) else 0), foreground);
+                    if (hovered) try self.drawSidebarRowActions(renderer, text, index, row, true, foreground);
                     ordinal += 1;
                     y += sidebar_search_stride;
                     continue;
                 }
                 if (entry.project_name.len != 0) {
                     try icon(renderer, .folder, x, row.y + 9, muted);
-                    try self.labels.drawFitted(renderer, text, entry.project_name.slice(), x + 22, row.y + 10, width - 22 - (if (entry.run_status == .idle) @as(f32, 0) else 72), 12, muted);
+                    if (entry.pinned) try icon(renderer, .pin, x + 20, row.y + 9, muted);
+                    const project_inset: f32 = if (entry.pinned) 40 else 22;
+                    try self.labels.drawFitted(renderer, text, entry.project_name.slice(), x + project_inset, row.y + 10, width - project_inset - (if (entry.run_status == .idle) @as(f32, 36) else 84), 12, muted);
                 }
-                if (entry.run_status != .idle) {
+                const hovered = self.sidebar_hover == index and self.navigation_enabled;
+                if (!hovered and entry.run_status == .idle and entry.updated_at_ms > 0) {
+                    var time_buffer: [32]u8 = undefined;
+                    const elapsed = @max(0, self.sidebar_now_ms - entry.updated_at_ms);
+                    const time_label = if (elapsed < 60_000) "now" else if (elapsed < 3_600_000) try std.fmt.bufPrint(&time_buffer, "{d}m", .{@divFloor(elapsed, 60_000)}) else if (elapsed < 86_400_000) try std.fmt.bufPrint(&time_buffer, "{d}h", .{@divFloor(elapsed, 3_600_000)}) else try std.fmt.bufPrint(&time_buffer, "{d}d", .{@divFloor(elapsed, 86_400_000)});
+                    const time_width = try self.labels.width(text, time_label, 12);
+                    try self.labels.draw(text, time_label, row.x + row.w - 10 - time_width, row.y + 10, 12, muted);
+                }
+                if (!hovered and entry.run_status != .idle) {
                     const status_label: []const u8 = switch (entry.run_status) {
                         .running => "Working",
+                        .question => "Input",
                         .approval => "Approval",
                         .failed => "Failed",
                         .interrupted => "Interrupted",
                         .unknown => "Unknown",
                         .idle => unreachable,
                     };
-                    try self.labels.drawFitted(renderer, text, status_label, row.x + row.w - 76, row.y + 10, 66, 11, muted);
+                    const status_color = if (entry.run_status == .failed) self.design.colors.danger else if (entry.run_status == .question or entry.run_status == .approval) self.design.colors.foreground else muted;
+                    try icon(renderer, if (entry.run_status == .running) .working else if (entry.run_status == .failed) .alert else .question, row.x + row.w - 92, row.y + 8, status_color);
+                    try self.labels.drawFitted(renderer, text, status_label, row.x + row.w - 72, row.y + 10, 62, 11, status_color);
                 }
-                try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], x, row.y + 32, width, 14, foreground);
+                if (hovered) try self.drawSidebarRowActions(renderer, text, index, row, false, foreground);
+                try self.drawSidebarTitle(renderer, text, entry, x, row.y + 32, width, foreground);
+                if (entry.runtime_kind.len != 0) {
+                    const provider = if (entry.runtime_kind.eql("codex")) "Codex" else if (entry.runtime_kind.eql("opencode")) "OpenCode" else entry.runtime_kind.slice();
+                    const provider_width = try self.labels.width(text, provider, 10);
+                    try self.labels.draw(text, provider, row.x + row.w - 10 - provider_width, row.y + 58, 10, muted);
+                }
                 const metadata = if (entry.branch.len != 0) entry.branch.slice() else entry.workspace_name.slice();
                 if (metadata.len != 0) {
                     try icon(renderer, if (entry.branch.len != 0) .branch else .folder, x, row.y + 54, muted);
-                    try self.labels.drawFitted(renderer, text, metadata, x + 20, row.y + 56, width - 40, 12, muted);
+                    try self.labels.drawFitted(renderer, text, metadata, x + 20, row.y + 56, @max(0, width - 84), 12, muted);
                 }
             }
             ordinal += 1;
-            y += self.sidebarStride();
+            y += if (slim) sidebar_search_stride else sidebar_card_stride;
+        }
+        if (!searching and count != 0) {
+            while (section_cursor <= 4) : (section_cursor += 1) {
+                if (section_cursor < 2 or (section_cursor < 4 and section_counts[section_cursor] == 0)) continue;
+                if (!shelf_started) {
+                    y += shelf_gap;
+                    shelf_started = true;
+                }
+                try self.drawSidebarShelf(renderer, text, section_cursor - 2, section_counts[section_cursor], y, muted);
+                y += 33;
+            }
+        }
+    }
+
+    fn drawSidebarRowActions(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, index: usize, row: c.SDL_FRect, slim: bool, color: Color) !void {
+        const entry = &self.threads[index];
+        const wake = entry.snoozed_until > self.sidebar_now_ms;
+        const label: []const u8 = if (wake) "Wake" else if (entry.settled) "Unsettle" else "Settle";
+        const action_width: f32 = if (entry.settled) 68 else 54;
+        const top = row.y + (if (slim) @as(f32, 6) else 8);
+        self.sidebar_action_bounds[index][0] = clippedRect(.{ .x = row.x + row.w - action_width - 6, .y = top, .w = action_width, .h = 22 }, self.sidebar_rows);
+        const action = self.sidebar_action_bounds[index][0];
+        try self.labels.draw(text, label, action.x + 4, top + 4, 11, color);
+        var id: [96]u8 = undefined;
+        _ = self.navigation_targets.add(try std.fmt.bufPrint(&id, "sidebar.thread.{d}.settle", .{index}), "button", action, action.h > 0) catch {};
+        if (!slim) {
+            self.sidebar_action_bounds[index][1] = clippedRect(.{ .x = action.x - 24, .y = top, .w = 24, .h = 22 }, self.sidebar_rows);
+            const snooze = self.sidebar_action_bounds[index][1];
+            try icon(renderer, .clock, snooze.x + 4, top + 3, color);
+            _ = self.navigation_targets.add(try std.fmt.bufPrint(&id, "sidebar.thread.{d}.snooze", .{index}), "button", snooze, snooze.h > 0) catch {};
+        }
+    }
+
+    fn drawSidebarShelf(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, index: usize, count: usize, y: f32, muted: Color) !void {
+        const row = c.SDL_FRect{ .x = self.sidebar_rows.x + 2, .y = y, .w = @max(0, self.sidebar_rows.w - 4), .h = 32 };
+        self.sidebar_shelf_bounds[index] = clippedRect(row, self.sidebar_rows);
+        const names = [_][]const u8{ "Working", "Snoozed", "Settled" };
+        const ids = [_][]const u8{ "sidebar.shelf.working", "sidebar.shelf.snoozed", "sidebar.shelf.settled" };
+        _ = self.navigation_targets.add(ids[index], "button", self.sidebar_shelf_bounds[index], self.sidebar_shelf_bounds[index].h > 0) catch {};
+        var buffer: [48]u8 = undefined;
+        const label = if (self.sidebar_shelf_expanded[index]) names[index] else try std.fmt.bufPrint(&buffer, "{s} ({d})", .{ names[index], count });
+        try self.labels.draw(text, label, row.x + 8, y + 9, 12, muted);
+        const label_width = try self.labels.width(text, label, 12);
+        try widgets.panel(renderer, .{ .x = row.x + label_width + 16, .y = y + 16, .w = @max(0, row.w - label_width - 44), .h = 1 }, 0, self.design.colors.sidebar_border);
+        try icon(renderer, if (self.sidebar_shelf_expanded[index]) .chevron else .chevron_up, row.x + row.w - 20, y + 8, muted);
+    }
+
+    fn drawSidebarMenu(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, width: f32, height: f32) !void {
+        const index = self.sidebarMenuIndex() orelse {
+            self.sidebar_menu_thread = .{};
+            return;
+        };
+        const entry = self.threads[index];
+        const snoozed = entry.snoozed_until > wallTimeMs();
+        const labels = [_][]const u8{ if (entry.pinned) "Unpin thread" else "Pin thread", if (entry.settled) "Unsettle thread" else "Settle thread", if (snoozed) "Wake thread" else "Snooze for 1 hour", "Snooze for 4 hours", "Snooze for 1 day", "Move up", "Move down", "Rename thread", if (self.scope_project.eql(entry.project_id.slice())) "Show all projects" else "Filter by project", "Copy thread ID", "Copy branch", "Copy path" };
+        const ids = [_][]const u8{ "sidebar.menu.pin", "sidebar.menu.settle", if (snoozed) "sidebar.menu.wake" else "sidebar.menu.snooze.1h", "sidebar.menu.snooze.4h", "sidebar.menu.snooze.tomorrow", "sidebar.menu.move_up", "sidebar.menu.move_down", "sidebar.menu.rename", "sidebar.menu.filter", "sidebar.menu.copy_id", "sidebar.menu.copy_branch", "sidebar.menu.copy_path" };
+        self.sidebar_menu_actions[0..7].* = .{ if (entry.pinned) .unpin else .pin, if (entry.settled) .unsettle else .settle, if (snoozed) .wake else .snooze, .snooze, .snooze, .move_up, .move_down };
+        self.sidebar_menu_count = labels.len;
+        const menu_width = @min(220, width - 16);
+        const menu_height: f32 = labels.len * 28 + 8;
+        self.sidebar_menu_bounds = .{ .x = std.math.clamp(self.sidebar_menu_x, 8, @max(8, width - menu_width - 8)), .y = std.math.clamp(self.sidebar_menu_y, 8, @max(8, height - menu_height - 8)), .w = menu_width, .h = menu_height };
+        try widgets.panel(renderer, self.sidebar_menu_bounds, 8, self.design.colors.border);
+        try widgets.panel(renderer, .{ .x = self.sidebar_menu_bounds.x + 1, .y = self.sidebar_menu_bounds.y + 1, .w = menu_width - 2, .h = menu_height - 2 }, 7, self.design.colors.raised);
+        for (labels, 0..) |label, row_index| {
+            const row = c.SDL_FRect{ .x = self.sidebar_menu_bounds.x + 4, .y = self.sidebar_menu_bounds.y + 4 + @as(f32, @floatFromInt(row_index)) * 28, .w = menu_width - 8, .h = 28 };
+            self.sidebar_menu_rows[row_index] = row;
+            const enabled = self.navigation_enabled and (row_index != 10 or entry.branch.len != 0) and (row_index != 11 or entry.workspace_path_len != 0);
+            _ = self.navigation_targets.add(ids[row_index], "menuitem", row, enabled) catch {};
+            if (row_index == self.sidebar_menu_hover) try widgets.panel(renderer, row, 4, self.design.colors.sidebar_active);
+            try self.labels.draw(text, label, row.x + 8, row.y + 7, 12, self.design.colors.foreground);
         }
     }
 
@@ -2746,6 +3230,7 @@ pub const View = struct {
         if (self.custom_root == null and self.effort_open) try self.drawEffort(renderer, text, foreground, muted);
         if (self.custom_root == null and self.setup_open) try self.drawSetup(renderer, text, bounds, foreground, muted);
         if (self.custom_root == null and self.workspace_open and !self.setup_open) try self.drawWorkspace(renderer, text, bounds, foreground, muted);
+        if (self.custom_root == null and self.sidebar_menu_thread.len != 0) try self.drawSidebarMenu(renderer, text, bounds.header.width, self.sidebar_bounds.h);
     }
 };
 
@@ -3902,6 +4387,107 @@ test "sidebar project scope keyboard selection retains real identity and consume
     event.key.key = c.SDLK_RETURN;
     _ = try view.handle(event, undefined, undefined);
     try std.testing.expectEqual(@as(usize, 0), view.scope_project.len);
+}
+
+test "sidebar inline rename targets an unselected Unicode row without changing the active draft" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.insert("active chat draft", .typing);
+    view.navigation_enabled = true;
+    view.thread_count = 2;
+    view.threads[0].id = try transcript.Id.init("active-thread");
+    view.threads[1].id = try transcript.Id.init("other-thread");
+    view.threads[1].len = 4;
+    @memcpy(view.threads[1].label[0..4], "Chat");
+    view.active_thread = view.threads[0].id;
+    view.beginSidebarRename(1);
+    try view.sidebarRenameInsert("レビュー 🎮");
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_BACKSPACE;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqualStrings("レビュー ", view.sidebar_rename_buffer[0..view.sidebar_rename_len]);
+    try std.testing.expectError(error.InvalidTitle, view.sidebarRenameInsert("bad\nname"));
+    try std.testing.expectError(error.InvalidUtf8, view.sidebarRenameInsert("\xff"));
+    view.sidebar_rename_select_all = true;
+    try view.sidebarRenameInsert("🎮" ** 40);
+    try std.testing.expectError(error.TextTooLarge, view.sidebarRenameInsert("x"));
+    std.mem.swap(View.Entry, &view.threads[0], &view.threads[1]);
+    view.commitSidebarRename();
+    try std.testing.expectEqual(@as(usize, 0), view.navigation.?.rename.index);
+    try std.testing.expectEqualStrings("🎮" ** 40, view.navigation.?.rename.title[0..view.navigation.?.rename.len]);
+    try std.testing.expect(view.active_thread.eql("active-thread"));
+    try std.testing.expectEqualStrings("active chat draft", view.editor.textBytes());
+    view.beginSidebarRename(0);
+    event.key.key = c.SDLK_ESCAPE;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqual(@as(usize, 0), view.sidebar_rename_thread.len);
+}
+
+test "sidebar shelves retain selected rows and context actions keep stable thread identity" {
+    const surface = c.SDL_CreateSurface(1280, 800, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(text);
+    var layout = try Layout.init(std.testing.allocator, 1280, 800);
+    defer layout.deinit();
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.insert("preserve this draft", .typing);
+    view.navigation_enabled = true;
+    view.thread_count = 5;
+    for (view.threads[0..5], 0..) |*entry, index| {
+        var id: [32]u8 = undefined;
+        entry.id = try transcript.Id.init(try std.fmt.bufPrint(&id, "actual-{d}", .{index}));
+        entry.len = 4;
+        @memcpy(entry.label[0..4], "Chat");
+    }
+    view.threads[0].pinned = true;
+    view.threads[2].run_status = .running;
+    view.threads[3].snoozed_until = View.wallTimeMs() + 3_600_000;
+    view.threads[4].settled = true;
+    view.active_thread = view.threads[1].id;
+    const bounds = layout.coding(1280);
+    try view.drawChrome(renderer, text, bounds, view.design.colors.foreground, view.design.colors.muted);
+    try std.testing.expectEqual(@as(f32, 78), view.threadRowBounds(0).h);
+    try std.testing.expectEqual(@as(f32, 78), view.threadRowBounds(2).h);
+    try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(3));
+    try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(4));
+    try std.testing.expectEqual(@as(f32, 0), view.sidebar_shelf_bounds[0].h);
+    try std.testing.expect(view.sidebar_shelf_bounds[1].h > 0);
+    try std.testing.expect(view.sidebar_shelf_bounds[2].h > 0);
+    view.active_thread = view.threads[4].id;
+    try view.drawChrome(renderer, text, bounds, view.design.colors.foreground, view.design.colors.muted);
+    try std.testing.expectEqual(@as(f32, 36), view.threadRowBounds(4).h);
+    view.sidebar_shelf_expanded[1] = true;
+    try view.drawChrome(renderer, text, bounds, view.design.colors.foreground, view.design.colors.muted);
+    try std.testing.expectEqual(@as(f32, 36), view.threadRowBounds(3).h);
+    view.sidebar_menu_thread = view.threads[0].id;
+    try view.drawSidebarMenu(renderer, text, 1280, 800);
+    try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(0));
+    std.mem.swap(View.Entry, &view.threads[0], &view.threads[1]);
+    view.activateSidebarMenu(0);
+    try std.testing.expectEqual(@as(usize, 1), view.navigation.?.sidebar.index);
+    try std.testing.expectEqual(View.SidebarAction.unpin, view.navigation.?.sidebar.action);
+    try std.testing.expectEqualStrings("preserve this draft", view.editor.textBytes());
+    view.sidebar_collapsed = true;
+    layout.sidebar_collapsed = true;
+    const collapsed = layout.coding(1280);
+    try view.drawChrome(renderer, text, collapsed, view.design.colors.foreground, view.design.colors.muted);
+    try std.testing.expectEqual(@as(f32, 0), view.sidebarWidth(1280));
+    try std.testing.expectEqual(@as(f32, 0), view.search_bounds.w);
+    try std.testing.expectEqual(@as(f32, 0), view.setup_bounds.w);
+    try std.testing.expect(collapsed.composer.x < bounds.composer.x);
+    view.sidebar_collapsed = false;
+    layout.sidebar_collapsed = false;
+    view.sidebar_width_override = 340;
+    layout.sidebar_width_override = view.sidebar_width_override;
+    try std.testing.expectEqual(view.sidebarWidth(1280), layout.sidebarWidthFor(1280));
+    try std.testing.expectEqual(@as(f32, 340), view.sidebarWidth(1280));
+    try std.testing.expectEqual(@as(?i64, view.threads[3].snoozed_until), view.nextSidebarWakeMs(View.wallTimeMs()));
+    try std.testing.expectEqual(@as(?i64, null), view.nextSidebarWakeMs(view.threads[3].snoozed_until));
 }
 
 test "flat rendered sidebar cards clip hits filter real project IDs and use bundled chrome" {
