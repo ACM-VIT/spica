@@ -161,6 +161,76 @@ class Proof:
     def shot(self, filename):
         self.ui.capture(self.session, filename)
 
+    def row_label(self, snapshot, identifier):
+        index = rows(snapshot)[identifier]["index"]
+        return snapshot["thread_labels"][index]
+
+    def clipboard(self):
+        return self.ui.run_command(["vd", "run", str(self.session.vd_session), "--",
+                                     "wl-paste", "--no-newline"]).stdout
+
+    def row_menu_utilities(self, identifier, retained, draft):
+        self.right_click(identifier)
+        self.click("sidebar.menu.rename")
+        current = self.wait(lambda value: value.get("sidebar_rename_thread") == identifier,
+                            "inactive row rename opened for exact thread")
+        assert_retained(retained, current, draft)
+        self.key("ctrl+a")
+        title = "Sidebar Alpha renamed café Straße Σίσυφος"
+        self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, title])
+        self.key("Return")
+        current = self.wait(lambda value: not value.get("sidebar_rename_thread")
+                            and not value.get("pending_command") and self.row_label(value, identifier) == title,
+                            "inactive row Unicode title committed to exact thread")
+        assert_retained(retained, current, draft)
+        self.right_click(identifier)
+        self.click("sidebar.menu.rename")
+        self.wait(lambda value: value.get("sidebar_rename_thread") == identifier,
+                  "inactive row rename reopened")
+        self.key("ctrl+a")
+        self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, "Discard inactive title"])
+        self.key("Escape")
+        current = self.wait(lambda value: not value.get("sidebar_rename_thread")
+                            and self.row_label(value, identifier) == title,
+                            "Escape cancels inactive row rename")
+        assert_retained(retained, current, draft)
+        self.shot("row-renamed.png")
+        for action, expected in (("copy_id", identifier), ("copy_path", self.session.data["workspace"])):
+            self.right_click(identifier)
+            self.click("sidebar.menu." + action)
+            current = self.wait(lambda value: not value.get("sidebar_menu_thread"),
+                                "row " + action + " closes menu")
+            if self.clipboard() != expected:
+                raise ValueError("private clipboard contains wrong " + action + " value")
+            assert_retained(retained, current, draft)
+            self.assertions.append("private clipboard verifies exact row " + action)
+        current = self.session.snapshot(self.args.timeout)
+        branch = current["thread_branches"][rows(current)[identifier]["index"]]
+        self.right_click(identifier)
+        if branch:
+            self.click("sidebar.menu.copy_branch")
+            current = self.wait(lambda value: not value.get("sidebar_menu_thread"), "row branch copied")
+            if self.clipboard() != branch:
+                raise ValueError("private clipboard contains wrong branch")
+            assert_retained(retained, current, draft)
+        else:
+            target = next(target for target in self.ui.target_groups(self.session.snapshot(self.args.timeout))
+                          if target.get("id") == "sidebar.menu.copy_branch")
+            if target.get("enabled"):
+                raise ValueError("copy branch admitted despite missing branch metadata")
+            self.key("Escape")
+        self.right_click(identifier)
+        self.click("sidebar.menu.filter")
+        current = self.wait(lambda value: value.get("sidebar_scope_project")
+                            == value["thread_projects"][rows(value)[identifier]["index"]],
+                            "row project filter selects exact target project")
+        assert_retained(retained, current, draft)
+        self.right_click(identifier)
+        self.click("sidebar.menu.filter")
+        current = self.wait(lambda value: not value.get("sidebar_scope_project"),
+                            "row project filter toggles back to all projects")
+        assert_retained(retained, current, draft)
+
     def measure_sidebar(self, identifier, retained, draft):
         """Measure painted sidebar work; input delivery itself has no latency claim."""
         self.measure = load_tool("measure_process", ROOT / "tools/measure_process.py")
@@ -252,7 +322,7 @@ class Proof:
         self.ui.launch(launch_args)
         self.session = self.ui.Session.load(self.args.output)
         self.wait(lambda value: value.get("send_ready"), "fresh native conversation ready")
-        first = self.ui.send_turn(self.session, "Sidebar Alpha café", self.args.timeout)
+        first = self.ui.send_turn(self.session, "Sidebar Alpha café Straße Σίσυφος", self.args.timeout)
         alpha, first_project = first["thread_id"], first["project_id"]
         self.click("workspace.new_thread")
         self.wait(lambda value: value.get("thread_id") != alpha and value.get("send_ready"),
@@ -278,11 +348,14 @@ class Proof:
         assert_compact(current, identifiers)
         assert_retained(retained, current, draft)
         self.shot("search.png")
-        self.key("ctrl+a")
-        self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, "CAFé"])
-        current = self.wait(lambda value: value.get("sidebar_search") == "CAFé"
-                            and [target.get("id") for target in value.get("thread_targets", [])
-                                 if target.get("enabled")] == [alpha], "Unicode case-folded search selects exact Alpha chat")
+        for query in ("CAFÉ", "STRASSE", "ΣΊΣΥΦΟΣ"):
+            self.key("ctrl+a")
+            self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, query])
+            current = self.wait(lambda value: value.get("sidebar_search") == query
+                                and [target.get("id") for target in value.get("thread_targets", [])
+                                     if target.get("enabled")] == [alpha],
+                                "Unicode case-folded search selects exact Alpha chat: " + query)
+        self.shot("unicode-search.png")
         self.key("Return")
         self.wait(lambda value: value.get("thread_id") == alpha and not value.get("sidebar_search"),
                   "keyboard search activation opens exact matched chat")
@@ -310,6 +383,8 @@ class Proof:
 
         if self.args.measure:
             self.measure_sidebar(alpha, retained, draft)
+
+        self.row_menu_utilities(alpha, retained, draft)
 
         self.action(alpha, "pin", lambda row: row["pinned"], "inactive Alpha pin persisted", retained, draft)
         self.shot("pinned.png")

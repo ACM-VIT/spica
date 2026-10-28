@@ -45,6 +45,16 @@ class SidebarEvidenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 MODULE.assert_retained(value, {**value, field: "changed"}, value["draft"])
 
+    def test_resident_count_excludes_disabled_placeholder_slots(self):
+        value = {"thread_count": 1,
+                 "thread_targets": [{"id": "alpha"}, {"id": "window.close"}, {"id": "window.close"}],
+                 "thread_pinned": [True, False, False], "thread_settled": [False] * 3,
+                 "thread_snoozed_until": [0] * 3, "thread_sort_order": [0] * 3}
+        self.assertEqual(set(MODULE.rows(value)), {"alpha"})
+        for count in (-1, 4, True):
+            with self.assertRaises(ValueError):
+                MODULE.rows({**value, "thread_count": count})
+
     def test_compact_geometry_rejects_cards_overlap_and_wrong_identity(self):
         target = lambda identifier, y, height=36: {"id": identifier, "enabled": True,
                                                    "pointer_bounds": [8, y, 240, height]}
