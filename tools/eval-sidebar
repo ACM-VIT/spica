@@ -7,7 +7,13 @@ import importlib.machinery
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
+import shlex
+import shutil
+import socket
+import struct
+import subprocess
 import sys
 import time
 from typing import Any
@@ -100,6 +106,81 @@ class Proof:
         self.samples = []
         self.phases = []
 
+    def prepare_pointer(self):
+        """Extend the installed vd helper, keeping its verified socket-FD boundary."""
+        installed = shutil.which("vd")
+        if not installed:
+            raise ValueError("installed vd is unavailable")
+        source = Path(installed).resolve().with_name("virtual_pointer.c")
+        original = source.read_text()
+        guard = 'if (strcmp(argv[6], "click") == 0) {'
+        button = "(uint32_t)BTN_LEFT"
+        release = "        wl_proxy_marshal_flags(pointer, 2, NULL, 1, 0, now_ms(), (uint32_t)BTN_LEFT, 0u);"
+        if original.count(guard) != 1 or original.count(button) != 2 or original.count(release) != 1:
+            raise ValueError("installed vd pointer source drifted from audited extension anchors")
+        drag = '''        if (strncmp(argv[6], "drag:", 5) == 0) {
+            int dx, dy;
+            if (sscanf(argv[6], "drag:%d:%d", &dx, &dy) != 2) return 2;
+            for (int step = 1; step <= 6; step++) {
+                wl_proxy_marshal_flags(pointer, 1, NULL, 1, 0, now_ms(),
+                    (uint32_t)(atoi(argv[2]) + dx * step / 6),
+                    (uint32_t)(atoi(argv[3]) + dy * step / 6),
+                    (uint32_t)atoi(argv[4]), (uint32_t)atoi(argv[5]));
+                wl_proxy_marshal_flags(pointer, 4, NULL, 1, 0);
+                if (settle(display) < 0) return 1;
+            }
+        }
+'''
+        extended = original.replace(release, drag + release)
+        extended = extended.replace(guard, 'if (strcmp(argv[6], "click") == 0 || strcmp(argv[6], "right") == 0 || strncmp(argv[6], "drag:", 5) == 0) {')
+        extended = extended.replace(button, '(uint32_t)(strcmp(argv[6], "right") == 0 ? BTN_RIGHT : BTN_LEFT)')
+        directory = self.args.output.parent / (self.args.output.name + "-pointer")
+        directory.mkdir(parents=True, exist_ok=False)
+        generated = directory / "virtual_pointer.c"
+        generated.write_text(extended)
+        self.pointer_helper = directory / "virtual-pointer"
+        flags = shlex.split(self.ui.run_command(["pkg-config", "--cflags", "--libs", "wayland-client"]).stdout)
+        command = ["gcc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", str(generated),
+                   "-o", str(self.pointer_helper), *flags]
+        self.ui.run_command(command)
+        self.pointer_provenance = dict(installed_source=str(source), installed_sha256=self.ui.sha256(source),
+                                       transformed_source=str(generated), transformed_sha256=self.ui.sha256(generated),
+                                       binary=str(self.pointer_helper), binary_sha256=self.ui.sha256(self.pointer_helper),
+                                       compiler_command=command,
+                                       transformation="Count-checked BTN_RIGHT selection and six-step left-button drag; existing FD boundary preserved",
+                                       protocol_source="https://github.com/swaywm/wlr-protocols/blob/master/unstable/wlr-virtual-pointer-unstable-v1.xml")
+        self.ui.atomic_json(directory / "provenance.json", self.pointer_provenance)
+
+    def pointer_event(self, x, y, operation):
+        self.session.require_live()
+        self.ui.focus(self.session)
+        outputs = json.loads(self.ui.run_command(["swaymsg", "--socket", self.session.sway_socket,
+                                                 "--raw", "-t", "get_outputs"]).stdout)
+        headless = [output for output in outputs if output.get("name") == "HEADLESS-1" and output.get("active")]
+        if len(headless) != 1:
+            raise ValueError("owned private desktop lacks one HEADLESS-1 output")
+        width, height = headless[0]["rect"]["width"], headless[0]["rect"]["height"]
+        if not 0 <= x < width or not 0 <= y < height:
+            raise ValueError("pointer position is outside the owned private output")
+        if operation.startswith("drag:"):
+            dx, dy = map(int, operation.split(":")[1:])
+            if not 0 <= x + dx < width or not 0 <= y + dy < height:
+                raise ValueError("drag destination is outside the owned private output")
+        if self.ui.sha256(self.pointer_helper) != self.pointer_provenance["binary_sha256"]:
+            raise ValueError("private pointer helper binary changed")
+        environment = self.session.data["private_desktop"]["environment"]
+        with socket.socket(socket.AF_UNIX) as channel:
+            channel.connect(str(Path(environment["XDG_RUNTIME_DIR"]) / environment["WAYLAND_DISPLAY"]))
+            pid, uid, _ = struct.unpack("3i", channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if (pid, uid) != (self.session.data["private_desktop"]["compositor"]["pid"], os.getuid()):
+                raise ValueError("private Wayland peer identity changed")
+            command = [str(self.pointer_helper), str(channel.fileno()), str(x), str(y),
+                       str(width), str(height), operation]
+            result = subprocess.run(command, env=environment, pass_fds=(channel.fileno(),),
+                                    capture_output=True, text=True, timeout=15)
+            if result.returncode:
+                raise ValueError("private pointer helper failed: " + result.stderr)
+
     def wait(self, predicate, label):
         current = self.ui.wait_snapshot(self.session, predicate, self.args.timeout, label)
         self.assertions.append(label)
@@ -127,15 +208,11 @@ class Proof:
     def right_click(self, identifier):
         before = self.session.snapshot(self.args.timeout)
         target = self.ui.find_target(before, identifier)
-        self.ui.focus(self.session)
         x, y = self.ui.pointer(self.session, target)
-        self.ui.run_command(["vd", "move", str(self.session.vd_session), self.session.window,
-                             str(x), str(y)])
-        self.ipc("seat", "seat0", "cursor", "press", "button3")
-        self.ipc("seat", "seat0", "cursor", "release", "button3")
+        self.pointer_event(x, y, "right")
         self.session.journal("sidebar.context", before, self.session.snapshot(self.args.timeout),
                              target=identifier, pointer=[x, y],
-                             input_origin="ordinary vd pointer and private compositor right button")
+                             input_origin="ordinary verified private wlr virtual-pointer right button")
         current = self.wait(lambda value: any(target.get("enabled")
                             and target.get("id", "").startswith("sidebar.menu.")
                             for target in self.ui.target_groups(value)), "painted row context menu")
@@ -313,6 +390,9 @@ class Proof:
         self.session.data["sidebar_performance"] = summary
 
     def run(self):
+        # Compile only the compositor input helper before native launch and all
+        # measured boundaries. No app source or package installation occurs.
+        self.prepare_pointer()
         launch_args = argparse.Namespace(output=self.args.output, binary=self.args.binary,
                                         provider="fake", private=True, build=False,
                                         optimize="ReleaseSafe", scenario="sidebar",
@@ -321,6 +401,8 @@ class Proof:
                                         timeout=self.args.timeout, dry_run=False)
         self.ui.launch(launch_args)
         self.session = self.ui.Session.load(self.args.output)
+        self.session.data["pointer_helper"] = self.pointer_provenance
+        self.session.save()
         self.wait(lambda value: value.get("send_ready"), "fresh native conversation ready")
         first = self.ui.send_turn(self.session, "Sidebar Alpha café Straße Σίσυφος", self.args.timeout)
         alpha, first_project = first["thread_id"], first["project_id"]
@@ -434,15 +516,7 @@ class Proof:
         before_width = current["sidebar_width"]
         target = self.ui.find_target(current, "sidebar.resize")
         x, y = self.ui.pointer(self.session, target)
-        self.ui.focus(self.session)
-        self.ui.run_command(["vd", "move", str(self.session.vd_session), self.session.window, str(x), str(y)])
-        self.ipc("seat", "seat0", "cursor", "press", "button1")
-        try:
-            for delta in (20, 40, 60):
-                self.ipc("seat", "seat0", "cursor", "set", str(x + delta), str(y))
-                time.sleep(.06)
-        finally:
-            self.ipc("seat", "seat0", "cursor", "release", "button1")
+        self.pointer_event(x, y, "drag:60:0")
         current = self.wait(lambda value: value.get("sidebar_width", 0) > before_width + 20,
                             "observed resize rail changes native sidebar width")
         assert_retained(retained, current, draft)
