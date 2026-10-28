@@ -29,12 +29,12 @@ pub const Request = struct {
     }
 
     /// Borrow only after the callback publishes all result bytes.
-    pub fn result(self: *Request) ?union(enum) { selected: []const u8, cancelled, failed } {
+    pub fn result(self: *Request) ?union(enum) { selected: []const u8, cancelled, failed: []const u8 } {
         if (!self.ready.load(.acquire)) return null;
         return switch (self.state) {
             .selected => .{ .selected = self.bytes[0..self.len] },
             .cancelled => .cancelled,
-            .failed => .failed,
+            .failed => .{ .failed = self.bytes[0..self.len] },
         };
     }
 
@@ -42,13 +42,20 @@ pub const Request = struct {
         self.state = .cancelled;
         if (paths == null) {
             self.state = .failed;
-        } else if (paths[0] != null) {
+            self.len = 0;
+            const detail = c.SDL_GetError();
+            while (self.len < self.bytes.len - 1 and detail[self.len] != 0) : (self.len += 1) {}
+            @memcpy(self.bytes[0..self.len], detail[0..self.len]);
+        } else if (paths[0] != null and paths[0][0] != 0) {
             // Bound foreign strings before copying; never shorten a folder.
             const path = paths[0];
             var len: usize = 0;
             while (len < self.bytes.len and path[len] != 0) : (len += 1) {}
             if (len == self.bytes.len or !std.fs.path.isAbsolute(path[0..len]) or !std.unicode.utf8ValidateSlice(path[0..len])) {
                 self.state = .failed;
+                const detail = "The folder chooser returned an invalid or oversized path.";
+                @memcpy(self.bytes[0..detail.len], detail);
+                self.len = detail.len;
             } else {
                 @memcpy(self.bytes[0..len], path[0..len]);
                 self.bytes[len] = 0;
@@ -98,6 +105,10 @@ test "folder cancellation and invalid paths never replace the current workspace"
     var request: Request = .{ .allocator = std.testing.allocator };
     const empty = [_][*c]const u8{null};
     request.complete(&empty);
+    try std.testing.expect(request.result().? == .cancelled);
+    // SDL's Zenity backend also represents cancelled empty stdout this way.
+    const empty_string = [_][*c]const u8{ "", null };
+    request.complete(&empty_string);
     try std.testing.expect(request.result().? == .cancelled);
     const invalid = [_][*c]const u8{ "relative/folder", null };
     request.complete(&invalid);

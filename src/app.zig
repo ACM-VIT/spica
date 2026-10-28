@@ -356,7 +356,11 @@ pub const App = struct {
                     self.view.notice = "This folder path cannot fit in the connection form. Choose a shorter path (up to 512 UTF-8 bytes).";
                 } else self.view.notice = "Project folder selected. Connect to use it.";
             },
-            .failed => self.view.notice = "Could not open the system folder chooser. Enter the project folder in the Workspace field above.",
+            .failed => |detail| {
+                var buffer: [1024]u8 = undefined;
+                const message = std.fmt.bufPrint(&buffer, "Folder chooser failed: {s}. Enter the project folder in the Workspace field above.", .{@import("text/utf8.zig").prefix(detail, 700)}) catch "Could not open the folder chooser. Enter the Workspace path above.";
+                if (self.conversation) |conversation| conversation.notice(&self.view, message) else self.view.notice = "Could not open the folder chooser. Enter the Workspace path above.";
+            },
             .cancelled => {},
         }
     }
