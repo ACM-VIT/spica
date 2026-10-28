@@ -96,6 +96,17 @@ pub fn copy(has_path: bool, has_branch: bool) Panel {
     return panel;
 }
 
+pub fn snooze() Panel {
+    var panel: Panel = .{};
+    panel.append(.{ .action = .preset, .id = "sidebar.menu.snooze.1h", .label = "In 1 hour", .preset_index = 0 });
+    panel.append(.{ .action = .preset, .id = "sidebar.menu.snooze.3h", .label = "In 3 hours", .preset_index = 1 });
+    panel.append(.{ .action = .preset, .id = "sidebar.menu.snooze.evening", .label = "This evening", .preset_index = 2 });
+    panel.append(.{ .action = .preset, .id = "sidebar.menu.snooze.tomorrow", .label = "Tomorrow 09:00", .preset_index = 3 });
+    panel.append(.{ .action = .preset, .id = "sidebar.menu.snooze.monday", .label = "Next week Monday 09:00", .preset_index = 4 });
+    panel.append(.{ .action = .custom, .id = "sidebar.menu.snooze.custom", .label = "Custom…", .separator_before = true });
+    return panel;
+}
+
 /// Gregorian date-grid presentation contains no OS timezone/locale mechanics.
 /// Local today/selection come from the platform calendar boundary as ISO dates.
 pub const Calendar = struct {
@@ -190,6 +201,10 @@ test "menus keep local utilities available and skip disabled items with wrapped 
     try std.testing.expectEqual(Action.copy_id, copied.current().?.action);
     copied.move(true);
     try std.testing.expectEqual(Action.copy_id, copied.current().?.action);
+    const snoozes = snooze();
+    try std.testing.expectEqual(@as(usize, 6), snoozes.len);
+    try std.testing.expectEqual(@as(u3, 0), snoozes.items[0].preset_index);
+    try std.testing.expectEqual(Action.custom, snoozes.items[5].action);
     panel = .{};
     panel.move(true);
     try std.testing.expect(panel.current() == null);

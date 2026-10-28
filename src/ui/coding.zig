@@ -3,6 +3,8 @@ const c = @import("../native/bindings.zig").c;
 const Composer = @import("../text/composer.zig").Composer;
 const LineEdit = @import("../text/line_edit.zig").LineEdit;
 const LineView = @import("line_view.zig").LineView;
+const SidebarMenu = @import("sidebar_menu.zig");
+const SidebarTime = @import("../platform/sidebar_time.zig");
 const EditorView = @import("editor_view.zig").EditorView;
 const LabelCache = @import("label_cache.zig").LabelCache;
 const widgets = @import("widgets.zig");
@@ -221,7 +223,6 @@ pub const View = struct {
     sidebar_menu_x: f32 = 0,
     sidebar_menu_y: f32 = 0,
     sidebar_menu_hover: usize = 0,
-    sidebar_menu_actions: [16]SidebarAction = undefined,
     sidebar_menu_rows: [16]c.SDL_FRect = @splat(zero_rect),
     sidebar_rename_thread: transcript.Id = .{},
     sidebar_rename_followup: ?RenameFollowup = null,
@@ -230,6 +231,11 @@ pub const View = struct {
     sidebar_rename_select_all: bool = false,
     sidebar_rename_bounds: c.SDL_FRect = zero_rect,
     sidebar_menu_count: usize = 0,
+    sidebar_menu_panel: SidebarMenu.Panel = .{},
+    sidebar_menu_mode: enum { main, copy, snooze } = .main,
+    sidebar_snooze_deadlines: [5]i64 = @splat(0),
+    sidebar_snooze_when: [5]SidebarTime.Text = @splat(.{}),
+    sidebar_snooze_count: usize = 0,
     sidebar_action_bounds: [32][2]c.SDL_FRect = @splat(@splat(zero_rect)),
     search_bounds: c.SDL_FRect = zero_rect,
     search_clear_bounds: c.SDL_FRect = zero_rect,
@@ -1174,42 +1180,107 @@ pub const View = struct {
         return null;
     }
 
+    fn openSidebarSnooze(self: *View) void {
+        self.sidebar_menu_mode = .snooze;
+        self.sidebar_menu_panel = SidebarMenu.snooze();
+        for (0..5) |slot| self.sidebar_menu_panel.items[slot].enabled = false;
+        self.sidebar_snooze_deadlines = @splat(0);
+        self.sidebar_snooze_when = @splat(.{});
+        self.sidebar_snooze_count = 0;
+        const options = SidebarTime.presets(wallTimeMs()) catch {
+            self.sidebar_menu_panel.selected = 0;
+            self.sidebar_menu_count = self.sidebar_menu_panel.len;
+            return;
+        };
+        for (options.slice()) |option| {
+            const slot: usize = switch (option.id) {
+                .one_hour => 0,
+                .three_hours => 1,
+                .this_evening => 2,
+                .tomorrow => 3,
+                .next_monday => 4,
+            };
+            self.sidebar_snooze_deadlines[slot] = option.wake_ms;
+            self.sidebar_snooze_when[slot] = option.when_label;
+            self.sidebar_snooze_count = @max(self.sidebar_snooze_count, slot + 1);
+            self.sidebar_menu_panel.items[slot].enabled = true;
+        }
+        self.sidebar_menu_count = self.sidebar_menu_panel.len;
+        self.sidebar_menu_panel.edge(false);
+        self.sidebar_menu_hover = self.sidebar_menu_panel.selected orelse 0;
+    }
+
     fn activateSidebarMenu(self: *View, row: usize) void {
         const index = self.sidebarMenuIndex() orelse return;
-        if (!self.navigation_enabled or row >= self.sidebar_menu_count) return;
-        if (row >= 7) {
-            const entry = &self.threads[index];
-            if ((row == 10 and entry.branch.len == 0) or (row == 11 and entry.workspace_path_len == 0)) return;
-            switch (row) {
-                7 => self.beginSidebarRename(index),
-                8 => {
+        if (row >= self.sidebar_menu_panel.len) return;
+        const item = self.sidebar_menu_panel.items[row];
+        if (!item.enabled) return;
+        const entry = &self.threads[index];
+        switch (self.sidebar_menu_mode) {
+            .copy => switch (item.action) {
+                .copy_path => {
+                    clipboard.copyBytes(entry.workspace_path[0..entry.workspace_path_len], self.scratch) catch {
+                        self.notice = "Unable to copy workspace path";
+                    };
+                },
+                .copy_branch => {
+                    clipboard.copyBytes(entry.branch.slice(), self.scratch) catch {
+                        self.notice = "Unable to copy branch";
+                    };
+                },
+                .copy_id => {
+                    clipboard.copyBytes(entry.id.slice(), self.scratch) catch {
+                        self.notice = "Unable to copy thread ID";
+                    };
+                },
+                else => return,
+            },
+            .snooze => switch (item.action) {
+                .preset => {
+                    const deadline = self.sidebar_snooze_deadlines[item.preset_index];
+                    if (deadline <= wallTimeMs()) return;
+                    self.navigation = .{ .sidebar = .{ .index = index, .action = .snooze, .snoozed_until = deadline } };
+                },
+                .custom => {
+                    self.notice = "Custom snooze is not available in this native build";
+                    return;
+                },
+                else => return,
+            },
+            .main => switch (item.action) {
+                .copy => {
+                    self.sidebar_menu_mode = .copy;
+                    self.sidebar_menu_panel = SidebarMenu.copy(entry.workspace_path_len != 0, entry.branch.len != 0);
+                    self.sidebar_menu_count = self.sidebar_menu_panel.len;
+                    self.sidebar_menu_hover = self.sidebar_menu_panel.selected orelse 0;
+                    return;
+                },
+                .rename => self.beginSidebarRename(index),
+                .filter => {
                     self.scope_project = if (self.scope_project.eql(entry.project_id.slice())) .{} else entry.project_id;
                     self.sidebarChanged();
                 },
-                9 => clipboard.copyBytes(entry.id.slice(), self.scratch) catch {
-                    self.notice = "Unable to copy thread ID";
+                .pin, .unpin, .settle, .unsettle, .wake => |action| {
+                    const sidebar_action: SidebarAction = switch (action) {
+                        .pin => .pin,
+                        .unpin => .unpin,
+                        .settle => .settle,
+                        .unsettle => .unsettle,
+                        .wake => .wake,
+                        else => return,
+                    };
+                    self.navigation = .{ .sidebar = .{ .index = index, .action = sidebar_action, .snoozed_until = 0 } };
                 },
-                10 => clipboard.copyBytes(entry.branch.slice(), self.scratch) catch {
-                    self.notice = "Unable to copy branch";
+                .snooze => {
+                    self.openSidebarSnooze();
+                    return;
                 },
-                11 => clipboard.copyBytes(entry.workspace_path[0..entry.workspace_path_len], self.scratch) catch {
-                    self.notice = "Unable to copy workspace path";
-                },
-                else => {},
-            }
-            self.sidebar_menu_thread = .{};
-            return;
+                else => return,
+            },
         }
-        const action = self.sidebar_menu_actions[row];
-        if (action == .snooze and !self.threads[index].can_snooze) return;
-        const duration: i64 = switch (row) {
-            2 => 3_600_000,
-            3 => 14_400_000,
-            else => 86_400_000,
-        };
-        self.navigation = .{ .sidebar = .{ .index = index, .action = action, .snoozed_until = if (action == .snooze) wallTimeMs() + duration else 0 } };
         self.sidebar_menu_thread = .{};
         self.sidebar_menu_count = 0;
+        self.sidebar_menu_mode = .main;
     }
 
     fn beginSidebarRename(self: *View, index: usize) void {
@@ -1495,6 +1566,7 @@ pub const View = struct {
                     self.sidebar_menu_thread = .{};
                     for (0..self.thread_count) |index| if (widgets.contains(self.threadRowBounds(index), event.button.x, event.button.y)) {
                         self.sidebar_menu_thread = self.threads[index].id;
+                        self.sidebar_menu_mode = .main;
                         self.sidebar_menu_x = event.button.x;
                         self.sidebar_menu_y = event.button.y;
                         self.sidebar_menu_hover = 0;
@@ -1522,7 +1594,7 @@ pub const View = struct {
                         for (self.sidebar_menu_rows[0..self.sidebar_menu_count], 0..) |row, index| {
                             if (widgets.contains(row, x, y)) self.activateSidebarMenu(index);
                         }
-                        self.sidebar_menu_thread = .{};
+                        if (self.sidebar_menu_mode == .main) self.sidebar_menu_thread = .{};
                         if (self.sidebar_rename_thread.len != 0) try self.focus(window, true);
                         return true;
                     }
@@ -1729,6 +1801,7 @@ pub const View = struct {
                                 if (widgets.contains(actions[1], x, y)) {
                                     if (!self.threads[index].can_snooze) return true;
                                     self.sidebar_menu_thread = self.threads[index].id;
+                                    self.sidebar_menu_mode = .main;
                                     self.sidebar_menu_x = actions[1].x;
                                     self.sidebar_menu_y = actions[1].y + actions[1].h;
                                     self.sidebar_menu_hover = 2;
@@ -1988,9 +2061,26 @@ pub const View = struct {
                 }
                 if (self.custom_root == null and self.sidebar_menu_thread.len != 0) {
                     switch (key) {
-                        c.SDLK_ESCAPE => self.sidebar_menu_thread = .{},
-                        c.SDLK_UP => self.sidebar_menu_hover -|= 1,
-                        c.SDLK_DOWN => self.sidebar_menu_hover = @min(self.sidebar_menu_count -| 1, self.sidebar_menu_hover + 1),
+                        c.SDLK_ESCAPE => {
+                            self.sidebar_menu_thread = .{};
+                            self.sidebar_menu_mode = .main;
+                        },
+                        c.SDLK_UP => {
+                            self.sidebar_menu_panel.move(false);
+                            self.sidebar_menu_hover = self.sidebar_menu_panel.selected orelse self.sidebar_menu_hover;
+                        },
+                        c.SDLK_DOWN => {
+                            self.sidebar_menu_panel.move(true);
+                            self.sidebar_menu_hover = self.sidebar_menu_panel.selected orelse self.sidebar_menu_hover;
+                        },
+                        c.SDLK_LEFT => if (self.sidebar_menu_mode != .main) {
+                            self.sidebar_menu_mode = .main;
+                            self.sidebar_menu_hover = 0;
+                        },
+                        c.SDLK_RIGHT => if (self.sidebar_menu_mode == .main and self.sidebar_menu_hover < self.sidebar_menu_panel.len) {
+                            const action = self.sidebar_menu_panel.items[self.sidebar_menu_hover].action;
+                            if (action == .copy) self.activateSidebarMenu(self.sidebar_menu_hover) else if (action == .snooze and self.threads[self.sidebarMenuIndex() orelse 0].snoozed_until <= wallTimeMs()) self.activateSidebarMenu(self.sidebar_menu_hover);
+                        },
                         c.SDLK_RETURN, c.SDLK_KP_ENTER => {
                             self.activateSidebarMenu(self.sidebar_menu_hover);
                             if (self.sidebar_rename_thread.len != 0) try self.focus(window, true);
@@ -2005,6 +2095,7 @@ pub const View = struct {
                         const row = self.threadRowBounds(index);
                         if (row.h == 0) return true;
                         self.sidebar_menu_thread = entry.id;
+                        self.sidebar_menu_mode = .main;
                         self.sidebar_menu_x = row.x + row.w / 2;
                         self.sidebar_menu_y = row.y;
                         self.sidebar_menu_hover = 0;
@@ -2788,22 +2879,30 @@ pub const View = struct {
         };
         const entry = self.threads[index];
         const snoozed = entry.snoozed_until > wallTimeMs();
-        const labels = [_][]const u8{ if (entry.pinned) "Unpin thread" else "Pin thread", if (entry.settled) "Unsettle thread" else "Settle thread", if (snoozed) "Wake thread" else "Snooze for 1 hour", "Snooze for 4 hours", "Snooze for 1 day", "Move up", "Move down", "Rename thread", if (self.scope_project.eql(entry.project_id.slice())) "Show all projects" else "Filter by project", "Copy thread ID", "Copy branch", "Copy path" };
-        const ids = [_][]const u8{ "sidebar.menu.pin", "sidebar.menu.settle", if (snoozed) "sidebar.menu.wake" else "sidebar.menu.snooze.1h", "sidebar.menu.snooze.4h", "sidebar.menu.snooze.tomorrow", "sidebar.menu.move_up", "sidebar.menu.move_down", "sidebar.menu.rename", "sidebar.menu.filter", "sidebar.menu.copy_id", "sidebar.menu.copy_branch", "sidebar.menu.copy_path" };
-        self.sidebar_menu_actions[0..7].* = .{ if (entry.pinned) .unpin else .pin, if (entry.settled) .unsettle else .settle, if (snoozed) .wake else .snooze, .snooze, .snooze, .move_up, .move_down };
-        self.sidebar_menu_count = labels.len;
-        const menu_width = @min(220, width - 16);
-        const menu_height: f32 = labels.len * 28 + 8;
+        if (self.sidebar_menu_mode == .main) {
+            self.sidebar_menu_panel = SidebarMenu.main(.{ .can_operate = self.navigation_enabled, .pinned = entry.pinned, .settled = entry.settled, .snoozed = snoozed, .can_snooze = entry.can_snooze, .filter_active = self.scope_project.eql(entry.project_id.slice()) });
+        } else if (self.sidebar_menu_mode == .copy) {
+            self.sidebar_menu_panel = SidebarMenu.copy(entry.workspace_path_len != 0, entry.branch.len != 0);
+        }
+        if (self.sidebar_menu_hover < self.sidebar_menu_panel.len and self.sidebar_menu_panel.items[self.sidebar_menu_hover].enabled) _ = self.sidebar_menu_panel.choose(self.sidebar_menu_hover);
+        self.sidebar_menu_count = self.sidebar_menu_panel.len;
+        const menu_width = @min(260, width - 16);
+        const menu_height: f32 = @as(f32, @floatFromInt(self.sidebar_menu_count)) * 28 + 8;
         self.sidebar_menu_bounds = .{ .x = std.math.clamp(self.sidebar_menu_x, 8, @max(8, width - menu_width - 8)), .y = std.math.clamp(self.sidebar_menu_y, 8, @max(8, height - menu_height - 8)), .w = menu_width, .h = menu_height };
         try widgets.panel(renderer, self.sidebar_menu_bounds, 8, self.design.colors.border);
         try widgets.panel(renderer, .{ .x = self.sidebar_menu_bounds.x + 1, .y = self.sidebar_menu_bounds.y + 1, .w = menu_width - 2, .h = menu_height - 2 }, 7, self.design.colors.raised);
-        for (labels, 0..) |label, row_index| {
+        for (0..self.sidebar_menu_count) |row_index| {
+            const item = self.sidebar_menu_panel.items[row_index];
+            var label_buffer: [64]u8 = undefined;
+            const label = if (self.sidebar_menu_mode == .snooze and item.action == .preset and self.sidebar_snooze_deadlines[item.preset_index] != 0)
+                std.fmt.bufPrint(&label_buffer, "{s} ({s})", .{ item.label, self.sidebar_snooze_when[item.preset_index].slice() }) catch item.label
+            else
+                item.label;
             const row = c.SDL_FRect{ .x = self.sidebar_menu_bounds.x + 4, .y = self.sidebar_menu_bounds.y + 4 + @as(f32, @floatFromInt(row_index)) * 28, .w = menu_width - 8, .h = 28 };
             self.sidebar_menu_rows[row_index] = row;
-            const enabled = self.navigation_enabled and (row_index < 2 or row_index > 4 or (row_index == 2 and snoozed) or entry.can_snooze) and (row_index != 10 or entry.branch.len != 0) and (row_index != 11 or entry.workspace_path_len != 0);
-            _ = self.navigation_targets.add(ids[row_index], "menuitem", row, enabled) catch {};
-            if (row_index == self.sidebar_menu_hover) try widgets.panel(renderer, row, 4, self.design.colors.sidebar_active);
-            try self.labels.draw(text, label, row.x + 8, row.y + 7, 12, if (enabled) self.design.colors.foreground else self.design.colors.muted);
+            _ = self.navigation_targets.add(item.id, "menuitem", row, item.enabled) catch {};
+            if (row_index == self.sidebar_menu_hover and item.enabled) try widgets.panel(renderer, row, 4, self.design.colors.sidebar_active);
+            try self.labels.draw(text, label, row.x + 8, row.y + 7, 12, if (item.enabled) self.design.colors.foreground else self.design.colors.muted);
         }
     }
 
