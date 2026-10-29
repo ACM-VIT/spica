@@ -467,6 +467,29 @@ pub const App = struct {
                 self.view.notice = @errorName(err);
             };
         }
+        if (self.view.takeSidebarArchiveBrowserRequest()) |archived| {
+            self.view.thread_search_revision +%= 1;
+            self.view.thread_count = 0;
+            if (self.conversation) |conversation| {
+                conversation.thread_search_started = true;
+                conversation.thread_search_active = false;
+                conversation.ask(.threads, .{ .threads = .{ .archived = archived, .canonical_root = conversation.workspace_root, .page = Conversation.page } }) catch |err| {
+                    self.view.notice = @errorName(err);
+                };
+            }
+        }
+        if (self.view.takeSidebarLifecycleRequest()) |request| {
+            if (self.conversation) |conversation| {
+                conversation.beginLifecycle(request) catch |err| self.view.finishSidebarLifecycle(@errorName(err));
+            } else self.view.finishSidebarLifecycle("No connected conversation. Your selection is retained.");
+        }
+        if (self.view.takeSidebarUndoRequest()) |operation| {
+            if (self.conversation) |conversation| {
+                conversation.beginSidebarUndo(self, operation) catch |err| {
+                    self.view.notice = @errorName(err);
+                };
+            }
+        }
         if (self.view.takeCustomSnoozeRequest()) |request| {
             if (self.conversation) |conversation| {
                 conversation.beginCustomSnooze(request) catch |err| self.view.finishCustomSnooze(@errorName(err));
@@ -806,6 +829,9 @@ pub const App = struct {
         self.snapshot.thread_settled = @splat(false);
         self.snapshot.thread_snoozed_until = @splat(0);
         self.snapshot.thread_sort_order = @splat(0);
+        self.snapshot.thread_archived = @splat(false);
+        self.snapshot.thread_can_archive = @splat(false);
+        self.snapshot.thread_can_delete = @splat(false);
         for (self.view.threads[0..self.view.thread_count], 0..) |*entry, index| {
             self.snapshot.thread_labels[index] = entry.label[0..entry.len];
             self.snapshot.thread_projects[index] = entry.project_id.slice();
@@ -817,7 +843,17 @@ pub const App = struct {
             self.snapshot.thread_settled[index] = entry.settled;
             self.snapshot.thread_snoozed_until[index] = entry.snoozed_until;
             self.snapshot.thread_sort_order[index] = entry.sort_order;
+            self.snapshot.thread_archived[index] = entry.archived;
+            self.snapshot.thread_can_archive[index] = entry.can_archive;
+            self.snapshot.thread_can_delete[index] = entry.can_delete;
         }
+        self.snapshot.sidebar_archived = self.view.sidebar_archived;
+        self.snapshot.sidebar_lifecycle_confirm_open = self.view.sidebarLifecycleConfirmOpen();
+        self.snapshot.sidebar_lifecycle_confirm_thread = if (self.view.sidebar_lifecycle.confirming) |id| id.slice() else "";
+        self.snapshot.sidebar_lifecycle_pending = self.view.sidebarLifecyclePending();
+        self.snapshot.sidebar_lifecycle_error = self.view.sidebar_lifecycle.error_bytes[0..self.view.sidebar_lifecycle.error_len];
+        self.snapshot.sidebar_undo_available = self.view.sidebar_lifecycle.undo != null;
+        self.snapshot.sidebar_undo_label = if (self.view.sidebar_lifecycle.undo) |undo| undo.label[0..undo.label_len] else "";
         self.snapshot.selected_runtime = "";
         self.snapshot.selected_provider = "";
         self.snapshot.selected_model = "";
@@ -1063,7 +1099,7 @@ const Conversation = struct {
         }
     };
     const PendingCommand = struct { ticket: types.Ticket, kind: CommandKind, draft_revision: u64, id: [32]u8 };
-    const SidebarPending = struct { id: Id, revision: u64, advance: bool = false, next: Id = .{}, next_project: Id = .{}, custom: bool = false };
+    const SidebarPending = struct { id: Id, revision: u64, advance: bool = false, next: Id = .{}, next_project: Id = .{}, custom: bool = false, lifecycle: ?@import("ui/sidebar_lifecycle.zig").Action = null, undo: ?Coding.SidebarUndoOperation = null };
     const SidebarPlan = struct { id: Id, revision: u64, action: Coding.SidebarAction, deadline: i64 };
     const ThreadCursor = struct {
         bytes: [1024]u8 = undefined,
@@ -1093,6 +1129,8 @@ const Conversation = struct {
     sidebar_pending: ?SidebarPending = null,
     sidebar_plan: ?SidebarPlan = null,
     custom_snooze_request: ?Coding.CustomSnoozeRequest = null,
+    lifecycle_request: ?Coding.SidebarLifecycleRequest = null,
+    sidebar_undo_operation: ?Coding.SidebarUndoOperation = null,
     rename_followup: ?Coding.RenameFollowup = null,
     worker: *presentation.Worker,
     wake: *Wake,
@@ -1689,6 +1727,10 @@ const Conversation = struct {
                 const entry = app.view.threads[operation.index];
                 if (entry.id.len == 0 or entry.revision == 0) return error.NoThread;
                 try self.beginSidebar(app, entry.id, entry.revision, operation.action, operation.snoozed_until);
+                if (self.sidebar_pending) |*pending| switch (operation.action) {
+                    .pin, .unpin, .settle, .unsettle, .snooze, .wake => pending.undo = .{ .metadata = .{ .id = entry.id, .pinned = entry.pinned, .settled = entry.settled, .snoozed_until = entry.snoozed_until, .sort_order = entry.sort_order } },
+                    else => {},
+                };
             },
             .rename => |operation| {
                 if (operation.index >= app.view.thread_count or operation.len == 0 or operation.len > operation.title.len) return error.NoThread;
@@ -1747,6 +1789,19 @@ const Conversation = struct {
         };
     }
 
+    fn lifecyclePayload(action: @import("ui/sidebar_lifecycle.zig").Action) types.Payload {
+        return switch (action) {
+            .archive => .{ .thread_archive = {} },
+            .restore => .{ .thread_restore = {} },
+            .delete => .{ .thread_delete = {} },
+        };
+    }
+
+    fn submitLifecycle(self: *Conversation, id: Id, revision: u64, action: @import("ui/sidebar_lifecycle.zig").Action) !void {
+        try self.submit(.sidebar, .{ .thread = .{ .value = id.slice() } }, .{ .revision = revision }, lifecyclePayload(action), 0);
+        self.sidebar_pending = .{ .id = id, .revision = revision, .lifecycle = action };
+    }
+
     fn submitSidebar(self: *Conversation, id: Id, revision: u64, action: Coding.SidebarAction, deadline: i64) !void {
         try self.submit(.sidebar, .{ .thread = .{ .value = id.slice() } }, .{ .revision = revision }, sidebarPayload(action, deadline), 0);
         self.sidebar_pending = .{ .id = id, .revision = revision };
@@ -1767,6 +1822,28 @@ const Conversation = struct {
         self.custom_snooze_request = request;
         errdefer self.custom_snooze_request = null;
         try self.ask(.custom_snooze, .{ .thread = .{ .value = request.id.slice() } });
+    }
+
+    fn beginLifecycle(self: *Conversation, request: Coding.SidebarLifecycleRequest) !void {
+        if (self.query != null or self.command != null or self.unknown_send != null) return error.WorkspaceBusy;
+        self.lifecycle_request = request;
+        errdefer self.lifecycle_request = null;
+        try self.ask(.lifecycle, .{ .thread = .{ .value = request.id.slice() } });
+    }
+
+    fn beginSidebarUndo(self: *Conversation, app: *App, operation: Coding.SidebarUndoOperation) !void {
+        switch (operation) {
+            .restore => |restore| {
+                const request: Coding.SidebarLifecycleRequest = .{ .id = restore.id, .action = .restore };
+                try self.beginLifecycle(request);
+                self.sidebar_pending = .{ .id = restore.id, .revision = 0, .undo = operation };
+            },
+            .metadata => |metadata| {
+                self.sidebar_undo_operation = operation;
+                try self.ask(.sidebar_undo, .{ .thread = .{ .value = metadata.id.slice() } });
+                _ = app;
+            },
+        }
     }
 
     fn applyRenameFollowup(self: *Conversation, app: *App, followup: Coding.RenameFollowup) !void {
@@ -1899,6 +1976,9 @@ const Conversation = struct {
             entry.settled = row.settled;
             entry.snoozed_until = row.snoozed_until;
             entry.can_snooze = row.can_snooze;
+            entry.archived = row.archived;
+            entry.can_archive = row.can_archive;
+            entry.can_delete = row.can_delete;
             entry.sort_order = row.sort_order;
             entry.updated_at_ms = if (row.last_user_message_at_ms != 0) row.last_user_message_at_ms else row.updated_at_ms;
             entry.runtime_kind = if (row.selection) |selection| try displayId(selection.runtime_kind) else .{};
@@ -2124,7 +2204,7 @@ const Conversation = struct {
         }
     }
 
-    const QueryKind = enum { send_receipt, capabilities, projects, startup_thread, rename_followup, sidebar_next, custom_snooze, workspaces, inspection_workspace, threads, cards, thread_search, thread, models, runtime_status, startup_status, runs, effects, approvals, questions, tasks, messages, blocks, content };
+    const QueryKind = enum { send_receipt, capabilities, projects, startup_thread, rename_followup, sidebar_next, custom_snooze, lifecycle, sidebar_undo, workspaces, inspection_workspace, threads, cards, thread_search, thread, models, runtime_status, startup_status, runs, effects, approvals, questions, tasks, messages, blocks, content };
     const CommandKind = enum { prompt_cleanup, followup_enqueue, followup_edit, followup_cancel, followup_order, attachment_add, attachment_remove, question, project, workspace, thread, title, sidebar_title, sidebar, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
@@ -2559,6 +2639,10 @@ const Conversation = struct {
                     if (self.query) |pending| if (pending.ticket.value == value.ticket.value) {
                         self.query = null;
                         if (pending.kind == .rename_followup) self.rename_followup = null;
+                        if (pending.kind == .lifecycle) {
+                            self.lifecycle_request = null;
+                            app.view.finishSidebarLifecycle(@tagName(value.failure.reason));
+                        }
                         if (pending.kind == .sidebar_next) self.sidebar_plan = null;
                         if (pending.kind == .custom_snooze or (pending.kind == .sidebar_next and self.custom_snooze_request != null)) {
                             self.custom_snooze_request = null;
@@ -2858,6 +2942,7 @@ const Conversation = struct {
         if (value.outcome == .rejected) {
             if (pending.kind == .sidebar or pending.kind == .sidebar_title) {
                 if (self.sidebar_pending) |operation| if (operation.custom) app.view.finishCustomSnooze(if (value.reason) |reason| rejectionMessage(reason) else "Snooze was rejected. Your selection is retained.");
+                if (self.sidebar_pending) |operation| if (operation.lifecycle != null) app.view.finishSidebarLifecycle(if (value.reason) |reason| rejectionMessage(reason) else "Sidebar lifecycle action was rejected. Your selection is retained.");
                 if (pending.kind == .sidebar_title) _ = app.view.takeRenameFollowup();
                 self.sidebar_pending = null;
                 app.view.thread_search_revision +%= 1;
@@ -2904,12 +2989,28 @@ const Conversation = struct {
                 const operation = self.sidebar_pending orelse return error.UnexpectedCommandReceipt;
                 self.sidebar_pending = null;
                 if (operation.custom) app.view.finishCustomSnooze(null);
+                if (operation.lifecycle) |action| {
+                    app.view.finishSidebarLifecycle(null);
+                    if (action == .archive) app.view.thread_search_revision +%= 1;
+                    if (operation.undo) |undo| if (action == .archive) app.view.offerSidebarUndo(undo, "Archived");
+                }
+                if (operation.undo) |undo| switch (undo) {
+                    .restore => |restore| if ((operation.lifecycle == null or operation.lifecycle == .restore) and restore.navigate) {
+                        self.project = operation.next_project;
+                        try self.selectThread(app, restore.id);
+                    },
+                    else => {},
+                };
+                if (operation.undo) |undo| if (operation.lifecycle == null and undo != .restore) app.view.offerSidebarUndo(undo, "Sidebar updated");
                 for (value.committed_revisions) |committed| {
                     if (committed.target == .thread and self.thread.eql(committed.target.thread.value)) self.thread_revision = committed.revision;
                 }
                 app.view.thread_search_revision +%= 1;
                 self.thread_search_started = true;
                 self.notice(&app.view, "Sidebar updated.");
+                if (operation.lifecycle) |action| if ((action == .archive or action == .delete) and operation.id.eql(self.thread.slice())) {
+                    try self.createThread();
+                };
                 if (operation.advance and operation.id.eql(self.thread.slice())) {
                     if (operation.next.len != 0) {
                         self.project = operation.next_project;
@@ -3060,6 +3161,45 @@ const Conversation = struct {
 
     fn consume(self: *Conversation, app: *App, kind: QueryKind, value: types.QueryPage) !void {
         switch (kind) {
+            .lifecycle => {
+                const request = self.lifecycle_request orelse return error.StaleLifecycleRequest;
+                self.lifecycle_request = null;
+                if (value.items.len != 1 or value.items[0] != .thread) {
+                    app.view.finishSidebarLifecycle("The thread is no longer available.");
+                    return;
+                }
+                const row = value.items[0].thread;
+                if (!std.mem.eql(u8, row.workspace_root, self.workspace_root) or (request.action == .archive and !row.can_archive) or (request.action == .delete and !row.can_delete)) {
+                    app.view.finishSidebarLifecycle("This lifecycle action is unavailable now.");
+                    return;
+                }
+                self.submitLifecycle(request.id, row.revision, request.action) catch |err| {
+                    app.view.finishSidebarLifecycle(@errorName(err));
+                    return;
+                };
+                if (request.action == .archive) self.sidebar_pending.?.undo = .{ .restore = .{ .id = request.id, .navigate = request.id.eql(self.thread.slice()) } };
+                if (request.action == .restore) {
+                    if (self.sidebar_undo_operation) |undo| self.sidebar_pending.?.undo = undo;
+                }
+            },
+            .sidebar_undo => {
+                const operation = self.sidebar_undo_operation orelse return error.StaleSidebarPlan;
+                self.sidebar_undo_operation = null;
+                if (value.items.len != 1 or value.items[0] != .thread) {
+                    app.view.notice = "Undo target is no longer available.";
+                    return;
+                }
+                const row = value.items[0].thread;
+                if (!std.mem.eql(u8, row.workspace_root, self.workspace_root)) return error.WrongCheckout;
+                switch (operation) {
+                    .metadata => |metadata| {
+                        if (!metadata.id.eql(row.id.value)) return error.StaleSidebarPlan;
+                        try self.submit(.sidebar, .{ .thread = .{ .value = metadata.id.slice() } }, .{ .revision = row.revision }, .{ .thread_sidebar_set = .{ .pinned = metadata.pinned, .settled = metadata.settled, .snoozed_until = metadata.snoozed_until, .sort_order = metadata.sort_order } }, 0);
+                        self.sidebar_pending = .{ .id = metadata.id, .revision = row.revision };
+                    },
+                    .restore => return error.StaleSidebarPlan,
+                }
+            },
             .custom_snooze => {
                 const request = self.custom_snooze_request orelse return error.StaleSidebarPlan;
                 if (value.items.len != 1 or value.items[0] != .thread or !request.id.eql(value.items[0].thread.id.value)) {
