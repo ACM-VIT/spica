@@ -1,0 +1,1358 @@
+#!/usr/bin/env python3
+"""Exercise the native sidebar with ordinary input on an owned vd desktop."""
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+from pathlib import Path
+import shlex
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+# Three real editor cohorts include hundreds of compositor roundtrips. The
+# observed private transport takes ~2.6s/action; bound fixture life with headroom.
+# This is process lifetime only; measured idle/active phases remain unchanged.
+SCENARIO_LIFETIME_MS = 30 * 60 * 1000
+
+
+def publish_clipboard(environment: dict[str, str], value: str, timeout: float) -> None:
+    # wl-copy forks a compositor-owned clipboard server. Captured stdout/stderr
+    # remain inherited by that child and make communicate wait until it exits.
+    # Detach every stdio FD so completion tracks the publisher parent only.
+    try:
+        result = subprocess.run(["wl-copy", "--", value], cwd=ROOT, env=environment,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True,
+                                timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("private clipboard publication timed out") from error
+    except OSError as error:
+        raise ValueError("private clipboard publisher unavailable") from error
+    if result.returncode:
+        raise ValueError("private clipboard publisher failed")
+
+
+def load_driver():
+    loader = importlib.machinery.SourceFileLoader("sidebar_spica_ui", str(ROOT / "tools/spica-ui"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_tool(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def rows(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Require aligned, explicit native metadata; missing exports cannot pass."""
+    targets = snapshot.get("thread_targets", [])
+    fields = ("thread_pinned", "thread_settled", "thread_snoozed_until", "thread_sort_order")
+    if not targets or any(not isinstance(snapshot.get(field), list)
+                          or len(snapshot[field]) != len(targets) for field in fields):
+        raise ValueError("missing or misaligned native sidebar metadata")
+    count = snapshot.get("thread_count", len(targets))
+    if type(count) is not int or not 0 <= count <= len(targets):
+        raise ValueError("invalid native resident thread count")
+    result = {}
+    for index, target in enumerate(targets[:count]):
+        identifier = target.get("id")
+        if not identifier:
+            continue
+        if identifier in result:
+            raise ValueError("duplicate native thread identity")
+        result[identifier] = {field.removeprefix("thread_"): snapshot[field][index] for field in fields}
+        result[identifier].update(target=target, index=index)
+    return result
+
+
+def assert_retained(before: dict[str, Any], after: dict[str, Any], draft: str) -> None:
+    for field in ("thread_id", "project_id", "run_id", "send_command_id", "send_run_id"):
+        if after.get(field) != before.get(field):
+            raise ValueError("sidebar action changed active execution: " + field)
+    if after.get("draft") != draft:
+        raise ValueError("sidebar action changed the active draft")
+
+
+def assert_route_restored(before: dict[str, Any], after: dict[str, Any], draft: str) -> None:
+    # Deliberate navigation resets the last Send diagnostic. Durable identity,
+    # selected run and retained composer content must still return exactly.
+    for field in ("thread_id", "project_id", "run_id"):
+        if not before.get(field) or after.get(field) != before[field]:
+            raise ValueError("sidebar navigation failed to restore active execution: " + field)
+    if after.get("draft") != draft:
+        raise ValueError("sidebar navigation failed to restore the exact draft")
+
+
+def assert_compact(snapshot: dict[str, Any], identifiers: set[str]) -> None:
+    visible = [target for target in snapshot.get("thread_targets", []) if target.get("enabled")]
+    if {target.get("id") for target in visible} != identifiers:
+        raise ValueError("search did not retain the expected native thread identities")
+    bounds = sorted((target["pointer_bounds"] for target in visible), key=lambda box: box[1])
+    if any(len(box) != 4 or box[2] <= 0 or not 0 < box[3] <= 36 for box in bounds):
+        raise ValueError("search results do not use compact T3 rows")
+    if any(b[1] < a[1] + a[3] for a, b in zip(bounds, bounds[1:])):
+        raise ValueError("search result hit regions overlap")
+
+
+def assert_suppressed(snapshot: dict[str, Any]) -> None:
+    if any(target.get("enabled") for target in snapshot.get("thread_targets", [])):
+        raise ValueError("overlay admits covered thread hit targets")
+
+
+def menu_parent(action: str) -> str | None:
+    """Native child items require ordinary input through their painted parent."""
+    if action.startswith("copy_"):
+        return "copy"
+    if action.startswith("snooze."):
+        return "snooze"
+    return None
+
+
+def assert_menu(snapshot: dict[str, Any], targets: list[dict[str, Any]], required: set[str],
+                absent: set[str] = frozenset()) -> None:
+    """A menu can pass only with painted, bounded and nonoverlapping hit boxes."""
+    assert_suppressed(snapshot)
+    menu = {target.get("id"): target for target in targets
+            if target.get("id", "").startswith("sidebar.menu.") and target.get("enabled")}
+    if not required <= menu.keys() or absent & menu.keys():
+        raise ValueError("native menu differs from the expected submenu topology")
+    width, height = snapshot.get("logical_width"), snapshot.get("logical_height")
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+        raise ValueError("native menu lacks valid viewport dimensions")
+    bounds = []
+    for target in menu.values():
+        box = target.get("pointer_bounds")
+        if (not isinstance(box, list) or len(box) != 4
+                or any(type(value) not in (int, float) or not math.isfinite(value) for value in box)):
+            raise ValueError("native menu lacks a finite pointer box")
+        x, y, w, h = box
+        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > width or y + h > height:
+            raise ValueError("native menu hit box escapes its viewport")
+        bounds.append(box)
+    bounds.sort(key=lambda box: box[1])
+    if any(b[1] < a[1] + a[3] for a, b in zip(bounds, bounds[1:])):
+        raise ValueError("native menu hit boxes overlap")
+
+
+def sidebar_metadata(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    indexed = rows(snapshot)
+    revisions = snapshot.get("thread_revisions")
+    if not isinstance(revisions, list) or len(revisions) != len(snapshot.get("thread_targets", [])):
+        raise ValueError("missing or misaligned native sidebar revisions")
+    return {identifier: {**{field: row[field] for field in
+                           ("pinned", "settled", "snoozed_until", "sort_order")},
+                         "revision": revisions[row["index"]]}
+            for identifier, row in indexed.items()}
+
+
+def lifecycle_rows(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Require lifecycle capability/archived observations aligned to rows."""
+    indexed = rows(snapshot)
+    targets = snapshot.get("thread_targets", [])
+    fields = ("thread_archived", "thread_can_archive", "thread_can_delete")
+    if any(not isinstance(snapshot.get(field), list) or len(snapshot[field]) != len(targets)
+           for field in fields):
+        raise ValueError("missing or misaligned native lifecycle metadata")
+    for identifier, row in indexed.items():
+        index = row["index"]
+        row.update(archived=snapshot["thread_archived"][index],
+                   can_archive=snapshot["thread_can_archive"][index],
+                   can_delete=snapshot["thread_can_delete"][index])
+    return indexed
+
+
+def assert_lifecycle_unchanged(before: dict[str, Any], after: dict[str, Any], draft: str) -> None:
+    assert_retained(before, after, draft)
+    if lifecycle_rows(before) != lifecycle_rows(after):
+        raise ValueError("cancelled lifecycle action changed durable row metadata")
+
+
+def assert_duration_deadline(actual: Any, begin_ms: int, end_ms: int, amount: float, unit: str) -> None:
+    multipliers = {"minutes": 60_000, "hours": 3_600_000, "days": 86_400_000}
+    if (type(actual) is not int or unit not in multipliers or not math.isfinite(amount)
+            or amount <= 0 or end_ms < begin_ms):
+        raise ValueError("invalid native duration evidence")
+    delta = round(amount * multipliers[unit])
+    if not begin_ms + delta <= actual <= end_ms + delta:
+        raise ValueError("native duration deadline is outside the actual submit-time bracket")
+
+
+def assert_editor(snapshot: dict[str, Any], field: str, expected: str) -> None:
+    if field not in snapshot or snapshot[field] != expected:
+        raise ValueError("native line editor differs from exact expected text: " + field)
+
+
+def preferences(snapshot: dict[str, Any]) -> dict[str, Any]:
+    fields = ("sidebar_collapsed", "sidebar_width_override", "sidebar_working_shelf",
+              "sidebar_shelf_expanded", "sidebar_scope_project")
+    if any(field not in snapshot for field in fields):
+        raise ValueError("native sidebar preference observations are incomplete")
+    result = {field: snapshot[field] for field in fields}
+    if (type(result["sidebar_collapsed"]) is not bool
+            or type(result["sidebar_working_shelf"]) is not bool
+            or not isinstance(result["sidebar_scope_project"], str)
+            or not isinstance(result["sidebar_shelf_expanded"], list)
+            or len(result["sidebar_shelf_expanded"]) != 3
+            or any(type(value) is not bool for value in result["sidebar_shelf_expanded"])):
+        raise ValueError("native sidebar preferences have invalid types")
+    width = result["sidebar_width_override"]
+    if width is not None and (type(width) not in (int, float) or not math.isfinite(width) or width < 208):
+        raise ValueError("native sidebar width preference is invalid")
+    return result
+
+
+def assert_preferences(before: dict[str, Any], after: dict[str, Any]) -> None:
+    if preferences(before) != preferences(after):
+        raise ValueError("sidebar presentation preferences changed across native process restart")
+    for field in ("project_id", "thread_id", "run_id"):
+        if not before.get(field) or before[field] != after.get(field):
+            raise ValueError("active route changed across native process restart: " + field)
+
+
+def plan(focus="full") -> list[str]:
+    if focus == "lifecycle":
+        return ["launch an offline fake provider and create three chats across two projects on a private vd desktop",
+                "archive an inactive chat while retaining the active route/run/draft",
+                "open the archived browser, restore the exact row, and reject delete confirmation without mutation",
+                "delete the active chat through confirmation and verify exact successor/tombstone absence",
+                "consume accepted metadata Undo through button and Ctrl+Z, including single-use and five-second expiry"]
+    if focus == "measure":
+        return ["launch an offline fake provider and create three chats across two projects on a private vd desktop",
+                "collect isolated idle, repeated ordinary sidebar input and settled-idle process-tree samples",
+                "close the app through ordinary Ctrl+Q input and validate native frame/cache metrics",
+                "require at least 100 successful active frames and preserve exact source/binary fingerprints"]
+    if focus == "menus":
+        return ["launch an offline fake provider and create three chats across two projects on a private vd desktop",
+                "verify Copy clipboard values, nested pointer/keyboard menus and inactive execution/draft retention",
+                "reject/cancel custom snooze without mutation, then submit exact local date and fractional durations",
+                "settle an active chat to its exact successor and restore its retained draft",
+                "snooze the sole scoped chat into a fresh same-project chat, then restore its original draft",
+                "collapse/reopen, drag-resize and inspect regular/minimum-window screenshots",
+                "restart and verify exact active route, durable metadata and sidebar preferences"]
+    return ["launch an offline fake provider in fresh state on a private vd desktop",
+            "create three completed chats across two projects through painted controls",
+            "verify compact Unicode search, keyboard activation and project scope",
+            "right-click an inactive chat, pin/unpin, settle/restore, snooze/wake and reorder",
+            "open nested Copy/Snooze menus through pointer and keyboard input",
+            "reject invalid custom snooze dates, cancel without mutation, and submit local date/fractional durations",
+            "verify inactive-chat actions retain active execution and the Unicode draft",
+            "exercise real search/title editors: caret, selection, graphemes, clipboard and overflow",
+            "save trimmed titles on blur and cancel title edits through ordinary F2/Escape input",
+            "collapse, reopen and drag-resize the native sidebar",
+            "inspect regular and minimum-window screenshot artifacts",
+            "restart and verify durable metadata, active route and exact sidebar preferences"]
+
+
+class Proof:
+    def __init__(self, driver, args):
+        self.ui, self.args = driver, args
+        self.session = None
+        self.app_closed = False
+        self.assertions = []
+        self.samples = []
+        self.phases = []
+
+    def prepare_pointer(self):
+        """Extend the installed vd helper, keeping its verified socket-FD boundary."""
+        installed = shutil.which("vd")
+        if not installed:
+            raise ValueError("installed vd is unavailable")
+        source = Path(installed).resolve().with_name("virtual_pointer.c")
+        original = source.read_text()
+        guard = 'if (strcmp(argv[6], "click") == 0) {'
+        button = "(uint32_t)BTN_LEFT"
+        release = "        wl_proxy_marshal_flags(pointer, 2, NULL, 1, 0, now_ms(), (uint32_t)BTN_LEFT, 0u);"
+        if original.count(guard) != 1 or original.count(button) != 2 or original.count(release) != 1:
+            raise ValueError("installed vd pointer source drifted from audited extension anchors")
+        drag = '''        if (strncmp(argv[6], "drag:", 5) == 0) {
+            int dx, dy;
+            if (sscanf(argv[6], "drag:%d:%d", &dx, &dy) != 2) return 2;
+            for (int step = 1; step <= 6; step++) {
+                wl_proxy_marshal_flags(pointer, 1, NULL, 1, 0, now_ms(),
+                    (uint32_t)(atoi(argv[2]) + dx * step / 6),
+                    (uint32_t)(atoi(argv[3]) + dy * step / 6),
+                    (uint32_t)atoi(argv[4]), (uint32_t)atoi(argv[5]));
+                wl_proxy_marshal_flags(pointer, 4, NULL, 1, 0);
+                if (settle(display) < 0) return 1;
+            }
+        }
+'''
+        extended = original.replace(release, drag + release)
+        extended = extended.replace(guard, 'if (strcmp(argv[6], "click") == 0 || strcmp(argv[6], "right") == 0 || strncmp(argv[6], "drag:", 5) == 0) {')
+        extended = extended.replace(button, '(uint32_t)(strcmp(argv[6], "right") == 0 ? BTN_RIGHT : BTN_LEFT)')
+        directory = self.args.output.parent / (self.args.output.name + "-pointer")
+        directory.mkdir(parents=True, exist_ok=False)
+        generated = directory / "virtual_pointer.c"
+        generated.write_text(extended)
+        self.pointer_helper = directory / "virtual-pointer"
+        flags = shlex.split(self.ui.run_command(["pkg-config", "--cflags", "--libs", "wayland-client"]).stdout)
+        command = ["gcc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", str(generated),
+                   "-o", str(self.pointer_helper), *flags]
+        self.ui.run_command(command)
+        self.pointer_provenance = dict(installed_source=str(source), installed_sha256=self.ui.sha256(source),
+                                       transformed_source=str(generated), transformed_sha256=self.ui.sha256(generated),
+                                       binary=str(self.pointer_helper), binary_sha256=self.ui.sha256(self.pointer_helper),
+                                       compiler_command=command,
+                                       transformation="Count-checked BTN_RIGHT selection and six-step left-button drag; existing FD boundary preserved",
+                                       protocol_source="https://github.com/swaywm/wlr-protocols/blob/master/unstable/wlr-virtual-pointer-unstable-v1.xml")
+        self.ui.atomic_json(directory / "provenance.json", self.pointer_provenance)
+
+    def pointer_event(self, x, y, operation):
+        self.session.require_live()
+        self.ui.focus(self.session)
+        outputs = json.loads(self.ui.run_command(["swaymsg", "--socket", self.session.sway_socket,
+                                                 "--raw", "-t", "get_outputs"]).stdout)
+        headless = [output for output in outputs if output.get("name") == "HEADLESS-1" and output.get("active")]
+        if len(headless) != 1:
+            raise ValueError("owned private desktop lacks one HEADLESS-1 output")
+        width, height = headless[0]["rect"]["width"], headless[0]["rect"]["height"]
+        if not 0 <= x < width or not 0 <= y < height:
+            raise ValueError("pointer position is outside the owned private output")
+        if operation.startswith("drag:"):
+            dx, dy = map(int, operation.split(":")[1:])
+            if not 0 <= x + dx < width or not 0 <= y + dy < height:
+                raise ValueError("drag destination is outside the owned private output")
+        if self.ui.sha256(self.pointer_helper) != self.pointer_provenance["binary_sha256"]:
+            raise ValueError("private pointer helper binary changed")
+        environment = self.session.data["private_desktop"]["environment"]
+        with socket.socket(socket.AF_UNIX) as channel:
+            channel.connect(str(Path(environment["XDG_RUNTIME_DIR"]) / environment["WAYLAND_DISPLAY"]))
+            pid, uid, _ = struct.unpack("3i", channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if (pid, uid) != (self.session.data["private_desktop"]["compositor"]["pid"], os.getuid()):
+                raise ValueError("private Wayland peer identity changed")
+            command = [str(self.pointer_helper), str(channel.fileno()), str(x), str(y),
+                       str(width), str(height), operation]
+            result = subprocess.run(command, env=environment, pass_fds=(channel.fileno(),),
+                                    capture_output=True, text=True, timeout=15)
+            if result.returncode:
+                raise ValueError("private pointer helper failed: " + result.stderr)
+
+    def wait(self, predicate, label):
+        current = self.ui.wait_snapshot(self.session, predicate, self.args.timeout, label)
+        self.assertions.append(label)
+        self.session.journal("sidebar.assert", None, current, assertion=label)
+        return current
+
+    def click(self, identifier):
+        return self.ui.perform_input(self.session, "click", identifier, self.args.timeout)
+
+    def text(self, identifier, value):
+        return self.ui.perform_input(self.session, "text", identifier, self.args.timeout, value)
+
+    def key(self, value):
+        return self.ui.perform_key(self.session, value, self.args.timeout)
+
+    def focused_text(self, value):
+        before = self.session.snapshot(self.args.timeout)
+        self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, value], private=True)
+        current = self.session.snapshot(self.args.timeout)
+        self.session.journal("sidebar.editor.text", before, current, bytes=len(value.encode()),
+                             sha256=hashlib.sha256(value.encode()).hexdigest(),
+                             input_origin="ordinary private vd text at existing editor focus")
+        return current
+
+    def editor_value(self, field, expected, label, retained, draft):
+        current = self.wait(lambda value: field in value and value[field] == expected, label)
+        assert_editor(current, field, expected)
+        assert_retained(retained, current, draft)
+        return current
+
+    def replace_editor(self, field, value, label, retained, draft):
+        self.key("ctrl+a")
+        self.focused_text(value)
+        return self.editor_value(field, value, label, retained, draft)
+
+    def set_clipboard(self, value):
+        self.session.require_live()
+        environment = self.session.data["private_desktop"]["environment"]
+        publish_clipboard(environment, value, self.args.timeout)
+        if self.clipboard() != value:
+            raise ValueError("owned private clipboard failed to retain exact synthetic input")
+        self.session.journal("sidebar.editor.clipboard", None, self.session.snapshot(self.args.timeout),
+                             bytes=len(value.encode()), sha256=hashlib.sha256(value.encode()).hexdigest(),
+                             input_origin="ordinary clipboard owned by verified private compositor")
+
+    def exercise_editor(self, field, retained, draft):
+        """Assert outcomes via SDL observations; never write an internal editor buffer."""
+        self.replace_editor(field, "café 世界", field + " Unicode fixture", retained, draft)
+        self.key("Home")
+        self.key("Right")
+        self.key("Right")
+        self.focused_text("X")
+        self.editor_value(field, "caXfé 世界", field + " middle caret insertion", retained, draft)
+        self.key("Home")
+        self.focused_text("[")
+        self.key("End")
+        self.focused_text("]")
+        self.editor_value(field, "[caXfé 世界]", field + " Home/End insertion", retained, draft)
+        self.replace_editor(field, "alpha café 世界", field + " selection fixture", retained, draft)
+        self.key("Home")
+        for _ in range(5):
+            self.key("shift+Right")
+        self.focused_text("β")
+        self.editor_value(field, "β café 世界", field + " Shift selection replacement", retained, draft)
+        self.replace_editor(field, "Ae\u0301👩‍💻B", field + " grapheme fixture", retained, draft)
+        self.key("End")
+        self.key("Left")
+        self.key("BackSpace")
+        self.editor_value(field, "Ae\u0301B", field + " Backspace removes entire ZWJ grapheme", retained, draft)
+        self.key("Home")
+        self.key("Right")
+        self.key("Delete")
+        self.editor_value(field, "AB", field + " Delete removes entire combining grapheme", retained, draft)
+        copied = "clipboard café 世界"
+        self.replace_editor(field, copied, field + " clipboard fixture", retained, draft)
+        self.key("ctrl+a")
+        self.key("ctrl+c")
+        if self.clipboard() != copied:
+            raise ValueError(field + " Ctrl+C copied wrong text")
+        self.key("ctrl+x")
+        self.editor_value(field, "", field + " Ctrl+X removes selection", retained, draft)
+        if self.clipboard() != copied:
+            raise ValueError(field + " Ctrl+X copied wrong text")
+        self.key("ctrl+v")
+        self.editor_value(field, copied, field + " Ctrl+V restores exact Unicode clipboard", retained, draft)
+        self.key("Home")
+        for _ in range(9):
+            self.key("shift+Right")
+        self.key("ctrl+x")
+        self.editor_value(field, " café 世界", field + " partial cut keeps unselected text", retained, draft)
+        if self.clipboard() != "clipboard":
+            raise ValueError(field + " partial cut copied wrong selection")
+        self.key("End")
+        self.key("ctrl+v")
+        self.editor_value(field, " café 世界clipboard", field + " paste inserts at caret", retained, draft)
+        full = "L" + "é" * 79 + "Z"
+        self.replace_editor(field, full, field + " exact 160-byte Unicode capacity", retained, draft)
+        self.key("Home")
+        self.focused_text("X")
+        self.editor_value(field, full, field + " insertion at capacity retains original text", retained, draft)
+        self.key("End")
+        self.shot("editor-" + field + "-long.png")
+        preserved = "Keep overflow café 世界"
+        self.replace_editor(field, preserved, field + " overflow retained fixture", retained, draft)
+        self.key("ctrl+a")
+        self.set_clipboard("x" * 161)
+        self.key("ctrl+v")
+        self.editor_value(field, preserved, field + " oversized replacement retains original text", retained, draft)
+
+    def ipc(self, *arguments):
+        if not self.session.sway_socket:
+            raise ValueError("owned private desktop has no compositor socket")
+        result = self.ui.run_command(["swaymsg", "--socket", self.session.sway_socket,
+                                      "--raw", *arguments])
+        response = json.loads(result.stdout)
+        if not isinstance(response, list) or not all(item.get("success") for item in response):
+            raise ValueError("private compositor rejected input: " + result.stdout)
+
+    def right_click(self, identifier):
+        before = self.session.snapshot(self.args.timeout)
+        target = self.ui.find_target(before, identifier)
+        x, y = self.ui.pointer(self.session, target)
+        self.pointer_event(x, y, "right")
+        self.session.journal("sidebar.context", before, self.session.snapshot(self.args.timeout),
+                             target=identifier, pointer=[x, y],
+                             input_origin="ordinary verified private wlr virtual-pointer right button")
+        current = self.wait(lambda value: any(target.get("enabled")
+                            and target.get("id", "").startswith("sidebar.menu.")
+                            for target in self.ui.target_groups(value)), "painted row context menu")
+        assert_suppressed(current)
+        return current
+
+    def action(self, identifier, action, predicate, label, retained, draft):
+        self.right_click(identifier)
+        self.menu_choose(action)
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and predicate(rows(value)[identifier]), label)
+        assert_retained(retained, current, draft)
+        return current
+
+    def lifecycle_action(self, identifier, action, predicate, label, retained, draft):
+        self.right_click(identifier)
+        self.menu_choose(action)
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and predicate(lifecycle_rows(value)[identifier]), label)
+        assert_retained(retained, current, draft)
+        return current
+
+    def menu_open(self, parent, method="pointer"):
+        parent_id = "sidebar.menu." + parent
+        if method == "pointer":
+            self.click(parent_id)
+        elif method == "keyboard":
+            # Home selects the first enabled item; walk the actual main-menu
+            # order so keyboard opening never depends on an invented row index.
+            current = self.session.snapshot(self.args.timeout)
+            targets = [target for target in self.ui.target_groups(current)
+                       if target.get("enabled") and target.get("id", "").startswith("sidebar.menu.")]
+            parent_index = next((index for index, target in enumerate(targets)
+                                 if target["id"] == parent_id), None)
+            if parent_index is None:
+                raise ValueError("native parent menu item unavailable: " + parent_id)
+            self.key("Home")
+            for _ in range(parent_index):
+                self.key("Down")
+            self.key("Right")
+        else:
+            raise ValueError("unsupported ordinary menu input method")
+        required = {"sidebar.menu.copy_id"} if parent == "copy" else {
+            "sidebar.menu.snooze.1h", "sidebar.menu.snooze.3h", "sidebar.menu.snooze.custom"}
+        current = self.wait(lambda value: required <= {target.get("id")
+                            for target in self.ui.target_groups(value) if target.get("enabled")},
+                            parent + " submenu painted through " + method + " input")
+        assert_menu(current, self.ui.target_groups(current), required,
+                    {"sidebar.menu.pin", "sidebar.menu.rename", "sidebar.menu.copy", "sidebar.menu.snooze"})
+        return current
+
+    def menu_choose(self, action):
+        parent = menu_parent(action)
+        if parent is not None:
+            self.menu_open(parent)
+        return self.click("sidebar.menu." + action)
+
+    def exercise_submenus(self, identifier, retained, draft):
+        """Enter and leave both nested menus with ordinary keyboard input."""
+        for parent in ("copy", "snooze"):
+            self.right_click(identifier)
+            current = self.menu_open(parent, "keyboard")
+            assert_retained(retained, current, draft)
+
+            self.shot(parent + "-submenu.png")
+            self.key("Left")
+            current = self.wait(lambda value: any(target.get("enabled")
+                                and target.get("id") == "sidebar.menu." + parent
+                                for target in self.ui.target_groups(value)),
+                                "Left returns from " + parent + " submenu to its parent")
+            assert_menu(current, self.ui.target_groups(current), {"sidebar.menu." + parent},
+                        {"sidebar.menu.copy_id", "sidebar.menu.snooze.1h"})
+            self.key("Right")
+            required = "sidebar.menu.copy_id" if parent == "copy" else "sidebar.menu.snooze.1h"
+            current = self.wait(lambda value: any(target.get("enabled") and target.get("id") == required
+                                for target in self.ui.target_groups(value)),
+                                "Right reopens the retained " + parent + " parent selection")
+            assert_retained(retained, current, draft)
+            self.key("Escape")
+            current = self.wait(lambda value: not value.get("sidebar_menu_thread"),
+                                "Escape dismisses " + parent + " submenu without mutation")
+            assert_retained(retained, current, draft)
+
+    def custom_open(self, identifier, retained, draft):
+        self.right_click(identifier)
+        self.menu_choose("snooze.custom")
+        current = self.wait(lambda value: value.get("sidebar_custom_snooze_open") is True
+                            and value.get("sidebar_custom_snooze_thread") == identifier,
+                            "custom snooze dialog owns exact inactive thread")
+        required = {"sidebar.custom_snooze.mode.date", "sidebar.custom_snooze.mode.duration",
+                    "sidebar.custom_snooze.date", "sidebar.custom_snooze.time",
+                    "sidebar.custom_snooze.cancel", "sidebar.custom_snooze.submit"}
+        enabled = {target.get("id") for target in self.ui.target_groups(current) if target.get("enabled")}
+        if not required <= enabled:
+            raise ValueError("custom snooze lacks painted date controls")
+        assert_suppressed(current)
+        assert_retained(retained, current, draft)
+        return current
+
+    def custom_field(self, target, value, retained, draft):
+        self.click("sidebar.custom_snooze." + target)
+        return self.replace_editor("sidebar_custom_snooze_" + target, value,
+                                   "custom snooze " + target + " exact ordinary input", retained, draft)
+
+    def custom_snooze_cases(self, identifier, retained, draft):
+        before = sidebar_metadata(self.session.snapshot(self.args.timeout))
+        self.custom_open(identifier, retained, draft)
+        self.custom_field("date", "2026-02-30", retained, draft)
+        self.click("sidebar.custom_snooze.submit")
+        current = self.wait(lambda value: value.get("sidebar_custom_snooze_open") is True
+                            and bool(value.get("sidebar_custom_snooze_error")),
+                            "invalid local snooze date shows error and keeps dialog open")
+        if sidebar_metadata(current) != before:
+            raise ValueError("invalid custom date mutated durable thread metadata")
+        assert_retained(retained, current, draft)
+        self.shot("custom-snooze-invalid.png")
+        self.click("sidebar.custom_snooze.cancel")
+        current = self.wait(lambda value: value.get("sidebar_custom_snooze_open") is False,
+                            "custom snooze cancel dismisses without mutation")
+        if sidebar_metadata(current) != before:
+            raise ValueError("custom date cancellation mutated durable thread metadata")
+        assert_retained(retained, current, draft)
+
+        self.custom_open(identifier, retained, draft)
+        self.click("sidebar.custom_snooze.calendar")
+        self.wait(lambda value: value.get("sidebar_custom_snooze_calendar_open") is True,
+                  "custom snooze calendar opens through painted control")
+        self.shot("custom-snooze-calendar.png")
+        self.key("Escape")
+        self.wait(lambda value: value.get("sidebar_custom_snooze_open") is True
+                  and value.get("sidebar_custom_snooze_calendar_open") is False,
+                  "Escape closes calendar while preserving custom dialog")
+        local = datetime.datetime.now() + datetime.timedelta(days=2)
+        chosen = local.replace(hour=12, minute=34, second=0, microsecond=0)
+        self.custom_field("date", chosen.strftime("%Y-%m-%d"), retained, draft)
+        self.custom_field("time", chosen.strftime("%H:%M"), retained, draft)
+        self.shot("custom-snooze-date.png")
+        self.click("sidebar.custom_snooze.submit")
+        current = self.wait(lambda value: value.get("sidebar_custom_snooze_open") is False
+                            and not value.get("pending_command")
+                            and rows(value)[identifier]["snoozed_until"] > 0,
+                            "valid custom date commits exact inactive thread")
+        expected = int(time.mktime(chosen.timetuple()) * 1000)
+        if rows(current)[identifier]["snoozed_until"] != expected:
+            raise ValueError("custom local date does not resolve to the expected calendar instant")
+        assert_retained(retained, current, draft)
+        self.reveal("snoozed", identifier)
+        self.action(identifier, "wake", lambda row: row["snoozed_until"] == 0,
+                    "custom date snooze wakes through painted menu", retained, draft)
+
+        for unit in ("minutes", "hours", "days"):
+            self.custom_open(identifier, retained, draft)
+            self.click("sidebar.custom_snooze.mode.duration")
+            self.wait(lambda value: value.get("sidebar_custom_snooze_mode") == "duration",
+                      "custom snooze duration mode paints")
+            self.custom_field("amount", "1.5", retained, draft)
+            for _ in range(3):
+                current = self.session.snapshot(self.args.timeout)
+                if current.get("sidebar_custom_snooze_unit") == unit:
+                    break
+                self.click("sidebar.custom_snooze.unit")
+            current = self.wait(lambda value: value.get("sidebar_custom_snooze_unit") == unit,
+                                "custom snooze unit selects " + unit)
+            assert_retained(retained, current, draft)
+            self.shot("custom-snooze-duration-" + unit + ".png")
+            begin_ms = time.time_ns() // 1_000_000
+            self.click("sidebar.custom_snooze.submit")
+            current = self.wait(lambda value: value.get("sidebar_custom_snooze_open") is False
+                                and not value.get("pending_command")
+                                and rows(value)[identifier]["snoozed_until"] > 0,
+                                "fractional custom snooze " + unit + " commits")
+            end_ms = time.time_ns() // 1_000_000
+            assert_duration_deadline(rows(current)[identifier]["snoozed_until"], begin_ms, end_ms, 1.5, unit)
+            assert_retained(retained, current, draft)
+            self.session.journal("sidebar.custom.duration", None, current, thread=identifier,
+                                 begin_ms=begin_ms, end_ms=end_ms, amount=1.5, unit=unit)
+            self.reveal("snoozed", identifier)
+            self.action(identifier, "wake", lambda row: row["snoozed_until"] == 0,
+                        "fractional custom snooze " + unit + " wakes", retained, draft)
+
+    def reveal(self, shelf, identifier):
+        current = self.session.snapshot(self.args.timeout)
+        if rows(current)[identifier]["target"].get("enabled"):
+            return current
+        self.click("sidebar.shelf." + shelf)
+        return self.wait(lambda value: rows(value)[identifier]["target"].get("enabled"),
+                         shelf + " shelf expands to an actual thread target")
+
+    def shot(self, filename):
+        self.ui.capture(self.session, filename)
+
+    def row_label(self, snapshot, identifier):
+        index = rows(snapshot)[identifier]["index"]
+        return snapshot["thread_labels"][index]
+
+    def clipboard(self):
+        # vd run redirects child stdout to its log and returns launcher JSON.
+        # Read only the owned compositor's clipboard, with its exact environment.
+        self.session.require_live()
+        environment = self.session.data["private_desktop"]["environment"]
+        value = self.ui.run_command(["wl-paste", "--no-newline"], env=environment).stdout
+        self.session.data.setdefault("private_clipboard_reads", []).append(
+            dict(value=value, bytes=len(value.encode()),
+                 sha256=hashlib.sha256(value.encode()).hexdigest(),
+                 wayland_display=environment["WAYLAND_DISPLAY"],
+                 runtime_directory=environment["XDG_RUNTIME_DIR"]))
+        self.session.save()
+        return value
+
+    def row_menu_utilities(self, identifier, retained, draft):
+        self.right_click(identifier)
+        self.click("sidebar.menu.rename")
+        current = self.wait(lambda value: value.get("sidebar_rename_thread") == identifier,
+                            "inactive row rename opened for exact thread")
+        assert_retained(retained, current, draft)
+        self.exercise_editor("sidebar_rename_text", retained, draft)
+        title = "Sidebar Alpha renamed café Straße Σίσυφος"
+        self.replace_editor("sidebar_rename_text", "  " + title + "  ",
+                            "inactive row padded title before blur", retained, draft)
+        # Match normal browser blur behavior: the same click saves the row and
+        # focuses the requested search textbox, preserving route and draft.
+        self.click("sidebar.search")
+        current = self.wait(lambda value: not value.get("sidebar_rename_thread")
+                            and value.get("sidebar_search_focused")
+                            and not value.get("pending_command") and self.row_label(value, identifier) == title,
+                            "same blur click saves trimmed title and focuses search")
+        assert_retained(retained, current, draft)
+        self.right_click(identifier)
+        self.click("sidebar.menu.rename")
+        self.wait(lambda value: value.get("sidebar_rename_thread") == identifier,
+                  "inactive row rename reopened")
+        self.replace_editor("sidebar_rename_text", "Discard inactive title",
+                            "inactive title cancellation fixture", retained, draft)
+        self.key("Escape")
+        current = self.wait(lambda value: not value.get("sidebar_rename_thread")
+                            and self.row_label(value, identifier) == title,
+                            "Escape cancels inactive row rename")
+        assert_retained(retained, current, draft)
+        self.shot("row-renamed.png")
+        self.menu_copy_cases(identifier, retained, draft)
+
+    def menu_copy_cases(self, identifier, retained, draft):
+        for action, expected in (("copy_id", identifier), ("copy_path", self.session.data["workspace"])):
+            self.right_click(identifier)
+            self.menu_choose(action)
+            current = self.wait(lambda value: not value.get("sidebar_menu_thread"),
+                                "row " + action + " closes menu")
+            if self.clipboard() != expected:
+                raise ValueError("private clipboard contains wrong " + action + " value")
+            assert_retained(retained, current, draft)
+            self.assertions.append("private clipboard verifies exact row " + action)
+        current = self.session.snapshot(self.args.timeout)
+        branch = current["thread_branches"][rows(current)[identifier]["index"]]
+        self.right_click(identifier)
+        self.menu_open("copy", "keyboard")
+        if branch:
+            self.click("sidebar.menu.copy_branch")
+            current = self.wait(lambda value: not value.get("sidebar_menu_thread"), "row branch copied")
+            if self.clipboard() != branch:
+                raise ValueError("private clipboard contains wrong branch")
+            assert_retained(retained, current, draft)
+        else:
+            if any(target.get("id") == "sidebar.menu.copy_branch" and target.get("enabled")
+                   for target in self.ui.target_groups(self.session.snapshot(self.args.timeout))):
+                raise ValueError("copy branch admitted despite missing branch metadata")
+            self.key("Escape")
+        self.right_click(identifier)
+        self.click("sidebar.menu.filter")
+        current = self.wait(lambda value: value.get("sidebar_scope_project")
+                            == value["thread_projects"][rows(value)[identifier]["index"]],
+                            "row project filter selects exact target project")
+        assert_retained(retained, current, draft)
+        self.right_click(identifier)
+        self.click("sidebar.menu.filter")
+        current = self.wait(lambda value: not value.get("sidebar_scope_project"),
+                            "row project filter toggles back to all projects")
+        assert_retained(retained, current, draft)
+
+    def active_park_cases(self, alpha, charlie, retained, draft):
+        self.click(alpha)
+        self.wait(lambda value: value.get("thread_id") == alpha and value.get("send_ready"),
+                  "active park fixture selects exact Alpha chat")
+        parked_draft = "Retain parked Alpha café 🎮"
+        self.text("composer.input", parked_draft)
+        before = self.wait(lambda value: value.get("draft") == parked_draft,
+                           "active Alpha park fixture owns a distinct draft")
+        ordered = sorted((row for row in rows(before).values() if row["target"].get("enabled")),
+                         key=lambda row: row["target"]["pointer_bounds"][1])
+        ordered_ids = [row["target"]["id"] for row in ordered]
+        at = ordered_ids.index(alpha)
+        candidates = ordered_ids[at + 1:] + ordered_ids[:at]
+        next_id = next((identifier for identifier in candidates
+                        if not rows(before)[identifier]["settled"]
+                        and rows(before)[identifier]["snoozed_until"] == 0), None)
+        if next_id is None:
+            raise ValueError("active successor fixture lacks a distinct eligible chat")
+        self.right_click(alpha)
+        self.menu_choose("settle")
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and rows(value)[alpha]["settled"] and value.get("thread_id") == next_id,
+                            "active settlement advances to exact observed successor after acceptance")
+        if next_id == charlie:
+            assert_route_restored(retained, current, draft)
+        self.shot("active-settle-successor.png")
+        self.reveal("settled", alpha)
+        self.click(alpha)
+        alpha_retained = self.wait(lambda value: value.get("thread_id") == alpha
+                                   and value.get("draft") == parked_draft and value.get("send_ready"),
+                                   "revisiting settled Alpha restores its exact retained draft")
+        self.action(alpha, "settle", lambda row: not row["settled"],
+                    "active Alpha restore retains its route and draft", alpha_retained, parked_draft)
+        self.click(charlie)
+        current = self.wait(lambda value: value.get("thread_id") == charlie
+                            and value.get("draft") == draft and value.get("send_ready"),
+                            "Charlie draft restored before sole-project snooze")
+        assert_route_restored(retained, current, draft)
+        project = current["project_id"]
+        self.click("sidebar.scope")
+        self.wait(lambda value: value.get("sidebar_scope_open"), "sole-project park scope opens")
+        self.click(project)
+        before = self.wait(lambda value: value.get("sidebar_scope_project") == project,
+                           "sole-project park scope selects Charlie project")
+        if [identifier for identifier, row in rows(before).items()
+            if row["target"].get("enabled") and not row["settled"] and row["snoozed_until"] == 0] != [charlie]:
+            raise ValueError("new-chat fallback fixture contains another eligible scoped chat")
+        self.right_click(charlie)
+        self.menu_choose("snooze.1h")
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and value.get("thread_id") not in ("", alpha, charlie)
+                            and value.get("project_id") == project and value.get("send_ready")
+                            and rows(value).get(charlie, {}).get("snoozed_until", 0) > time.time() * 1000,
+                            "active sole-project snooze opens a fresh chat in the same project")
+        if current.get("run_id") or current.get("draft"):
+            raise ValueError("fresh fallback chat inherited parked execution or draft")
+        fallback = current
+        self.shot("active-snooze-new-chat.png")
+        self.reveal("snoozed", charlie)
+        self.action(charlie, "wake", lambda row: row["snoozed_until"] == 0,
+                    "inactive wake preserves fresh fallback route", fallback, "")
+        self.click(charlie)
+        current = self.wait(lambda value: value.get("thread_id") == charlie
+                            and value.get("draft") == draft and value.get("send_ready"),
+                            "revisiting snoozed Charlie restores original run and draft")
+        assert_route_restored(retained, current, draft)
+        self.click("sidebar.scope")
+        self.wait(lambda value: value.get("sidebar_scope_open"), "park proof scope opens for reset")
+        self.click("scope.all")
+        return self.wait(lambda value: not value.get("sidebar_scope_project"),
+                         "all-project scope restored after active park proofs")
+
+    def lifecycle_cases(self, alpha, bravo, charlie, identifiers, retained, draft):
+        """Exercise archive browser, destructive confirmation, successor and Undo."""
+        # Setup ends on the newest project. Lifecycle fixtures intentionally
+        # span both projects, so reset to the all-project resident page before
+        # targeting the background Alpha row.
+        current = self.session.snapshot(self.args.timeout)
+        if not (identifiers <= rows(current).keys() and not current.get("sidebar_scope_project")):
+            self.click("sidebar.scope")
+            self.wait(lambda value: value.get("sidebar_scope_open"),
+                      "lifecycle all-project scope opens")
+            self.click("scope.all")
+            current = self.wait(lambda value: not value.get("sidebar_scope_project")
+                                and identifiers <= rows(value).keys(),
+                               "lifecycle all-project rows restored before actions")
+        before = self.session.snapshot(self.args.timeout)
+        lifecycle_rows(before)
+        # Background archive preserves the exact active route, execution and draft.
+        self.right_click(alpha)
+        self.menu_choose("archive")
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and alpha not in lifecycle_rows(value),
+                            "inactive Alpha archives durably")
+        assert_retained(retained, current, draft)
+        current = self.session.snapshot(self.args.timeout)
+        if current.get("thread_id") != retained.get("thread_id"):
+            raise ValueError("background archive changed the active route")
+        self.click("sidebar.archived.toggle")
+        current = self.wait(lambda value: value.get("sidebar_archived") is True,
+                            "archived browser opens through painted toggle")
+        archived = lifecycle_rows(current)
+        if not archived.get(alpha, {}).get("archived"):
+            raise ValueError("archived browser omitted the accepted Alpha archive")
+        if any(row["target"].get("enabled") and not row["archived"] for row in archived.values()):
+            raise ValueError("archived browser injected an active row")
+        self.shot("archived-browser.png")
+        self.right_click(alpha)
+        self.click("sidebar.menu.restore")
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and not lifecycle_rows(value)[alpha]["archived"],
+                            "archived Alpha restores through painted action")
+        assert_route_restored(retained, current, draft)
+        self.click("sidebar.archived.toggle")
+        self.wait(lambda value: value.get("sidebar_archived") is False,
+                  "archived browser closes after restore")
+
+        # Active archive parks the route in a fresh same-project chat; the
+        # archived original remains restorable with its composer state.
+        self.click(charlie)
+        active = self.wait(lambda value: value.get("thread_id") == charlie
+                           and value.get("draft") == draft and value.get("send_ready"),
+                          "active Charlie selected before archive")
+        project = active["project_id"]
+        self.right_click(charlie)
+        self.click("sidebar.menu.archive")
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and value.get("thread_id") not in ("", charlie)
+                            and value.get("project_id") == project
+                            and value.get("send_ready")
+                            and lifecycle_rows(value).get(charlie, {}).get("archived") is True,
+                            "active archive opens a fresh same-project chat")
+        if current.get("run_id") or current.get("draft"):
+            raise ValueError("active archive fresh chat inherited execution or draft")
+        self.click("sidebar.archived.toggle")
+        archived = self.wait(lambda value: value.get("sidebar_archived") is True,
+                             "archived browser reopens for active archive restore")
+        self.right_click(charlie)
+        self.click("sidebar.menu.restore")
+        self.wait(lambda value: not value.get("pending_command")
+                  and not lifecycle_rows(value)[charlie]["archived"],
+                  "active archived Charlie restores through browser action")
+        self.click("sidebar.archived.toggle")
+        self.wait(lambda value: value.get("sidebar_archived") is False,
+                  "active archive browser closes after restore")
+        self.click(charlie)
+        current = self.wait(lambda value: value.get("thread_id") == charlie
+                            and value.get("draft") == draft and value.get("send_ready"),
+                           "restored Charlie returns its original draft")
+        assert_route_restored(retained, current, draft)
+
+        # Delete confirmation cancel is observationally inert.
+        before = self.session.snapshot(self.args.timeout)
+        self.right_click(bravo)
+        self.click("sidebar.menu.delete")
+        current = self.wait(lambda value: value.get("sidebar_lifecycle_confirm_open") is True
+                            and value.get("sidebar_lifecycle_confirm_thread") == bravo,
+                            "delete confirmation owns exact inactive Bravo")
+        assert_lifecycle_unchanged(before, current, draft)
+        if not any(target.get("enabled") and target.get("id") == "sidebar.delete.confirm"
+                   for target in self.ui.target_groups(current)):
+            raise ValueError("delete confirmation lacks a painted confirm target")
+        self.click("sidebar.delete.cancel")
+        current = self.wait(lambda value: not value.get("sidebar_lifecycle_confirm_open"),
+                            "delete cancellation closes without mutation")
+        assert_lifecycle_unchanged(before, current, draft)
+
+        # Accepted active delete advances to the exact observed successor and
+        # leaves no row behind after the durable tombstone receipt.
+        self.click(charlie)
+        active = self.wait(lambda value: value.get("thread_id") == charlie
+                           and value.get("draft") == draft and value.get("send_ready"),
+                        "active Charlie selected before delete")
+        ordered = sorted((row for row in lifecycle_rows(active).values()
+                          if row["target"].get("enabled") and not row["archived"] and row["target"]["id"] != charlie),
+                         key=lambda row: row["target"]["pointer_bounds"][1])
+        successor = ordered[0]["target"]["id"] if ordered else None
+        self.right_click(charlie)
+        self.click("sidebar.menu.delete")
+        self.wait(lambda value: value.get("sidebar_lifecycle_confirm_open") is True,
+                  "active delete confirmation opens")
+        self.click("sidebar.delete.confirm")
+        current = self.wait(lambda value: not value.get("pending_command")
+                            and charlie not in lifecycle_rows(value)
+                            and (successor is None or value.get("thread_id") == successor),
+                            "accepted active delete removes tombstone and advances route")
+        if current.get("sidebar_lifecycle_error"):
+            raise ValueError("accepted delete left a lifecycle error")
+
+        # Accepted metadata action offers one exact, single-use Undo claim.
+        target = successor or alpha
+        if target not in lifecycle_rows(current):
+            raise ValueError("lifecycle Undo fixture has no durable target")
+        undo_retained, undo_draft = current, current.get("draft", "")
+        before = self.session.snapshot(self.args.timeout)
+        previous = sidebar_metadata(before)[target]
+        self.action(target, "pin", lambda row: row["pinned"],
+                    "Undo fixture pin accepted", undo_retained, undo_draft)
+        current = self.wait(lambda value: value.get("sidebar_undo_available") is True
+                            and bool(value.get("sidebar_undo_label")),
+                            "accepted pin offers a painted Undo claim")
+        self.click("sidebar.undo")
+        current = self.wait(lambda value: value.get("sidebar_undo_available") is False
+                            and sidebar_metadata(value)[target] == previous,
+                            "painted Undo restores exact prior metadata once")
+        assert_retained(undo_retained, current, undo_draft)
+        if any(target_item.get("enabled") and target_item.get("id") == "sidebar.undo"
+               for target_item in self.ui.target_groups(current)):
+            raise ValueError("consumed Undo remained actionable")
+
+        # Ctrl+Z claims a fresh accepted Undo; expiry is checked without a
+        # second mutation and the claim cannot be consumed twice.
+        self.action(target, "pin", lambda row: row["pinned"],
+                    "second Undo fixture pin accepted", undo_retained, undo_draft)
+        self.wait(lambda value: value.get("sidebar_undo_available") is True,
+                  "second accepted pin offers Ctrl+Z claim")
+        self.key("ctrl+z")
+        current = self.wait(lambda value: value.get("sidebar_undo_available") is False
+                            and sidebar_metadata(value)[target] == previous,
+                            "Ctrl+Z consumes Undo and restores exact metadata")
+        self.action(target, "pin", lambda row: row["pinned"],
+                    "third Undo fixture pin accepted", undo_retained, undo_draft)
+        self.wait(lambda value: value.get("sidebar_undo_available") is True,
+                  "third accepted pin offers expiring Undo claim")
+        time.sleep(5.2)
+        current = self.session.snapshot(self.args.timeout)
+        if current.get("sidebar_undo_available"):
+            raise ValueError("Undo claim remained available after its five-second expiry")
+        self.assertions.append("archive browser, destructive confirmation, active successor and single-use Undo passed")
+
+    def measure_sidebar(self, identifier, retained, draft):
+        """Measure painted sidebar work; input delivery itself has no latency claim."""
+        self.measure = load_tool("measure_process", ROOT / "tools/measure_process.py")
+        pid = self.session.data["launch"]["pid"]
+        initial = self.measure.stat(Path(f"/proc/{pid}/stat"))
+        identity = self.measure.identity(initial)
+
+        def sample(name):
+            row = self.measure.sample(pid, expected_root=identity)
+            row["phase"] = name
+            self.samples.append(row)
+            self.ui.atomic_json(self.session.output / "samples.json", self.samples)
+            if row["root_exited"]:
+                raise ValueError("native process exited during sidebar measurement")
+
+        def idle(name):
+            begin = time.monotonic()
+            due = begin
+            while time.monotonic() < begin + 5:
+                sample(name)
+                due += .25
+                time.sleep(max(0, due - time.monotonic()))
+            self.phases.append(dict(name=name, begin=begin, end=time.monotonic()))
+
+        # Screenshots and recording are outside all measured phase boundaries.
+        idle("idle_before")
+        begin = time.monotonic()
+        for cycle in range(self.args.cycles):
+            query = "Sidebar" if cycle % 2 == 0 else "Side"
+            self.text("sidebar.search", query)
+            self.wait(lambda value: value.get("sidebar_search") == query, "measured search query painted")
+            sample("active_sidebar")
+            self.key("Escape")
+            self.wait(lambda value: not value.get("sidebar_search"), "measured search cleared")
+            sample("active_sidebar")
+            self.click("sidebar.scope")
+            self.wait(lambda value: value.get("sidebar_scope_open"), "measured scope opened")
+            sample("active_sidebar")
+            self.key("Escape")
+            self.wait(lambda value: not value.get("sidebar_scope_open"), "measured scope closed")
+            self.right_click(identifier)
+            sample("active_sidebar")
+            self.key("Escape")
+            self.wait(lambda value: not any(target.get("enabled")
+                      and target.get("id", "").startswith("sidebar.menu.")
+                      for target in self.ui.target_groups(value)), "measured context menu closed")
+            self.click("sidebar.toggle")
+            self.wait(lambda value: value.get("sidebar_collapsed") is True, "measured sidebar collapsed")
+            sample("active_sidebar")
+            self.key("ctrl+b")
+            current = self.wait(lambda value: value.get("sidebar_collapsed") is False,
+                                "measured sidebar reopened")
+            assert_retained(retained, current, draft)
+            sample("active_sidebar")
+        self.phases.append(dict(name="active_sidebar", begin=begin, end=time.monotonic(), cycles=self.args.cycles))
+        idle("settled_after")
+        self.ui.atomic_json(self.session.output / "phases.json", self.phases)
+
+    def finish_metrics(self):
+        # The first process exports native.json on ordinary close before restart.
+        sys.modules.setdefault("measure_process", self.measure)
+        starter = load_tool("sidebar_eval_starter", ROOT / "tools/eval-starter")
+        native = self.ui.read_json(self.session.output / "native.json", time.monotonic() + self.args.timeout)
+        starter.validate_native(native)
+        frames = [dict(phase=phase["name"], **starter.frame_summary(native, phase)) for phase in self.phases]
+        active = next(phase for phase in frames if phase["phase"] == "active_sidebar")
+        if active["successful_samples"] < 100:
+            raise ValueError("sidebar active cohort has fewer than 100 frames; p99 is not accepted")
+        resources = [dict(phase=phase["name"], **self.measure.summarize(
+            [sample for sample in self.samples if sample["phase"] == phase["name"]])) for phase in self.phases]
+        if any(phase["incomplete_samples"] for phase in resources):
+            raise ValueError("sidebar process-tree samples are incomplete")
+        summary = dict(renderer=native["renderer"], video=native["video"],
+                       frames=frames, resources=resources,
+                       cache_tail=starter.cache_tail_summary(native, self.phases[-1]),
+                       limitations=["Native paint work and present-return timing; no physical input-to-photon claim.",
+                                    "Process-tree memory covers observed sample boundaries, not an absolute peak.",
+                                    "Repeated three-chat sidebar fixture; low-end hardware and large-history acceptance remain separate."])
+        self.ui.atomic_json(self.session.output / "performance.json", summary)
+        self.session.data["sidebar_performance"] = summary
+
+    def run(self):
+        # Compile only the compositor input helper before native launch and all
+        # measured boundaries. No app source or package installation occurs.
+        self.prepare_pointer()
+        launch_args = argparse.Namespace(output=self.args.output, binary=self.args.binary,
+                                        provider="fake", private=True, build=False,
+                                        optimize="ReleaseSafe", scenario="sidebar",
+                                        width=1280, height=800, quit_after_ms=SCENARIO_LIFETIME_MS,
+                                        metrics_output=self.args.output / "native.json" if self.args.measure else None,
+                                        timeout=self.args.timeout, dry_run=False)
+        self.ui.launch(launch_args)
+        self.session = self.ui.Session.load(self.args.output)
+        self.session.data["pointer_helper"] = self.pointer_provenance
+        self.session.save()
+        self.wait(lambda value: value.get("send_ready"), "fresh native conversation ready")
+        first = self.ui.send_turn(self.session, "Sidebar Alpha café Straße Σίσυφος", self.args.timeout)
+        alpha, first_project = first["thread_id"], first["project_id"]
+        self.click("workspace.new_thread")
+        self.wait(lambda value: value.get("thread_id") != alpha and value.get("send_ready"),
+                  "second chat created through native new-thread control")
+        second = self.ui.send_turn(self.session, "Sidebar Bravo 世界", self.args.timeout)
+        bravo = second["thread_id"]
+        self.click("workspace.new_project")
+        self.wait(lambda value: value.get("project_id") != first_project and value.get("send_ready"),
+                  "second project created through native control")
+        third = self.ui.send_turn(self.session, "Sidebar Charlie 🎮", self.args.timeout)
+        charlie = third["thread_id"]
+        draft = "Keep this draft café 世界 🎮"
+        self.text("composer.input", draft)
+        retained = self.wait(lambda value: value.get("draft") == draft,
+                             "Unicode composer draft retained before sidebar input")
+        identifiers = {alpha, bravo, charlie}
+        self.shot("cards.png")
+
+        if self.args.focus == "lifecycle":
+            self.session.data["sidebar_focus"] = "lifecycle"
+            self.session.data["limitations"].append(
+                "Focused lifecycle/archive cohort; full editor, reorder, custom snooze, performance and one-to-one visual acceptance are separate.")
+            self.session.save()
+            self.lifecycle_cases(alpha, bravo, charlie, identifiers, retained, draft)
+            self.session.data.update(passed=True, sidebar_verified=self.assertions)
+            self.session.save()
+            return
+
+        if self.args.focus == "measure":
+            self.session.data["sidebar_focus"] = "measure"
+            self.session.data["limitations"].append(
+                "Focused three-chat sidebar measurement only; full functional, large-history, low-end-hardware and one-to-one visual acceptance are separate.")
+            self.session.save()
+            self.measure_sidebar(alpha, retained, draft)
+            self.shot("measured-settled.png")
+            self.ui.close_app(self.session, self.args.timeout)
+            self.app_closed = True
+            self.finish_metrics()
+            if (self.session.data["source_sha256"] != self.ui.source_fingerprint()
+                    or self.session.data["binary_sha256"] != self.ui.sha256(self.args.binary)):
+                raise ValueError("source or native binary changed during the sidebar measurement")
+            self.session.data.update(passed=True, sidebar_verified=self.assertions)
+            self.session.save()
+            return
+
+        if self.args.focus == "menus":
+            self.session.data["sidebar_focus"] = "menus"
+            self.session.data["limitations"].append(
+                "Focused menu/custom-snooze/active-park/restart cohort; full editor, drag/reorder and one-to-one visual acceptance are separate.")
+            self.session.save()
+            self.menu_copy_cases(alpha, retained, draft)
+            self.exercise_submenus(alpha, retained, draft)
+            self.custom_snooze_cases(alpha, retained, draft)
+            retained = self.active_park_cases(alpha, charlie, retained, draft)
+            title = retained["title_text"]
+            self.resize_restart(launch_args, alpha, bravo, identifiers, retained, draft, title)
+            return
+
+        self.click("sidebar.search")
+        self.exercise_editor("sidebar_search", retained, draft)
+        self.key("Escape")
+        self.wait(lambda value: not value.get("sidebar_search"), "editor search fixture cleared")
+        self.text("sidebar.search", "Sidebar")
+        current = self.wait(lambda value: value.get("sidebar_search") == "Sidebar"
+                            and len([target for target in value.get("thread_targets", [])
+                                     if target.get("enabled")]) == 3, "three native compact search results")
+        assert_compact(current, identifiers)
+        assert_retained(retained, current, draft)
+        self.shot("search.png")
+        for query in ("CAFÉ", "STRASSE", "ΣΊΣΥΦΟΣ"):
+            self.key("ctrl+a")
+            self.ui.run_command(["vd", "text", str(self.session.vd_session), self.session.window, query])
+            current = self.wait(lambda value: value.get("sidebar_search") == query
+                                and [target.get("id") for target in value.get("thread_targets", [])
+                                     if target.get("enabled")] == [alpha],
+                                "Unicode case-folded search selects exact Alpha chat: " + query)
+        self.shot("unicode-search.png")
+        self.key("Return")
+        self.wait(lambda value: value.get("thread_id") == alpha and not value.get("sidebar_search"),
+                  "keyboard search activation opens exact matched chat")
+        self.click(charlie)
+        retained = self.wait(lambda value: value.get("thread_id") == charlie and value.get("draft") == draft,
+                             "search navigation restores the other chat draft")
+        self.click("sidebar.scope")
+        current = self.wait(lambda value: value.get("sidebar_scope_open"), "scope dropdown painted")
+        assert_suppressed(current)
+        projects = [target["id"] for target in current.get("scope_targets", [])
+                    if target.get("enabled") and target.get("id") != "scope.all"]
+        if len(projects) != 2:
+            raise ValueError("scope lacks two actual project identities")
+        self.key("Home")
+        self.key("Down")
+        self.key("Return")
+        current = self.wait(lambda value: not value.get("sidebar_scope_open")
+                            and value.get("sidebar_scope_project") == projects[0],
+                            "scope keyboard selection follows actual project identity")
+        assert_retained(retained, current, draft)
+        self.click("sidebar.scope")
+        self.wait(lambda value: value.get("sidebar_scope_open"), "scope reopened")
+        self.click("scope.all")
+        self.wait(lambda value: not value.get("sidebar_scope_project"), "all-project scope restored")
+
+        if self.args.measure:
+            self.measure_sidebar(alpha, retained, draft)
+
+        self.row_menu_utilities(alpha, retained, draft)
+        self.exercise_submenus(alpha, retained, draft)
+        self.custom_snooze_cases(alpha, retained, draft)
+
+        self.action(alpha, "pin", lambda row: row["pinned"], "inactive Alpha pin persisted", retained, draft)
+        self.shot("pinned.png")
+        self.action(alpha, "pin", lambda row: not row["pinned"], "inactive Alpha unpin persisted", retained, draft)
+        self.action(bravo, "settle", lambda row: row["settled"], "inactive Bravo settlement persisted", retained, draft)
+        self.reveal("settled", bravo)
+        self.shot("settled.png")
+        self.action(bravo, "settle", lambda row: not row["settled"], "inactive Bravo restoration persisted", retained, draft)
+        self.action(alpha, "snooze.1h", lambda row: row["snoozed_until"] > time.time() * 1000,
+                    "inactive Alpha one-hour snooze persisted", retained, draft)
+        self.reveal("snoozed", alpha)
+        self.shot("snoozed.png")
+        self.action(alpha, "wake", lambda row: row["snoozed_until"] == 0,
+                    "inactive Alpha wake persisted", retained, draft)
+
+        current = self.session.snapshot(self.args.timeout)
+        order_before = rows(current)[alpha]["sort_order"]
+        self.action(alpha, "move_up", lambda row: row["sort_order"] != order_before,
+                    "inactive Alpha order mutation persisted", retained, draft)
+        self.key("F2")
+        self.wait(lambda value: value.get("title_editing"), "active title edit opened")
+        self.exercise_editor("title_text", retained, draft)
+        title = "Sidebar Charlie renamed 🎮"
+        self.replace_editor("title_text", title, "active title save fixture", retained, draft)
+        self.key("Return")
+        current = self.wait(lambda value: not value.get("title_editing")
+                            and value.get("title_text") == title and not value.get("pending_command"),
+                            "Unicode active title committed")
+        assert_retained(retained, current, draft)
+        self.key("F2")
+        self.wait(lambda value: value.get("title_editing"), "second title edit opened")
+        self.replace_editor("title_text", "Discard this title", "active title cancellation fixture", retained, draft)
+        self.key("Escape")
+        self.wait(lambda value: not value.get("title_editing") and value.get("title_text") == title,
+                  "Escape cancels title edit")
+
+        self.resize_restart(launch_args, alpha, bravo, identifiers, retained, draft, title)
+
+    def resize_restart(self, launch_args, alpha, bravo, identifiers, retained, draft, title):
+        self.click("sidebar.toggle")
+        current = self.wait(lambda value: value.get("sidebar_collapsed") is True,
+                            "sidebar collapses through native toggle")
+        assert_suppressed(current)
+        assert_retained(retained, current, draft)
+        self.shot("collapsed.png")
+        self.key("ctrl+b")
+        current = self.wait(lambda value: value.get("sidebar_collapsed") is False,
+                            "Ctrl+B reopens sidebar")
+        before_width = current["sidebar_width"]
+        target = self.ui.find_target(current, "sidebar.resize")
+        x, y = self.ui.pointer(self.session, target)
+        self.pointer_event(x, y, "drag:60:0")
+        current = self.wait(lambda value: value.get("sidebar_width", 0) > before_width + 20,
+                            "observed resize rail changes native sidebar width")
+        assert_retained(retained, current, draft)
+        self.shot("resized.png")
+        self.ipc(f"[con_id={self.session.window}]", "resize", "set", "width", "720", "px", "height", "480", "px")
+        self.wait(lambda value: value.get("logical_width") == 720 and value.get("logical_height") == 480,
+                  "minimum supported native window painted")
+        self.shot("minimum.png")
+        self.ipc(f"[con_id={self.session.window}]", "resize", "set", "width", "1280", "px", "height", "800", "px")
+        self.wait(lambda value: value.get("logical_width") == 1280 and value.get("logical_height") == 800,
+                  "regular native window restored")
+
+        self.action(alpha, "pin", lambda row: row["pinned"], "Alpha pin prepared for restart", retained, draft)
+        self.action(bravo, "settle", lambda row: row["settled"], "Bravo settled prepared for restart", retained, draft)
+        before_scope = self.session.snapshot(self.args.timeout)
+        persisted = {identifier: {field: row[field] for field in ("pinned", "settled", "snoozed_until", "sort_order")}
+                     for identifier, row in rows(before_scope).items() if identifier in identifiers}
+        if set(persisted) != identifiers:
+            raise ValueError("all-project snapshot lacks one of the three restart metadata fixtures")
+        self.click("sidebar.scope")
+        self.wait(lambda value: value.get("sidebar_scope_open"), "nondefault restart scope opened")
+        current = self.session.snapshot(self.args.timeout)
+        active_project = retained["project_id"]
+        scope = next((target["id"] for target in current.get("scope_targets", [])
+                      if target.get("enabled") and target.get("id") == active_project), None)
+        if scope is None:
+            raise ValueError("active project lacks its exact scope target for restart proof")
+        self.click(scope)
+        self.wait(lambda value: value.get("sidebar_scope_project") == active_project,
+                  "nondefault scope prepared for restart")
+        self.click("sidebar.toggle")
+        self.wait(lambda value: value.get("sidebar_collapsed") is True,
+                  "collapsed preference prepared for restart")
+        before_restart = self.session.snapshot(self.args.timeout)
+        preferences(before_restart)
+        current = self.ui.restart_app(self.session, launch_args)
+        assert_preferences(before_restart, current)
+        if self.args.measure:
+            self.finish_metrics()
+        self.shot("reopened-collapsed.png")
+        self.key("ctrl+b")
+        self.wait(lambda value: value.get("sidebar_collapsed") is False, "persisted sidebar reopens after restart")
+        self.click("sidebar.scope")
+        self.wait(lambda value: value.get("sidebar_scope_open"), "persisted scope opens after restart")
+        self.click("scope.all")
+        self.wait(lambda value: not value.get("sidebar_scope_project"), "all-project rows requested after preference proof")
+        self.wait(lambda value: identifiers <= rows(value).keys(), "all durable sidebar rows reopened")
+        for identifier, expected in persisted.items():
+            actual = rows(self.session.snapshot(self.args.timeout))[identifier]
+            if any(actual[field] != value for field, value in expected.items()):
+                raise ValueError("sidebar metadata changed across process restart: " + identifier)
+        if current.get("title_text") != title:
+            raise ValueError("saved Unicode title changed across process restart")
+        if (self.session.data["source_sha256"] != self.ui.source_fingerprint()
+                or self.session.data["binary_sha256"] != self.ui.sha256(self.args.binary)):
+            raise ValueError("source or native binary changed during the sidebar cohort")
+        self.assertions.append("pin, settlement, wake and order metadata survive process restart")
+        self.assertions.append("exact active route, width, collapse, shelves and project scope survive process restart")
+        self.shot("reopened.png")
+        self.session.data.update(passed=True, sidebar_verified=self.assertions)
+        self.session.save()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / ".artifacts/sidebar-evidence/ui")
+    parser.add_argument("--binary", type=Path, default=ROOT / "zig-out/bin/spica")
+    parser.add_argument("--timeout", type=float, default=20)
+    parser.add_argument("--private", action="store_true", help="required acknowledgement of private vd desktop")
+    parser.add_argument("--focus", choices=("full", "menus", "lifecycle", "measure"), default="full",
+                        help="menus/lifecycle run focused functional checks; measure runs only the measured sidebar cohort")
+    parser.add_argument("--measure", action="store_true", help="collect isolated idle and active-sidebar native frame/process-tree evidence")
+    parser.add_argument("--cycles", type=int, default=16, help="12..50 repeated sidebar input cycles in the measured active phase")
+    parser.add_argument("--dry-run", action="store_true", help="print steps without filesystem, build or desktop activity")
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.timeout) or not 0 < args.timeout <= 120:
+        parser.error("timeout must be finite and between zero and 120 seconds")
+    if not 12 <= args.cycles <= 50:
+        parser.error("measurement cycles must be between 12 and 50")
+    if args.focus == "menus" and args.measure:
+        parser.error("focused functional evidence and performance measurements must run separately")
+    if args.focus == "measure" and not args.measure:
+        parser.error("--focus measure requires --measure")
+    if args.focus == "lifecycle" and args.measure:
+        parser.error("focused lifecycle evidence and performance measurements must run separately")
+    if args.dry_run:
+        print(json.dumps({"scenario": "sidebar", "provider": "fake", "build": False,
+                          "fixture_lifetime_ms": SCENARIO_LIFETIME_MS,
+                          "focus": args.focus, "steps": plan(args.focus),
+                          "limitations": ["No performance or physical latency claim."] +
+                          (["Focused menus omits full editor and reorder acceptance."] if args.focus == "menus" else []) +
+                          (["Focused lifecycle omits full editor, reorder, custom snooze and performance acceptance."] if args.focus == "lifecycle" else []) +
+                          (["Focused measurement omits full functional, large-history and low-end-hardware acceptance."] if args.focus == "measure" else [])}, indent=2))
+        return 0
+    if not args.private:
+        parser.error("--private is required; the user's active desktop is never used")
+    args.output, args.binary = args.output.resolve(), args.binary.resolve()
+    ui = load_driver()
+    proof = Proof(ui, args)
+    try:
+        proof.run()
+        ui.receipt(argparse.Namespace(dry_run=False), proof.session)
+        return 0
+    except Exception as error:
+        if proof.session is not None:
+            ui.failure_packet(proof.session, error)
+        print("eval-sidebar: " + str(error), file=sys.stderr)
+        return 1
+    finally:
+        if proof.session is not None and not proof.app_closed:
+            try:
+                ui.close_app(proof.session, args.timeout)
+            except Exception as error:
+                print("eval-sidebar cleanup: " + str(error), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

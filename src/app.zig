@@ -71,7 +71,7 @@ const NavigationObservation = struct {
         for (self.view.navigation_targets.slice()) |target| {
             try writer.write(setupTarget(target.id[0..target.id_len], target.role[0..target.role_len], target.bounds, target.enabled));
         }
-        try writer.write(setupTarget("sidebar.search.more", "button", self.view.search_more_bounds, self.view.search_len != 0 and self.view.search_more_available and self.view.navigation_enabled));
+        try writer.write(setupTarget("sidebar.search.more", "button", self.view.search_more_bounds, !self.view.customSnoozeOpen() and self.view.search_more_available and self.view.navigation_enabled and self.view.search_more_bounds.w > 0 and self.view.search_more_bounds.h > 0 and self.view.sidebar_menu_thread.len == 0));
         try writer.endArray();
         try writer.objectField("workspace_open");
         try writer.write(self.view.workspace_open);
@@ -282,7 +282,10 @@ pub const App = struct {
             self.view.allocator.destroy(bridge);
             self.lua = null;
         }
-        if (self.conversation) |conversation| conversation.destroy();
+        if (self.conversation) |conversation| {
+            conversation.retainFinalSidebarState(&self.view);
+            conversation.destroy();
+        }
         self.conversation = null;
     }
 
@@ -316,12 +319,21 @@ pub const App = struct {
             self.pollFolderDialog();
             if (self.conversation) |conversation| try conversation.pump(self);
             if (self.lua) |bridge| try bridge.pump(self);
+            if (self.view.nextSidebarWakeMs(self.view.sidebar_now_ms)) |due| {
+                if (due <= Coding.wallTimeMs() and self.view.custom_root == null and !self.view.sidebar_collapsed) self.dirty = true;
+            }
+            self.view.sidebar_now_ms = Coding.wallTimeMs();
             if (self.dirty and !self.minimized) {
                 try self.paint();
                 self.dirty = false;
             }
             var event: c.SDL_Event = undefined;
             var next_wake = deadline;
+            if (if (self.view.custom_root == null and !self.view.sidebar_collapsed) self.view.nextSidebarWakeMs(Coding.wallTimeMs()) else null) |due| {
+                const delay: u64 = @intCast(@max(0, due - Coding.wallTimeMs()));
+                const wake = c.SDL_GetTicks() +| delay;
+                next_wake = if (next_wake) |existing| @min(existing, wake) else wake;
+            }
             if (self.conversation) |conversation| if (conversation.login_inflight and conversation.query == null and conversation.command == null) {
                 next_wake = if (next_wake) |due| @min(due, conversation.login_poll_due) else conversation.login_poll_due;
             };
@@ -421,8 +433,8 @@ pub const App = struct {
             }
         }
         const changed = self.view.handle(event, self.window, self.text) catch |err| switch (err) {
-            error.TextTooLarge, error.PieceLimit, error.InvalidUtf8, error.ClipboardRead, error.ClipboardWrite, error.ClipboardContainsNul => blk: {
-                self.view.notice = @errorName(err);
+            error.TextTooLarge, error.PieceLimit, error.InvalidUtf8, error.InvalidTitle, error.ClipboardRead, error.ClipboardWrite, error.ClipboardContainsNul => blk: {
+                self.view.notice = self.view.inputErrorNotice(err) orelse @errorName(err);
                 self.snapshot.admission_errors += 1;
                 self.snapshot.last_admission_error = @errorName(err);
                 break :blk true;
@@ -454,6 +466,34 @@ pub const App = struct {
             if (self.conversation) |conversation| conversation.navigateWorkspace(self, navigation) catch |err| {
                 self.view.notice = @errorName(err);
             };
+        }
+        if (self.view.takeSidebarArchiveBrowserRequest()) |archived| {
+            self.view.thread_search_revision +%= 1;
+            self.view.thread_count = 0;
+            if (self.conversation) |conversation| {
+                conversation.thread_search_started = true;
+                conversation.thread_search_active = false;
+                conversation.ask(.threads, .{ .threads = .{ .archived = archived, .canonical_root = conversation.workspace_root, .page = Conversation.page } }) catch |err| {
+                    self.view.notice = @errorName(err);
+                };
+            }
+        }
+        if (self.view.takeSidebarLifecycleRequest()) |request| {
+            if (self.conversation) |conversation| {
+                conversation.beginLifecycle(request) catch |err| self.view.finishSidebarLifecycle(@errorName(err));
+            } else self.view.finishSidebarLifecycle("No connected conversation. Your selection is retained.");
+        }
+        if (self.view.takeSidebarUndoRequest()) |operation| {
+            if (self.conversation) |conversation| {
+                conversation.beginSidebarUndo(self, operation) catch |err| {
+                    self.view.notice = @errorName(err);
+                };
+            }
+        }
+        if (self.view.takeCustomSnoozeRequest()) |request| {
+            if (self.conversation) |conversation| {
+                conversation.beginCustomSnooze(request) catch |err| self.view.finishCustomSnooze(@errorName(err));
+            } else self.view.finishCustomSnooze("No connected conversation. Your selection is retained.");
         }
         if (self.view.title_action) |action| {
             self.view.title_action = null;
@@ -555,6 +595,8 @@ pub const App = struct {
         const scale_y = @as(f32, @floatFromInt(pixel_height)) / h;
         if (!c.SDL_SetRenderScale(self.renderer, scale_x, scale_y) or !c.spica_text_set_render_scale(self.text, scale_x, scale_y)) return error.RenderScale;
         self.layout.resize(w, h);
+        self.layout.sidebar_collapsed = self.view.sidebar_collapsed;
+        self.layout.sidebar_width_override = self.view.sidebar_width_override;
         var coding_bounds = if (self.view.custom_root) |root| self.layout.script(root, &self.view.custom_bounds) else self.layout.coding(w);
         if (self.view.custom_root == null and self.view.rich_count == 0 and !self.view.workflow_open and !self.view.workspace_open) {
             self.layout.centerEmpty(&coding_bounds);
@@ -592,7 +634,8 @@ pub const App = struct {
         const extra_bounds = [_]c.SDL_FRect{ self.view.new_project_bounds, self.view.new_thread_bounds, self.view.picker_bounds, self.view.effort_bounds, self.view.setup_bounds };
         for (extra_bounds, 6..) |bounds, index| {
             self.snapshot.targets[index].pointer_bounds = .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) };
-            self.snapshot.targets[index].enabled = self.view.custom_root == null and (index >= 8 or self.view.navigation_enabled);
+            self.snapshot.targets[index].enabled = self.view.custom_root == null and bounds.w > 0 and bounds.h > 0 and
+                self.view.sidebar_menu_thread.len == 0 and (index >= 8 or self.view.navigation_enabled);
         }
         self.snapshot.thread_targets = @splat(.{ .enabled = false });
         for (self.view.threads[0..self.view.thread_count], 0..) |*entry, index| {
@@ -612,10 +655,38 @@ pub const App = struct {
         self.snapshot.sidebar_search_focused = self.view.search_focused;
         self.snapshot.sidebar_scope_open = self.view.scope_open;
         self.snapshot.sidebar_scope_project = self.view.scope_project.slice();
+        self.snapshot.sidebar_collapsed = self.view.sidebar_collapsed;
+        self.snapshot.sidebar_width_override = self.view.sidebar_width_override;
+        self.snapshot.sidebar_working_shelf = self.view.sidebar_working_shelf;
+        self.snapshot.sidebar_shelf_expanded = self.view.sidebar_shelf_expanded;
+        self.snapshot.sidebar_width = self.view.sidebar_bounds.w;
+        self.snapshot.sidebar_menu_thread = self.view.sidebar_menu_thread.slice();
+        self.snapshot.sidebar_rename_thread = self.view.sidebar_rename_thread.slice();
+        self.snapshot.sidebar_rename_text = self.view.sidebar_rename_buffer[0..self.view.sidebar_rename_len];
+        self.snapshot.sidebar_custom_snooze_open = self.view.customSnoozeOpen();
+        self.snapshot.sidebar_custom_snooze_thread = self.view.custom_snooze_thread.slice();
+        self.snapshot.sidebar_custom_snooze_mode = "";
+        self.snapshot.sidebar_custom_snooze_date = "";
+        self.snapshot.sidebar_custom_snooze_time = "";
+        self.snapshot.sidebar_custom_snooze_amount = "";
+        self.snapshot.sidebar_custom_snooze_unit = "";
+        self.snapshot.sidebar_custom_snooze_error = "";
+        self.snapshot.sidebar_custom_snooze_calendar_open = false;
+        self.snapshot.sidebar_custom_snooze_pending = false;
+        if (self.view.custom_snooze) |*state| {
+            self.snapshot.sidebar_custom_snooze_mode = @tagName(state.mode);
+            self.snapshot.sidebar_custom_snooze_date = state.date.slice();
+            self.snapshot.sidebar_custom_snooze_time = state.time.slice();
+            self.snapshot.sidebar_custom_snooze_amount = state.amount.slice();
+            self.snapshot.sidebar_custom_snooze_unit = @tagName(state.unit);
+            self.snapshot.sidebar_custom_snooze_error = state.error_bytes[0..state.error_len];
+            self.snapshot.sidebar_custom_snooze_calendar_open = state.calendar_open;
+            self.snapshot.sidebar_custom_snooze_pending = state.pending;
+        }
         self.snapshot.effort_open = self.view.effort_open;
         const sidebar_bounds = [_]c.SDL_FRect{ self.view.search_bounds, self.view.scope_bounds };
         for (sidebar_bounds, 0..) |bounds, index| {
-            self.snapshot.sidebar_targets[index] = .{ .id = if (index == 0) "sidebar.search" else "sidebar.scope", .role = if (index == 0) "textbox" else "button", .key = "", .enabled = self.view.custom_root == null and bounds.w > 0 and bounds.h > 0, .pointer_bounds = .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } };
+            self.snapshot.sidebar_targets[index] = .{ .id = if (index == 0) "sidebar.search" else "sidebar.scope", .role = if (index == 0) "textbox" else "button", .key = "", .enabled = self.view.custom_root == null and !self.view.sidebar_collapsed and self.view.sidebar_menu_thread.len == 0 and !self.view.scope_open and !self.view.setup_open and !self.view.workflow_open and bounds.w > 0 and bounds.h > 0, .pointer_bounds = .{ @intFromFloat(bounds.x), @intFromFloat(bounds.y), @intFromFloat(bounds.w), @intFromFloat(bounds.h) } };
         }
         self.snapshot.scope_targets = @splat(.{ .enabled = false });
         for (0..self.view.project_count + 1) |index| {
@@ -755,12 +826,37 @@ pub const App = struct {
         self.snapshot.thread_projects = @splat("");
         self.snapshot.thread_branches = @splat("");
         self.snapshot.thread_run_states = @splat("");
+        self.snapshot.thread_revisions = @splat(0);
+        self.snapshot.thread_pinned = @splat(false);
+        self.snapshot.thread_can_snooze = @splat(false);
+        self.snapshot.thread_settled = @splat(false);
+        self.snapshot.thread_snoozed_until = @splat(0);
+        self.snapshot.thread_sort_order = @splat(0);
+        self.snapshot.thread_archived = @splat(false);
+        self.snapshot.thread_can_archive = @splat(false);
+        self.snapshot.thread_can_delete = @splat(false);
         for (self.view.threads[0..self.view.thread_count], 0..) |*entry, index| {
             self.snapshot.thread_labels[index] = entry.label[0..entry.len];
             self.snapshot.thread_projects[index] = entry.project_id.slice();
             self.snapshot.thread_branches[index] = entry.branch.slice();
             self.snapshot.thread_run_states[index] = @tagName(entry.run_status);
+            self.snapshot.thread_revisions[index] = entry.revision;
+            self.snapshot.thread_pinned[index] = entry.pinned;
+            self.snapshot.thread_can_snooze[index] = entry.can_snooze;
+            self.snapshot.thread_settled[index] = entry.settled;
+            self.snapshot.thread_snoozed_until[index] = entry.snoozed_until;
+            self.snapshot.thread_sort_order[index] = entry.sort_order;
+            self.snapshot.thread_archived[index] = entry.archived;
+            self.snapshot.thread_can_archive[index] = entry.can_archive;
+            self.snapshot.thread_can_delete[index] = entry.can_delete;
         }
+        self.snapshot.sidebar_archived = self.view.sidebar_archived;
+        self.snapshot.sidebar_lifecycle_confirm_open = self.view.sidebarLifecycleConfirmOpen();
+        self.snapshot.sidebar_lifecycle_confirm_thread = if (self.view.sidebar_lifecycle.confirming) |id| id.slice() else "";
+        self.snapshot.sidebar_lifecycle_pending = self.view.sidebarLifecyclePending();
+        self.snapshot.sidebar_lifecycle_error = self.view.sidebar_lifecycle.error_bytes[0..self.view.sidebar_lifecycle.error_len];
+        self.snapshot.sidebar_undo_available = self.view.sidebar_lifecycle.undo != null;
+        self.snapshot.sidebar_undo_label = if (self.view.sidebar_lifecycle.undo) |undo| undo.label[0..undo.label_len] else "";
         self.snapshot.selected_runtime = "";
         self.snapshot.selected_provider = "";
         self.snapshot.selected_model = "";
@@ -771,6 +867,18 @@ pub const App = struct {
             self.snapshot.selected_provider = selected.model_provider.slice();
             self.snapshot.selected_model = selected.model_id.slice();
             self.snapshot.selected_effort = selected.effort.slice();
+        }
+        if (self.view.customSnoozeOpen()) {
+            self.snapshot.editor_focused = false;
+            // The modal publishes its own painted targets through the native
+            // navigation ledger. Disable every covered base snapshot target.
+            inline for (std.meta.fields(automation.Snapshot)) |field| {
+                if (field.type == automation.Target) {
+                    @field(self.snapshot, field.name).enabled = false;
+                } else if (@typeInfo(field.type) == .array and @typeInfo(field.type).array.child == automation.Target) {
+                    for (&@field(self.snapshot, field.name)) |*target| target.enabled = false;
+                }
+            }
         }
         if (self.live) |live| {
             // Explicit automation only. Fixed storage, after measured present,
@@ -960,10 +1068,73 @@ const LuaBridge = struct {
 /// One query, one mutation, one parse and one visible-tile request at a time.
 /// Every borrowed output is consumed/copied before drain storage is reused.
 const Conversation = struct {
+    const SidebarState = struct {
+        version: u8 = 1,
+        selected_thread: []const u8 = "",
+        scope_project: []const u8 = "",
+        collapsed: bool = false,
+        width: ?f32 = null,
+        working_shelf: bool = false,
+        expanded: [3]bool = @splat(false),
+
+        fn capture(view: *const Coding) SidebarState {
+            return .{ .selected_thread = view.active_thread.slice(), .scope_project = view.scope_project.slice(), .collapsed = view.sidebar_collapsed, .width = view.sidebar_width_override, .working_shelf = view.sidebar_working_shelf, .expanded = view.sidebar_shelf_expanded };
+        }
+        fn decode(bytes: []const u8, allocator: std.mem.Allocator) !SidebarState {
+            if (bytes.len > 4096) return error.InvalidSidebarState;
+            const state = try types.decode(SidebarState, bytes, allocator);
+            if (state.version != 1 or state.selected_thread.len > 256 or state.scope_project.len > 256 or
+                !std.unicode.utf8ValidateSlice(state.selected_thread) or !std.unicode.utf8ValidateSlice(state.scope_project)) return error.InvalidSidebarState;
+            for (state.selected_thread) |byte| if (std.ascii.isControl(byte)) return error.InvalidSidebarState;
+            for (state.scope_project) |byte| if (std.ascii.isControl(byte)) return error.InvalidSidebarState;
+            // The viewport/layout clamps a finite preferred width. The byte
+            // limit on this record is unrelated to physical display size.
+            if (state.width) |width| if (!std.math.isFinite(width) or width < 0) return error.InvalidSidebarState;
+            return state;
+        }
+        fn restore(self: SidebarState, view: *Coding) !Id {
+            view.scope_project = if (self.scope_project.len == 0) .{} else try Id.init(self.scope_project);
+            view.sidebar_collapsed = self.collapsed;
+            view.sidebar_width_override = self.width;
+            view.sidebar_working_shelf = self.working_shelf;
+            view.sidebar_shelf_expanded = self.expanded;
+            return if (self.selected_thread.len == 0) .{} else try Id.init(self.selected_thread);
+        }
+    };
     const PendingCommand = struct { ticket: types.Ticket, kind: CommandKind, draft_revision: u64, id: [32]u8 };
+    const SidebarPending = struct { id: Id, revision: u64, advance: bool = false, next: Id = .{}, next_project: Id = .{}, custom: bool = false, lifecycle: ?@import("ui/sidebar_lifecycle.zig").Action = null, undo: ?Coding.SidebarUndoOperation = null };
+    const SidebarPlan = struct { id: Id, revision: u64, action: Coding.SidebarAction, deadline: i64 };
+    const ThreadCursor = struct {
+        bytes: [1024]u8 = undefined,
+        len: usize = 0,
+        fn init(value: []const u8) !ThreadCursor {
+            if (value.len == 0 or value.len > 1024) return error.InvalidThreadCursor;
+            var result: ThreadCursor = .{};
+            @memcpy(result.bytes[0..value.len], value);
+            result.len = value.len;
+            return result;
+        }
+        fn slice(self: *const ThreadCursor) []const u8 {
+            return self.bytes[0..self.len];
+        }
+    };
     allocator: std.mem.Allocator,
     io: std.Io,
     host: *domain.Host,
+    sidebar_state_key: [64]u8 = undefined,
+    sidebar_state_loaded: bool = false,
+    sidebar_load_ticket: ?types.Ticket = null,
+    sidebar_save_ticket: ?types.Ticket = null,
+    sidebar_state_bytes: [4096]u8 = undefined,
+    sidebar_state_len: usize = 0,
+    sidebar_route_validated: bool = false,
+    sidebar_validated_route: Id = .{},
+    sidebar_pending: ?SidebarPending = null,
+    sidebar_plan: ?SidebarPlan = null,
+    custom_snooze_request: ?Coding.CustomSnoozeRequest = null,
+    lifecycle_request: ?Coding.SidebarLifecycleRequest = null,
+    sidebar_undo_operation: ?Coding.SidebarUndoOperation = null,
+    rename_followup: ?Coding.RenameFollowup = null,
     worker: *presentation.Worker,
     wake: *Wake,
     workspace_root: []u8,
@@ -999,7 +1170,8 @@ const Conversation = struct {
     /// Cursor retained after the resident thread-card budget is full. Search
     /// can advance through bounded Host pages without growing the UI arrays.
     thread_page_snapshot: ?types.SnapshotId = null,
-    thread_page_cursor: ?Id = null,
+    thread_page_cursor: ?ThreadCursor = null,
+    thread_page_sidebar_order: bool = true,
     thread_page_anchor: ?Id = null,
     create_thread_after_workspace: bool = false,
     run: Id = .{},
@@ -1517,6 +1689,10 @@ const Conversation = struct {
     }
     fn navigateWorkspace(self: *Conversation, app: *App, navigation: Coding.Navigation) !void {
         if (!app.view.navigation_enabled) return error.WorkspaceBusy;
+        try self.applyWorkspaceNavigation(app, navigation);
+    }
+
+    fn applyWorkspaceNavigation(self: *Conversation, app: *App, navigation: Coding.Navigation) !void {
         if (std.meta.activeTag(navigation) == .new_thread or std.meta.activeTag(navigation) == .new_project) {
             var available = false;
             for (app.view.retained) |slot| if (slot.editor == null) {
@@ -1548,6 +1724,22 @@ const Conversation = struct {
                 if (index >= app.view.thread_count) return;
                 self.project = app.view.threads[index].project_id;
                 try self.selectThread(app, app.view.threads[index].id);
+            },
+            .sidebar => |operation| {
+                if (operation.index >= app.view.thread_count) return error.NoThread;
+                const entry = app.view.threads[operation.index];
+                if (entry.id.len == 0 or entry.revision == 0) return error.NoThread;
+                try self.beginSidebar(app, entry.id, entry.revision, operation.action, operation.snoozed_until);
+                if (self.sidebar_pending) |*pending| switch (operation.action) {
+                    .pin, .unpin, .settle, .unsettle, .snooze, .wake => pending.undo = .{ .metadata = .{ .id = entry.id, .pinned = entry.pinned, .settled = entry.settled, .snoozed_until = entry.snoozed_until, .sort_order = entry.sort_order } },
+                    else => {},
+                };
+            },
+            .rename => |operation| {
+                if (operation.index >= app.view.thread_count or operation.len == 0 or operation.len > operation.title.len) return error.NoThread;
+                const entry = app.view.threads[operation.index];
+                try self.submit(.sidebar_title, .{ .thread = .{ .value = entry.id.slice() } }, .{ .revision = entry.revision }, .{ .thread_title_set = .{ .title = operation.title[0..operation.len] } }, 0);
+                self.sidebar_pending = .{ .id = entry.id, .revision = entry.revision };
             },
             .search_more => {
                 if (self.thread_page_cursor == null and self.thread_page_anchor == null) {
@@ -1587,10 +1779,102 @@ const Conversation = struct {
         }
     }
 
+    fn sidebarPayload(action: Coding.SidebarAction, deadline: i64) types.Payload {
+        return switch (action) {
+            .pin => .{ .thread_sidebar_set = .{ .pinned = true, .settled = false, .clear_snooze = true } },
+            .unpin => .{ .thread_sidebar_set = .{ .pinned = false } },
+            .settle => .{ .thread_sidebar_set = .{ .settled = true, .pinned = false, .clear_snooze = true } },
+            .unsettle => .{ .thread_sidebar_set = .{ .settled = false } },
+            .snooze => .{ .thread_sidebar_set = .{ .snoozed_until = deadline } },
+            .wake => .{ .thread_sidebar_set = .{ .clear_snooze = true } },
+            .move_up => .{ .thread_sidebar_move = .{ .direction = .up } },
+            .move_down => .{ .thread_sidebar_move = .{ .direction = .down } },
+        };
+    }
+
+    fn lifecyclePayload(action: @import("ui/sidebar_lifecycle.zig").Action) types.Payload {
+        return switch (action) {
+            .archive => .{ .thread_archive = {} },
+            .restore => .{ .thread_restore = {} },
+            .delete => .{ .thread_delete = {} },
+        };
+    }
+
+    fn submitLifecycle(self: *Conversation, id: Id, revision: u64, action: @import("ui/sidebar_lifecycle.zig").Action) !void {
+        try self.submit(.sidebar, .{ .thread = .{ .value = id.slice() } }, .{ .revision = revision }, lifecyclePayload(action), 0);
+        self.sidebar_pending = .{ .id = id, .revision = revision, .lifecycle = action };
+    }
+
+    fn submitSidebar(self: *Conversation, id: Id, revision: u64, action: Coding.SidebarAction, deadline: i64) !void {
+        try self.submit(.sidebar, .{ .thread = .{ .value = id.slice() } }, .{ .revision = revision }, sidebarPayload(action, deadline), 0);
+        self.sidebar_pending = .{ .id = id, .revision = revision };
+    }
+
+    fn beginSidebar(self: *Conversation, app: *App, id: Id, revision: u64, action: Coding.SidebarAction, deadline: i64) !void {
+        // Capture the successor before parking changes pin/order partitioning.
+        // The Host scans the root index; the resident page is not authoritative.
+        if (id.eql(self.thread.slice()) and (action == .settle or action == .snooze)) {
+            self.sidebar_plan = .{ .id = id, .revision = revision, .action = action, .deadline = deadline };
+            errdefer self.sidebar_plan = null;
+            try self.ask(.sidebar_next, .{ .thread_sidebar_next = .{ .canonical_root = self.workspace_root, .project = if (app.view.scope_project.len != 0) .{ .value = app.view.scope_project.slice() } else null, .after = .{ .value = id.slice() } } });
+        } else try self.submitSidebar(id, revision, action, deadline);
+    }
+
+    fn beginCustomSnooze(self: *Conversation, request: Coding.CustomSnoozeRequest) !void {
+        if (self.query != null or self.command != null or self.unknown_send != null) return error.WorkspaceBusy;
+        self.custom_snooze_request = request;
+        errdefer self.custom_snooze_request = null;
+        try self.ask(.custom_snooze, .{ .thread = .{ .value = request.id.slice() } });
+    }
+
+    fn beginLifecycle(self: *Conversation, request: Coding.SidebarLifecycleRequest) !void {
+        if (self.query != null or self.command != null or self.unknown_send != null) return error.WorkspaceBusy;
+        self.lifecycle_request = request;
+        errdefer self.lifecycle_request = null;
+        try self.ask(.lifecycle, .{ .thread = .{ .value = request.id.slice() } });
+    }
+
+    fn beginSidebarUndo(self: *Conversation, app: *App, operation: Coding.SidebarUndoOperation) !void {
+        switch (operation) {
+            .restore => |restore| {
+                const request: Coding.SidebarLifecycleRequest = .{ .id = restore.id, .action = .restore };
+                try self.beginLifecycle(request);
+                self.sidebar_pending = .{ .id = restore.id, .revision = 0, .undo = operation };
+            },
+            .metadata => |metadata| {
+                self.sidebar_undo_operation = operation;
+                try self.ask(.sidebar_undo, .{ .thread = .{ .value = metadata.id.slice() } });
+                _ = app;
+            },
+        }
+    }
+
+    fn applyRenameFollowup(self: *Conversation, app: *App, followup: Coding.RenameFollowup) !void {
+        switch (followup) {
+            // The row can move or leave the resident page during the title
+            // write. Fresh thread projection resolves project and workspace.
+            .thread => |id| try self.selectThread(app, id),
+            .new_thread => try self.applyWorkspaceNavigation(app, .new_thread),
+            .new_project => try self.applyWorkspaceNavigation(app, .new_project),
+            .sidebar => |operation| {
+                self.rename_followup = followup;
+                errdefer self.rename_followup = null;
+                try self.ask(.rename_followup, .{ .thread = .{ .value = operation.id.slice() } });
+            },
+            .edit_active_title => {
+                if (app.view.active_thread.len == 0) return error.NoThread;
+                self.rename_followup = followup;
+                errdefer self.rename_followup = null;
+                try self.ask(.rename_followup, .{ .thread = .{ .value = app.view.active_thread.slice() } });
+            },
+        }
+    }
+
     fn selectThread(self: *Conversation, app: *App, id: Id) !void {
         const changed_thread = app.view.active_thread.len != 0 and !app.view.active_thread.eql(id.slice());
         try app.view.selectThread(id);
         self.thread = id;
+        self.sidebar_route_validated = false;
         self.run = .{};
         self.run_state = null;
         app.view.send_diagnostic = .{};
@@ -1635,7 +1919,8 @@ const Conversation = struct {
 
     fn cardRunStatus(state: types.RunState) Coding.RunStatus {
         return switch (state) {
-            .queued, .starting, .streaming, .awaiting_question, .cancel_requested => .running,
+            .queued, .starting, .streaming, .cancel_requested => .running,
+            .awaiting_question => .question,
             .awaiting_approval => .approval,
             .failed => .failed,
             .interrupted => .interrupted,
@@ -1689,6 +1974,22 @@ const Conversation = struct {
             entry.workspace_name = try displayId(std.fs.path.basename(if (row.workspace_root.len != 0) row.workspace_root else self.workspace_root));
             entry.branch = try displayId(row.workspace_branch);
             entry.run_status = if (row.latest_run_state) |state| cardRunStatus(state) else .idle;
+            entry.revision = row.revision;
+            entry.pinned = row.pinned;
+            entry.settled = row.settled;
+            entry.snoozed_until = row.snoozed_until;
+            entry.can_snooze = row.can_snooze;
+            entry.archived = row.archived;
+            entry.can_archive = row.can_archive;
+            entry.can_delete = row.can_delete;
+            entry.sort_order = row.sort_order;
+            entry.updated_at_ms = if (row.last_user_message_at_ms != 0) row.last_user_message_at_ms else row.updated_at_ms;
+            entry.runtime_kind = if (row.selection) |selection| try displayId(selection.runtime_kind) else .{};
+            entry.model_provider = if (row.selection) |selection| try displayId(selection.model_provider) else .{};
+            entry.model_id = if (row.selection) |selection| try displayId(selection.model_id) else .{};
+            const workspace_path = if (row.workspace_root.len <= entry.workspace_path.len) row.workspace_root else "";
+            @memcpy(entry.workspace_path[0..workspace_path.len], workspace_path);
+            entry.workspace_path_len = workspace_path.len;
             return;
         };
     }
@@ -1740,6 +2041,57 @@ const Conversation = struct {
     fn askHistory(self: *Conversation, app: *App) !void {
         if (self.prepareHistoryRestore(&app.view)) return self.askBlocks();
         return self.askMessages();
+    }
+
+    fn sidebarStateKey(root: []const u8) [64]u8 {
+        var digest: [32]u8 = undefined;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("spica-sidebar-v1\x00");
+        hash.update(root);
+        hash.final(&digest);
+        return std.fmt.bytesToHex(digest, .lower);
+    }
+
+    fn saveSidebarState(self: *Conversation, view: *Coding) void {
+        if (!self.sidebar_state_loaded or !self.sidebar_route_validated or self.sidebar_save_ticket != null or view.sidebar_resizing) return;
+        if (!std.mem.eql(u8, &sidebarStateKey(self.workspace_root), &self.sidebar_state_key)) return;
+        var buffer: [4096]u8 = undefined;
+        const bytes = types.encode(SidebarState.capture(view), &buffer) catch {
+            self.notice(view, "Sidebar settings exceed the saved-state limit.");
+            return;
+        };
+        if (std.mem.eql(u8, bytes, self.sidebar_state_bytes[0..self.sidebar_state_len])) return;
+        const ticket = self.host.savePresentation(&self.sidebar_state_key, bytes) catch |err| {
+            if (err != error.Full and err != error.Busy) self.notice(view, "Sidebar settings could not be saved.");
+            return;
+        };
+        // One asynchronous write at a time. The next pump after its receipt
+        // compares against the latest view, coalescing changes while in flight.
+        @memcpy(self.sidebar_state_bytes[0..bytes.len], bytes);
+        self.sidebar_state_len = bytes.len;
+        self.sidebar_save_ticket = ticket;
+    }
+
+    fn retainFinalSidebarState(self: *Conversation, view: *Coding) void {
+        if (!self.sidebar_state_loaded or !std.mem.eql(u8, &sidebarStateKey(self.workspace_root), &self.sidebar_state_key)) return;
+        var state = SidebarState.capture(view);
+        // Closing during navigation must not persist an unvalidated route.
+        // The most recent validated route still belongs to this workspace.
+        state.selected_thread = self.sidebar_validated_route.slice();
+        var buffer: [4096]u8 = undefined;
+        const bytes = types.encode(state, &buffer) catch |err| {
+            std.log.err("Final sidebar settings could not be encoded: {s}", .{@errorName(err)});
+            return;
+        };
+        self.host.retainFinalPresentation(&self.sidebar_state_key, bytes) catch |err| {
+            std.log.err("Final sidebar settings could not be retained: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn clearHistoryRecoveryNotice(view: *Coding) void {
+        if (view.notice) |notice_text| if (std.mem.eql(u8, notice_text, "History snapshot expired; restoring stable anchor")) {
+            view.notice = null;
+        };
     }
 
     fn recoveryQuery(self: *Conversation, kind: QueryKind) ?struct { kind: QueryKind, value: types.Query } {
@@ -1855,8 +2207,8 @@ const Conversation = struct {
         }
     }
 
-    const QueryKind = enum { send_receipt, capabilities, projects, workspaces, inspection_workspace, threads, cards, thread_search, thread, models, runtime_status, startup_status, runs, effects, approvals, questions, tasks, messages, blocks, content };
-    const CommandKind = enum { prompt_cleanup, followup_enqueue, followup_edit, followup_cancel, followup_order, attachment_add, attachment_remove, question, project, workspace, thread, title, selection, send, cancel, approval, configure, login, refresh_models };
+    const QueryKind = enum { send_receipt, capabilities, projects, startup_thread, rename_followup, sidebar_next, custom_snooze, lifecycle, sidebar_undo, workspaces, inspection_workspace, threads, cards, thread_search, thread, models, runtime_status, startup_status, runs, effects, approvals, questions, tasks, messages, blocks, content };
+    const CommandKind = enum { prompt_cleanup, followup_enqueue, followup_edit, followup_cancel, followup_order, attachment_add, attachment_remove, question, project, workspace, thread, title, sidebar_title, sidebar, selection, send, cancel, approval, configure, login, refresh_models };
     const page: types.Page = .{ .limit = 8, .max_bytes = 16 * 1024 };
 
     fn create(allocator: std.mem.Allocator, io: std.Io, host: *domain.Host, file: std.Io.File, wake: *Wake, workspace_root: []const u8) !*Conversation {
@@ -1886,7 +2238,13 @@ const Conversation = struct {
 
     fn ask(self: *Conversation, kind: QueryKind, value: types.Query) !void {
         std.debug.assert(self.query == null);
-        self.query = .{ .ticket = try self.host.query(value), .kind = kind, .search_revision = self.thread_search_revision };
+        var request = value;
+        if (request == .threads) {
+            if (request.threads.page.cursor == null) self.thread_page_sidebar_order = kind != .threads or self.thread.len != 0;
+            request.threads.sidebar_order = self.thread_page_sidebar_order;
+            if (self.workspace_root.len != 0) request.threads.canonical_root = self.workspace_root;
+        }
+        self.query = .{ .ticket = try self.host.query(request), .kind = kind, .search_revision = self.thread_search_revision };
     }
 
     fn resetThreadCards(self: *Conversation, view: *Coding) void {
@@ -1909,7 +2267,7 @@ const Conversation = struct {
         if (self.thread_search_active) {
             try self.ask(.thread_search, .{ .threads = .{ .page = page } });
         } else {
-            try self.ask(.threads, .{ .threads = .{ .page = page } });
+            try self.ask(.cards, .{ .threads = .{ .page = page } });
         }
     }
 
@@ -2202,12 +2560,35 @@ const Conversation = struct {
     }
 
     fn pump(self: *Conversation, app: *App) !void {
+        defer self.saveSidebarState(&app.view);
         var outputs: [8]types.Output = undefined;
         const drained = self.host.drain(&outputs, &self.drain_storage);
         if (drained.required_bytes_for_next != 0) return error.DomainOutputBudget;
         for (outputs[0..drained.output_count]) |output| {
             app.dirty = true;
             switch (output) {
+                .presentation_loaded => |value| {
+                    const pending = self.sidebar_load_ticket orelse return error.UnexpectedQueryTicket;
+                    if (pending.value != value.ticket.value) return error.UnexpectedQueryTicket;
+                    self.sidebar_load_ticket = null;
+                    self.sidebar_state_loaded = true;
+                    var route: Id = .{};
+                    if (value.value) |bytes| {
+                        var storage: [8192]u8 = undefined;
+                        var fixed = std.heap.FixedBufferAllocator.init(&storage);
+                        if (SidebarState.decode(bytes, fixed.allocator())) |saved| {
+                            route = try saved.restore(&app.view);
+                        } else |_| self.notice(&app.view, "Saved sidebar settings were invalid; using defaults.");
+                    }
+                    if (route.len != 0) {
+                        self.thread = route;
+                        try self.ask(.startup_thread, .{ .thread = .{ .value = route.slice() } });
+                    } else try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
+                },
+                .presentation_saved => |value| {
+                    if (self.sidebar_save_ticket == null or self.sidebar_save_ticket.?.value != value.ticket.value) return error.UnexpectedCommandReceipt;
+                    self.sidebar_save_ticket = null;
+                },
                 .command_receipt => |value| try self.receipt(app, value.ticket, value.receipt),
                 .query_page => |value| {
                     const pending = self.query orelse continue;
@@ -2244,8 +2625,37 @@ const Conversation = struct {
                 },
                 .unsubscribed => {},
                 .failure => |value| {
+                    if (self.sidebar_save_ticket) |ticket| if (ticket.value == value.ticket.value) {
+                        self.sidebar_save_ticket = null;
+                        // Retain attempted bytes to avoid a retry loop. The
+                        // next preference change or final shutdown retries.
+                        self.notice(&app.view, "Sidebar settings could not be saved. Conversation execution is still available.");
+                        continue;
+                    };
+                    if (self.sidebar_load_ticket) |ticket| if (ticket.value == value.ticket.value) {
+                        self.sidebar_load_ticket = null;
+                        self.sidebar_state_loaded = true;
+                        self.notice(&app.view, "Sidebar settings could not be restored; using defaults.");
+                        try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
+                        continue;
+                    };
                     if (self.query) |pending| if (pending.ticket.value == value.ticket.value) {
                         self.query = null;
+                        if (pending.kind == .rename_followup) self.rename_followup = null;
+                        if (pending.kind == .lifecycle) {
+                            self.lifecycle_request = null;
+                            app.view.finishSidebarLifecycle(@tagName(value.failure.reason));
+                        }
+                        if (pending.kind == .sidebar_next) self.sidebar_plan = null;
+                        if (pending.kind == .custom_snooze or (pending.kind == .sidebar_next and self.custom_snooze_request != null)) {
+                            self.custom_snooze_request = null;
+                            app.view.finishCustomSnooze(@tagName(value.failure.reason));
+                        }
+                        if (pending.kind == .startup_thread and value.failure.reason == .not_found) {
+                            self.thread = .{};
+                            try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
+                            continue;
+                        }
                         if (pending.kind == .thread_search) {
                             app.view.thread_search_busy = false;
                             app.view.search_more_available = false;
@@ -2284,6 +2694,11 @@ const Conversation = struct {
                         }
                     };
                     if (self.command) |pending| if (pending.ticket.value == value.ticket.value) {
+                        if (pending.kind == .sidebar) {
+                            if (self.sidebar_pending) |operation| if (operation.custom) app.view.finishCustomSnooze(@tagName(value.failure.reason));
+                            self.sidebar_pending = null;
+                        }
+                        if (pending.kind == .sidebar_title) _ = app.view.takeRenameFollowup();
                         switch (pending.kind) {
                             .followup_enqueue, .followup_edit, .followup_cancel, .followup_order => {
                                 app.view.workflow_uncertain = true;
@@ -2314,6 +2729,11 @@ const Conversation = struct {
                 },
             }
         }
+        if (self.sidebar_load_ticket != null) {
+            app.view.navigation_enabled = false;
+            app.view.can_send = false;
+            return;
+        }
         if (self.query == null and self.unknown_send != null and !self.receipt_lookup_attempted) {
             try self.ask(.send_receipt, .{ .command_receipt = .{ .value = &self.unknown_send.?.id } });
             self.receipt_lookup_attempted = true;
@@ -2342,6 +2762,7 @@ const Conversation = struct {
                 },
                 .tile => |*tile| if (self.worker_key) |key| {
                     if (std.meta.eql(tile.key, key)) {
+                        clearHistoryRecoveryNotice(&app.view);
                         self.history_retrying = false;
                         self.recovery_block = null;
                         if (self.history_first == null) self.history_first = .{ .key = tile.key, .cursor = .{ .block = tile.block.index, .byte = tile.start_byte }, .ordinal = self.blocks[self.block_index].ordinal };
@@ -2522,6 +2943,14 @@ const Conversation = struct {
         };
         if (workflow_command and (!self.workflow_pending.thread.eql(self.thread.slice()) or !self.workflow_pending.run.eql(self.run.slice()))) return error.StaleWorkflowReceipt;
         if (value.outcome == .rejected) {
+            if (pending.kind == .sidebar or pending.kind == .sidebar_title) {
+                if (self.sidebar_pending) |operation| if (operation.custom) app.view.finishCustomSnooze(if (value.reason) |reason| rejectionMessage(reason) else "Snooze was rejected. Your selection is retained.");
+                if (self.sidebar_pending) |operation| if (operation.lifecycle != null) app.view.finishSidebarLifecycle(if (value.reason) |reason| rejectionMessage(reason) else "Sidebar lifecycle action was rejected. Your selection is retained.");
+                if (pending.kind == .sidebar_title) _ = app.view.takeRenameFollowup();
+                self.sidebar_pending = null;
+                app.view.thread_search_revision +%= 1;
+                self.thread_search_started = true;
+            }
             if (workflow_command) {
                 app.view.workflow_error = if (value.reason) |reason| @tagName(reason) else "rejected";
                 app.view.workflowNotice(switch (pending.kind) {
@@ -2559,6 +2988,46 @@ const Conversation = struct {
             return;
         }
         switch (pending.kind) {
+            .sidebar, .sidebar_title => {
+                const operation = self.sidebar_pending orelse return error.UnexpectedCommandReceipt;
+                self.sidebar_pending = null;
+                if (operation.custom) app.view.finishCustomSnooze(null);
+                if (operation.lifecycle) |action| {
+                    app.view.finishSidebarLifecycle(null);
+                    if (action == .archive) app.view.thread_search_revision +%= 1;
+                    if (operation.undo) |undo| if (action == .archive) app.view.offerSidebarUndo(undo, "Archived");
+                }
+                if (operation.undo) |undo| switch (undo) {
+                    .restore => |restore| if ((operation.lifecycle == null or operation.lifecycle == .restore) and restore.navigate) {
+                        self.project = operation.next_project;
+                        try self.selectThread(app, restore.id);
+                    },
+                    else => {},
+                };
+                if (operation.undo) |undo| if (operation.lifecycle == null and undo != .restore) app.view.offerSidebarUndo(undo, "Sidebar updated");
+                for (value.committed_revisions) |committed| {
+                    if (committed.target == .thread and self.thread.eql(committed.target.thread.value)) self.thread_revision = committed.revision;
+                }
+                app.view.thread_search_revision +%= 1;
+                self.thread_search_started = true;
+                self.notice(&app.view, "Sidebar updated.");
+                if (operation.lifecycle) |action| if ((action == .archive or action == .delete) and operation.id.eql(self.thread.slice())) {
+                    try self.createThread();
+                };
+                if (operation.advance and operation.id.eql(self.thread.slice())) {
+                    if (operation.next.len != 0) {
+                        self.project = operation.next_project;
+                        try self.selectThread(app, operation.next);
+                    } else {
+                        // No eligible successor: keep the parked draft in the
+                        // view's retained store and open a fresh project chat.
+                        try self.createThread();
+                    }
+                }
+                if (pending.kind == .sidebar_title) if (app.view.takeRenameFollowup()) |followup| {
+                    self.applyRenameFollowup(app, followup) catch |err| self.notice(&app.view, @errorName(err));
+                };
+            },
             .title => {
                 app.view.title_editing = false;
                 app.view.title_select_all = false;
@@ -2695,6 +3164,132 @@ const Conversation = struct {
 
     fn consume(self: *Conversation, app: *App, kind: QueryKind, value: types.QueryPage) !void {
         switch (kind) {
+            .lifecycle => {
+                const request = self.lifecycle_request orelse return error.StaleLifecycleRequest;
+                self.lifecycle_request = null;
+                if (value.items.len != 1 or value.items[0] != .thread) {
+                    app.view.finishSidebarLifecycle("The thread is no longer available.");
+                    return;
+                }
+                const row = value.items[0].thread;
+                if (!std.mem.eql(u8, row.workspace_root, self.workspace_root) or (request.action == .archive and !row.can_archive) or (request.action == .delete and !row.can_delete)) {
+                    app.view.finishSidebarLifecycle("This lifecycle action is unavailable now.");
+                    return;
+                }
+                self.submitLifecycle(request.id, row.revision, request.action) catch |err| {
+                    app.view.finishSidebarLifecycle(@errorName(err));
+                    return;
+                };
+                if (request.action == .archive) self.sidebar_pending.?.undo = .{ .restore = .{ .id = request.id, .navigate = request.id.eql(self.thread.slice()) } };
+                if (request.action == .restore) {
+                    if (self.sidebar_undo_operation) |undo| self.sidebar_pending.?.undo = undo;
+                }
+            },
+            .sidebar_undo => {
+                const operation = self.sidebar_undo_operation orelse return error.StaleSidebarPlan;
+                self.sidebar_undo_operation = null;
+                if (value.items.len != 1 or value.items[0] != .thread) {
+                    app.view.notice = "Undo target is no longer available.";
+                    return;
+                }
+                const row = value.items[0].thread;
+                if (!std.mem.eql(u8, row.workspace_root, self.workspace_root)) return error.WrongCheckout;
+                switch (operation) {
+                    .metadata => |metadata| {
+                        if (!metadata.id.eql(row.id.value)) return error.StaleSidebarPlan;
+                        try self.submit(.sidebar, .{ .thread = .{ .value = metadata.id.slice() } }, .{ .revision = row.revision }, .{ .thread_sidebar_set = .{ .pinned = metadata.pinned, .settled = metadata.settled, .snoozed_until = metadata.snoozed_until, .sort_order = metadata.sort_order } }, 0);
+                        self.sidebar_pending = .{ .id = metadata.id, .revision = row.revision };
+                    },
+                    .restore => return error.StaleSidebarPlan,
+                }
+            },
+            .custom_snooze => {
+                const request = self.custom_snooze_request orelse return error.StaleSidebarPlan;
+                if (value.items.len != 1 or value.items[0] != .thread or !request.id.eql(value.items[0].thread.id.value)) {
+                    self.custom_snooze_request = null;
+                    app.view.finishCustomSnooze("The thread is no longer available.");
+                    return;
+                }
+                const row = value.items[0].thread;
+                if (!std.mem.eql(u8, row.workspace_root, self.workspace_root) or row.archived or !row.can_snooze) {
+                    self.custom_snooze_request = null;
+                    app.view.finishCustomSnooze("This thread cannot be snoozed now. Your selection is retained.");
+                    return;
+                }
+                self.beginSidebar(app, request.id, row.revision, .snooze, request.snoozed_until) catch |err| {
+                    self.custom_snooze_request = null;
+                    app.view.finishCustomSnooze(@errorName(err));
+                    return;
+                };
+                if (self.sidebar_pending) |*operation| {
+                    operation.custom = true;
+                    self.custom_snooze_request = null;
+                }
+            },
+            .sidebar_next => {
+                errdefer if (self.custom_snooze_request != null) {
+                    self.custom_snooze_request = null;
+                    app.view.finishCustomSnooze("Unable to resolve the next thread. Your selection is retained.");
+                };
+                const plan = self.sidebar_plan orelse return error.StaleSidebarPlan;
+                self.sidebar_plan = null;
+                if (!plan.id.eql(self.thread.slice())) {
+                    if (self.custom_snooze_request != null) app.view.finishCustomSnooze("The active thread changed. Retry your selection.");
+                    self.custom_snooze_request = null;
+                    return;
+                }
+                if (value.items.len > 1) return error.InvalidSidebarSuccessor;
+                var next: Id = .{};
+                var next_project: Id = .{};
+                if (value.items.len == 1) {
+                    if (value.items[0] != .thread) return error.InvalidSidebarSuccessor;
+                    const row = value.items[0].thread;
+                    if (!std.mem.eql(u8, row.workspace_root, self.workspace_root)) return error.WrongCheckout;
+                    if (!plan.id.eql(row.id.value)) {
+                        next = try Id.init(row.id.value);
+                        next_project = try Id.init(row.project.value);
+                    }
+                }
+                self.submitSidebar(plan.id, plan.revision, plan.action, plan.deadline) catch |err| {
+                    if (self.custom_snooze_request != null) app.view.finishCustomSnooze(@errorName(err));
+                    self.custom_snooze_request = null;
+                    self.notice(&app.view, @errorName(err));
+                    return;
+                };
+                self.sidebar_pending.?.advance = true;
+                self.sidebar_pending.?.next = next;
+                self.sidebar_pending.?.next_project = next_project;
+                if (self.custom_snooze_request != null) {
+                    self.sidebar_pending.?.custom = true;
+                    self.custom_snooze_request = null;
+                }
+            },
+            .rename_followup => {
+                const followup = self.rename_followup orelse return error.StaleRenameFollowup;
+                self.rename_followup = null;
+                if (value.items.len != 1 or value.items[0] != .thread) {
+                    self.notice(&app.view, "The thread is no longer available. Your active draft is retained.");
+                    return;
+                }
+                const row = value.items[0].thread;
+                if (!std.mem.eql(u8, row.workspace_root, self.workspace_root)) {
+                    self.notice(&app.view, "The thread belongs to another checkout. Your active draft is retained.");
+                    return;
+                }
+                switch (followup) {
+                    .sidebar => |operation| {
+                        if (!operation.id.eql(row.id.value)) return error.StaleRenameFollowup;
+                        self.beginSidebar(app, operation.id, row.revision, operation.action, operation.snoozed_until) catch |err| self.notice(&app.view, @errorName(err));
+                    },
+                    .edit_active_title => {
+                        if (!app.view.active_thread.eql(row.id.value)) return;
+                        try self.updateThreadCard(&app.view, row);
+                        self.thread_revision = row.revision;
+                        app.view.beginTitleEdit();
+                    },
+                    else => return error.StaleRenameFollowup,
+                }
+            },
             .send_receipt => {
                 const pending = self.unknown_send orelse return;
                 if (value.items.len != 1 or value.items[0] != .command_receipt) return error.UnexpectedCommandReceipt;
@@ -2856,13 +3451,46 @@ const Conversation = struct {
                     try self.ask(.capabilities, .{ .capabilities = {} });
                 }
             },
+            .startup_thread => {
+                if (value.items.len == 1 and !value.items[0].thread.archived and std.mem.eql(u8, value.items[0].thread.workspace_root, self.workspace_root)) {
+                    self.project = try Id.init(value.items[0].thread.project.value);
+                    self.workspace = try Id.init(value.items[0].thread.workspace.value);
+                    // Saved routing is checked against a fresh thread query,
+                    // never against the first bounded page of sidebar cards.
+                    self.startup_runtime = null;
+                    try self.selectThread(app, try Id.init(value.items[0].thread.id.value));
+                    self.resetThreadCards(&app.view);
+                    self.refresh = false;
+                    try self.ask(.cards, .{ .threads = .{ .page = page } });
+                } else {
+                    self.thread = .{};
+                    try self.ask(.projects, .{ .projects = .{ .limit = 16, .max_bytes = 16 * 1024 } });
+                }
+            },
             .projects => {
                 if (self.startup_probe_pending) {
                     self.startup_probe_pending = false;
                     try self.ask(.startup_status, .{ .runtime_status = {} });
                     return;
                 }
+                const key = sidebarStateKey(self.workspace_root);
                 for (value.items) |row| try addEntry(&app.view.projects, &app.view.project_count, row.project.id.value, row.project.display_name);
+                // Keep project residency bounded while consuming opaque pages;
+                // the sidebar owns at most its fixed project table and never
+                // materializes an unbounded catalog in UI memory.
+                if (value.next_cursor) |cursor| if (app.view.project_count < app.view.projects.len) {
+                    try self.ask(.projects, .{ .projects = .{ .limit = @min(page.limit, app.view.projects.len - app.view.project_count), .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = cursor } });
+                    return;
+                };
+                if (!self.sidebar_state_loaded or !std.mem.eql(u8, &key, &self.sidebar_state_key)) {
+                    self.sidebar_state_key = key;
+                    self.sidebar_state_loaded = false;
+                    self.sidebar_state_len = 0;
+                    self.sidebar_route_validated = false;
+                    self.sidebar_validated_route = .{};
+                    self.sidebar_load_ticket = try self.host.loadPresentation(&self.sidebar_state_key);
+                    return;
+                }
                 if (value.items.len == 0) try self.submit(.project, .absent, .absent, .{ .project_create = .{ .display_name = "Native coding workspace" } }, 0) else {
                     self.project = try Id.init(value.items[0].project.id.value);
                     try self.ask(.workspaces, .{ .workspaces = .{ .project = .{ .value = self.project.slice() }, .page = page } });
@@ -2921,18 +3549,18 @@ const Conversation = struct {
                 }
                 if (kind == .thread_search) {
                     self.thread_page_snapshot = value.snapshot_id;
-                    self.thread_page_cursor = if (value.next_cursor) |cursor| try Id.init(cursor) else null;
+                    self.thread_page_cursor = if (value.next_cursor) |cursor| try ThreadCursor.init(cursor) else null;
                     app.view.thread_search_busy = value.next_cursor != null and app.view.thread_count < app.view.threads.len;
                     app.view.search_more_available = value.next_cursor != null and !app.view.thread_search_busy;
                     // The next bounded page is scheduled once per pump, after
                     // receipt recovery, refresh and transcript projection.
                 } else if (value.next_cursor != null and app.view.thread_count < app.view.threads.len and self.card_rows_seen < 128) {
                     self.thread_page_snapshot = value.snapshot_id;
-                    self.thread_page_cursor = try Id.init(value.next_cursor.?);
+                    self.thread_page_cursor = try ThreadCursor.init(value.next_cursor.?);
                     try self.ask(kind, .{ .threads = .{ .page = .{ .limit = page.limit, .max_bytes = page.max_bytes, .snapshot = value.snapshot_id, .cursor = value.next_cursor } } });
                 } else {
                     self.thread_page_snapshot = value.snapshot_id;
-                    self.thread_page_cursor = if (value.next_cursor) |cursor| try Id.init(cursor) else null;
+                    self.thread_page_cursor = if (value.next_cursor) |cursor| try ThreadCursor.init(cursor) else null;
                     self.thread_page_anchor = if (value.items.len != 0) try Id.init(value.items[value.items.len - 1].thread.id.value) else self.thread_page_anchor;
                     app.view.thread_search_busy = false;
                     app.view.search_more_available = self.thread_page_cursor != null;
@@ -2941,6 +3569,10 @@ const Conversation = struct {
                         try self.ask(.thread, .{ .thread = .{ .value = self.thread.slice() } });
                     } else if (self.thread.len != 0) {
                         try self.selectThread(app, self.thread);
+                        if (!self.thread_page_sidebar_order) {
+                            self.resetThreadCards(&app.view);
+                            try self.ask(.cards, .{ .threads = .{ .page = page } });
+                        }
                     } else try self.createThread();
                 }
             },
@@ -2963,7 +3595,10 @@ const Conversation = struct {
             .thread => {
                 if (value.items.len != 1) return error.MissingThread;
                 if (!std.mem.eql(u8, value.items[0].thread.workspace_root, self.workspace_root)) return error.WrongCheckout;
+                self.sidebar_route_validated = true;
+                self.sidebar_validated_route = self.thread;
                 self.project = try Id.init(value.items[0].thread.project.value);
+                app.view.active_project = self.project;
                 try self.updateThreadCard(&app.view, value.items[0].thread);
                 self.thread_revision = value.items[0].thread.revision;
                 self.workspace = try Id.init(value.items[0].thread.workspace.value);
@@ -3232,7 +3867,8 @@ test "ordinary text admission failure stays local and preserves draft and undo" 
     event.type = c.SDL_EVENT_TEXT_INPUT;
     event.text.text = "extra";
     try app.handle(event);
-    try std.testing.expectEqualStrings("TextTooLarge", app.view.notice.?);
+    try std.testing.expectEqualStrings("Text exceeds this editor's limit. Existing text retained.", app.view.notice.?);
+    try std.testing.expectEqualStrings("TextTooLarge", app.snapshot.last_admission_error.?);
     try std.testing.expectEqualSlices(u8, &full, app.view.editor.textBytes());
     try std.testing.expect(app.view.editor.redo());
     try std.testing.expectEqualStrings("retained", app.view.editor.textBytes());
@@ -3877,6 +4513,432 @@ test "thread cards own real titles and workspace metadata across refresh" {
     const full_branch = [_]u8{'b'} ** 255 ++ "é";
     try std.testing.expectEqual(@as(u16, 255), (try Conversation.displayId(full_branch)).len);
     try std.testing.expectEqual(@as(usize, 257), full_branch.len);
+}
+
+test "sidebar projection preserves provider timestamps and refuses truncated workspace paths" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/sidebar") };
+    var row: @FieldType(types.Row, "thread") = .{
+        .id = .{ .value = "thread" },
+        .revision = 9,
+        .project = .{ .value = "project" },
+        .workspace = .{ .value = "workspace" },
+        .session = null,
+        .selection = contract.fakeSelection(.{ .value = "workspace" }),
+        .workspace_root = "/" ++ "p" ** 1024,
+        .last_user_message_at_ms = 3000,
+        .updated_at_ms = 4000,
+    };
+    try conversation.updateThreadCard(&view, row);
+    try std.testing.expectEqual(@as(usize, 0), view.threads[0].workspace_path_len);
+    try std.testing.expectEqual(@as(i64, 3000), view.threads[0].updated_at_ms);
+    try std.testing.expectEqualStrings("fake", view.threads[0].runtime_kind.slice());
+    try std.testing.expectEqual(@as(u64, 9), view.threads[0].revision);
+    row.workspace_root = "/tmp/café";
+    row.last_user_message_at_ms = 0;
+    try conversation.updateThreadCard(&view, row);
+    try std.testing.expectEqualStrings(row.workspace_root, view.threads[0].workspace_path[0..view.threads[0].workspace_path_len]);
+    try std.testing.expectEqual(@as(i64, 4000), view.threads[0].updated_at_ms);
+}
+
+test "sidebar receipt updates active neighbor revision while retaining execution and Unicode draft" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    try app.view.editor.setText("Keep café 🎮 draft");
+    app.view.active_thread = try Id.init("active");
+    const command_id = [_]u8{'a'} ** 32;
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/sidebar-receipt") };
+    conversation.thread = try Id.init("active");
+    conversation.run = try Id.init("active-run");
+    conversation.project = try Id.init("active-project");
+    conversation.thread_revision = 7;
+    conversation.command = .{ .ticket = .{ .value = 42 }, .kind = .sidebar, .draft_revision = 0, .id = command_id };
+    conversation.sidebar_pending = .{ .id = try Id.init("background"), .revision = 3 };
+    const revisions = [_]types.CommittedRevision{
+        .{ .target = .{ .thread = .{ .value = "background" } }, .revision = 4 },
+        .{ .target = .{ .thread = .{ .value = "active" } }, .revision = 8 },
+    };
+    try conversation.receipt(&app, .{ .value = 42 }, .{ .command_id = .{ .value = &command_id }, .outcome = .accepted, .commit_sequence = 100, .committed_revisions = &revisions });
+    try std.testing.expectEqual(@as(u64, 8), conversation.thread_revision);
+    try std.testing.expectEqualStrings("active", conversation.thread.slice());
+    try std.testing.expectEqualStrings("active-run", conversation.run.slice());
+    try std.testing.expectEqualStrings("active-project", conversation.project.slice());
+    try std.testing.expectEqualStrings("Keep café 🎮 draft", app.view.editor.textBytes());
+    try std.testing.expect(conversation.command == null);
+    try std.testing.expect(conversation.sidebar_pending == null);
+    try std.testing.expect(conversation.thread_search_started);
+}
+
+test "sidebar action payloads promote pin and clear pin on settle without coupling snooze" {
+    const pin = Conversation.sidebarPayload(.pin, 0).thread_sidebar_set;
+    try std.testing.expect(pin.pinned.? and !pin.settled.? and pin.clear_snooze);
+    const settle = Conversation.sidebarPayload(.settle, 0).thread_sidebar_set;
+    try std.testing.expect(!settle.pinned.? and settle.settled.? and settle.clear_snooze);
+    const snooze = Conversation.sidebarPayload(.snooze, 5000).thread_sidebar_set;
+    try std.testing.expectEqual(@as(?i64, 5000), snooze.snoozed_until);
+    try std.testing.expect(snooze.pinned == null and snooze.settled == null and !snooze.clear_snooze);
+}
+
+test "active park snapshots its successor before command and navigates only after acceptance" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path);
+    const host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path[0..n] });
+    defer host.destroy();
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    app.view.active_thread = try Id.init("parked");
+    try app.view.editor.setText("Keep parked café 🎮");
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = host, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/park") };
+    conversation.thread = app.view.active_thread;
+    conversation.project = try Id.init("project-a");
+    conversation.run = try Id.init("parked-run");
+    conversation.thread_revision = 9;
+    try conversation.beginSidebar(&app, conversation.thread, 9, .settle, 0);
+    try std.testing.expect(conversation.command == null);
+    try std.testing.expectEqual(Conversation.QueryKind.sidebar_next, conversation.query.?.kind);
+    try std.testing.expect(conversation.sidebar_plan != null);
+    conversation.query = null;
+    // The successor is outside the resident cards and in a different project.
+    const candidate = [_]types.Row{.{ .thread = .{ .id = .{ .value = "next" }, .revision = 3, .project = .{ .value = "project-b" }, .workspace = .{ .value = "work-b" }, .workspace_root = "/tmp/park", .session = null } }};
+    try conversation.consume(&app, .sidebar_next, .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{}, .items = &candidate, .expires_at = 0 });
+    try std.testing.expectEqualStrings("parked", conversation.thread.slice());
+    try std.testing.expectEqualStrings("parked-run", conversation.run.slice());
+    try std.testing.expectEqualStrings("Keep parked café 🎮", app.view.editor.textBytes());
+    try std.testing.expect(conversation.sidebar_pending.?.advance);
+    const pending = conversation.command.?;
+    const revisions = [_]types.CommittedRevision{.{ .target = .{ .thread = .{ .value = "parked" } }, .revision = 10 }};
+    try conversation.receipt(&app, pending.ticket, .{ .command_id = .{ .value = &pending.id }, .outcome = .accepted, .commit_sequence = 1, .committed_revisions = &revisions });
+    try std.testing.expectEqualStrings("next", conversation.thread.slice());
+    try std.testing.expectEqualStrings("project-b", conversation.project.slice());
+    try std.testing.expect(conversation.run.len == 0);
+    try app.view.selectThread(try Id.init("parked"));
+    try std.testing.expectEqualStrings("Keep parked café 🎮", app.view.editor.textBytes());
+}
+
+test "rejected active park retains route run and exact draft" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    app.view.active_thread = try Id.init("active");
+    try app.view.editor.setText("Stay here é 🎮");
+    const command_id = [_]u8{'b'} ** 32;
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/park") };
+    conversation.thread = app.view.active_thread;
+    conversation.run = try Id.init("live-run");
+    conversation.command = .{ .ticket = .{ .value = 43 }, .kind = .sidebar, .draft_revision = 0, .id = command_id };
+    conversation.sidebar_pending = .{ .id = conversation.thread, .revision = 7, .advance = true, .next = try Id.init("next"), .next_project = try Id.init("other") };
+    try conversation.receipt(&app, .{ .value = 43 }, .{ .command_id = .{ .value = &command_id }, .outcome = .rejected, .reason = .revision_conflict, .commit_sequence = 1 });
+    try std.testing.expectEqualStrings("active", conversation.thread.slice());
+    try std.testing.expectEqualStrings("live-run", conversation.run.slice());
+    try std.testing.expectEqualStrings("Stay here é 🎮", app.view.editor.textBytes());
+    try std.testing.expect(conversation.sidebar_pending == null);
+}
+
+test "successor plan fails closed on foreign roots and abandons changed routes" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/park") };
+    conversation.thread = try Id.init("active");
+    const request: Conversation.SidebarPlan = .{ .id = conversation.thread, .revision = 2, .action = .snooze, .deadline = 9000 };
+    const candidate = [_]types.Row{.{ .thread = .{ .id = .{ .value = "foreign" }, .revision = 3, .project = .{ .value = "other" }, .workspace = .{ .value = "w" }, .workspace_root = "/tmp/foreign", .session = null } }};
+    const result: types.QueryPage = .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{}, .items = &candidate, .expires_at = 0 };
+    conversation.sidebar_plan = request;
+    try std.testing.expectError(error.WrongCheckout, conversation.consume(&app, .sidebar_next, result));
+    try std.testing.expect(conversation.command == null and conversation.sidebar_plan == null);
+    conversation.sidebar_plan = request;
+    conversation.thread = try Id.init("changed-route");
+    try conversation.consume(&app, .sidebar_next, result);
+    try std.testing.expect(conversation.command == null and conversation.sidebar_plan == null);
+}
+
+test "custom sidebar snooze resolves fresh inactive revision and closes only on acceptance" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path);
+    const host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path[0..n] });
+    defer host.destroy();
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    app.view.active_thread = try Id.init("active");
+    try app.view.editor.setText("Keep active 🎮 draft");
+    app.view.custom_snooze = try @import("ui/sidebar_snooze.zig").State.init(Coding.wallTimeMs());
+    app.view.custom_snooze_thread = try Id.init("background");
+    app.view.custom_snooze.?.mode = .duration;
+    app.view.custom_snooze.?.amount.set("1.5");
+    try std.testing.expect(app.view.custom_snooze.?.submit(Coding.wallTimeMs()));
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = host, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/custom") };
+    conversation.thread = app.view.active_thread;
+    conversation.run = try Id.init("active-run");
+    try conversation.beginCustomSnooze(app.view.takeCustomSnoozeRequest().?);
+    try std.testing.expectEqual(Conversation.QueryKind.custom_snooze, conversation.query.?.kind);
+    conversation.query = null;
+    const candidate = [_]types.Row{.{ .thread = .{ .id = .{ .value = "background" }, .revision = 31, .project = .{ .value = "p" }, .workspace = .{ .value = "w" }, .workspace_root = "/tmp/custom", .session = null, .can_snooze = true } }};
+    const result: types.QueryPage = .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{}, .items = &candidate, .expires_at = 0 };
+    try conversation.consume(&app, .custom_snooze, result);
+    try std.testing.expectEqual(@as(u64, 31), conversation.sidebar_pending.?.revision);
+    try std.testing.expect(conversation.sidebar_pending.?.custom);
+    try std.testing.expect(!conversation.sidebar_pending.?.advance);
+    try std.testing.expect(app.view.customSnoozePending());
+    const rejected = conversation.command.?;
+    try conversation.receipt(&app, rejected.ticket, .{ .command_id = .{ .value = &rejected.id }, .outcome = .rejected, .reason = .revision_conflict, .commit_sequence = 0 });
+    try std.testing.expect(app.view.customSnoozeOpen() and !app.view.customSnoozePending());
+    try std.testing.expectEqualStrings("1.5", app.view.custom_snooze.?.amount.slice());
+    try std.testing.expect(app.view.custom_snooze.?.error_len > 0);
+    try std.testing.expect(app.view.custom_snooze.?.submit(Coding.wallTimeMs()));
+    try conversation.beginCustomSnooze(app.view.takeCustomSnoozeRequest().?);
+    conversation.query = null;
+    try conversation.consume(&app, .custom_snooze, result);
+    const accepted = conversation.command.?;
+    try conversation.receipt(&app, accepted.ticket, .{ .command_id = .{ .value = &accepted.id }, .outcome = .accepted, .commit_sequence = 1 });
+    try std.testing.expect(!app.view.customSnoozeOpen());
+    try std.testing.expectEqualStrings("active", conversation.thread.slice());
+    try std.testing.expectEqualStrings("active-run", conversation.run.slice());
+    try std.testing.expectEqualStrings("Keep active 🎮 draft", app.view.editor.textBytes());
+}
+
+test "rename followup resolves fresh sidebar target revision without selecting it or reusing row index" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path);
+    const host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path[0..n] });
+    defer host.destroy();
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    app.view.active_thread = try Id.init("active");
+    try app.view.editor.setText("Retain active 🎮 draft");
+    app.view.thread_count = 1;
+    app.view.threads[0].id = try Id.init("unrelated-row");
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = host, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/fresh-sidebar") };
+    conversation.thread = app.view.active_thread;
+    conversation.run = try Id.init("active-run");
+    conversation.project = try Id.init("active-project");
+    conversation.rename_followup = .{ .sidebar = .{ .id = try Id.init("background-target"), .action = .settle } };
+    const rows = [_]types.Row{.{ .thread = .{ .id = .{ .value = "background-target" }, .revision = 19, .project = .{ .value = "background-project" }, .workspace = .{ .value = "workspace" }, .workspace_root = "/tmp/fresh-sidebar", .session = null } }};
+    try conversation.consume(&app, .rename_followup, .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{}, .items = &rows, .expires_at = 0 });
+    try std.testing.expect(conversation.rename_followup == null);
+    try std.testing.expectEqualStrings("background-target", conversation.sidebar_pending.?.id.slice());
+    try std.testing.expectEqual(@as(u64, 19), conversation.sidebar_pending.?.revision);
+    try std.testing.expectEqualStrings("active", conversation.thread.slice());
+    try std.testing.expectEqualStrings("active-run", conversation.run.slice());
+    try std.testing.expectEqualStrings("active-project", conversation.project.slice());
+    try std.testing.expectEqualStrings("Retain active 🎮 draft", app.view.editor.textBytes());
+    conversation.rename_followup = .edit_active_title;
+    const active = [_]types.Row{.{ .thread = .{ .id = .{ .value = "active" }, .revision = 21, .project = .{ .value = "active-project" }, .workspace = .{ .value = "workspace" }, .workspace_root = "/tmp/fresh-sidebar", .session = null, .title = "Fresh renamed title", .can_snooze = true } }};
+    try conversation.consume(&app, .rename_followup, .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{}, .items = &active, .expires_at = 0 });
+    try std.testing.expect(app.view.title_editing);
+    try std.testing.expectEqualStrings("Fresh renamed title", app.view.title_buffer[0..app.view.title_len]);
+    try std.testing.expectEqual(@as(u64, 21), conversation.thread_revision);
+    try std.testing.expectEqualStrings("Retain active 🎮 draft", app.view.editor.textBytes());
+    var found = false;
+    for (app.view.threads[0..app.view.thread_count]) |entry| if (entry.id.eql("active")) {
+        try std.testing.expect(entry.can_snooze);
+        found = true;
+    };
+    try std.testing.expect(found);
+}
+
+test "accepted rename releases stable route followup and rejection discards it" {
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    try app.view.editor.setText("outgoing café draft");
+    app.view.active_thread = try Id.init("old-active");
+    app.view.sidebar_rename_followup = .{ .thread = try Id.init("clicked-target") };
+    app.view.thread_count = 1;
+    app.view.threads[0].id = try Id.init("unrelated-after-reorder");
+    const command_id = [_]u8{'b'} ** 32;
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = undefined, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/rename-followup") };
+    conversation.thread = app.view.active_thread;
+    conversation.run = try Id.init("outgoing-run");
+    conversation.command = .{ .ticket = .{ .value = 42 }, .kind = .sidebar_title, .draft_revision = 0, .id = command_id };
+    conversation.sidebar_pending = .{ .id = try Id.init("background-renamed"), .revision = 3 };
+    try conversation.receipt(&app, .{ .value = 42 }, .{ .command_id = .{ .value = &command_id }, .outcome = .accepted, .commit_sequence = 9 });
+    try std.testing.expectEqualStrings("clicked-target", conversation.thread.slice());
+    try std.testing.expectEqualStrings("clicked-target", app.view.active_thread.slice());
+    try std.testing.expect(app.view.sidebar_rename_followup == null);
+    try std.testing.expectEqual(@as(usize, 0), app.view.editor.textBytes().len);
+    try app.view.selectThread(try Id.init("old-active"));
+    try std.testing.expectEqualStrings("outgoing café draft", app.view.editor.textBytes());
+    app.view.sidebar_rename_followup = .{ .thread = try Id.init("must-not-open") };
+    conversation.command = .{ .ticket = .{ .value = 43 }, .kind = .sidebar_title, .draft_revision = 0, .id = command_id };
+    conversation.sidebar_pending = .{ .id = try Id.init("background-renamed"), .revision = 3 };
+    try conversation.receipt(&app, .{ .value = 43 }, .{ .command_id = .{ .value = &command_id }, .outcome = .rejected, .reason = .revision_conflict, .commit_sequence = 10 });
+    try std.testing.expect(app.view.sidebar_rename_followup == null);
+    try std.testing.expectEqualStrings("clicked-target", conversation.thread.slice());
+    try std.testing.expectEqualStrings("outgoing café draft", app.view.editor.textBytes());
+}
+
+test "final sidebar capture saves latest preferences with only a validated workspace route" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path);
+    const host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path[0..n] });
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    view.active_thread = try Id.init("unvalidated-new-route");
+    view.sidebar_collapsed = true;
+    view.sidebar_width_override = 348;
+    view.sidebar_shelf_expanded = .{ true, false, true };
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = host, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/final-sidebar") };
+    conversation.sidebar_state_loaded = true;
+    conversation.sidebar_state_key = Conversation.sidebarStateKey(conversation.workspace_root);
+    conversation.sidebar_validated_route = try Id.init("validated-old-route");
+    conversation.retainFinalSidebarState(&view);
+    host.destroy();
+    var store = try @import("domain/store.zig").Store.open(std.testing.io, path[0..n]);
+    defer store.close() catch {};
+    const bytes = (try store.loadPresentation(std.testing.allocator, &conversation.sidebar_state_key)).?;
+    defer std.testing.allocator.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const state = try Conversation.SidebarState.decode(bytes, arena.allocator());
+    try std.testing.expectEqualStrings("validated-old-route", state.selected_thread);
+    try std.testing.expect(state.collapsed);
+    try std.testing.expectEqual(@as(?f32, 348), state.width);
+    try std.testing.expectEqualDeep([3]bool{ true, false, true }, state.expanded);
+}
+
+test "sidebar saved settings validate bounds and preserve script default width" {
+    var view = try Coding.init(std.testing.allocator);
+    defer view.deinit();
+    view.active_thread = try Id.init("selected-in-second-project");
+    view.scope_project = try Id.init("second-project");
+    view.sidebar_collapsed = true;
+    view.sidebar_working_shelf = true;
+    view.sidebar_shelf_expanded = .{ true, false, true };
+    var bytes: [4096]u8 = undefined;
+    const encoded = try types.encode(Conversation.SidebarState.capture(&view), &bytes);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const saved = try Conversation.SidebarState.decode(encoded, arena.allocator());
+    view.sidebar_width_override = 333;
+    view.active_thread = .{};
+    const route = try saved.restore(&view);
+    try std.testing.expectEqualStrings("selected-in-second-project", route.slice());
+    try std.testing.expectEqualStrings("second-project", view.scope_project.slice());
+    try std.testing.expect(view.sidebar_width_override == null);
+    try std.testing.expect(view.sidebar_collapsed and view.sidebar_working_shelf);
+    try std.testing.expectEqualDeep([3]bool{ true, false, true }, view.sidebar_shelf_expanded);
+    try std.testing.expectError(error.InvalidSidebarState, Conversation.SidebarState.decode("x" ** 4097, arena.allocator()));
+    try std.testing.expectError(error.InvalidSidebarState, Conversation.SidebarState.decode(try types.encode(Conversation.SidebarState{ .version = 2 }, &bytes), arena.allocator()));
+    try std.testing.expectError(error.InvalidSidebarState, Conversation.SidebarState.decode(try types.encode(Conversation.SidebarState{ .width = -1 }, &bytes), arena.allocator()));
+    try std.testing.expectError(error.InvalidSidebarState, Conversation.SidebarState.decode(try types.encode(Conversation.SidebarState{ .selected_thread = "bad\x00id" }, &bytes), arena.allocator()));
+    try std.testing.expectError(error.InvalidSidebarState, Conversation.SidebarState.decode(try types.encode(Conversation.SidebarState{ .scope_project = "bad\nproject" }, &bytes), arena.allocator()));
+    try std.testing.expectEqual(@as(?f32, 8192), (try Conversation.SidebarState.decode(try types.encode(Conversation.SidebarState{ .width = 8192 }, &bytes), arena.allocator())).width);
+    try std.testing.expectError(error.InvalidSidebarState, Conversation.SidebarState.decode(try types.encode(Conversation.SidebarState{ .selected_thread = "x" ** 257 }, &bytes), arena.allocator()));
+    try std.testing.expect(!std.mem.eql(u8, &Conversation.sidebarStateKey("/checkout/a"), &Conversation.sidebarStateKey("/checkout/b")));
+    view.notice = "History snapshot expired; restoring stable anchor";
+    Conversation.clearHistoryRecoveryNotice(&view);
+    try std.testing.expect(view.notice == null);
+    view.notice = "History snapshot expired again; navigate to retry";
+    Conversation.clearHistoryRecoveryNotice(&view);
+    try std.testing.expect(view.notice != null);
+    view.notice = "Keep meaningful errors";
+    Conversation.clearHistoryRecoveryNotice(&view);
+    try std.testing.expectEqualStrings("Keep meaningful errors", view.notice.?);
+}
+
+test "sidebar persistence coalesces in flight edits and validates restored routes" {
+    const Sink = struct {
+        host: *domain.Host,
+        event: std.Io.Event = .unset,
+        fn wake(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.event.set(std.testing.io);
+        }
+        fn next(self: *@This(), storage: []u8) !types.Output {
+            var output: [1]types.Output = undefined;
+            while (true) {
+                self.event.reset();
+                const result = self.host.drain(&output, storage);
+                if (result.output_count != 0) return output[0];
+                if (result.required_bytes_for_next != 0) return error.OutputTooLarge;
+                self.event.waitUncancelable(std.testing.io);
+            }
+        }
+    };
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try temporary.dir.realPath(std.testing.io, &path);
+    var sink: Sink = .{ .host = undefined };
+    sink.host = try domain.Host.create(std.testing.allocator, std.testing.io, .{ .state_directory = path[0..n], .wake = Sink.wake, .wake_context = &sink });
+    defer sink.host.destroy();
+    var app: App = undefined;
+    app.view = try Coding.init(std.testing.allocator);
+    defer app.view.deinit();
+    var conversation: Conversation = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = sink.host, .worker = undefined, .wake = undefined, .workspace_root = @constCast("/tmp/sidebar-route") };
+    conversation.sidebar_state_key = Conversation.sidebarStateKey(conversation.workspace_root);
+    conversation.sidebar_state_loaded = true;
+    conversation.sidebar_route_validated = true;
+    app.view.active_thread = try Id.init("first");
+    app.view.sidebar_resizing = true;
+    conversation.saveSidebarState(&app.view);
+    try std.testing.expect(conversation.sidebar_save_ticket == null);
+    app.view.sidebar_resizing = false;
+    conversation.saveSidebarState(&app.view);
+    const initial = conversation.sidebar_save_ticket.?;
+    app.view.active_thread = try Id.init("latest");
+    app.view.sidebar_width_override = 343;
+    conversation.saveSidebarState(&app.view);
+    try std.testing.expectEqual(initial.value, conversation.sidebar_save_ticket.?.value);
+    var storage_bytes: [65536]u8 = undefined;
+    try std.testing.expectEqual(initial.value, (try sink.next(&storage_bytes)).presentation_saved.ticket.value);
+    conversation.sidebar_save_ticket = null;
+    conversation.saveSidebarState(&app.view);
+    const latest = conversation.sidebar_save_ticket.?;
+    try std.testing.expect(latest.value > initial.value);
+    try std.testing.expectEqual(latest.value, (try sink.next(&storage_bytes)).presentation_saved.ticket.value);
+    conversation.sidebar_save_ticket = null;
+    conversation.saveSidebarState(&app.view);
+    try std.testing.expect(conversation.sidebar_save_ticket == null);
+    _ = try sink.host.loadPresentation(&conversation.sidebar_state_key);
+    const loaded = (try sink.next(&storage_bytes)).presentation_loaded.value.?;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const saved = try Conversation.SidebarState.decode(loaded, arena.allocator());
+    try std.testing.expectEqualStrings("latest", saved.selected_thread);
+    try std.testing.expectEqual(@as(?f32, 343), saved.width);
+    // A missing/deleted saved route takes the ordinary deterministic startup
+    // fallback. A route for another checkout must do the same.
+    const empty: types.QueryPage = .{ .snapshot_id = .{ .slot = 0, .generation = 1 }, .snapshot_position = .{}, .items = &.{}, .expires_at = 0 };
+    conversation.thread = try Id.init("missing");
+    try conversation.consume(&app, .startup_thread, empty);
+    try std.testing.expectEqual(Conversation.QueryKind.projects, conversation.query.?.kind);
+    try std.testing.expectEqual(@as(u16, 0), conversation.thread.len);
+    _ = try sink.next(&storage_bytes);
+    conversation.query = null;
+    var wrong_root = [_]types.Row{.{ .thread = .{ .id = .{ .value = "foreign" }, .revision = 1, .project = .{ .value = "p" }, .workspace = .{ .value = "w" }, .session = null, .workspace_root = "/other/checkout" } }};
+    var foreign_page = empty;
+    foreign_page.items = &wrong_root;
+    try conversation.consume(&app, .startup_thread, foreign_page);
+    try std.testing.expectEqual(Conversation.QueryKind.projects, conversation.query.?.kind);
+    try std.testing.expectEqual(@as(u16, 0), conversation.thread.len);
+    _ = try sink.next(&storage_bytes);
+}
+
+test "sidebar opaque cursors retain composite query identity beyond transcript ID capacity" {
+    var identity_buffer: [1024]u8 = undefined;
+    var cursor_buffer: [1024]u8 = undefined;
+    const id_value = "f" ** 32;
+    const query: types.Query = .{ .threads = .{ .sidebar_order = true, .anchor = .{ .value = id_value } } };
+    const identity = try types.encode(query, &identity_buffer);
+    const encoded = try types.encode(.{ .query = identity, .key = std.math.maxInt(i64), .order_pin = -1, .order_sort = std.math.minInt(i64), .order_id = id_value }, &cursor_buffer);
+    try std.testing.expect(encoded.len > @import("ui/transcript.zig").id_bytes);
+    const copied = try Conversation.ThreadCursor.init(encoded);
+    try std.testing.expectEqualStrings(encoded, copied.slice());
+    try std.testing.expectError(error.InvalidThreadCursor, Conversation.ThreadCursor.init("x" ** 1025));
 }
 
 test "native thread search keeps only bounded matches and rejects stale revisions" {

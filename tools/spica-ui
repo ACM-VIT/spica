@@ -9,6 +9,7 @@ coordinates, and records enough provenance to reproduce a failed action.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import math
 import json
@@ -40,6 +41,8 @@ EX_PROCESS = 17
 EX_BUILD = 18
 
 HISTORY_CASES = {"history-deep": (2, 130), "history-wide": (160, 2)}
+JOURNAL_FORMAT = 1
+MAX_JOURNAL_RECORD_BYTES = 4 * 1024 * 1024
 
 
 class DriverError(Exception):
@@ -189,6 +192,16 @@ class Session:
     def __init__(self, output: Path, data: dict[str, Any]):
         self.output = output
         self.data = data
+        self.data.setdefault("session_nonce", secrets.token_hex(16))
+        self._legacy_actions = self.data.pop("actions", [])
+        if (not isinstance(self.data["session_nonce"], str) or not self.data["session_nonce"]
+                or not isinstance(self._legacy_actions, list)):
+            raise DriverError("invalid action journal identity or legacy events", EX_STALE)
+        self._journal_ready = False
+        self._count = self.data.get("actions_count", 0)
+        self._offset = self.data.get("journal_bytes", 0)
+        self._tail = self.data.get("journal_tail_sha256", "")
+        self._checkpoint = self.data.get("journal_checkpoint", 0)
 
     @classmethod
     def load(cls, output: Path) -> "Session":
@@ -196,13 +209,188 @@ class Session:
         if not path.is_file():
             raise DriverError(f"no spica-ui session at {output}", EX_STALE)
         data = read_json(path)
-        if data.get("version") != 1 or not data.get("session_nonce"):
+        if type(data.get("version")) is not int or data["version"] != 1 or not data.get("session_nonce"):
             raise DriverError("invalid or stale spica-ui session manifest", EX_STALE)
-        return cls(output, data)
+        session = cls(output, data)
+        session._ensure_journal()
+        return session
+
+    @property
+    def journal_path(self) -> Path:
+        return self.output / "actions.jsonl"
+
+    def _record(self, entry: dict[str, Any], sequence: int, previous: str) -> bytes:
+        payload = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        record = {"version": JOURNAL_FORMAT, "session_nonce": self.data["session_nonce"],
+                  "sequence": sequence, "previous_sha256": previous,
+                  "entry_sha256": hashlib.sha256(payload).hexdigest(), "entry": entry}
+        raw = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        if len(raw) > MAX_JOURNAL_RECORD_BYTES:
+            raise DriverError("action journal record exceeds its bounded capacity", EX_ASSERTION)
+        return raw
+
+    def _records(self, source):
+        sequence, offset, previous = 0, 0, ""
+        while True:
+            raw = source.readline(MAX_JOURNAL_RECORD_BYTES + 1)
+            if not raw:
+                return
+            if len(raw) > MAX_JOURNAL_RECORD_BYTES:
+                raise DriverError("action journal contains an oversized record", EX_STALE)
+            if not raw.endswith(b"\n"):
+                # Only a trailing noncommitted record is recoverable. Complete
+                # malformed records, nonce changes, gaps and checksums fail closed.
+                yield None, offset, previous, raw
+                return
+            try:
+                record = json.loads(raw)
+                if not isinstance(record, dict):
+                    raise ValueError("action envelope is not an object")
+                entry = record["entry"]
+                payload = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+                if (type(record.get("version")) is not int or record["version"] != JOURNAL_FORMAT
+                        or type(record.get("sequence")) is not int
+                        or record["sequence"] != sequence + 1
+                        or record.get("session_nonce") != self.data["session_nonce"]
+                        or record.get("previous_sha256") != previous
+                        or record.get("entry_sha256") != hashlib.sha256(payload).hexdigest()
+                        or not isinstance(entry, dict) or not isinstance(entry.get("action"), str)
+                        or any(type(entry.get(key)) is not int for key in ("begin_unix_ns", "end_unix_ns"))
+                        or "before" not in entry or "after" not in entry):
+                    raise ValueError("invalid action envelope")
+            except (ValueError, KeyError, TypeError, UnicodeError) as error:
+                raise DriverError("action journal complete-record integrity failed", EX_STALE) from error
+            sequence += 1
+            offset += len(raw)
+            previous = hashlib.sha256(raw).hexdigest()
+            yield entry, offset, previous, None
+
+    def _ensure_journal(self) -> None:
+        if self._journal_ready:
+            return
+        if any(type(value) is not int or value < 0 for value in (self._count, self._offset, self._checkpoint)):
+            raise DriverError("invalid action journal checkpoint", EX_STALE)
+        if (type(self.data.get("journal_format", JOURNAL_FORMAT)) is not int
+                or self.data.get("journal_format", JOURNAL_FORMAT) != JOURNAL_FORMAT):
+            raise DriverError("unsupported action journal format", EX_STALE)
+        self.output.mkdir(parents=True, exist_ok=True)
+        if not self.journal_path.exists() and (self._count or self._offset):
+            raise DriverError("checkpointed action journal is missing", EX_STALE)
+        with self.journal_path.open("a+b", buffering=0) as journal:
+            fcntl.flock(journal, fcntl.LOCK_EX)
+            journal.seek(0)
+            count, offset, tail = 0, 0, ""
+            checkpoint_seen = self._count == 0 and self._offset == 0 and self._tail == ""
+            for entry, end, digest, torn in self._records(journal):
+                if torn is not None:
+                    if not checkpoint_seen:
+                        raise DriverError("torn action journal precedes its checkpoint", EX_STALE)
+                    digest = hashlib.sha256(torn).hexdigest()
+                    artifact = self.output / ("actions.torn-" + digest + ".bin")
+                    if artifact.exists():
+                        if artifact.read_bytes() != torn:
+                            raise DriverError("torn action artifact changed", EX_STALE)
+                    else:
+                        with artifact.open("xb") as saved:
+                            saved.write(torn)
+                            saved.flush()
+                            os.fsync(saved.fileno())
+                    # Preserve the exact tail before truncation. The fsynced
+                    # complete prefix remains the authoritative crash evidence.
+                    journal.truncate(offset)
+                    os.fsync(journal.fileno())
+                    self.data["journal_recovery"] = {"torn_artifact": str(artifact),
+                                                     "bytes": len(torn), "sha256": digest}
+                    break
+                if count < len(self._legacy_actions) and entry != redact(self._legacy_actions[count]):
+                    raise DriverError("legacy action journal prefix changed", EX_STALE)
+                count, offset, tail = count + 1, end, digest
+                if count == self._count:
+                    checkpoint_seen = (offset, tail) == (self._offset, self._tail)
+            if not checkpoint_seen:
+                raise DriverError("action journal checkpoint differs from durable records", EX_STALE)
+            # Legacy manifests are accepted for explicit receipts/recovery. A
+            # one-time append preserves their full redacted records; new sessions
+            # never keep the growing action history in their metadata or memory.
+            for entry in self._legacy_actions[count:]:
+                raw = self._record(redact(entry), count + 1, tail)
+                self._append(journal, raw)
+                count, offset, tail = count + 1, offset + len(raw), hashlib.sha256(raw).hexdigest()
+            if self._legacy_actions or not offset:
+                os.fsync(journal.fileno())
+            self._legacy_actions = []
+            self._count, self._offset, self._tail = count, offset, tail
+            self._journal_ready = True
+            self._sync_journal_metadata()
+
+    def _sync_journal_metadata(self) -> None:
+        self.data.update(journal_format=JOURNAL_FORMAT, actions_count=self._count,
+                         journal_bytes=self._offset, journal_tail_sha256=self._tail,
+                         journal_checkpoint=self._checkpoint)
+
+    def _check_writer(self, journal) -> None:
+        if os.fstat(journal.fileno()).st_size != self._offset:
+            raise DriverError("action journal changed under a stale writer", EX_STALE)
+        manifest = session_file(self.output)
+        if manifest.exists():
+            saved = read_json(manifest)
+            if (saved.get("journal_checkpoint", 0) != self._checkpoint
+                    or saved.get("session_nonce") != self.data["session_nonce"]):
+                raise DriverError("session metadata changed under a stale writer", EX_STALE)
+
+    def _save_locked(self) -> None:
+        self._sync_journal_metadata()
+        candidate = self._checkpoint + 1
+        atomic_json(session_file(self.output), redact({**self.data, "journal_checkpoint": candidate}))
+        self._checkpoint = candidate
+        self.data["journal_checkpoint"] = candidate
+
+    @staticmethod
+    def _append(journal, raw: bytes) -> None:
+        pending = memoryview(raw)
+        while pending:
+            written = journal.write(pending)
+            if written is None or written <= 0:
+                raise OSError("action journal write made no progress")
+            pending = pending[written:]
 
     def save(self) -> None:
-        atomic_json(session_file(self.output), redact(self.data))
-        atomic_json(self.output / "actions.json", redact(self.data.get("actions", [])))
+        self._ensure_journal()
+        with self.journal_path.open("a+b", buffering=0) as journal:
+            fcntl.flock(journal, fcntl.LOCK_EX)
+            self._check_writer(journal)
+            self._save_locked()
+
+    def materialize_actions(self) -> Path:
+        """Stream the compatibility JSON array without retaining action history."""
+        self._ensure_journal()
+        with self.journal_path.open("rb", buffering=0) as journal:
+            fcntl.flock(journal, fcntl.LOCK_SH)
+            self._check_writer(journal)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.output,
+                                                 prefix=".actions.json.", delete=False) as out:
+                    temporary = Path(out.name)
+                    out.write("[\n")
+                    count = 0
+                    for entry, _, _, torn in self._records(journal):
+                        if torn is not None:
+                            raise DriverError("action journal has an uncommitted tail", EX_STALE)
+                        if count:
+                            out.write(",\n")
+                        json.dump(entry, out, ensure_ascii=False, sort_keys=True, indent=2)
+                        count += 1
+                    if count != self._count:
+                        raise DriverError("action journal count changed during export", EX_STALE)
+                    out.write("\n]\n")
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.replace(temporary, self.output / "actions.json")
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        return self.output / "actions.json"
 
     @property
     def vd_session(self) -> Path:
@@ -254,9 +442,17 @@ class Session:
         entry = {"action": action, "begin_unix_ns": extra.pop("begin_unix_ns", now_ns()),
                  "end_unix_ns": now_ns(), "before": redact(before), "after": redact(after)}
         entry.update(redact(extra))
-        self.data.setdefault("actions", []).append(entry)
-        atomic_json(self.output / "actions.json", redact(self.data["actions"]))
-        self.save()
+        self._ensure_journal()
+        with self.journal_path.open("a+b", buffering=0) as journal:
+            fcntl.flock(journal, fcntl.LOCK_EX)
+            self._check_writer(journal)
+            raw = self._record(entry, self._count + 1, self._tail)
+            self._append(journal, raw)
+            os.fsync(journal.fileno())
+            self._count += 1
+            self._offset += len(raw)
+            self._tail = hashlib.sha256(raw).hexdigest()
+            self._save_locked()
 
 
 def target_groups(snapshot: dict[str, Any]) -> Iterable[dict[str, Any]]:
@@ -390,6 +586,8 @@ def offline_provider_argv(provider: str, output: Path) -> list[str]:
 def launch(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
     provider_argv = offline_provider_argv(args.provider, output)
+    metrics = getattr(args, "metrics_output", None)
+    metrics_argv = ["--metrics-output", str(Path(metrics).resolve())] if metrics else []
     if args.dry_run:
         binary = Path(args.binary).resolve() if args.binary else ROOT / "zig-out/bin/spica"
         plan = {"command": "launch", "private": args.private, "provider": args.provider,
@@ -397,7 +595,7 @@ def launch(args: argparse.Namespace) -> int:
                 "state_directory": str(output / "state"), "workspace": str(output / "workspace"),
                 "argv": [str(binary), *provider_argv, "--state-directory", str(output / "state"), "--workspace", str(output / "workspace"),
                          "--automation-live", str(output / "live.json"), "--automation-output", str(output / "final.json"),
-                         "--automation-session", "<fresh 32-digit process nonce>"]}
+                         "--automation-session", "<fresh 32-digit process nonce>", *metrics_argv]}
         print(json.dumps(plan, indent=2))
         return 0
     if not args.private:
@@ -468,7 +666,7 @@ def launch(args: argparse.Namespace) -> int:
         argv = [str(binary), *provider_argv, "--state-directory", str(state), "--workspace", str(workspace),
                 "--automation-live", str(output / "live.json"), "--automation-output", str(output / "final.json"),
                 "--automation-session", process_nonce,
-                "--quit-after-ms", str(args.quit_after_ms)]
+                "--quit-after-ms", str(args.quit_after_ms), *metrics_argv]
         launch_result = run_command(["vd", "run", private_path, "--bg", "--log", str(output / "app.log"), "--", *argv])
         launch_info = json.loads(launch_result.stdout)
         deadline = time.monotonic() + args.timeout
@@ -752,6 +950,7 @@ def close_app(session: Session, timeout: float, *, clean_desktop: bool = True) -
     finally:
         if clean_desktop:
             run_command(["vd", "clean", str(session.vd_session)], check=False)
+        session.materialize_actions()
 
 
 def prepare_workspace_fixture(workspace: Path) -> None:
@@ -1042,6 +1241,7 @@ def failure_packet(session: Session, error: Exception) -> None:
         capture(session, "failure.png")
     except (DriverError, OSError, ValueError):
         pass
+    session.materialize_actions()
 
 
 def scenario_followup_refusal(session: Session, args: argparse.Namespace) -> None:
@@ -1903,6 +2103,7 @@ def receipt(args: argparse.Namespace, session: Session | None = None) -> int:
         return 0
     if session is None:
         session = get_session(args)
+    session.materialize_actions()
     manifest = redact(session.data)
     receipt_data = {"version": 1, "status": "passed" if manifest.get("passed") else "incomplete",
                     "provider": manifest.get("provider"), "fixture_sha256": manifest.get("fixture_sha256"),
@@ -1910,14 +2111,29 @@ def receipt(args: argparse.Namespace, session: Session | None = None) -> int:
                     "history_fixture": manifest.get("history_fixture"),
                     "source_sha256": manifest.get("source_sha256"), "binary_sha256": manifest.get("binary_sha256"),
                     "input_method": manifest.get("input_method"), "expected_outcome": manifest.get("expected_outcome"),
-                    "actions": len(manifest.get("actions", [])),
+                    "actions": manifest.get("actions_count", 0),
                     "evidence": {"manifest": str(session.output / "session.json"),
                                  "actions": str(session.output / "actions.json"),
+                                 "action_journal": str(session.journal_path),
                                  "offline_protocol_events": str(session.output / f"{manifest.get('provider')}-account/{'orchestration-events.jsonl' if manifest.get('provider') == 'codex-orchestration-fixture' else 'workflow-events.jsonl'}") if manifest.get("provider") in {"codex-fixture", "codex-orchestration-fixture", "opencode-fixture"} else None,
                                  "screenshots": [str(path) for path in session.output.glob("*.png")]},
                     "limitations": manifest.get("limitations", [])}
     atomic_json(session.output / "receipt.json", receipt_data)
     print(json.dumps(receipt_data, indent=2))
+    return 0
+
+
+def materialize(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        print(json.dumps({"command": "materialize", "output": str(Path(args.output).resolve()),
+                          "recover_torn_tail": True, "desktop_input": False}, indent=2))
+        return 0
+    session = Session.load(Path(args.output).resolve())
+    session.save()
+    path = session.materialize_actions()
+    print(json.dumps({"actions": str(path), "actions_count": session.data["actions_count"],
+                      "journal": str(session.journal_path),
+                      "recovery": session.data.get("journal_recovery")}, indent=2))
     return 0
 
 
@@ -1944,6 +2160,7 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--width", type=int, default=1280)
     item.add_argument("--height", type=int, default=800)
     item.add_argument("--quit-after-ms", type=int, default=180000)
+    item.add_argument("--metrics-output", type=Path, help="opt in to bounded native frame/cache telemetry")
     item.add_argument("--scenario", default="manual")
     add_common(item)
 
@@ -2008,6 +2225,8 @@ def parser() -> argparse.ArgumentParser:
 
     item = commands.add_parser("receipt", help="write a redacted manifest/receipt")
     add_common(item)
+    item = commands.add_parser("materialize", help="recover complete journal records and export actions.json without desktop input")
+    add_common(item)
     return root
 
 
@@ -2040,6 +2259,8 @@ def main(argv: list[str] | None = None) -> int:
             return scenario(args)
         if args.command == "receipt":
             return receipt(args)
+        if args.command == "materialize":
+            return materialize(args)
         raise DriverError("unknown command", EX_USAGE)
     except DriverError as error:
         print(f"spica-ui: {error}", file=sys.stderr)

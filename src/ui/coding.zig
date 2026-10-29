@@ -1,6 +1,12 @@
 const std = @import("std");
 const c = @import("../native/bindings.zig").c;
 const Composer = @import("../text/composer.zig").Composer;
+const LineEdit = @import("../text/line_edit.zig").LineEdit;
+const LineView = @import("line_view.zig").LineView;
+const SidebarMenu = @import("sidebar_menu.zig");
+const SidebarTime = @import("../platform/sidebar_time.zig");
+const SidebarSnooze = @import("sidebar_snooze.zig");
+const SidebarLifecycle = @import("sidebar_lifecycle.zig");
 const EditorView = @import("editor_view.zig").EditorView;
 const LabelCache = @import("label_cache.zig").LabelCache;
 const widgets = @import("widgets.zig");
@@ -13,6 +19,9 @@ const presentation = @import("../content/presentation.zig");
 const contract = @import("../contract.zig");
 const attachment_text = @import("../text/attachments.zig");
 const script_api = @import("../script.zig");
+const fuzzy = @cImport({
+    @cInclude("fuzzy.h");
+});
 
 // Visual reference: T3 Code eb1510d (MIT), apps/marketing/src/assets/app-desktop.webp;
 // apps/web/src/components/sidebar/{SidebarThreadHeader,SidebarThreadRow}.tsx and
@@ -201,12 +210,64 @@ pub const View = struct {
     sidebar_bounds: c.SDL_FRect = zero_rect,
     sidebar_rows: c.SDL_FRect = zero_rect,
     sidebar_scroll: f32 = 0,
+    sidebar_collapsed: bool = false,
+    sidebar_width_override: ?f32 = null,
+    sidebar_window_width: f32 = 1280,
+    sidebar_resizing: bool = false,
+    sidebar_toggle_bounds: c.SDL_FRect = zero_rect,
+    sidebar_resize_bounds: c.SDL_FRect = zero_rect,
+    sidebar_empty_project_bounds: c.SDL_FRect = zero_rect,
+    sidebar_footer_bounds: [4]c.SDL_FRect = @splat(zero_rect),
+    sidebar_now_ms: i64 = 0,
+    sidebar_working_shelf: bool = false,
+    sidebar_shelf_expanded: [3]bool = @splat(false),
+    sidebar_shelf_bounds: [3]c.SDL_FRect = @splat(zero_rect),
+    sidebar_menu_thread: transcript.Id = .{},
+    sidebar_menu_bounds: c.SDL_FRect = zero_rect,
+    sidebar_menu_x: f32 = 0,
+    sidebar_menu_y: f32 = 0,
+    sidebar_menu_hover: usize = 0,
+    sidebar_menu_rows: [16]c.SDL_FRect = @splat(zero_rect),
+    sidebar_rename_thread: transcript.Id = .{},
+    sidebar_rename_followup: ?RenameFollowup = null,
+    sidebar_rename_buffer: [160]u8 = undefined,
+    sidebar_rename_len: usize = 0,
+    sidebar_rename_select_all: bool = false,
+    sidebar_rename_bounds: c.SDL_FRect = zero_rect,
+    sidebar_menu_count: usize = 0,
+    sidebar_menu_panel: SidebarMenu.Panel = .{},
+    sidebar_menu_mode: enum { main, copy, snooze } = .main,
+    sidebar_snooze_deadlines: [5]i64 = @splat(0),
+    sidebar_snooze_when: [5]SidebarTime.Text = @splat(.{}),
+    sidebar_snooze_count: usize = 0,
+    custom_snooze: ?SidebarSnooze.State = null,
+    custom_snooze_thread: transcript.Id = .{},
+    custom_snooze_focus: enum { date_mode, duration_mode, date, time, calendar, amount, unit, cancel, submit } = .date,
+    custom_snooze_bounds: [9]c.SDL_FRect = @splat(zero_rect),
+    custom_snooze_days: [42]c.SDL_FRect = @splat(zero_rect),
+    custom_snooze_month_bounds: [2]c.SDL_FRect = @splat(zero_rect),
+    custom_snooze_calendar_bounds: c.SDL_FRect = zero_rect,
+    sidebar_lifecycle: SidebarLifecycle.State = .{},
+    sidebar_archived: bool = false,
+    sidebar_archive_request: ?bool = null,
+    sidebar_undo_bounds: c.SDL_FRect = zero_rect,
+    sidebar_archive_bounds: c.SDL_FRect = zero_rect,
+    sidebar_undo_label: [32]u8 = @splat(0),
+    sidebar_undo_len: usize = 0,
+    sidebar_undo_request: ?SidebarLifecycle.UndoOperation = null,
+    sidebar_lifecycle_bounds: [2]c.SDL_FRect = @splat(zero_rect),
+    sidebar_action_bounds: [32][2]c.SDL_FRect = @splat(@splat(zero_rect)),
     search_bounds: c.SDL_FRect = zero_rect,
     search_clear_bounds: c.SDL_FRect = zero_rect,
     search_query: [160]u8 = undefined,
     search_len: usize = 0,
     search_focused: bool = false,
     search_select_all: bool = false,
+    search_edit: LineEdit = .{},
+    rename_edit: LineEdit = .{},
+    title_line_edit: LineEdit = .{},
+    line_view: LineView = .{},
+    line_drag: ?LineField = null,
     search_hover: usize = 0,
     scope_bounds: c.SDL_FRect = zero_rect,
     scope_all_bounds: c.SDL_FRect = zero_rect,
@@ -214,6 +275,7 @@ pub const View = struct {
     scope_project: transcript.Id = .{},
     scope_open: bool = false,
     scope_scroll: f32 = 0,
+    scope_hover: usize = 0,
     sidebar_hover: ?usize = null,
     new_project_bounds: c.SDL_FRect = zero_rect,
     new_thread_bounds: c.SDL_FRect = zero_rect,
@@ -313,7 +375,8 @@ pub const View = struct {
     search_more_bounds: c.SDL_FRect = zero_rect,
     const zero_rect: c.SDL_FRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     pub const picker_row_height: f32 = 48;
-    pub const sidebar_card_stride: f32 = 83;
+    pub const sidebar_card_stride: f32 = 82;
+    pub const sidebar_search_stride: f32 = 37;
 
     const SetupDraft = struct {
         fields: [4][512]u8 = undefined,
@@ -491,8 +554,25 @@ pub const View = struct {
     /// Sidebar navigation stays presentation-only. `search_more` asks the
     /// App/Host consumer for the next bounded page while retaining the draft,
     /// current thread and scroll state in this view.
-    pub const Navigation = union(enum) { new_project, new_thread, project: usize, thread: usize, search_more, search_reset };
-    pub const RunStatus = enum { idle, running, approval, failed, interrupted, unknown };
+    pub const SidebarAction = enum { pin, unpin, settle, unsettle, snooze, wake, move_up, move_down };
+    pub const RenameFollowup = union(enum) {
+        thread: transcript.Id,
+        new_thread,
+        new_project,
+        edit_active_title,
+        sidebar: struct { id: transcript.Id, action: SidebarAction, snoozed_until: i64 = 0 },
+    };
+    pub const Navigation = union(enum) {
+        new_project,
+        new_thread,
+        project: usize,
+        thread: usize,
+        search_more,
+        search_reset,
+        rename: struct { index: usize, title: [160]u8, len: usize },
+        sidebar: struct { index: usize, action: SidebarAction, snoozed_until: i64 = 0 },
+    };
+    pub const RunStatus = enum { idle, running, question, approval, failed, interrupted, unknown };
     pub const Entry = struct {
         id: transcript.Id = .{},
         label: [160]u8 = undefined,
@@ -502,6 +582,21 @@ pub const View = struct {
         workspace_name: transcript.Id = .{},
         branch: transcript.Id = .{},
         run_status: RunStatus = .idle,
+        can_snooze: bool = false,
+        runtime_kind: transcript.Id = .{},
+        model_provider: transcript.Id = .{},
+        model_id: transcript.Id = .{},
+        updated_at_ms: i64 = 0,
+        workspace_path: [1024]u8 = undefined,
+        workspace_path_len: usize = 0,
+        revision: u64 = 0,
+        pinned: bool = false,
+        settled: bool = false,
+        snoozed_until: i64 = 0,
+        sort_order: i64 = 0,
+        archived: bool = false,
+        can_archive: bool = false,
+        can_delete: bool = false,
     };
 
     pub const WorkflowAction = union(enum) { cleanup_prompt, add, remove: usize, enqueue, edit: usize, cancel: usize, up: usize, down: usize, question_choice: usize, question_submit };
@@ -713,6 +808,7 @@ pub const View = struct {
         for (self.followups[0..self.followup_count]) |item| self.allocator.free(item.content);
         for (&self.rich_tiles) |*tile| tile.deinit();
         self.custom_tile.deinit();
+        self.line_view.deinit();
         if (self.preedit_layout) |layout| c.spica_text_layout_release(layout);
         self.editor_view.deinit();
         self.labels.deinit();
@@ -744,6 +840,7 @@ pub const View = struct {
 
     fn releasePointer(self: *View) void {
         self.dragging = false;
+        self.sidebar_resizing = false;
         self.transcript_drag = null;
         _ = c.SDL_CaptureMouse(false);
     }
@@ -926,15 +1023,19 @@ pub const View = struct {
 
     /// Original source index, even when search/scope remove preceding cards.
     pub fn threadRowBounds(self: *const View, index: usize) c.SDL_FRect {
-        if (self.scope_open or index >= self.thread_count or !self.threadMatches(&self.threads[index])) return zero_rect;
+        if (self.custom_snooze != null or self.sidebar_collapsed or self.scope_open or self.sidebar_menu_thread.len != 0 or index >= self.thread_count or !self.threadMatches(&self.threads[index]) or !self.sidebarShelfVisible(&self.threads[index])) return zero_rect;
         return clippedRect(self.thread_bounds[index], self.sidebar_rows);
     }
 
     pub fn beginTitleEdit(self: *View) void {
         if (self.active_thread.len == 0) return;
+        self.sidebar_rename_thread = .{};
+        self.search_focused = false;
         for (self.threads[0..self.thread_count]) |*entry| if (entry.id.eql(self.active_thread.slice())) {
             self.title_len = entry.len;
             @memcpy(self.title_buffer[0..self.title_len], entry.label[0..entry.len]);
+            self.line_view.reset();
+            self.title_line_edit = .{};
             self.title_select_all = true;
             self.title_editing = true;
             self.title_action = null;
@@ -943,6 +1044,8 @@ pub const View = struct {
         if (self.active_thread_title_len != 0) {
             self.title_len = self.active_thread_title_len;
             @memcpy(self.title_buffer[0..self.title_len], self.active_thread_title[0..self.title_len]);
+            self.line_view.reset();
+            self.title_line_edit = .{};
             self.title_select_all = true;
             self.title_editing = true;
             self.title_action = null;
@@ -955,18 +1058,25 @@ pub const View = struct {
     }
 
     fn titleInsert(self: *View, bytes: []const u8) !void {
-        if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.InvalidUtf8;
-        for (bytes) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidTitle;
-        const start = if (self.title_select_all) 0 else self.title_len;
-        if (start + bytes.len > self.title_buffer.len) return error.TextTooLarge;
-        @memcpy(self.title_buffer[start..][0..bytes.len], bytes);
-        self.title_len = start + bytes.len;
-        self.title_select_all = false;
+        try self.lineInsert(.title, bytes);
     }
 
     fn finishTitle(self: *View, action: TitleAction) void {
-        self.title_action = action;
-        if (action == .cancel) self.title_editing = false;
+        if (action == .save) {
+            const trimmed = std.mem.trim(u8, self.title_buffer[0..self.title_len], " \t\r\n");
+            if (trimmed.len == 0) {
+                self.title_action = .cancel;
+                self.title_editing = false;
+            } else {
+                std.mem.copyForwards(u8, &self.title_buffer, trimmed);
+                self.title_len = trimmed.len;
+                self.title_action = .save;
+            }
+        } else {
+            self.title_action = .cancel;
+            self.title_editing = false;
+        }
+        self.line_view.reset();
     }
 
     fn clippedRect(row: c.SDL_FRect, viewport: c.SDL_FRect) c.SDL_FRect {
@@ -982,12 +1092,48 @@ pub const View = struct {
         if (self.scope_project.len != 0 and !entry.project_id.eql(self.scope_project.slice())) return false;
         const query = std.mem.trim(u8, self.search_query[0..self.search_len], " \t\r\n");
         if (query.len == 0) return true;
-        // Literal Unicode with ASCII case-insensitivity; no history decode,
-        // provider requests, allocation or unbounded indexing on the UI thread.
+        // Reuse the retained Unicode fold table. Both the source metadata and
+        // query are bounded, and ASCII candidates keep the short fast path.
         for ([_][]const u8{ entry.label[0..entry.len], entry.project_name.slice(), entry.workspace_name.slice(), entry.branch.slice() }) |value| {
-            if (std.ascii.indexOfIgnoreCase(value, query) != null) return true;
+            if (searchContains(value, query)) return true;
         }
         return false;
+    }
+
+    fn foldedSearch(bytes: []const u8, output: []u32) ?[]const u32 {
+        const input = std.unicode.Utf8View.init(bytes) catch return null;
+        var iterator = input.iterator();
+        var length: usize = 0;
+        while (iterator.nextCodepoint()) |scalar| {
+            var folded: [3]u32 = undefined;
+            const count = fuzzy.spica_fuzzy_case_fold(scalar, &folded);
+            if (count > folded.len or length + count > output.len) return null;
+            @memcpy(output[length..][0..count], folded[0..count]);
+            length += count;
+        }
+        return output[0..length];
+    }
+
+    fn searchContains(value: []const u8, query: []const u8) bool {
+        var ascii = true;
+        for (value) |byte| {
+            if (byte >= 0x80) {
+                ascii = false;
+                break;
+            }
+        }
+        if (ascii) for (query) |byte| {
+            if (byte >= 0x80) {
+                ascii = false;
+                break;
+            }
+        };
+        if (ascii) return std.ascii.indexOfIgnoreCase(value, query) != null;
+        var query_buffer: [160 * 3]u32 = undefined;
+        var value_buffer: [transcript.id_bytes * 3]u32 = undefined;
+        const folded_query = foldedSearch(query, &query_buffer) orelse return false;
+        const folded_value = foldedSearch(value, &value_buffer) orelse return false;
+        return std.mem.indexOf(u32, folded_value, folded_query) != null;
     }
 
     pub fn visibleThreadCount(self: *const View) usize {
@@ -996,6 +1142,367 @@ pub const View = struct {
             count += 1;
         };
         return count;
+    }
+
+    pub fn wallTimeMs() i64 {
+        var time: c.SDL_Time = 0;
+        if (!c.SDL_GetCurrentTime(&time)) return 0;
+        return @divFloor(time, 1_000_000);
+    }
+
+    pub fn nextSidebarWakeMs(self: *const View, now: i64) ?i64 {
+        var next: ?i64 = null;
+        for (self.threads[0..self.thread_count]) |entry| {
+            if (entry.snoozed_until > now and (next == null or entry.snoozed_until < next.?)) next = entry.snoozed_until;
+        }
+        return next;
+    }
+
+    const SidebarSection = enum(u8) { pinned, active, working, snoozed, settled };
+
+    fn sidebarSection(self: *const View, entry: *const Entry) SidebarSection {
+        if (entry.archived) return .settled;
+        if (entry.snoozed_until > self.sidebar_now_ms) return .snoozed;
+        if (entry.settled) return .settled;
+        if (entry.pinned) return .pinned;
+        if (self.sidebar_working_shelf and entry.run_status == .running) return .working;
+        return .active;
+    }
+
+    fn sidebarSlim(self: *const View, entry: *const Entry) bool {
+        const section = self.sidebarSection(entry);
+        return self.search_len != 0 or section == .snoozed or section == .settled;
+    }
+
+    fn sidebarShelfVisible(self: *const View, entry: *const Entry) bool {
+        if (self.search_len != 0) return true;
+        const section = @intFromEnum(self.sidebarSection(entry));
+        return section < 2 or self.sidebar_shelf_expanded[section - 2] or entry.id.eql(self.active_thread.slice());
+    }
+
+    fn sidebarContentHeight(self: *const View) f32 {
+        var height: f32 = 0;
+        var counts: [5]usize = @splat(0);
+        for (self.threads[0..self.thread_count]) |*entry| {
+            if (!self.threadMatches(entry)) continue;
+            counts[@intFromEnum(self.sidebarSection(entry))] += 1;
+            if (self.sidebarShelfVisible(entry)) height += if (self.sidebarSlim(entry)) sidebar_search_stride else sidebar_card_stride;
+        }
+        if (self.search_len == 0 and self.visibleThreadCount() != 0) {
+            if (counts[2] != 0) height += 33;
+            if (counts[3] != 0) height += 33;
+            height += 33; // The settled shelf remains available when empty.
+        }
+        return height;
+    }
+
+    fn sidebarMenuIndex(self: *const View) ?usize {
+        if (self.sidebar_menu_thread.len == 0) return null;
+        for (self.threads[0..self.thread_count], 0..) |entry, index| {
+            if (entry.id.eql(self.sidebar_menu_thread.slice())) return index;
+        }
+        return null;
+    }
+
+    fn openSidebarSnooze(self: *View) void {
+        self.sidebar_menu_mode = .snooze;
+        self.sidebar_snooze_deadlines = @splat(0);
+        self.sidebar_snooze_when = @splat(.{});
+        self.sidebar_snooze_count = 0;
+        const options = SidebarTime.presets(wallTimeMs()) catch {
+            self.sidebar_menu_panel = SidebarMenu.snooze(@splat(false));
+            self.sidebar_menu_count = self.sidebar_menu_panel.len;
+            self.sidebar_menu_hover = 0;
+            return;
+        };
+        var available: [5]bool = @splat(false);
+        for (options.slice()) |option| {
+            const slot: usize = switch (option.id) {
+                .one_hour => 0,
+                .three_hours => 1,
+                .this_evening => 2,
+                .tomorrow => 3,
+                .next_monday => 4,
+            };
+            self.sidebar_snooze_deadlines[slot] = option.wake_ms;
+            self.sidebar_snooze_when[slot] = option.when_label;
+            self.sidebar_snooze_count = @max(self.sidebar_snooze_count, slot + 1);
+            available[slot] = true;
+        }
+        self.sidebar_menu_panel = SidebarMenu.snooze(available);
+        self.sidebar_menu_count = self.sidebar_menu_panel.len;
+        self.sidebar_menu_panel.edge(false);
+        self.sidebar_menu_hover = self.sidebar_menu_panel.selected orelse 0;
+    }
+
+    fn activateSidebarMenu(self: *View, row: usize) void {
+        const index = self.sidebarMenuIndex() orelse return;
+        if (row >= self.sidebar_menu_panel.len) return;
+        const item = self.sidebar_menu_panel.items[row];
+        if (!item.enabled) return;
+        const entry = &self.threads[index];
+        switch (self.sidebar_menu_mode) {
+            .copy => switch (item.action) {
+                .copy_path => {
+                    clipboard.copyBytes(entry.workspace_path[0..entry.workspace_path_len], self.scratch) catch {
+                        self.notice = "Unable to copy workspace path";
+                    };
+                },
+                .copy_branch => {
+                    clipboard.copyBytes(entry.branch.slice(), self.scratch) catch {
+                        self.notice = "Unable to copy branch";
+                    };
+                },
+                .copy_id => {
+                    clipboard.copyBytes(entry.id.slice(), self.scratch) catch {
+                        self.notice = "Unable to copy thread ID";
+                    };
+                },
+                else => return,
+            },
+            .snooze => switch (item.action) {
+                .preset => {
+                    const deadline = self.sidebar_snooze_deadlines[item.preset_index];
+                    if (deadline <= wallTimeMs()) return;
+                    self.navigation = .{ .sidebar = .{ .index = index, .action = .snooze, .snoozed_until = deadline } };
+                },
+                .custom => {
+                    self.custom_snooze = SidebarSnooze.State.init(wallTimeMs()) catch {
+                        self.notice = "Local calendar is unavailable";
+                        return;
+                    };
+                    self.custom_snooze_thread = entry.id;
+                    self.custom_snooze_focus = .date;
+                    self.sidebar_menu_thread = .{};
+                    self.line_view.reset();
+                    return;
+                },
+                else => return,
+            },
+            .main => switch (item.action) {
+                .copy => {
+                    self.sidebar_menu_mode = .copy;
+                    self.sidebar_menu_panel = SidebarMenu.copy(entry.workspace_path_len != 0, entry.branch.len != 0);
+                    self.sidebar_menu_count = self.sidebar_menu_panel.len;
+                    self.sidebar_menu_hover = self.sidebar_menu_panel.selected orelse 0;
+                    return;
+                },
+                .rename => self.beginSidebarRename(index),
+                .filter => {
+                    self.scope_project = if (self.scope_project.eql(entry.project_id.slice())) .{} else entry.project_id;
+                    self.sidebarChanged();
+                },
+                .pin, .unpin, .settle, .unsettle, .wake => |action| {
+                    const sidebar_action: SidebarAction = switch (action) {
+                        .pin => .pin,
+                        .unpin => .unpin,
+                        .settle => .settle,
+                        .unsettle => .unsettle,
+                        .wake => .wake,
+                        else => return,
+                    };
+                    self.navigation = .{ .sidebar = .{ .index = index, .action = sidebar_action, .snoozed_until = 0 } };
+                },
+                .snooze => {
+                    self.openSidebarSnooze();
+                    return;
+                },
+                .archive, .restore, .delete => |action| {
+                    self.requestSidebarLifecycle(entry.id, switch (action) {
+                        .archive => .archive,
+                        .restore => .restore,
+                        .delete => .delete,
+                        else => unreachable,
+                    });
+                    return;
+                },
+                else => return,
+            },
+        }
+        self.sidebar_menu_thread = .{};
+        self.sidebar_menu_count = 0;
+        self.sidebar_menu_mode = .main;
+    }
+
+    pub const CustomSnoozeRequest = struct { id: transcript.Id, snoozed_until: i64 };
+    pub fn customSnoozeOpen(self: *const View) bool {
+        return self.custom_snooze != null;
+    }
+    pub fn customSnoozePending(self: *const View) bool {
+        return if (self.custom_snooze) |state| state.pending else false;
+    }
+    pub fn takeCustomSnoozeRequest(self: *View) ?CustomSnoozeRequest {
+        const state = if (self.custom_snooze) |*state| state else return null;
+        if (!state.requested or state.pending) return null;
+        state.requested = false;
+        state.pending = true;
+        return .{ .id = self.custom_snooze_thread, .snoozed_until = state.deadline };
+    }
+    pub fn finishCustomSnooze(self: *View, failure: ?[]const u8) void {
+        if (failure) |message| {
+            if (self.custom_snooze) |*state| {
+                state.pending = false;
+                state.requested = false;
+                state.setError(message);
+            }
+        } else {
+            self.custom_snooze = null;
+            self.custom_snooze_thread = .{};
+            self.line_view.reset();
+        }
+    }
+
+    pub const SidebarLifecycleRequest = SidebarLifecycle.Request;
+    pub const SidebarUndoOperation = SidebarLifecycle.UndoOperation;
+    pub fn takeSidebarLifecycleRequest(self: *View) ?SidebarLifecycleRequest {
+        return self.sidebar_lifecycle.take();
+    }
+    pub fn sidebarLifecycleConfirmOpen(self: *const View) bool {
+        return self.sidebar_lifecycle.confirming != null;
+    }
+    pub fn sidebarLifecyclePending(self: *const View) bool {
+        return self.sidebar_lifecycle.pending;
+    }
+    pub fn finishSidebarLifecycle(self: *View, failure: ?[]const u8) void {
+        self.sidebar_lifecycle.finish(failure);
+    }
+    pub fn requestSidebarLifecycle(self: *View, id: transcript.Id, action: SidebarLifecycle.Action) void {
+        self.sidebar_lifecycle.request(id, action);
+    }
+    pub fn confirmSidebarDelete(self: *View) void {
+        self.sidebar_lifecycle.confirmDelete();
+    }
+    pub fn offerSidebarUndo(self: *View, operation: SidebarUndoOperation, label: []const u8) void {
+        self.sidebar_lifecycle.offerUndo(operation, label, wallTimeMs());
+    }
+    pub fn takeSidebarUndoRequest(self: *View) ?SidebarUndoOperation {
+        const undo_request = self.sidebar_undo_request;
+        self.sidebar_undo_request = null;
+        // Undo is claimed by an explicit button or shortcut event. A plain
+        // App.update poll must not consume the five-second notice before the
+        // user has chosen it.
+        return undo_request;
+    }
+    pub fn invalidateSidebarUndo(self: *View, id: transcript.Id) void {
+        self.sidebar_lifecycle.invalidateUndo(id);
+    }
+
+    fn claimSidebarUndo(self: *View) void {
+        if (self.sidebar_undo_request == null) self.sidebar_undo_request = self.sidebar_lifecycle.takeUndo(wallTimeMs());
+    }
+    pub fn takeSidebarArchiveBrowserRequest(self: *View) ?bool {
+        const archive_request = self.sidebar_archive_request;
+        self.sidebar_archive_request = null;
+        return archive_request;
+    }
+    pub fn discardSidebarThreadDraft(self: *View, id: transcript.Id) void {
+        if (self.active_thread.eql(id.slice())) {
+            self.editor.setText("") catch {};
+            self.active_thread = .{};
+            self.active_project = .{};
+        }
+    }
+
+    fn handleSidebarLifecycle(self: *View, event: c.SDL_Event) bool {
+        if (self.sidebar_lifecycle.confirming == null) return false;
+        if (event.type == c.SDL_EVENT_KEY_DOWN) {
+            if (event.key.key == c.SDLK_ESCAPE) {
+                self.sidebar_lifecycle.confirming = null;
+                return true;
+            }
+            if (event.key.key == c.SDLK_RETURN or event.key.key == c.SDLK_KP_ENTER) {
+                if (self.sidebar_lifecycle.confirm_delete_selected) {
+                    self.confirmSidebarDelete();
+                } else {
+                    self.sidebar_lifecycle.confirming = null;
+                }
+                return true;
+            }
+            if (event.key.key == c.SDLK_TAB or event.key.key == c.SDLK_LEFT or event.key.key == c.SDLK_RIGHT) {
+                self.sidebar_lifecycle.confirm_delete_selected = !self.sidebar_lifecycle.confirm_delete_selected;
+                return true;
+            }
+        } else if (event.type == c.SDL_EVENT_MOUSE_BUTTON_DOWN and event.button.button == c.SDL_BUTTON_LEFT) {
+            if (widgets.contains(self.sidebar_lifecycle_bounds[0], event.button.x, event.button.y)) {
+                self.sidebar_lifecycle.confirm_delete_selected = false;
+                self.sidebar_lifecycle.confirming = null;
+                return true;
+            }
+            if (widgets.contains(self.sidebar_lifecycle_bounds[1], event.button.x, event.button.y)) {
+                self.sidebar_lifecycle.confirm_delete_selected = true;
+                self.confirmSidebarDelete();
+                return true;
+            }
+        }
+        return true;
+    }
+
+    fn beginSidebarRename(self: *View, index: usize) void {
+        if (index >= self.thread_count or !self.navigation_enabled) return;
+        const entry = &self.threads[index];
+        self.title_editing = false;
+        self.sidebar_rename_followup = null;
+        self.sidebar_rename_thread = entry.id;
+        self.sidebar_rename_len = entry.len;
+        @memcpy(self.sidebar_rename_buffer[0..entry.len], entry.label[0..entry.len]);
+        self.line_view.reset();
+        self.rename_edit = .{};
+        self.sidebar_rename_select_all = true;
+        self.search_focused = false;
+    }
+
+    fn sidebarRenameInsert(self: *View, bytes: []const u8) !void {
+        try self.lineInsert(.rename, bytes);
+    }
+
+    pub fn takeRenameFollowup(self: *View) ?RenameFollowup {
+        const action = self.sidebar_rename_followup;
+        self.sidebar_rename_followup = null;
+        return action;
+    }
+
+    fn commitSidebarRename(self: *View) void {
+        const trimmed = std.mem.trim(u8, self.sidebar_rename_buffer[0..self.sidebar_rename_len], " \t\r\n");
+        if (trimmed.len == 0) {
+            self.sidebar_rename_thread = .{};
+            self.line_view.reset();
+            return;
+        }
+        std.mem.copyForwards(u8, &self.sidebar_rename_buffer, trimmed);
+        self.sidebar_rename_len = trimmed.len;
+        self.line_view.reset();
+        for (self.threads[0..self.thread_count], 0..) |entry, index| {
+            if (entry.id.eql(self.sidebar_rename_thread.slice())) {
+                self.navigation = .{ .rename = .{ .index = index, .title = self.sidebar_rename_buffer, .len = self.sidebar_rename_len } };
+                self.sidebar_rename_thread = .{};
+                return;
+            }
+        }
+        self.sidebar_rename_thread = .{};
+    }
+
+    fn drawSidebarTitle(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, entry: *const Entry, x: f32, y: f32, width: f32, foreground: Color) !void {
+        if (entry.id.eql(self.sidebar_rename_thread.slice())) {
+            self.sidebar_rename_bounds = .{ .x = x - 2, .y = y - 2, .w = @max(0, width + 4), .h = 22 };
+            try widgets.panel(renderer, self.sidebar_rename_bounds, 3, self.design.colors.border);
+            const parts = self.lineParts(.rename);
+            parts.edit.sync(parts.len.*, parts.select.*);
+            try self.line_view.draw(renderer, text, parts.buffer[0..parts.len.*], parts.edit.*, .{ .x = x, .y = y, .w = width, .h = 20 }, foreground, self.design.colors.selection, self.window_active and self.activeLine() == .rename);
+            _ = self.navigation_targets.add("sidebar.rename", "textbox", self.sidebar_rename_bounds, true) catch {};
+        } else try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], x, y, width, 14, foreground);
+    }
+
+    fn sidebarStride(self: *const View) f32 {
+        return if (self.search_len != 0) sidebar_search_stride else sidebar_card_stride;
+    }
+
+    fn openScope(self: *View) void {
+        self.scope_open = true;
+        self.scope_hover = 0;
+        for (self.projects[0..self.project_count], 0..) |entry, index| {
+            if (entry.id.eql(self.scope_project.slice())) self.scope_hover = index + 1;
+        }
+        self.scope_scroll = 0;
     }
 
     fn sidebarChanged(self: *View) void {
@@ -1082,14 +1589,109 @@ pub const View = struct {
         return requested;
     }
 
+    const LineField = enum { search, rename, title, snooze_date, snooze_time, snooze_amount };
+    const LineParts = struct { buffer: []u8, len: *usize, select: *bool, edit: *LineEdit };
+    pub fn inputErrorNotice(self: *const View, err: anyerror) ?[]const u8 {
+        return switch (err) {
+            error.TextTooLarge => if (self.activeLine()) |field| switch (field) {
+                .search => "Search is limited to 160 UTF-8 bytes. Existing text retained.",
+                .rename, .title => "Titles are limited to 160 UTF-8 bytes. Existing text retained.",
+                .snooze_date, .snooze_time, .snooze_amount => "This field is limited to 32 UTF-8 bytes. Existing text retained.",
+            } else "Text exceeds this editor's limit. Existing text retained.",
+            error.PieceLimit => "The editor has reached its limit. Existing text retained.",
+            error.InvalidUtf8 => "Text is not valid UTF-8. Existing text retained.",
+            error.InvalidTitle => "Use a single line without control characters. Existing text retained.",
+            error.ClipboardRead => "Unable to read the clipboard. Existing text retained.",
+            error.ClipboardWrite => "Unable to copy to the clipboard.",
+            error.ClipboardContainsNul => "The clipboard text contains an unsupported null character.",
+            else => null,
+        };
+    }
+
+    fn lineParts(self: *View, field: LineField) LineParts {
+        return switch (field) {
+            .search => .{ .buffer = &self.search_query, .len = &self.search_len, .select = &self.search_select_all, .edit = &self.search_edit },
+            .rename => .{ .buffer = &self.sidebar_rename_buffer, .len = &self.sidebar_rename_len, .select = &self.sidebar_rename_select_all, .edit = &self.rename_edit },
+            .title => .{ .buffer = &self.title_buffer, .len = &self.title_len, .select = &self.title_select_all, .edit = &self.title_line_edit },
+            .snooze_date, .snooze_time, .snooze_amount => blk: {
+                const state = &self.custom_snooze.?;
+                const value = switch (field) {
+                    .snooze_date => &state.date,
+                    .snooze_time => &state.time,
+                    .snooze_amount => &state.amount,
+                    else => unreachable,
+                };
+                break :blk .{ .buffer = &value.bytes, .len = &value.len, .select = &value.select, .edit = &value.edit };
+            },
+        };
+    }
+    fn activeLine(self: *const View) ?LineField {
+        if (self.custom_snooze) |state| {
+            if (state.pending or state.calendar_open) return null;
+            return switch (self.custom_snooze_focus) {
+                .date => .snooze_date,
+                .time => .snooze_time,
+                .amount => .snooze_amount,
+                else => null,
+            };
+        }
+        if (self.custom_root != null or self.setup_open or self.workflow_open or self.workspace_open or self.scope_open or self.picker_open or self.effort_open or self.sidebar_menu_thread.len != 0) return null;
+        if (self.sidebar_rename_thread.len != 0) return .rename;
+        if (self.title_editing) return .title;
+        if (self.search_focused) return .search;
+        return null;
+    }
+    fn lineInsert(self: *View, field: LineField, bytes: []const u8) !void {
+        const parts = self.lineParts(field);
+        parts.edit.sync(parts.len.*, parts.select.*);
+        try parts.edit.insert(parts.buffer, parts.len, bytes);
+        parts.select.* = false;
+        self.line_view.preedit_len = 0;
+        if (field == .search) self.sidebarChanged();
+    }
+    fn lineKey(self: *View, field: LineField, key: c.SDL_Keycode, ctrl: bool, shift: bool) !bool {
+        const parts = self.lineParts(field);
+        parts.edit.sync(parts.len.*, parts.select.*);
+        var edited = false;
+        switch (key) {
+            c.SDLK_A => {
+                if (!ctrl) return false;
+                parts.edit.sync(parts.len.*, true);
+            },
+            c.SDLK_LEFT, c.SDLK_RIGHT => try parts.edit.move(parts.buffer[0..parts.len.*], key == c.SDLK_RIGHT, ctrl, shift),
+            c.SDLK_HOME, c.SDLK_END => parts.edit.set(if (key == c.SDLK_HOME) 0 else parts.len.*, shift),
+            c.SDLK_BACKSPACE, c.SDLK_DELETE => {
+                try parts.edit.delete(parts.buffer, parts.len, key == c.SDLK_DELETE, ctrl);
+                edited = true;
+            },
+            c.SDLK_C, c.SDLK_X => {
+                if (!ctrl) return false;
+                const range = parts.edit.range();
+                var copy: [161]u8 = undefined;
+                try clipboard.copyBytes(parts.buffer[range.start..range.end], &copy);
+                if (key == c.SDLK_X) {
+                    try parts.edit.insert(parts.buffer, parts.len, "");
+                    edited = true;
+                }
+            },
+            c.SDLK_V => {
+                if (!ctrl) return false;
+                const value = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
+                defer c.SDL_free(value);
+                try parts.edit.insert(parts.buffer, parts.len, std.mem.span(value));
+                edited = true;
+            },
+            else => return false,
+        }
+        parts.select.* = false;
+        if (edited) {
+            self.line_view.preedit_len = 0;
+            if (field == .search) self.sidebarChanged();
+        }
+        return true;
+    }
     fn searchInsert(self: *View, bytes: []const u8) !void {
-        if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
-        const start = if (self.search_select_all) 0 else self.search_len;
-        if (start + bytes.len > self.search_query.len) return error.TextTooLarge;
-        @memcpy(self.search_query[start..][0..bytes.len], bytes);
-        self.search_len = start + bytes.len;
-        self.search_select_all = false;
-        self.sidebarChanged();
+        try self.lineInsert(.search, bytes);
     }
 
     fn searchResult(self: *const View, ordinal: usize) ?usize {
@@ -1115,10 +1717,178 @@ pub const View = struct {
         return false;
     }
 
+    fn customSnoozeActivate(self: *View, target: usize) void {
+        const state = &(self.custom_snooze orelse return);
+        if (state.pending) return;
+        self.custom_snooze_focus = @enumFromInt(target);
+        switch (self.custom_snooze_focus) {
+            .date_mode => {
+                self.custom_snooze.?.mode = .date;
+                self.custom_snooze.?.calendar_open = false;
+            },
+            .duration_mode => {
+                self.custom_snooze.?.mode = .duration;
+                self.custom_snooze.?.calendar_open = false;
+            },
+            .calendar => {
+                self.custom_snooze.?.calendar_open = !state.calendar_open;
+                if (state.date.len == 10) self.custom_snooze.?.calendar = SidebarMenu.Calendar.init(state.date.bytes[0..10].*, state.calendar.today) catch state.calendar;
+                for (0..self.custom_snooze.?.calendar.count()) |index| {
+                    const cell = self.custom_snooze.?.calendar.cell(index) orelse continue;
+                    if (std.mem.eql(u8, &cell.date, &self.custom_snooze.?.calendar.selected)) self.custom_snooze.?.calendar_cursor = index;
+                }
+            },
+            .unit => self.custom_snooze.?.unit = switch (state.unit) {
+                .minutes => .hours,
+                .hours => .days,
+                .days => .minutes,
+            },
+            .cancel => {
+                self.custom_snooze = null;
+                self.line_view.reset();
+            },
+            .submit => {
+                _ = self.custom_snooze.?.submit(wallTimeMs());
+            },
+            else => {
+                self.custom_snooze.?.calendar_open = false;
+            },
+        }
+        self.line_view.reset();
+        if (self.custom_snooze) |*value| value.error_len = if (self.custom_snooze_focus == .submit) value.error_len else 0;
+    }
+
+    fn handleCustomSnooze(self: *View, event: c.SDL_Event, window: *c.SDL_Window) !bool {
+        const state = if (self.custom_snooze) |*value| value else return false;
+        if (state.pending) return true;
+        switch (event.type) {
+            c.SDL_EVENT_KEY_DOWN => {
+                if (!self.window_active) return true;
+                const key = event.key.key;
+                const ctrl = event.key.mod & c.SDL_KMOD_CTRL != 0;
+                const shift = event.key.mod & c.SDL_KMOD_SHIFT != 0;
+                if (self.line_view.preedit_len != 0) {
+                    if (key == c.SDLK_ESCAPE) self.line_view.preedit_len = 0;
+                    return true;
+                }
+                if (key == c.SDLK_ESCAPE) {
+                    if (state.calendar_open) state.calendar_open = false else self.custom_snooze = null;
+                    self.line_view.reset();
+                    return true;
+                }
+                if (key == c.SDLK_TAB) {
+                    const stops: []const usize = if (state.mode == .date) &[_]usize{ 0, 1, 2, 3, 4, 7, 8 } else &[_]usize{ 0, 1, 5, 6, 7, 8 };
+                    var at: usize = 0;
+                    for (stops, 0..) |target, index| if (target == @intFromEnum(self.custom_snooze_focus)) {
+                        at = index;
+                        break;
+                    };
+                    at = if (shift) (at + stops.len - 1) % stops.len else (at + 1) % stops.len;
+                    self.custom_snooze_focus = @enumFromInt(stops[at]);
+                    state.calendar_open = false;
+                    self.line_view.reset();
+                    try self.focus(window, true);
+                    return true;
+                }
+                if (state.calendar_open) {
+                    switch (key) {
+                        c.SDLK_LEFT => state.moveCalendar(-1),
+                        c.SDLK_RIGHT => state.moveCalendar(1),
+                        c.SDLK_UP => state.moveCalendar(-7),
+                        c.SDLK_DOWN => state.moveCalendar(7),
+                        c.SDLK_PAGEUP, c.SDLK_PAGEDOWN => {
+                            _ = state.calendar.shift(key == c.SDLK_PAGEDOWN);
+                            state.calendar_cursor = @min(state.calendar_cursor, state.calendar.count() - 1);
+                        },
+                        c.SDLK_RETURN, c.SDLK_KP_ENTER, c.SDLK_SPACE => {
+                            _ = state.chooseDate(state.calendar_cursor);
+                        },
+                        else => {},
+                    }
+                    return true;
+                }
+                if (key == c.SDLK_RETURN or key == c.SDLK_KP_ENTER) {
+                    if (self.activeLine() != null) {
+                        _ = state.submit(wallTimeMs());
+                    } else self.customSnoozeActivate(@intFromEnum(self.custom_snooze_focus));
+                    return true;
+                }
+                if (self.activeLine()) |field| {
+                    _ = self.lineKey(field, key, ctrl, shift) catch |err| {
+                        state.setError(self.inputErrorNotice(err) orelse "Unable to edit this value.");
+                        return true;
+                    };
+                    state.error_len = 0;
+                } else if (key == c.SDLK_SPACE) self.customSnoozeActivate(@intFromEnum(self.custom_snooze_focus));
+            },
+            c.SDL_EVENT_TEXT_INPUT => if (self.activeLine()) |field| {
+                if (self.window_active) self.lineInsert(field, std.mem.span(event.text.text)) catch |err| {
+                    state.setError(self.inputErrorNotice(err) orelse "Unable to edit this value.");
+                    return true;
+                };
+                state.error_len = 0;
+            },
+            c.SDL_EVENT_TEXT_EDITING => if (self.activeLine() != null and self.window_active) {
+                try self.line_view.compose(std.mem.span(event.edit.text));
+            },
+            c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
+                if (event.button.button != c.SDL_BUTTON_LEFT) return true;
+                const x = event.button.x;
+                const y = event.button.y;
+                if (state.calendar_open) {
+                    for (self.custom_snooze_month_bounds, 0..) |rect, index| if (widgets.contains(rect, x, y)) {
+                        _ = state.calendar.shift(index == 1);
+                        return true;
+                    };
+                    for (self.custom_snooze_days, 0..) |rect, index| if (rect.w > 0 and widgets.contains(rect, x, y)) {
+                        _ = state.chooseDate(index);
+                        self.custom_snooze_focus = .date;
+                        return true;
+                    };
+                    if (!widgets.contains(self.custom_snooze_calendar_bounds, x, y)) state.calendar_open = false;
+                    return true;
+                }
+                for (self.custom_snooze_bounds, 0..) |rect, index| if (rect.w > 0 and widgets.contains(rect, x, y)) {
+                    const was_field = self.activeLine();
+                    const same_focus = @intFromEnum(self.custom_snooze_focus) == index;
+                    if (!same_focus or (index != 2 and index != 3 and index != 5)) self.customSnoozeActivate(index);
+                    if (self.activeLine()) |field| {
+                        if (was_field == field) {
+                            const parts = self.lineParts(field);
+                            parts.edit.sync(parts.len.*, parts.select.*);
+                            parts.edit.set(self.line_view.hit(x, y) orelse parts.len.*, c.SDL_GetModState() & c.SDL_KMOD_SHIFT != 0);
+                            parts.select.* = false;
+                        }
+                        try self.focus(window, true);
+                    }
+                    return true;
+                };
+            },
+            else => {},
+        }
+        return true;
+    }
+
     pub fn handle(self: *View, event: c.SDL_Event, window: *c.SDL_Window, text: *c.SpicaText) !bool {
+        if (self.handleSidebarLifecycle(event)) return true;
+        if (self.custom_snooze != null) switch (event.type) {
+            c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_KEY_UP, c.SDL_EVENT_TEXT_INPUT, c.SDL_EVENT_TEXT_EDITING, c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_BUTTON_UP, c.SDL_EVENT_MOUSE_MOTION, c.SDL_EVENT_MOUSE_WHEEL => return self.handleCustomSnooze(event, window),
+            else => {},
+        };
+        if (event.type == c.SDL_EVENT_KEY_DOWN) {
+            const undo_mod = event.key.mod & c.SDL_KMOD_CTRL != 0 or event.key.mod & c.SDL_KMOD_GUI != 0;
+            if (undo_mod and event.key.key == c.SDLK_Z and self.sidebar_lifecycle.shortcut_claimed) {
+                self.claimSidebarUndo();
+                return true;
+            }
+            if (!(undo_mod and event.key.key == c.SDLK_Z)) self.sidebar_lifecycle.shortcut_claimed = false;
+        } else if (event.type == c.SDL_EVENT_TEXT_INPUT or event.type == c.SDL_EVENT_TEXT_EDITING) self.sidebar_lifecycle.shortcut_claimed = false;
         switch (event.type) {
             c.SDL_EVENT_WINDOW_FOCUS_LOST => {
                 self.releasePointer();
+                self.line_drag = null;
+                self.line_view.preedit_len = 0;
+                self.sidebar_resizing = false;
                 self.window_active = false;
                 self.preedit_len = 0;
                 self.preedit_changed = true;
@@ -1131,12 +1901,107 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
+                if (event.button.button == c.SDL_BUTTON_RIGHT and self.custom_root == null and self.navigation_enabled and !self.setup_open and !self.workspace_open and !self.workflow_open and !self.scope_open and !self.picker_open and !self.effort_open) {
+                    self.sidebar_menu_thread = .{};
+                    for (0..self.thread_count) |index| if (widgets.contains(self.threadRowBounds(index), event.button.x, event.button.y)) {
+                        self.sidebar_menu_thread = self.threads[index].id;
+                        self.sidebar_menu_mode = .main;
+                        self.sidebar_menu_x = event.button.x;
+                        self.sidebar_menu_y = event.button.y;
+                        self.sidebar_menu_hover = 0;
+                    };
+                    return true;
+                }
                 if (event.button.button != c.SDL_BUTTON_LEFT) return false;
                 if (self.custom_root == null) {
                     const x = event.button.x;
                     const y = event.button.y;
-                    if (self.title_editing and !widgets.contains(self.title_bounds, x, y)) self.finishTitle(.cancel);
+                    var rename_blurred = false;
+                    if (self.activeLine() == .rename) {
+                        if (widgets.contains(self.sidebar_rename_bounds, x, y)) {
+                            const parts = self.lineParts(.rename);
+                            parts.edit.sync(parts.len.*, false);
+                            parts.edit.set(@min(self.line_view.hit(x, y) orelse parts.len.*, parts.len.*), c.SDL_GetModState() & c.SDL_KMOD_SHIFT != 0);
+                            parts.select.* = false;
+                            self.line_drag = .rename;
+                            return true;
+                        }
+                        self.commitSidebarRename();
+                        rename_blurred = if (self.navigation) |action| std.meta.activeTag(action) == .rename else false;
+                    }
+                    if (self.sidebar_menu_thread.len != 0) {
+                        var hit = false;
+                        for (self.sidebar_menu_rows[0..self.sidebar_menu_count], 0..) |row, index| {
+                            if (widgets.contains(row, x, y)) {
+                                self.activateSidebarMenu(index);
+                                hit = true;
+                                break;
+                            }
+                        }
+                        if (!hit and !widgets.contains(self.sidebar_menu_bounds, x, y)) self.sidebar_menu_thread = .{};
+                        if (self.sidebar_rename_thread.len != 0 or self.custom_snooze != null) try self.focus(window, true);
+                        return true;
+                    }
+                    if (widgets.contains(self.sidebar_toggle_bounds, x, y)) {
+                        self.sidebar_collapsed = !self.sidebar_collapsed;
+                        self.scope_open = false;
+                        self.search_focused = false;
+                        return true;
+                    }
+                    if (widgets.contains(self.sidebar_empty_project_bounds, x, y)) {
+                        self.navigation = .new_project;
+                        return true;
+                    }
+                    if (widgets.contains(self.sidebar_archive_bounds, x, y)) {
+                        self.sidebar_archived = !self.sidebar_archived;
+                        self.sidebar_archive_request = self.sidebar_archived;
+                        self.sidebarChanged();
+                        return true;
+                    }
+                    if (widgets.contains(self.sidebar_footer_bounds[2], x, y)) {
+                        self.notice = "Usage metrics are available after a connected provider is selected.";
+                        return true;
+                    }
+                    if (widgets.contains(self.sidebar_footer_bounds[3], x, y)) {
+                        self.sidebar_archive_request = self.sidebar_archived;
+                        self.sidebarChanged();
+                        return true;
+                    }
+                    if (widgets.contains(self.sidebar_undo_bounds, x, y)) {
+                        self.claimSidebarUndo();
+                        return true;
+                    }
+                    if (widgets.contains(self.sidebar_resize_bounds, x, y)) {
+                        if (event.button.clicks >= 2) {
+                            self.sidebar_width_override = null;
+                        } else {
+                            self.sidebar_resizing = true;
+                            _ = c.SDL_CaptureMouse(true);
+                        }
+                        return true;
+                    }
+                    for (self.sidebar_shelf_bounds, 0..) |row, index| {
+                        if (widgets.contains(row, x, y)) {
+                            self.sidebar_shelf_expanded[index] = !self.sidebar_shelf_expanded[index];
+                            self.thread_bounds = @splat(zero_rect);
+                            return true;
+                        }
+                    }
+                    if (self.activeLine() == .title) {
+                        if (widgets.contains(self.title_bounds, x, y)) {
+                            const parts = self.lineParts(.title);
+                            parts.edit.sync(parts.len.*, false);
+                            parts.edit.set(@min(self.line_view.hit(x, y) orelse parts.len.*, parts.len.*), c.SDL_GetModState() & c.SDL_KMOD_SHIFT != 0);
+                            parts.select.* = false;
+                            self.line_drag = .title;
+                        } else self.finishTitle(.save);
+                        return true;
+                    }
                     if (widgets.contains(self.title_bounds, x, y) and self.titleEditAvailable()) {
+                        if (rename_blurred) {
+                            self.sidebar_rename_followup = .edit_active_title;
+                            return true;
+                        }
                         self.beginTitleEdit();
                         try self.focus(window, true);
                         return true;
@@ -1228,8 +2093,13 @@ pub const View = struct {
                         return true;
                     }
                     if (widgets.contains(self.search_bounds, x, y)) {
+                        const was_focused = self.search_focused;
+                        if (!was_focused) self.line_view.reset();
                         self.search_focused = true;
                         self.search_select_all = false;
+                        self.search_edit.sync(self.search_len, false);
+                        self.search_edit.set(if (was_focused) @min(self.line_view.hit(x, y) orelse self.search_len, self.search_len) else self.search_len, c.SDL_GetModState() & c.SDL_KMOD_SHIFT != 0);
+                        self.line_drag = .search;
                         if (widgets.contains(self.search_clear_bounds, x, y)) {
                             self.search_len = 0;
                             self.sidebarChanged();
@@ -1239,13 +2109,13 @@ pub const View = struct {
                         if (!c.SDL_SetTextInputArea(window, &area, 0)) return error.TextInputArea;
                         return true;
                     }
-                    if (self.search_len != 0 and self.search_more_available and self.navigation_enabled and widgets.contains(self.search_more_bounds, x, y)) {
+                    if (self.search_more_available and self.navigation_enabled and widgets.contains(self.search_more_bounds, x, y)) {
                         self.navigation = .search_more;
                         return true;
                     }
                     self.search_focused = false;
                     if (widgets.contains(self.scope_bounds, x, y)) {
-                        self.scope_open = true;
+                        self.openScope();
                         return true;
                     }
                     if (widgets.contains(self.picker_bounds, x, y)) {
@@ -1285,11 +2155,37 @@ pub const View = struct {
                         return true;
                     }
                     if (self.navigation_enabled and widgets.contains(self.sidebar_bounds, x, y)) {
-                        if (widgets.contains(self.new_project_bounds, x, y)) self.navigation = .new_project;
-                        if (widgets.contains(self.new_thread_bounds, x, y)) self.navigation = .new_thread;
+                        if (widgets.contains(self.new_project_bounds, x, y)) {
+                            if (rename_blurred) self.sidebar_rename_followup = .new_project else self.navigation = .new_project;
+                        }
+                        if (widgets.contains(self.new_thread_bounds, x, y)) {
+                            if (rename_blurred) self.sidebar_rename_followup = .new_thread else self.navigation = .new_thread;
+                        }
                         if (widgets.contains(self.sidebar_rows, x, y)) {
+                            for (self.sidebar_action_bounds[0..self.thread_count], 0..) |actions, index| {
+                                if (widgets.contains(actions[0], x, y)) {
+                                    const entry = &self.threads[index];
+                                    const action: SidebarAction = if (entry.snoozed_until > wallTimeMs()) .wake else if (entry.settled) .unsettle else .settle;
+                                    if (rename_blurred) self.sidebar_rename_followup = .{ .sidebar = .{ .id = entry.id, .action = action } } else self.navigation = .{ .sidebar = .{ .index = index, .action = action } };
+                                    return true;
+                                }
+                                if (widgets.contains(actions[1], x, y)) {
+                                    if (!self.threads[index].can_snooze) return true;
+                                    self.sidebar_menu_thread = self.threads[index].id;
+                                    self.sidebar_menu_mode = .main;
+                                    self.sidebar_menu_x = actions[1].x;
+                                    self.sidebar_menu_y = actions[1].y + actions[1].h;
+                                    self.sidebar_menu_hover = 2;
+                                    return true;
+                                }
+                            }
                             for (0..self.thread_count) |index| if (widgets.contains(self.threadRowBounds(index), x, y)) {
-                                self.navigation = .{ .thread = index };
+                                if (event.button.clicks >= 2 and !rename_blurred) {
+                                    self.beginSidebarRename(index);
+                                    try self.focus(window, true);
+                                    return true;
+                                }
+                                if (rename_blurred) self.sidebar_rename_followup = .{ .thread = self.threads[index].id } else self.navigation = .{ .thread = index };
                                 if (self.search_len != 0) {
                                     self.search_len = 0;
                                     self.search_select_all = false;
@@ -1344,11 +2240,33 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_MOUSE_BUTTON_UP => {
+                self.line_drag = null;
+                if (event.button.button == c.SDL_BUTTON_LEFT and self.sidebar_resizing) {
+                    self.sidebar_resizing = false;
+                    _ = c.SDL_CaptureMouse(false);
+                    return true;
+                }
                 if (event.button.button != c.SDL_BUTTON_LEFT or (!self.dragging and self.transcript_drag == null)) return false;
                 self.releasePointer();
                 return true;
             },
             c.SDL_EVENT_MOUSE_MOTION => {
+                if (self.line_drag) |field| {
+                    const parts = self.lineParts(field);
+                    parts.edit.set(@min(self.line_view.hit(event.motion.x, event.motion.y) orelse parts.len.*, parts.len.*), true);
+                    parts.select.* = false;
+                    return true;
+                }
+                if (self.custom_root == null and self.sidebar_resizing) {
+                    if (std.math.isFinite(event.motion.x)) self.sidebar_width_override = std.math.clamp(event.motion.x, Layout.sidebarMinimumWith(self.design), Layout.sidebarMaximumWith(self.design, self.sidebar_window_width));
+                    return true;
+                }
+                if (self.custom_root == null and self.sidebar_menu_thread.len != 0) {
+                    for (self.sidebar_menu_rows[0..self.sidebar_menu_count], 0..) |row, index| {
+                        if (widgets.contains(row, event.motion.x, event.motion.y)) self.sidebar_menu_hover = index;
+                    }
+                    return true;
+                }
                 if (self.custom_root == null and self.effort_open) {
                     for (self.effort_rows, 0..) |row, index| if (widgets.contains(row, event.motion.x, event.motion.y)) {
                         self.effort_hover = index;
@@ -1360,11 +2278,23 @@ pub const View = struct {
                     return true;
                 }
 
+                if (self.custom_root == null and self.scope_open) {
+                    if (widgets.contains(self.scope_all_bounds, event.motion.x, event.motion.y)) self.scope_hover = 0;
+                    for (self.project_bounds[0..self.project_count], 0..) |row, index| {
+                        if (widgets.contains(row, event.motion.x, event.motion.y)) self.scope_hover = index + 1;
+                    }
+                    return true;
+                }
                 if (self.custom_root == null) {
                     const previous = self.sidebar_hover;
                     self.sidebar_hover = null;
                     for (0..self.thread_count) |index| if (widgets.contains(self.threadRowBounds(index), event.motion.x, event.motion.y)) {
                         self.sidebar_hover = index;
+                        if (self.search_len != 0) {
+                            for (0..self.visibleThreadCount()) |ordinal| {
+                                if (self.searchResult(ordinal) == index) self.search_hover = ordinal;
+                            }
+                        }
                     };
                     if (!self.dragging and self.transcript_drag == null and previous != self.sidebar_hover) return true;
                 }
@@ -1401,7 +2331,7 @@ pub const View = struct {
                         const height = @as(f32, @floatFromInt(self.project_count + 1)) * 28;
                         self.scope_scroll = std.math.clamp(self.scope_scroll - event.wheel.y * wheel_direction * 28, 0, @max(0, height - self.scope_menu.h + 8));
                     } else {
-                        const height = @as(f32, @floatFromInt(self.visibleThreadCount())) * sidebar_card_stride;
+                        const height = self.sidebarContentHeight();
                         self.sidebar_scroll = std.math.clamp(self.sidebar_scroll - event.wheel.y * wheel_direction * 36, 0, @max(0, height - self.sidebar_rows.h));
                     }
                     return true;
@@ -1421,7 +2351,11 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_TEXT_EDITING => {
-                if (self.custom_root == null and (self.workflow_open or self.setup_open or self.picker_open or self.effort_open or self.search_focused)) return true;
+                if (self.activeLine() != null) {
+                    if (self.window_active) try self.line_view.compose(std.mem.span(event.edit.text));
+                    return true;
+                }
+                if (self.custom_root == null and (self.workflow_open or self.setup_open or self.workspace_open or self.scope_open or self.picker_open or self.effort_open or self.sidebar_menu_thread.len != 0)) return true;
                 if (!self.hasComposer() or !self.focused or !self.window_active) return false;
                 const bytes = std.mem.span(event.edit.text);
                 self.preedit_changed = true;
@@ -1435,6 +2369,11 @@ pub const View = struct {
                 return true;
             },
             c.SDL_EVENT_TEXT_INPUT => {
+                if (self.activeLine() == .rename) {
+                    if (self.window_active) try self.sidebarRenameInsert(std.mem.span(event.text.text));
+                    return true;
+                }
+                if (self.custom_root == null and self.sidebar_menu_thread.len != 0) return true;
                 if (self.workflow_open and self.custom_root == null) {
                     if (self.workflow_path_focus and self.window_active) try self.workflowInsert(std.mem.span(event.text.text));
                     return true;
@@ -1444,13 +2383,13 @@ pub const View = struct {
                     try self.setupInsert(std.mem.span(event.text.text));
                     return true;
                 }
-                if (self.title_editing and self.custom_root == null) {
+                if (self.activeLine() == .title) {
                     if (!self.window_active) return false;
                     try self.titleInsert(std.mem.span(event.text.text));
                     return true;
                 }
-                if (self.workspace_open and self.custom_root == null) return true;
-                if (self.custom_root == null and self.search_focused) {
+                if ((self.workspace_open or self.scope_open) and self.custom_root == null) return true;
+                if (self.activeLine() == .search) {
                     if (!self.window_active) return false;
                     try self.searchInsert(std.mem.span(event.text.text));
                     return true;
@@ -1467,28 +2406,97 @@ pub const View = struct {
                 const mods = event.key.mod;
                 const ctrl = mods & c.SDL_KMOD_CTRL != 0;
                 const shift = mods & c.SDL_KMOD_SHIFT != 0;
+                if (self.activeLine()) |field| {
+                    if (!self.window_active) return false;
+                    if (self.line_view.preedit_len != 0) {
+                        if (key == c.SDLK_ESCAPE) self.line_view.preedit_len = 0;
+                        return true;
+                    }
+                    if (try self.lineKey(field, key, ctrl, shift)) return true;
+                    if (field == .rename) {
+                        if (key == c.SDLK_ESCAPE) {
+                            self.sidebar_rename_thread = .{};
+                            self.sidebar_rename_followup = null;
+                            self.line_view.reset();
+                        }
+                        if (key == c.SDLK_RETURN or key == c.SDLK_KP_ENTER) self.commitSidebarRename();
+                        return true;
+                    }
+                }
+                if (self.custom_root == null and ctrl and key == c.SDLK_B and !self.setup_open and !self.workspace_open and !self.workflow_open) {
+                    self.sidebar_collapsed = !self.sidebar_collapsed;
+                    self.sidebar_menu_thread = .{};
+                    self.scope_open = false;
+                    self.search_focused = false;
+                    return true;
+                }
+                if (self.custom_root == null and self.sidebar_menu_thread.len != 0) {
+                    switch (key) {
+                        c.SDLK_ESCAPE => {
+                            self.sidebar_menu_thread = .{};
+                            self.sidebar_menu_mode = .main;
+                        },
+                        c.SDLK_UP => {
+                            self.sidebar_menu_panel.move(false);
+                            self.sidebar_menu_hover = self.sidebar_menu_panel.selected orelse self.sidebar_menu_hover;
+                        },
+                        c.SDLK_DOWN => {
+                            self.sidebar_menu_panel.move(true);
+                            self.sidebar_menu_hover = self.sidebar_menu_panel.selected orelse self.sidebar_menu_hover;
+                        },
+                        c.SDLK_HOME, c.SDLK_END => {
+                            self.sidebar_menu_panel.edge(key == c.SDLK_END);
+                            self.sidebar_menu_hover = self.sidebar_menu_panel.selected orelse self.sidebar_menu_hover;
+                        },
+                        c.SDLK_LEFT => if (self.sidebar_menu_mode != .main) {
+                            const parent_action: SidebarMenu.Action = if (self.sidebar_menu_mode == .copy) .copy else .snooze;
+                            self.sidebar_menu_mode = .main;
+                            if (self.sidebarMenuIndex()) |index| {
+                                const entry = self.threads[index];
+                                self.sidebar_menu_panel = SidebarMenu.main(.{ .can_operate = self.navigation_enabled, .pinned = entry.pinned, .settled = entry.settled, .snoozed = entry.snoozed_until > wallTimeMs(), .can_snooze = entry.can_snooze, .filter_active = self.scope_project.eql(entry.project_id.slice()) });
+                                self.sidebar_menu_count = self.sidebar_menu_panel.len;
+                                for (self.sidebar_menu_panel.slice(), 0..) |item, row| if (item.action == parent_action) {
+                                    self.sidebar_menu_hover = row;
+                                    _ = self.sidebar_menu_panel.choose(row);
+                                    break;
+                                };
+                            }
+                        },
+                        c.SDLK_RIGHT => if (self.sidebar_menu_mode == .main and self.sidebar_menu_hover < self.sidebar_menu_panel.len) {
+                            const action = self.sidebar_menu_panel.items[self.sidebar_menu_hover].action;
+                            if (action == .copy) self.activateSidebarMenu(self.sidebar_menu_hover) else if (action == .snooze and self.threads[self.sidebarMenuIndex() orelse 0].snoozed_until <= wallTimeMs()) self.activateSidebarMenu(self.sidebar_menu_hover);
+                        },
+                        c.SDLK_RETURN, c.SDLK_KP_ENTER => {
+                            self.activateSidebarMenu(self.sidebar_menu_hover);
+                            if (self.sidebar_rename_thread.len != 0 or self.custom_snooze != null) try self.focus(window, true);
+                        },
+                        else => {},
+                    }
+                    return true;
+                }
+                if (self.custom_root == null and ((shift and key == c.SDLK_F10) or key == c.SDLK_MENU) and !self.setup_open and !self.workspace_open and !self.workflow_open) {
+                    for (self.threads[0..self.thread_count], 0..) |entry, index| {
+                        if (!entry.id.eql(self.active_thread.slice())) continue;
+                        const row = self.threadRowBounds(index);
+                        if (row.h == 0) return true;
+                        self.sidebar_menu_thread = entry.id;
+                        self.sidebar_menu_mode = .main;
+                        self.sidebar_menu_x = row.x + row.w / 2;
+                        self.sidebar_menu_y = row.y;
+                        self.sidebar_menu_hover = 0;
+                        return true;
+                    }
+                }
                 if (key == c.SDLK_F2 and self.titleEditAvailable()) {
                     self.beginTitleEdit();
                     try self.focus(window, true);
                     return true;
                 }
-                if (self.title_editing and self.custom_root == null) {
+                if (self.activeLine() == .title) {
                     if (key == c.SDLK_ESCAPE) {
                         self.finishTitle(.cancel);
                     } else if (key == c.SDLK_RETURN or key == c.SDLK_KP_ENTER) {
                         self.finishTitle(.save);
-                    } else if (ctrl and key == c.SDLK_A) {
-                        self.title_select_all = true;
-                    } else if (key == c.SDLK_BACKSPACE or key == c.SDLK_DELETE) {
-                        if (self.title_select_all) self.title_len = 0 else if (self.title_len != 0) {
-                            self.title_len -= 1;
-                            while (self.title_len > 0 and self.title_buffer[self.title_len] & 0xc0 == 0x80) self.title_len -= 1;
-                        }
-                        self.title_select_all = false;
-                    } else if (ctrl and key == c.SDLK_V) {
-                        const value = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
-                        defer c.SDL_free(value);
-                        try self.titleInsert(std.mem.span(value));
                     }
                     return true;
                 }
@@ -1609,47 +2617,49 @@ pub const View = struct {
                     return true;
                 }
                 if (self.scope_open and self.custom_root == null) {
-                    if (key == c.SDLK_ESCAPE) self.scope_open = false;
+                    if (!self.window_active) return false;
+                    switch (key) {
+                        c.SDLK_ESCAPE => self.scope_open = false,
+                        c.SDLK_UP => self.scope_hover -|= 1,
+                        c.SDLK_DOWN => self.scope_hover = @min(self.project_count, self.scope_hover + 1),
+                        c.SDLK_HOME => self.scope_hover = 0,
+                        c.SDLK_END => self.scope_hover = self.project_count,
+                        c.SDLK_RETURN, c.SDLK_KP_ENTER => {
+                            self.scope_project = if (self.scope_hover == 0) .{} else self.projects[self.scope_hover - 1].id;
+                            self.sidebarChanged();
+                            self.scope_open = false;
+                        },
+                        else => {},
+                    }
+                    const top = @as(f32, @floatFromInt(self.scope_hover)) * 28;
+                    if (top < self.scope_scroll) self.scope_scroll = top;
+                    if (top + 28 > self.scope_scroll + self.scope_menu.h - 8) self.scope_scroll = @max(0, top + 36 - self.scope_menu.h);
                     return true;
                 }
                 if (self.workspace_open and self.custom_root == null) {
                     if (key == c.SDLK_ESCAPE) self.workspace_open = false;
                     return true;
                 }
-                if (self.search_focused and self.custom_root == null) {
+                if (self.activeLine() == .search) {
                     if (!self.window_active) return false;
                     if (ctrl and key == c.SDLK_PAGEDOWN and self.search_more_available and self.navigation_enabled) {
                         self.navigation = .search_more;
                         return true;
                     }
-                    if (ctrl and key == c.SDLK_A) self.search_select_all = true;
-                    if (ctrl and key == c.SDLK_V) {
-                        const value = c.SDL_GetClipboardText() orelse return error.ClipboardRead;
-                        defer c.SDL_free(value);
-                        try self.searchInsert(std.mem.span(value));
-                    }
                     if (key == c.SDLK_ESCAPE) {
                         self.search_len = 0;
                         self.search_select_all = false;
+                        self.search_edit = .{};
+                        self.line_view.reset();
                         self.search_focused = false;
-                        self.sidebarChanged();
-                    }
-                    if (key == c.SDLK_BACKSPACE or key == c.SDLK_DELETE) {
-                        if (self.search_select_all) {
-                            self.search_len = 0;
-                        } else if (key == c.SDLK_BACKSPACE and self.search_len > 0) {
-                            self.search_len -= 1;
-                            while (self.search_len > 0 and self.search_query[self.search_len] & 0xc0 == 0x80) self.search_len -= 1;
-                        }
-                        self.search_select_all = false;
                         self.sidebarChanged();
                     }
                     if (key == c.SDLK_UP) self.search_hover -|= 1;
                     if (key == c.SDLK_DOWN) self.search_hover = @min(self.visibleThreadCount() -| 1, self.search_hover + 1);
                     if (key == c.SDLK_UP or key == c.SDLK_DOWN) {
-                        const top = @as(f32, @floatFromInt(self.search_hover)) * sidebar_card_stride;
+                        const top = @as(f32, @floatFromInt(self.search_hover)) * self.sidebarStride();
                         if (top < self.sidebar_scroll) self.sidebar_scroll = top;
-                        if (top + sidebar_card_stride > self.sidebar_scroll + self.sidebar_rows.h) self.sidebar_scroll = @max(0, top + sidebar_card_stride - self.sidebar_rows.h);
+                        if (top + self.sidebarStride() > self.sidebar_scroll + self.sidebar_rows.h) self.sidebar_scroll = @max(0, top + self.sidebarStride() - self.sidebar_rows.h);
                     }
                     if ((key == c.SDLK_RETURN or key == c.SDLK_KP_ENTER) and self.navigation_enabled) {
                         if (self.searchResult(self.search_hover)) |index| {
@@ -1850,7 +2860,10 @@ pub const View = struct {
     }
 
     pub fn sidebarWidth(self: *const View, width: f32) f32 {
-        return Layout.sidebarWidthWith(self.design, width);
+        if (self.sidebar_collapsed) return 0;
+        var design = self.design;
+        if (self.sidebar_width_override) |preferred| design.layout.sidebar_width = preferred;
+        return Layout.sidebarWidthWith(design, width);
     }
 
     fn workspaceName(self: *const View) []const u8 {
@@ -1908,16 +2921,27 @@ pub const View = struct {
 
     // Fixed native strokes: no decorative Unicode, face discovery or retained
     // icon textures. Coordinates use a 16-unit local grid.
-    const Icon = enum { plus, folder, pen, chevron, send, stop, settings, search, filter, branch, close };
+    const Icon = enum { plus, folder, pen, chevron, send, stop, settings, search, filter, branch, analytics, refresh, close, sidebar, chevron_up, working, alert, question, clock, pin, check, copy };
     fn icon(renderer: *c.SDL_Renderer, kind: Icon, x: f32, y: f32, color: Color) !void {
         // ComposerPrimaryActions.tsx uses an 8px filled rounded square inside
         // its 12px Stop glyph, centered in the 32px action.
         if (kind == .stop) return widgets.panel(renderer, .{ .x = x + 4, .y = y + 4, .w = 8, .h = 8 }, 1.5, color);
         if (!c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, 255)) return error.IconDraw;
         const paths: []const [4]f32 = switch (kind) {
+            .check => &.{ .{ 3, 8, 6, 11 }, .{ 6, 11, 13, 4 } },
+            .copy => &.{ .{ 5, 5, 14, 5 }, .{ 14, 5, 14, 14 }, .{ 14, 14, 5, 14 }, .{ 5, 14, 5, 5 }, .{ 2, 11, 2, 2 }, .{ 2, 2, 11, 2 } },
+            .pin => &.{ .{ 5, 1, 12, 1 }, .{ 6, 1, 6, 6 }, .{ 11, 1, 11, 6 }, .{ 6, 6, 3, 9 }, .{ 3, 9, 13, 9 }, .{ 13, 9, 11, 6 }, .{ 8, 9, 8, 15 } },
+            .clock => &.{ .{ 5, 1, 11, 1 }, .{ 11, 1, 15, 5 }, .{ 15, 5, 15, 11 }, .{ 15, 11, 11, 15 }, .{ 11, 15, 5, 15 }, .{ 5, 15, 1, 11 }, .{ 1, 11, 1, 5 }, .{ 1, 5, 5, 1 }, .{ 8, 4, 8, 8 }, .{ 8, 8, 11, 10 } },
+            .working => &.{ .{ 5, 1, 10, 1 }, .{ 13, 4, 15, 8 }, .{ 13, 12, 10, 15 }, .{ 6, 15, 2, 12 }, .{ 1, 8, 2, 4 } },
+            .alert => &.{ .{ 5, 1, 11, 1 }, .{ 11, 1, 15, 5 }, .{ 15, 5, 15, 11 }, .{ 15, 11, 11, 15 }, .{ 11, 15, 5, 15 }, .{ 5, 15, 1, 11 }, .{ 1, 11, 1, 5 }, .{ 1, 5, 5, 1 }, .{ 8, 4, 8, 9 }, .{ 8, 12, 8, 12 } },
+            .question => &.{ .{ 3, 4, 5, 2 }, .{ 5, 2, 10, 2 }, .{ 10, 2, 13, 5 }, .{ 13, 5, 13, 7 }, .{ 13, 7, 8, 10 }, .{ 8, 10, 8, 11 }, .{ 8, 14, 8, 14 } },
+            .sidebar => &.{ .{ 1, 2, 15, 2 }, .{ 15, 2, 15, 14 }, .{ 15, 14, 1, 14 }, .{ 1, 14, 1, 2 }, .{ 6, 2, 6, 14 } },
+            .chevron_up => &.{ .{ 4, 10, 8, 6 }, .{ 8, 6, 12, 10 } },
             .search => &.{ .{ 3, 2, 9, 2 }, .{ 9, 2, 12, 5 }, .{ 12, 5, 12, 9 }, .{ 12, 9, 9, 12 }, .{ 9, 12, 3, 12 }, .{ 3, 12, 1, 9 }, .{ 1, 9, 1, 5 }, .{ 1, 5, 3, 2 }, .{ 11, 11, 15, 15 } },
             .filter => &.{ .{ 1, 3, 15, 3 }, .{ 4, 8, 12, 8 }, .{ 6, 13, 10, 13 } },
             .branch => &.{ .{ 4, 2, 4, 13 }, .{ 4, 9, 11, 9 }, .{ 11, 9, 12, 7 }, .{ 12, 7, 12, 3 }, .{ 2, 1, 6, 1 }, .{ 10, 2, 14, 2 }, .{ 2, 14, 6, 14 } },
+            .analytics => &.{ .{ 2, 14, 2, 9 }, .{ 7, 14, 7, 5 }, .{ 12, 14, 12, 2 }, .{ 1, 14, 14, 14 } },
+            .refresh => &.{ .{ 13, 5, 11, 3 }, .{ 11, 3, 8, 2 }, .{ 8, 2, 5, 3 }, .{ 5, 3, 3, 6 }, .{ 3, 6, 3, 10 }, .{ 3, 10, 5, 13 }, .{ 5, 13, 8, 14 }, .{ 8, 14, 11, 13 }, .{ 11, 13, 13, 10 }, .{ 13, 10, 10, 10 }, .{ 13, 10, 13, 7 } },
             .close => &.{ .{ 4, 4, 12, 12 }, .{ 12, 4, 4, 12 } },
             .plus => &.{ .{ 8, 2, 8, 14 }, .{ 2, 8, 14, 8 } },
             .folder => &.{ .{ 1, 4, 6, 4 }, .{ 6, 4, 8, 6 }, .{ 8, 6, 15, 6 }, .{ 15, 6, 15, 14 }, .{ 15, 14, 1, 14 }, .{ 1, 14, 1, 4 } },
@@ -1933,68 +2957,124 @@ pub const View = struct {
     fn drawChrome(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
         const metrics = self.design.layout;
         const palette = self.design.colors;
+        self.sidebar_now_ms = wallTimeMs();
+        self.sidebar_window_width = bounds.header.width;
         const sidebar = self.sidebarWidth(bounds.header.width);
         const height = @max(bounds.canvas_height, bounds.composer.y + bounds.composer.height + metrics.gutter);
-        const inset = @min(metrics.gutter, 20);
         const radius = @min(metrics.radius, 8);
         self.sidebar_bounds = .{ .x = 0, .y = 0, .w = sidebar, .h = height };
-        try widgets.panel(renderer, self.sidebar_bounds, 0, palette.sidebar);
-        try widgets.panel(renderer, .{ .x = sidebar - 1, .y = 0, .w = 1, .h = height }, 0, palette.sidebar_border);
-        try self.labels.draw(text, "Spica", inset, (bounds.header.height - 16) / 2, 14, foreground);
-        // Current eb1510d source puts Search and all three icon actions on
-        // one 32px row. The older marketing image uses a separate scope row.
-        const row_top = bounds.header.height + 4;
-        const action_y = row_top + 2;
-        self.new_thread_bounds = .{ .x = sidebar - 36, .y = action_y, .w = 28, .h = 28 };
-        self.new_project_bounds = .{ .x = sidebar - 65, .y = action_y, .w = 28, .h = 28 };
-        self.scope_bounds = .{ .x = sidebar - 94, .y = action_y, .w = 28, .h = 28 };
-        self.search_bounds = .{ .x = 8, .y = row_top, .w = @max(0, self.scope_bounds.x - 9), .h = 32 };
-        self.search_clear_bounds = if (self.search_len == 0) zero_rect else .{ .x = self.search_bounds.x + self.search_bounds.w - 22, .y = action_y, .w = 22, .h = 28 };
-        const sidebar_muted = palette.sidebar_muted;
-        if (self.search_focused) try widgets.panel(renderer, self.search_bounds, 6, palette.raised);
-        try icon(renderer, .search, 16, row_top + 8, sidebar_muted);
-        const search_label = if (self.search_len == 0) "Search" else self.search_query[0..self.search_len];
-        try self.labels.drawFitted(renderer, text, search_label, 40, row_top + 8, self.search_bounds.w - 32 - (if (self.search_len == 0) @as(f32, 0) else 22), 14, if (self.search_len == 0) sidebar_muted else foreground);
-        if (self.search_focused and self.search_bounds.w > 40) {
-            var search_clip = widgets.Clip.push(renderer, .{ .x = 40, .y = row_top + 6, .w = @max(0, self.search_bounds.w - 54), .h = 20 });
-            defer search_clip.restore(renderer);
-            const text_width = try self.labels.width(text, @import("../text/utf8.zig").prefix(self.search_query[0..self.search_len], 128), 14);
-            if (self.search_select_all and self.search_len > 0) {
-                try widgets.panel(renderer, .{ .x = 40, .y = row_top + 6, .w = text_width, .h = 20 }, 2, palette.selection);
-                try self.labels.drawFitted(renderer, text, self.search_query[0..self.search_len], 40, row_top + 8, self.search_bounds.w - 54, 14, foreground);
-            } else {
-                try widgets.panel(renderer, .{ .x = 40 + @min(text_width, @max(0, self.search_bounds.w - 56)), .y = row_top + 8, .w = 1, .h = 16 }, 0, foreground);
-            }
-        }
-        if (self.search_len != 0) try icon(renderer, .close, self.search_clear_bounds.x + 3, row_top + 8, sidebar_muted);
-        if (self.scope_project.len != 0) try widgets.panel(renderer, self.scope_bounds, 6, palette.sidebar_active);
-        try icon(renderer, .filter, self.scope_bounds.x + 6, action_y + 6, sidebar_muted);
-        try icon(renderer, .folder, self.new_project_bounds.x + 6, action_y + 5, sidebar_muted);
-        try icon(renderer, .plus, self.new_project_bounds.x + 8, action_y + 7, sidebar_muted);
-        try icon(renderer, .pen, self.new_thread_bounds.x + 6, action_y + 6, sidebar_muted);
-        const more_height: f32 = if (self.search_len != 0 and self.search_more_available) 24 else 0;
-        self.search_more_bounds = if (more_height != 0) .{ .x = 8, .y = row_top + 36, .w = sidebar - 16, .h = more_height } else zero_rect;
-        if (more_height != 0) try self.labels.drawFitted(renderer, text, "More matches · Ctrl+PgDn", 18, row_top + 40, sidebar - 36, 12, sidebar_muted);
-        self.sidebar_rows = .{ .x = 8, .y = row_top + 40 + more_height, .w = sidebar - 16, .h = @max(0, height - row_top - 84 - more_height) };
-        const rows_height = @as(f32, @floatFromInt(self.visibleThreadCount())) * sidebar_card_stride;
-        self.sidebar_scroll = std.math.clamp(self.sidebar_scroll, 0, @max(0, rows_height - self.sidebar_rows.h));
-        self.project_bounds = @splat(zero_rect);
+        self.sidebar_toggle_bounds = if (self.sidebar_collapsed)
+            .{ .x = 8, .y = 12, .w = 28, .h = 28 }
+        else
+            .{ .x = 12, .y = 12, .w = 28, .h = 28 };
+        self.sidebar_resize_bounds = if (self.sidebar_collapsed) zero_rect else .{ .x = sidebar - 3, .y = 0, .w = 6, .h = height };
+        self.sidebar_empty_project_bounds = zero_rect;
+        _ = self.navigation_targets.add("sidebar.toggle", "button", self.sidebar_toggle_bounds, true) catch {};
+        _ = self.navigation_targets.add("sidebar.resize", "separator", self.sidebar_resize_bounds, !self.sidebar_collapsed) catch {};
+        self.new_thread_bounds = zero_rect;
+        self.new_project_bounds = zero_rect;
+        self.search_bounds = zero_rect;
+        self.scope_bounds = zero_rect;
+        self.setup_bounds = zero_rect;
+        self.search_more_bounds = zero_rect;
+        self.sidebar_rows = zero_rect;
         self.thread_bounds = @splat(zero_rect);
-        var clip = widgets.Clip.push(renderer, self.sidebar_rows);
-        defer clip.restore(renderer);
-        try self.drawThreads(renderer, text, foreground, sidebar_muted);
-        if (self.visibleThreadCount() == 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0 and self.thread_search_busy) "Searching older threads…" else if (self.search_len != 0 and self.search_more_available) "No match here · Enter searches older threads" else if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
-        clip.restore(renderer);
-        // Make the actual connection entry point legible. A settings glyph
-        // alone left first-time users guessing where provider setup lived;
-        // the whole status row is now one painted, clickable target.
-        self.setup_bounds = .{ .x = 8, .y = height - 36, .w = sidebar - 16, .h = 32 };
-        if (self.setup_open) try widgets.panel(renderer, self.setup_bounds, 6, palette.sidebar_active);
-        try icon(renderer, .settings, 16, height - 28, sidebar_muted);
-        try self.labels.draw(text, "Connection", 40, height - 29, 12, foreground);
-        try self.labels.drawFitted(renderer, text, self.status, 40, height - 16, sidebar - 56, 10, sidebar_muted);
-        if (self.scope_open) try self.drawScope(renderer, text, foreground, sidebar_muted);
-        const header_x = sidebar + metrics.gutter;
+        self.project_bounds = @splat(zero_rect);
+        self.sidebar_shelf_bounds = @splat(zero_rect);
+        self.sidebar_action_bounds = @splat(@splat(zero_rect));
+        self.sidebar_footer_bounds = @splat(zero_rect);
+        if (!self.sidebar_collapsed) {
+            try widgets.panel(renderer, self.sidebar_bounds, 0, palette.sidebar);
+            try widgets.panel(renderer, .{ .x = sidebar - 1, .y = 0, .w = 1, .h = height }, 0, palette.sidebar_border);
+            // T3 Code keeps its compact brand and collapse affordance inside a
+            // dark, softly colored header. Paint the gradient as bounded one
+            // pixel strips so it remains cheap on software renderers.
+            const header_height = @min(@as(f32, 52), bounds.header.height);
+            var strip: c.SDL_FRect = .{ .x = 0, .y = 0, .w = sidebar, .h = 1 };
+            var row: usize = 0;
+            while (row < @as(usize, @intFromFloat(header_height))) : (row += 1) {
+                const fade = 1.0 - @as(f32, @floatFromInt(row)) / @max(1, header_height);
+                const r: u8 = @intFromFloat(8 + 22 * fade);
+                const g: u8 = @intFromFloat(10 + 20 * fade);
+                const b: u8 = @intFromFloat(22 + 42 * fade);
+                if (!c.SDL_SetRenderDrawColor(renderer, r, g, b, 255) or !c.SDL_RenderFillRect(renderer, &strip)) return error.SidebarHeaderDraw;
+                strip.y += 1;
+            }
+            try icon(renderer, .sidebar, self.sidebar_toggle_bounds.x + 6, self.sidebar_toggle_bounds.y + 6, foreground);
+            try self.labels.draw(text, "T3", 50, (bounds.header.height - 16) / 2, 14, foreground);
+            try self.labels.draw(text, " Code", 70, (bounds.header.height - 16) / 2, 14, palette.sidebar_muted);
+            // Current eb1510d source puts Search and all three icon actions on
+            // one 32px row. The older marketing image uses a separate scope row.
+            const row_top = bounds.header.height + 4;
+            const action_y = row_top + 2;
+            const empty_sidebar = self.project_count == 0 and self.thread_count == 0 and self.search_len == 0;
+            self.new_thread_bounds = .{ .x = sidebar - 36, .y = action_y, .w = 28, .h = 28 };
+            self.new_project_bounds = if (empty_sidebar) zero_rect else .{ .x = sidebar - 65, .y = action_y, .w = 28, .h = 28 };
+            self.scope_bounds = if (empty_sidebar) zero_rect else .{ .x = sidebar - 94, .y = action_y, .w = 28, .h = 28 };
+            self.search_bounds = .{ .x = 8, .y = row_top, .w = @max(0, if (empty_sidebar) sidebar - 48 else self.scope_bounds.x - 9), .h = 32 };
+            self.search_clear_bounds = if (self.search_len == 0) zero_rect else .{ .x = self.search_bounds.x + self.search_bounds.w - 22, .y = action_y, .w = 22, .h = 28 };
+            const sidebar_muted = palette.sidebar_muted;
+            if (self.search_focused) try widgets.panel(renderer, self.search_bounds, 6, palette.raised);
+            try icon(renderer, .search, 16, row_top + 8, sidebar_muted);
+            const search_label = if (self.search_len == 0) "Search" else self.search_query[0..self.search_len];
+            if (!self.search_focused or self.search_len == 0) try self.labels.drawFitted(renderer, text, search_label, 40, row_top + 8, self.search_bounds.w - 32 - (if (self.search_len == 0) @as(f32, 0) else 22), 14, if (self.search_len == 0) sidebar_muted else foreground);
+            if (self.search_focused and self.search_bounds.w > 40 and self.activeLine() == .search) {
+                self.search_edit.sync(self.search_len, self.search_select_all);
+                try self.line_view.draw(renderer, text, self.search_query[0..self.search_len], self.search_edit, .{ .x = 40, .y = row_top + 8, .w = @max(0, self.search_bounds.w - 54), .h = 20 }, foreground, palette.selection, self.window_active);
+            }
+            if (self.search_len != 0) try icon(renderer, .close, self.search_clear_bounds.x + 3, row_top + 8, sidebar_muted);
+            if (!empty_sidebar) {
+                if (self.scope_project.len != 0) try widgets.panel(renderer, self.scope_bounds, 6, palette.sidebar_active);
+                try icon(renderer, .filter, self.scope_bounds.x + 6, action_y + 6, sidebar_muted);
+                try icon(renderer, .folder, self.new_project_bounds.x + 6, action_y + 5, sidebar_muted);
+                try icon(renderer, .plus, self.new_project_bounds.x + 8, action_y + 7, sidebar_muted);
+            }
+            try icon(renderer, .pen, self.new_thread_bounds.x + 6, action_y + 6, sidebar_muted);
+            const more_height: f32 = if (self.search_more_available) 24 else 0;
+            self.search_more_bounds = if (more_height != 0) .{ .x = 8, .y = row_top + 36, .w = sidebar - 16, .h = more_height } else zero_rect;
+            if (more_height != 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0) "More matches · Ctrl+PgDn" else "More threads", 18, row_top + 40, sidebar - 36, 12, sidebar_muted);
+            self.sidebar_rows = .{ .x = 8, .y = row_top + 40 + more_height, .w = sidebar - 16, .h = @max(0, height - row_top - 84 - more_height) };
+            const rows_height = self.sidebarContentHeight();
+            self.sidebar_scroll = std.math.clamp(self.sidebar_scroll, 0, @max(0, rows_height - self.sidebar_rows.h));
+            self.project_bounds = @splat(zero_rect);
+            self.thread_bounds = @splat(zero_rect);
+            var clip = widgets.Clip.push(renderer, self.sidebar_rows);
+            defer clip.restore(renderer);
+            try self.drawThreads(renderer, text, foreground, sidebar_muted);
+            if (self.visibleThreadCount() == 0 and !(self.project_count == 0 and self.thread_count == 0 and self.search_len == 0)) try self.labels.drawFitted(renderer, text, if (self.search_len != 0 and self.thread_search_busy) "Searching older threads…" else if (self.search_len != 0 and self.search_more_available) "No match here · Enter searches older threads" else if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
+            if (self.project_count == 0 and self.thread_count == 0 and self.search_len == 0) {
+                const center_x = self.sidebar_rows.x + self.sidebar_rows.w / 2;
+                try self.labels.drawFitted(renderer, text, "No projects yet", self.sidebar_rows.x, self.sidebar_rows.y + 26, self.sidebar_rows.w, 12, sidebar_muted);
+                self.sidebar_empty_project_bounds = .{ .x = center_x - 48, .y = self.sidebar_rows.y + 52, .w = 96, .h = 28 };
+                try widgets.panel(renderer, self.sidebar_empty_project_bounds, 5, palette.surface);
+                try icon(renderer, .plus, self.sidebar_empty_project_bounds.x + 10, self.sidebar_empty_project_bounds.y + 6, sidebar_muted);
+                try self.labels.draw(text, "Add project", self.sidebar_empty_project_bounds.x + 28, self.sidebar_empty_project_bounds.y + 8, 11, foreground);
+                _ = self.navigation_targets.add("workspace.empty_project", "button", self.sidebar_empty_project_bounds, true) catch {};
+            }
+            clip.restore(renderer);
+            // Make the actual connection entry point legible. A settings glyph
+            // alone left first-time users guessing where provider setup lived;
+            // the whole status row is now one painted, clickable target.
+            self.setup_bounds = .{ .x = 8, .y = height - 36, .w = 32, .h = 32 };
+            self.sidebar_archive_bounds = .{ .x = 48, .y = height - 36, .w = 32, .h = 32 };
+            self.sidebar_footer_bounds = .{
+                .{ .x = 8, .y = height - 36, .w = 32, .h = 32 },
+                .{ .x = 48, .y = height - 36, .w = 32, .h = 32 },
+                .{ .x = 84, .y = height - 36, .w = 32, .h = 32 },
+                .{ .x = sidebar - 40, .y = height - 36, .w = 32, .h = 32 },
+            };
+            if (self.setup_open) try widgets.panel(renderer, self.setup_bounds, 6, palette.sidebar_active);
+            try icon(renderer, .settings, 16, height - 28, sidebar_muted);
+            try icon(renderer, .branch, 56, height - 28, sidebar_muted);
+            try icon(renderer, .analytics, 92, height - 28, sidebar_muted);
+            try icon(renderer, .refresh, sidebar - 34, height - 28, sidebar_muted);
+            _ = self.navigation_targets.add("sidebar.archived.toggle", "button", self.sidebar_archive_bounds, true) catch {};
+            _ = self.navigation_targets.add("sidebar.analytics", "button", self.sidebar_footer_bounds[2], true) catch {};
+            _ = self.navigation_targets.add("sidebar.refresh", "button", self.sidebar_footer_bounds[3], true) catch {};
+            if (self.scope_open) try self.drawScope(renderer, text, foreground, sidebar_muted);
+        }
+        if (self.sidebar_collapsed) try icon(renderer, .sidebar, self.sidebar_toggle_bounds.x + 6, self.sidebar_toggle_bounds.y + 6, muted);
+        const header_x = sidebar + metrics.gutter + 32;
         var project_name: []const u8 = "Workspace";
         var thread_name: []const u8 = "New chat";
         for (self.projects[0..self.project_count]) |*entry| if (entry.id.eql(self.active_project.slice())) {
@@ -2019,7 +3099,8 @@ pub const View = struct {
         _ = self.navigation_targets.add("thread.title.edit", "textbox", self.title_bounds, self.titleEditAvailable()) catch {};
         if (self.title_editing) {
             try widgets.panel(renderer, self.title_bounds, 4, palette.surface);
-            try self.labels.drawFitted(renderer, text, self.title_buffer[0..self.title_len], title_x + 6, (bounds.header.height - 16) / 2, self.title_bounds.w - 12, 14, foreground);
+            self.title_line_edit.sync(self.title_len, self.title_select_all);
+            try self.line_view.draw(renderer, text, self.title_buffer[0..self.title_len], self.title_line_edit, .{ .x = title_x + 6, .y = (bounds.header.height - 16) / 2, .w = @max(0, self.title_bounds.w - 12), .h = 20 }, foreground, palette.selection, self.window_active and self.activeLine() == .title);
         } else try self.labels.drawFitted(renderer, text, thread_name, title_x, (bounds.header.height - 16) / 2, self.title_bounds.w, 14, foreground);
         if (self.workspace_toggle_bounds.w != 0) {
             try widgets.panel(renderer, self.workspace_toggle_bounds, @min(metrics.radius, 5), if (self.workspace_open) palette.sidebar_active else palette.surface);
@@ -2047,11 +3128,13 @@ pub const View = struct {
         defer clip.restore(renderer);
         var y = self.scope_menu.y + 4 - self.scope_scroll;
         self.scope_all_bounds = clippedRect(.{ .x = 12, .y = y, .w = self.scope_menu.w - 8, .h = 28 }, self.scope_menu);
+        if (self.scope_hover == 0) try widgets.panel(renderer, self.scope_all_bounds, 4, self.design.colors.sidebar_hover);
         if (self.scope_project.len == 0) try widgets.panel(renderer, self.scope_all_bounds, 4, self.design.colors.sidebar_active);
         try self.labels.drawFitted(renderer, text, "All projects", 20, y + 7, self.scope_menu.w - 24, 12, foreground);
         y += 28;
         for (self.projects[0..self.project_count], 0..) |*entry, index| {
             self.project_bounds[index] = clippedRect(.{ .x = 12, .y = y, .w = self.scope_menu.w - 8, .h = 28 }, self.scope_menu);
+            if (self.scope_hover == index + 1) try widgets.panel(renderer, self.project_bounds[index], 4, self.design.colors.sidebar_hover);
             if (self.scope_project.eql(entry.id.slice())) try widgets.panel(renderer, self.project_bounds[index], 4, self.design.colors.sidebar_active);
             try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], 20, y + 7, self.scope_menu.w - 24, 12, muted);
             y += 28;
@@ -2061,9 +3144,50 @@ pub const View = struct {
     fn drawThreads(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, foreground: Color, muted: Color) !void {
         var y = self.sidebar_rows.y - self.sidebar_scroll;
         var ordinal: usize = 0;
+        const searching = self.search_len != 0;
+        var ordered: [32]usize = undefined;
+        var count: usize = 0;
+        var section_counts: [5]usize = @splat(0);
         for (self.threads[0..self.thread_count], 0..) |*entry, index| {
             if (!self.threadMatches(entry)) continue;
-            const row = c.SDL_FRect{ .x = self.sidebar_rows.x, .y = y + 2, .w = self.sidebar_rows.w, .h = 78 };
+            section_counts[@intFromEnum(self.sidebarSection(entry))] += 1;
+            ordered[count] = index;
+            count += 1;
+        }
+        if (!searching) {
+            // Fixed-capacity insertion sort retains original indices for commands.
+            for (1..@max(1, count)) |at| {
+                var cursor = at;
+                while (cursor > 0) : (cursor -= 1) {
+                    const left = &self.threads[ordered[cursor - 1]];
+                    const right = &self.threads[ordered[cursor]];
+                    const ls = @intFromEnum(self.sidebarSection(left));
+                    const rs = @intFromEnum(self.sidebarSection(right));
+                    if (ls < rs or (ls == rs and left.sort_order <= right.sort_order)) break;
+                    std.mem.swap(usize, &ordered[cursor - 1], &ordered[cursor]);
+                }
+            }
+        }
+        var section_cursor: usize = 0;
+        const shelf_gap = if (searching) @as(f32, 0) else @max(0, self.sidebar_rows.h - self.sidebarContentHeight());
+        var shelf_started = false;
+        for (ordered[0..count]) |index| {
+            const entry = &self.threads[index];
+            const section = @intFromEnum(self.sidebarSection(entry));
+            if (!searching and section >= 2) {
+                while (section_cursor <= section) : (section_cursor += 1) {
+                    if (section_cursor < 2 or (section_cursor < 4 and section_counts[section_cursor] == 0)) continue;
+                    if (!shelf_started) {
+                        y += shelf_gap;
+                        shelf_started = true;
+                    }
+                    try self.drawSidebarShelf(renderer, text, section_cursor - 2, section_counts[section_cursor], y, muted);
+                    y += 33;
+                }
+            }
+            if (!self.sidebarShelfVisible(entry)) continue;
+            const slim = self.sidebarSlim(entry);
+            const row = c.SDL_FRect{ .x = self.sidebar_rows.x, .y = y + (if (slim) @as(f32, 0) else 2), .w = self.sidebar_rows.w, .h = if (slim) 36 else 78 };
             self.thread_bounds[index] = clippedRect(row, self.sidebar_rows);
             if (self.thread_bounds[index].h > 0) {
                 const active = entry.id.eql(self.active_thread.slice());
@@ -2074,31 +3198,299 @@ pub const View = struct {
                 }
                 const x = row.x + 10;
                 const width = row.w - 20;
+                if (slim) {
+                    try icon(renderer, .folder, x, row.y + 10, muted);
+                    const hovered = !searching and self.sidebar_hover == index and self.navigation_enabled;
+                    try self.drawSidebarTitle(renderer, text, entry, x + 26, row.y + 10, @max(0, (if (hovered) sidebarActionStart(entry, row, true) - 8 else x + width) - x - 26), foreground);
+                    if (hovered) try self.drawSidebarRowActions(renderer, text, index, row, true, foreground);
+                    ordinal += 1;
+                    y += sidebar_search_stride;
+                    continue;
+                }
+                const hovered = self.sidebar_hover == index and self.navigation_enabled;
                 if (entry.project_name.len != 0) {
                     try icon(renderer, .folder, x, row.y + 9, muted);
-                    try self.labels.drawFitted(renderer, text, entry.project_name.slice(), x + 22, row.y + 10, width - 22 - (if (entry.run_status == .idle) @as(f32, 0) else 72), 12, muted);
+                    if (entry.pinned) try icon(renderer, .pin, x + 20, row.y + 9, muted);
+                    const project_inset: f32 = if (entry.pinned) 40 else 22;
+                    const project_end = if (hovered) sidebarActionStart(entry, row, false) - 8 else row.x + row.w - 10 - (if (entry.run_status == .idle) @as(f32, 36) else 84);
+                    try self.labels.drawFitted(renderer, text, entry.project_name.slice(), x + project_inset, row.y + 10, @max(0, project_end - x - project_inset), 12, muted);
                 }
-                if (entry.run_status != .idle) {
+                if (!hovered and entry.run_status == .idle and entry.updated_at_ms > 0) {
+                    var time_buffer: [32]u8 = undefined;
+                    const elapsed = @max(0, self.sidebar_now_ms - entry.updated_at_ms);
+                    const time_label = if (elapsed < 60_000) "now" else if (elapsed < 3_600_000) try std.fmt.bufPrint(&time_buffer, "{d}m", .{@divFloor(elapsed, 60_000)}) else if (elapsed < 86_400_000) try std.fmt.bufPrint(&time_buffer, "{d}h", .{@divFloor(elapsed, 3_600_000)}) else try std.fmt.bufPrint(&time_buffer, "{d}d", .{@divFloor(elapsed, 86_400_000)});
+                    const time_width = try self.labels.width(text, time_label, 12);
+                    try self.labels.draw(text, time_label, row.x + row.w - 10 - time_width, row.y + 10, 12, muted);
+                }
+                if (!hovered and entry.run_status != .idle) {
                     const status_label: []const u8 = switch (entry.run_status) {
                         .running => "Working",
+                        .question => "Input",
                         .approval => "Approval",
                         .failed => "Failed",
                         .interrupted => "Interrupted",
                         .unknown => "Unknown",
                         .idle => unreachable,
                     };
-                    try self.labels.drawFitted(renderer, text, status_label, row.x + row.w - 76, row.y + 10, 66, 11, muted);
+                    const status_color = if (entry.run_status == .failed) self.design.colors.danger else if (entry.run_status == .question or entry.run_status == .approval) self.design.colors.foreground else muted;
+                    try icon(renderer, if (entry.run_status == .running) .working else if (entry.run_status == .failed) .alert else .question, row.x + row.w - 92, row.y + 8, status_color);
+                    try self.labels.drawFitted(renderer, text, status_label, row.x + row.w - 72, row.y + 10, 62, 11, status_color);
                 }
-                try self.labels.drawFitted(renderer, text, entry.label[0..entry.len], x, row.y + 32, width, 14, foreground);
+                if (hovered) try self.drawSidebarRowActions(renderer, text, index, row, false, foreground);
+                try self.drawSidebarTitle(renderer, text, entry, x, row.y + 32, width, foreground);
+                if (entry.runtime_kind.len != 0) {
+                    const provider = if (entry.runtime_kind.eql("codex")) "Codex" else if (entry.runtime_kind.eql("opencode")) "OpenCode" else entry.runtime_kind.slice();
+                    const provider_label = @import("../text/utf8.zig").prefix(provider, @import("label_cache.zig").max_bytes);
+                    const provider_width = try self.labels.width(text, provider_label, 10);
+                    try self.labels.draw(text, provider_label, row.x + row.w - 10 - provider_width, row.y + 58, 10, muted);
+                }
                 const metadata = if (entry.branch.len != 0) entry.branch.slice() else entry.workspace_name.slice();
                 if (metadata.len != 0) {
                     try icon(renderer, if (entry.branch.len != 0) .branch else .folder, x, row.y + 54, muted);
-                    try self.labels.drawFitted(renderer, text, metadata, x + 20, row.y + 56, width - 40, 12, muted);
+                    try self.labels.drawFitted(renderer, text, metadata, x + 20, row.y + 56, @max(0, width - 84), 12, muted);
                 }
             }
             ordinal += 1;
-            y += sidebar_card_stride;
+            y += if (slim) sidebar_search_stride else sidebar_card_stride;
         }
+        if (!searching and count != 0) {
+            while (section_cursor <= 4) : (section_cursor += 1) {
+                if (section_cursor < 2 or (section_cursor < 4 and section_counts[section_cursor] == 0)) continue;
+                if (!shelf_started) {
+                    y += shelf_gap;
+                    shelf_started = true;
+                }
+                try self.drawSidebarShelf(renderer, text, section_cursor - 2, section_counts[section_cursor], y, muted);
+                y += 33;
+            }
+        }
+    }
+
+    fn sidebarActionStart(entry: *const Entry, row: c.SDL_FRect, slim: bool) f32 {
+        const action_width: f32 = if (entry.settled) 68 else 54;
+        return row.x + row.w - action_width - 6 - (if (slim or !entry.can_snooze) @as(f32, 0) else 24);
+    }
+
+    fn drawSidebarRowActions(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, index: usize, row: c.SDL_FRect, slim: bool, color: Color) !void {
+        const entry = &self.threads[index];
+        const wake = entry.snoozed_until > self.sidebar_now_ms;
+        const label: []const u8 = if (wake) "Wake" else if (entry.settled) "Unsettle" else "Settle";
+        const action_width: f32 = if (entry.settled) 68 else 54;
+        const top = row.y + (if (slim) @as(f32, 6) else 8);
+        self.sidebar_action_bounds[index][0] = clippedRect(.{ .x = row.x + row.w - action_width - 6, .y = top, .w = action_width, .h = 22 }, self.sidebar_rows);
+        const action = self.sidebar_action_bounds[index][0];
+        try self.labels.draw(text, label, action.x + 4, top + 4, 11, color);
+        var id: [96]u8 = undefined;
+        _ = self.navigation_targets.add(try std.fmt.bufPrint(&id, "sidebar.thread.{d}.settle", .{index}), "button", action, action.h > 0) catch {};
+        if (!slim and entry.can_snooze) {
+            self.sidebar_action_bounds[index][1] = clippedRect(.{ .x = action.x - 24, .y = top, .w = 24, .h = 22 }, self.sidebar_rows);
+            const snooze = self.sidebar_action_bounds[index][1];
+            try icon(renderer, .clock, snooze.x + 4, top + 3, if (entry.can_snooze) color else self.design.colors.muted);
+            _ = self.navigation_targets.add(try std.fmt.bufPrint(&id, "sidebar.thread.{d}.snooze", .{index}), "button", snooze, snooze.h > 0 and entry.can_snooze) catch {};
+        }
+    }
+
+    fn drawSidebarShelf(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, index: usize, count: usize, y: f32, muted: Color) !void {
+        const row = c.SDL_FRect{ .x = self.sidebar_rows.x + 2, .y = y, .w = @max(0, self.sidebar_rows.w - 4), .h = 32 };
+        self.sidebar_shelf_bounds[index] = clippedRect(row, self.sidebar_rows);
+        const names = [_][]const u8{ "Working", "Snoozed", "Settled" };
+        const ids = [_][]const u8{ "sidebar.shelf.working", "sidebar.shelf.snoozed", "sidebar.shelf.settled" };
+        _ = self.navigation_targets.add(ids[index], "button", self.sidebar_shelf_bounds[index], self.sidebar_shelf_bounds[index].h > 0) catch {};
+        var buffer: [48]u8 = undefined;
+        const label = if (self.sidebar_shelf_expanded[index]) names[index] else try std.fmt.bufPrint(&buffer, "{s} ({d})", .{ names[index], count });
+        try self.labels.draw(text, label, row.x + 8, y + 9, 12, muted);
+        const label_width = try self.labels.width(text, label, 12);
+        try widgets.panel(renderer, .{ .x = row.x + label_width + 16, .y = y + 16, .w = @max(0, row.w - label_width - 44), .h = 1 }, 0, self.design.colors.sidebar_border);
+        try icon(renderer, if (self.sidebar_shelf_expanded[index]) .chevron else .chevron_up, row.x + row.w - 20, y + 8, muted);
+    }
+
+    fn drawSidebarMenu(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, width: f32, height: f32) !void {
+        const index = self.sidebarMenuIndex() orelse {
+            self.sidebar_menu_thread = .{};
+            return;
+        };
+        const entry = self.threads[index];
+        const snoozed = entry.snoozed_until > wallTimeMs();
+        if (self.sidebar_menu_mode == .main) {
+            self.sidebar_menu_panel = SidebarMenu.main(.{ .can_operate = self.navigation_enabled, .pinned = entry.pinned, .settled = entry.settled, .snoozed = snoozed, .can_snooze = entry.can_snooze, .filter_active = self.scope_project.eql(entry.project_id.slice()), .archived = entry.archived, .can_archive = entry.can_archive, .can_delete = entry.can_delete });
+        } else if (self.sidebar_menu_mode == .copy) {
+            self.sidebar_menu_panel = SidebarMenu.copy(entry.workspace_path_len != 0, entry.branch.len != 0);
+        }
+        if (self.sidebar_menu_hover < self.sidebar_menu_panel.len and self.sidebar_menu_panel.items[self.sidebar_menu_hover].enabled) _ = self.sidebar_menu_panel.choose(self.sidebar_menu_hover);
+        self.sidebar_menu_count = self.sidebar_menu_panel.len;
+        const menu_width = @min(260, width - 16);
+        const menu_height = self.sidebar_menu_panel.height();
+        self.sidebar_menu_bounds = .{ .x = std.math.clamp(self.sidebar_menu_x, 8, @max(8, width - menu_width - 8)), .y = std.math.clamp(self.sidebar_menu_y, 8, @max(8, height - menu_height - 8)), .w = menu_width, .h = menu_height };
+        try widgets.panel(renderer, self.sidebar_menu_bounds, 8, self.design.colors.border);
+        try widgets.panel(renderer, .{ .x = self.sidebar_menu_bounds.x + 1, .y = self.sidebar_menu_bounds.y + 1, .w = menu_width - 2, .h = menu_height - 2 }, 7, self.design.colors.raised);
+        for (0..self.sidebar_menu_count) |row_index| {
+            const item = self.sidebar_menu_panel.items[row_index];
+            var label_buffer: [64]u8 = undefined;
+            const label = if (self.sidebar_menu_mode == .snooze and item.action == .preset and self.sidebar_snooze_deadlines[item.preset_index] != 0)
+                std.fmt.bufPrint(&label_buffer, "{s} ({s})", .{ item.label, self.sidebar_snooze_when[item.preset_index].slice() }) catch item.label
+            else
+                item.label;
+            const row = c.SDL_FRect{ .x = self.sidebar_menu_bounds.x + 4, .y = self.sidebar_menu_bounds.y + self.sidebar_menu_panel.rowTop(row_index), .w = menu_width - 8, .h = 28 };
+            self.sidebar_menu_rows[row_index] = row;
+            if (item.separator_before and row_index != 0) try widgets.panel(renderer, .{ .x = row.x, .y = row.y - 5, .w = row.w, .h = 1 }, 0, self.design.colors.border);
+            _ = self.navigation_targets.add(item.id, "menuitem", row, item.enabled) catch {};
+            if (row_index == self.sidebar_menu_hover and item.enabled) try widgets.panel(renderer, row, 4, self.design.colors.sidebar_active);
+            const color = if (item.enabled) self.design.colors.foreground else self.design.colors.muted;
+            const glyph: ?Icon = switch (item.action) {
+                .pin, .unpin => .pin,
+                .settle, .unsettle => .check,
+                .wake, .snooze => .clock,
+                .rename => .pen,
+                .filter => .folder,
+                .copy, .copy_id => .copy,
+                .copy_path => .folder,
+                .copy_branch => .branch,
+                else => null,
+            };
+            if (glyph) |value| try icon(renderer, value, row.x + 7, row.y + 6, color);
+            const has_children = item.action == .copy or item.action == .snooze;
+            try self.labels.drawFitted(renderer, text, label, row.x + (if (glyph != null) @as(f32, 30) else 8), row.y + 7, row.w - (if (glyph != null) @as(f32, 38) else 16) - (if (has_children) @as(f32, 18) else 0), 12, color);
+            if (has_children) {
+                const right = row.x + row.w - 12;
+                if (!c.SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, 255) or !c.SDL_RenderLine(renderer, right - 3, row.y + 10, right + 1, row.y + 14) or !c.SDL_RenderLine(renderer, right + 1, row.y + 14, right - 3, row.y + 18)) return error.IconDraw;
+            }
+        }
+    }
+
+    fn drawCustomSnooze(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, width: f32, height: f32) !void {
+        const state = if (self.custom_snooze) |*value| value else return;
+        self.navigation_targets.clear();
+        self.custom_snooze_bounds = @splat(zero_rect);
+        self.custom_snooze_days = @splat(zero_rect);
+        self.custom_snooze_month_bounds = @splat(zero_rect);
+        self.custom_snooze_calendar_bounds = zero_rect;
+        const palette = self.design.colors;
+        const w = @min(384, @max(0, width - 24));
+        const h: f32 = @min(350, @max(0, height - 24));
+        const panel = c.SDL_FRect{ .x = (width - w) / 2, .y = (height - h) / 2, .w = w, .h = h };
+        if (!c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_BLEND) or !c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 160) or !c.SDL_RenderFillRect(renderer, null)) return error.ModalDraw;
+        try widgets.panel(renderer, panel, 10, palette.border);
+        try widgets.panel(renderer, .{ .x = panel.x + 1, .y = panel.y + 1, .w = w - 2, .h = h - 2 }, 9, palette.raised);
+        _ = self.navigation_targets.add("sidebar.custom_snooze", "dialog", panel, true) catch {};
+        try self.labels.draw(text, "Custom snooze", panel.x + 20, panel.y + 20, 16, palette.foreground);
+        try self.labels.drawFitted(renderer, text, "Choose when snoozed threads return to your inbox.", panel.x + 20, panel.y + 48, w - 40, 12, palette.muted);
+        const half = (w - 48) / 2;
+        self.custom_snooze_bounds[0] = .{ .x = panel.x + 20, .y = panel.y + 80, .w = half, .h = 32 };
+        self.custom_snooze_bounds[1] = .{ .x = panel.x + 28 + half, .y = panel.y + 80, .w = half, .h = 32 };
+        if (state.mode == .date) {
+            self.custom_snooze_bounds[2] = .{ .x = panel.x + 20, .y = panel.y + 148, .w = half - 30, .h = 32 };
+            self.custom_snooze_bounds[4] = .{ .x = panel.x + 20 + half - 28, .y = panel.y + 148, .w = 28, .h = 32 };
+            self.custom_snooze_bounds[3] = .{ .x = panel.x + 28 + half, .y = panel.y + 148, .w = half, .h = 32 };
+            try self.labels.draw(text, "Date", panel.x + 20, panel.y + 128, 12, palette.muted);
+            try self.labels.draw(text, "Time", panel.x + 28 + half, panel.y + 128, 12, palette.muted);
+        } else {
+            self.custom_snooze_bounds[5] = .{ .x = panel.x + 20, .y = panel.y + 148, .w = half, .h = 32 };
+            self.custom_snooze_bounds[6] = .{ .x = panel.x + 28 + half, .y = panel.y + 148, .w = half, .h = 32 };
+            try self.labels.draw(text, "Snooze for", panel.x + 20, panel.y + 128, 12, palette.muted);
+            try self.labels.draw(text, "Unit", panel.x + 28 + half, panel.y + 128, 12, palette.muted);
+        }
+        self.custom_snooze_bounds[7] = .{ .x = panel.x + w - 184, .y = panel.y + h - 52, .w = 76, .h = 32 };
+        self.custom_snooze_bounds[8] = .{ .x = panel.x + w - 100, .y = panel.y + h - 52, .w = 80, .h = 32 };
+        const ids = [_][]const u8{ "sidebar.custom_snooze.mode.date", "sidebar.custom_snooze.mode.duration", "sidebar.custom_snooze.date", "sidebar.custom_snooze.time", "sidebar.custom_snooze.calendar", "sidebar.custom_snooze.amount", "sidebar.custom_snooze.unit", "sidebar.custom_snooze.cancel", "sidebar.custom_snooze.submit" };
+        const unit_label: []const u8 = switch (state.unit) {
+            .minutes => "Minutes",
+            .hours => "Hours",
+            .days => "Days",
+        };
+        const labels = [_][]const u8{ "Date and time", "Duration", state.date.slice(), state.time.slice(), "▦", state.amount.slice(), unit_label, "Cancel", if (state.pending) "Snoozing…" else "Snooze" };
+        for (self.custom_snooze_bounds, 0..) |rect, index| {
+            if (rect.w <= 0) continue;
+            const field: ?LineField = switch (index) {
+                2 => .snooze_date,
+                3 => .snooze_time,
+                5 => .snooze_amount,
+                else => null,
+            };
+            const focused = @intFromEnum(self.custom_snooze_focus) == index;
+            const selected_mode = (index == 0 and state.mode == .date) or (index == 1 and state.mode == .duration);
+            try widgets.panel(renderer, rect, 5, if (focused or selected_mode) palette.selection else palette.surface);
+            _ = self.navigation_targets.add(ids[index], if (field != null) "textbox" else "button", rect, !state.pending) catch {};
+            if (field != null and self.activeLine() == field) {
+                const parts = self.lineParts(field.?);
+                parts.edit.sync(parts.len.*, parts.select.*);
+                try self.line_view.draw(renderer, text, parts.buffer[0..parts.len.*], parts.edit.*, .{ .x = rect.x + 7, .y = rect.y + 7, .w = rect.w - 14, .h = 20 }, palette.foreground, palette.selection, self.window_active);
+            } else try self.labels.drawFitted(renderer, text, labels[index], rect.x + 8, rect.y + 9, rect.w - 16, 12, if (state.pending) palette.muted else palette.foreground);
+        }
+        if (state.error_len != 0) try self.labels.drawFitted(renderer, text, state.error_bytes[0..state.error_len], panel.x + 20, panel.y + 200, w - 40, 12, palette.danger);
+        if (state.calendar_open) {
+            self.navigation_targets.clear();
+            // Keep the six-week grid inside the viewport even on short windows.
+            const cw = @min(280, width - 16);
+            const ch: f32 = 256;
+            const cx = std.math.clamp(panel.x + 20, 8, @max(8, width - cw - 8));
+            const cy = std.math.clamp(panel.y + 184, 8, @max(8, height - ch - 8));
+            const popup = c.SDL_FRect{ .x = cx, .y = cy, .w = cw, .h = ch };
+            self.custom_snooze_calendar_bounds = popup;
+            try widgets.panel(renderer, popup, 6, palette.border);
+            try widgets.panel(renderer, .{ .x = cx + 1, .y = cy + 1, .w = cw - 2, .h = ch - 2 }, 5, palette.raised);
+            var month: [32]u8 = undefined;
+            try self.labels.draw(text, try std.fmt.bufPrint(&month, "{d:0>4}-{d:0>2}", .{ @as(u32, state.calendar.year), @as(u32, state.calendar.month) }), cx + 78, cy + 12, 14, palette.foreground);
+            for (0..2) |index| {
+                const rect = c.SDL_FRect{ .x = cx + (if (index == 0) @as(f32, 8) else cw - 36), .y = cy + 6, .w = 28, .h = 28 };
+                self.custom_snooze_month_bounds[index] = rect;
+                _ = self.navigation_targets.add(if (index == 0) "sidebar.custom_snooze.calendar.previous" else "sidebar.custom_snooze.calendar.next", "button", rect, !state.pending) catch {};
+                try self.labels.draw(text, if (index == 0) "‹" else "›", rect.x + 8, rect.y + 4, 18, palette.foreground);
+            }
+            const day_width = (cw - 16) / 7;
+            for ([_][]const u8{ "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa" }, 0..) |name, index| try self.labels.draw(text, name, cx + 13 + @as(f32, @floatFromInt(index)) * day_width, cy + 40, 11, palette.muted);
+            for (0..state.calendar.count()) |index| {
+                const cell = state.calendar.cell(index) orelse continue;
+                const rect = c.SDL_FRect{ .x = cx + 8 + @as(f32, @floatFromInt(index % 7)) * day_width, .y = cy + 62 + @as(f32, @floatFromInt(index / 7)) * 30, .w = day_width, .h = 28 };
+                self.custom_snooze_days[index] = rect;
+                var id: [80]u8 = undefined;
+                _ = self.navigation_targets.add(try std.fmt.bufPrint(&id, "sidebar.custom_snooze.calendar.day.{d}", .{index}), "button", rect, !cell.disabled and !state.pending) catch {};
+                if (std.mem.eql(u8, &cell.date, &state.calendar.selected)) try widgets.panel(renderer, rect, 4, palette.selection);
+                if (index == state.calendar_cursor) try widgets.panel(renderer, .{ .x = rect.x + 2, .y = rect.y + rect.h - 2, .w = rect.w - 4, .h = 1 }, 0, palette.foreground);
+                var day: [4]u8 = undefined;
+                try self.labels.draw(text, try std.fmt.bufPrint(&day, "{d}", .{@as(u32, cell.day)}), rect.x + 8, rect.y + 7, 12, if (cell.disabled or !cell.current_month) palette.muted else palette.foreground);
+            }
+        }
+    }
+
+    fn drawSidebarLifecycle(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, width: f32, height: f32) !void {
+        const id = self.sidebar_lifecycle.confirming orelse return;
+        _ = id;
+        self.navigation_targets.clear();
+        const palette = self.design.colors;
+        const w: f32 = @min(360, width - 24);
+        const h: f32 = 170;
+        const panel = c.SDL_FRect{ .x = (width - w) / 2, .y = (height - h) / 2, .w = w, .h = h };
+        if (!c.SDL_SetRenderDrawBlendMode(renderer, c.SDL_BLENDMODE_BLEND) or !c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 160) or !c.SDL_RenderFillRect(renderer, null)) return error.ModalDraw;
+        try widgets.panel(renderer, panel, 10, palette.border);
+        try widgets.panel(renderer, .{ .x = panel.x + 1, .y = panel.y + 1, .w = w - 2, .h = h - 2 }, 9, palette.raised);
+        try self.labels.draw(text, "Delete thread?", panel.x + 20, panel.y + 22, 16, palette.foreground);
+        try self.labels.drawFitted(renderer, text, "This permanently removes the thread from the workspace.", panel.x + 20, panel.y + 52, w - 40, 12, palette.muted);
+        self.sidebar_lifecycle_bounds[0] = .{ .x = panel.x + w - 180, .y = panel.y + h - 48, .w = 76, .h = 32 };
+        self.sidebar_lifecycle_bounds[1] = .{ .x = panel.x + w - 96, .y = panel.y + h - 48, .w = 76, .h = 32 };
+        const labels = [_][]const u8{ "Cancel", "Delete" };
+        for (self.sidebar_lifecycle_bounds, 0..) |rect, index| {
+            try widgets.panel(renderer, rect, 5, if ((index == 1) == self.sidebar_lifecycle.confirm_delete_selected) palette.selection else palette.surface);
+            _ = self.navigation_targets.add(if (index == 0) "sidebar.delete.cancel" else "sidebar.delete.confirm", "button", rect, !self.sidebar_lifecycle.pending) catch {};
+            try self.labels.draw(text, labels[index], rect.x + 12, rect.y + 9, 12, if (index == 1) palette.danger else palette.foreground);
+        }
+    }
+
+    fn drawSidebarUndo(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, width: f32, height: f32) !void {
+        const undo = self.sidebar_lifecycle.undo orelse return;
+        if (wallTimeMs() >= undo.expires_at) {
+            self.sidebar_lifecycle.undo = null;
+            self.sidebar_lifecycle.shortcut_claimed = false;
+            return;
+        }
+        self.sidebar_undo_label = undo.label;
+        self.sidebar_undo_len = undo.label_len;
+        const w: f32 = @min(300, width - 24);
+        self.sidebar_undo_bounds = .{ .x = width - w - 16, .y = height - 74, .w = w, .h = 34 };
+        try widgets.panel(renderer, self.sidebar_undo_bounds, 6, self.design.colors.raised);
+        const label = undo.label[0..undo.label_len];
+        try self.labels.drawFitted(renderer, text, label, self.sidebar_undo_bounds.x + 10, self.sidebar_undo_bounds.y + 10, w - 90, 11, self.design.colors.foreground);
+        _ = self.navigation_targets.add("sidebar.undo", "button", .{ .x = self.sidebar_undo_bounds.x + w - 72, .y = self.sidebar_undo_bounds.y + 4, .w = 64, .h = 26 }, true) catch {};
+        try self.labels.draw(text, "Undo", self.sidebar_undo_bounds.x + w - 64, self.sidebar_undo_bounds.y + 10, 11, self.design.colors.accent_text);
     }
 
     fn drawWorkspace(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
@@ -2621,7 +4013,7 @@ pub const View = struct {
                 const available = @max(0, editor_bounds.h - 20);
                 self.editor_view.scroll = std.math.clamp(self.editor_view.scroll, 0, @max(0, content_height - available));
                 if (self.editor_view.caret(&self.editor)) |caret_rect| {
-                    if (self.focused and (self.custom_root != null or !self.search_focused) and self.reveal_caret) {
+                    if (self.focused and (self.activeLine() == null) and self.reveal_caret) {
                         if (caret_rect.y < self.editor_view.scroll) self.editor_view.scroll = caret_rect.y;
                         if (caret_rect.y + caret_rect.h > self.editor_view.scroll + available) self.editor_view.scroll = caret_rect.y + caret_rect.h - available;
                     }
@@ -2640,7 +4032,7 @@ pub const View = struct {
                     }
                     if (count > rects.len) self.notice = "Selection display budget exceeded";
                     if (!c.spica_text_layout_draw(text, layout, x, y, widgets.rgba(composer_foreground))) return error.EditorDraw;
-                    if (self.focused and (self.custom_root != null or !self.search_focused) and self.window_active) {
+                    if (self.focused and (self.activeLine() == null) and self.window_active) {
                         const caret = c.SDL_FRect{ .x = x + caret_rect.x, .y = y + caret_rect.y, .w = 1.5, .h = caret_rect.h };
                         if (!c.SDL_SetRenderDrawColor(renderer, composer_foreground.r, composer_foreground.g, composer_foreground.b, 255) or !c.SDL_RenderFillRect(renderer, &caret)) return error.CaretDraw;
                         const input_rect = c.SDL_Rect{ .x = @intFromFloat(caret.x), .y = @intFromFloat(caret.y), .w = 1, .h = @intFromFloat(caret.h) };
@@ -2700,8 +4092,82 @@ pub const View = struct {
         if (self.custom_root == null and self.effort_open) try self.drawEffort(renderer, text, foreground, muted);
         if (self.custom_root == null and self.setup_open) try self.drawSetup(renderer, text, bounds, foreground, muted);
         if (self.custom_root == null and self.workspace_open and !self.setup_open) try self.drawWorkspace(renderer, text, bounds, foreground, muted);
+        if (self.custom_root == null and self.sidebar_menu_thread.len != 0) try self.drawSidebarMenu(renderer, text, bounds.header.width, self.sidebar_bounds.h);
+        if (self.custom_snooze != null) try self.drawCustomSnooze(renderer, text, bounds.header.width, self.sidebar_bounds.h);
+        if (self.sidebar_lifecycle.confirming != null) try self.drawSidebarLifecycle(renderer, text, bounds.header.width, self.sidebar_bounds.h);
+        if (self.sidebar_lifecycle.undo != null and self.sidebar_lifecycle.confirming == null and self.custom_snooze == null) try self.drawSidebarUndo(renderer, text, bounds.header.width, self.sidebar_bounds.h);
+        if (self.window_active and self.focused) if (self.activeLine()) |field| {
+            const fallback = switch (field) {
+                .search => self.search_bounds,
+                .rename => self.sidebar_rename_bounds,
+                .title => self.title_bounds,
+                .snooze_date => self.custom_snooze_bounds[2],
+                .snooze_time => self.custom_snooze_bounds[3],
+                .snooze_amount => self.custom_snooze_bounds[5],
+            };
+            const caret = self.line_view.caretArea() orelse fallback;
+            if (caret.w > 0 and caret.h > 0) {
+                const area: c.SDL_Rect = .{ .x = @intFromFloat(caret.x), .y = @intFromFloat(caret.y), .w = @max(1, @as(c_int, @intFromFloat(caret.w))), .h = @max(1, @as(c_int, @intFromFloat(caret.h))) };
+                if (!c.SDL_SetTextInputArea(window, &area, 0)) return error.TextInputArea;
+            }
+        };
     }
 };
+
+test "sidebar custom snooze owns input and retains stable request values on rejection" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.insert("composer preserved", .typing);
+    view.custom_snooze = try SidebarSnooze.State.init(View.wallTimeMs());
+    view.custom_snooze_thread = try transcript.Id.init("stable-target");
+    view.custom_snooze.?.mode = .duration;
+    view.custom_snooze_focus = .amount;
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_TEXT_INPUT;
+    var entered = "1.5".* ++ .{@as(u8, 0)};
+    event.text.text = &entered;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqualStrings("1.5", view.custom_snooze.?.amount.slice());
+    const now = View.wallTimeMs();
+    try std.testing.expect(view.custom_snooze.?.submit(now));
+    const request = view.takeCustomSnoozeRequest().?;
+    try std.testing.expectEqualStrings("stable-target", request.id.slice());
+    try std.testing.expectEqual(now + 5_400_000, request.snoozed_until);
+    try std.testing.expect(view.customSnoozePending());
+    try std.testing.expect(view.takeCustomSnoozeRequest() == null);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_ESCAPE;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expect(view.customSnoozeOpen());
+    view.finishCustomSnooze("Busy");
+    try std.testing.expect(!view.customSnoozePending());
+    try std.testing.expectEqualStrings("1.5", view.custom_snooze.?.amount.slice());
+    try std.testing.expectEqualStrings("Busy", view.custom_snooze.?.error_bytes[0..view.custom_snooze.?.error_len]);
+    try std.testing.expectEqualStrings("composer preserved", view.editor.textBytes());
+    view.finishCustomSnooze(null);
+    try std.testing.expect(!view.customSnoozeOpen());
+}
+
+test "sidebar custom snooze renders only modal targets and a bounded calendar" {
+    const surface = c.SDL_CreateSurface(720, 480, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(text);
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.custom_snooze = try SidebarSnooze.State.init(View.wallTimeMs());
+    _ = try view.navigation_targets.add("underlying.send", "button", .{ .x = 1, .y = 1, .w = 50, .h = 50 }, true);
+    try view.drawCustomSnooze(renderer, text, 720, 480);
+    for (view.navigation_targets.slice()) |target| try std.testing.expect(std.mem.startsWith(u8, target.id[0..target.id_len], "sidebar.custom_snooze"));
+    view.customSnoozeActivate(4);
+    try std.testing.expect(view.custom_snooze.?.calendar_open);
+    try view.drawCustomSnooze(renderer, text, 720, 480);
+    for (view.custom_snooze_days) |rect| if (rect.w > 0) {
+        try std.testing.expect(rect.x >= 0 and rect.y >= 0 and rect.x + rect.w <= 720 and rect.y + rect.h <= 480);
+    };
+}
 
 test "root emits only enabled explicit intents and preserves draft until receipt" {
     var view = try View.init(std.testing.allocator);
@@ -2722,6 +4188,17 @@ test "root emits only enabled explicit intents and preserves draft until receipt
     view.can_cancel = true;
     view.request(.cancel);
     try std.testing.expectEqual(Intent.cancel, view.takeIntent().?);
+}
+
+test "sidebar Undo is not consumed by a plain view poll" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    const id = try transcript.Id.init("undo-poll");
+    view.offerSidebarUndo(.{ .restore = .{ .id = id, .navigate = true } }, "Archived");
+    try std.testing.expect(view.takeSidebarUndoRequest() == null);
+    view.sidebar_undo_request = .{ .restore = .{ .id = id, .navigate = true } };
+    try std.testing.expect(view.takeSidebarUndoRequest() != null);
+    try std.testing.expect(view.takeSidebarUndoRequest() == null);
 }
 
 test "workspace inspection keeps selection and rejects stale checkout results" {
@@ -3829,6 +5306,151 @@ test "search filtering preserves the active title editor when its card is absent
     try std.testing.expectEqualStrings("Pinned chat", view.title_buffer[0..view.title_len]);
 }
 
+test "sidebar project scope keyboard selection retains real identity and consumes modal input" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.project_count = 2;
+    view.projects[0].id = try transcript.Id.init("project-a");
+    view.projects[1].id = try transcript.Id.init("project-b");
+    view.scope_menu = .{ .x = 8, .y = 96, .w = 240, .h = 64 };
+    view.scope_project = view.projects[0].id;
+    view.openScope();
+    try std.testing.expectEqual(@as(usize, 1), view.scope_hover);
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_END;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expectEqual(@as(usize, 2), view.scope_hover);
+    try std.testing.expect(view.scope_scroll > 0);
+    event.key.key = c.SDLK_RETURN;
+    try std.testing.expect(try view.handle(event, undefined, undefined));
+    try std.testing.expect(view.scope_project.eql("project-b"));
+    try std.testing.expect(!view.scope_open);
+    try std.testing.expect(view.navigation == null);
+    view.openScope();
+    event.key.key = c.SDLK_HOME;
+    _ = try view.handle(event, undefined, undefined);
+    event.key.key = c.SDLK_RETURN;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqual(@as(usize, 0), view.scope_project.len);
+}
+
+test "sidebar Unicode search folds accents sharp s and Greek without allocating" {
+    for ([_][2][]const u8{ .{ "CAFÉ", "café" }, .{ "Straße", "STRASSE" }, .{ "Σίσυφος", "ΣΊΣΥΦΟΣ" }, .{ "naïve", "NAÏVE" } }) |pair| {
+        try std.testing.expect(View.searchContains(pair[0], pair[1]));
+        try std.testing.expect(View.searchContains(pair[1], pair[0]));
+    }
+    try std.testing.expect(!View.searchContains("café", "cafe"));
+    try std.testing.expect(!View.searchContains("🎮", "🎧"));
+    try std.testing.expect(!View.searchContains("\xff", "query"));
+}
+
+test "sidebar inline rename targets an unselected Unicode row without changing the active draft" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.insert("active chat draft", .typing);
+    view.navigation_enabled = true;
+    view.thread_count = 2;
+    view.threads[0].id = try transcript.Id.init("active-thread");
+    view.threads[1].id = try transcript.Id.init("other-thread");
+    view.threads[1].len = 4;
+    @memcpy(view.threads[1].label[0..4], "Chat");
+    view.active_thread = view.threads[0].id;
+    view.beginSidebarRename(1);
+    try view.sidebarRenameInsert("レビュー 🎮");
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_BACKSPACE;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqualStrings("レビュー ", view.sidebar_rename_buffer[0..view.sidebar_rename_len]);
+    try std.testing.expectError(error.InvalidTitle, view.sidebarRenameInsert("bad\nname"));
+    try std.testing.expectError(error.InvalidUtf8, view.sidebarRenameInsert("\xff"));
+    view.sidebar_rename_select_all = true;
+    try view.sidebarRenameInsert("🎮" ** 40);
+    try std.testing.expectError(error.TextTooLarge, view.sidebarRenameInsert("x"));
+    std.mem.swap(View.Entry, &view.threads[0], &view.threads[1]);
+    view.commitSidebarRename();
+    try std.testing.expectEqual(@as(usize, 0), view.navigation.?.rename.index);
+    try std.testing.expectEqualStrings("🎮" ** 40, view.navigation.?.rename.title[0..view.navigation.?.rename.len]);
+    try std.testing.expect(view.active_thread.eql("active-thread"));
+    try std.testing.expectEqualStrings("active chat draft", view.editor.textBytes());
+    view.beginSidebarRename(0);
+    event.key.key = c.SDLK_ESCAPE;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqual(@as(usize, 0), view.sidebar_rename_thread.len);
+}
+
+test "sidebar shelves retain selected rows and context actions keep stable thread identity" {
+    const surface = c.SDL_CreateSurface(1280, 800, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(text);
+    var layout = try Layout.init(std.testing.allocator, 1280, 800);
+    defer layout.deinit();
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.insert("preserve this draft", .typing);
+    view.navigation_enabled = true;
+    view.thread_count = 5;
+    for (view.threads[0..5], 0..) |*entry, index| {
+        var id: [32]u8 = undefined;
+        entry.id = try transcript.Id.init(try std.fmt.bufPrint(&id, "actual-{d}", .{index}));
+        entry.len = 4;
+        @memcpy(entry.label[0..4], "Chat");
+    }
+    view.threads[0].pinned = true;
+    view.threads[2].run_status = .running;
+    view.threads[3].snoozed_until = View.wallTimeMs() + 3_600_000;
+    view.threads[4].settled = true;
+    view.active_thread = view.threads[1].id;
+    @memcpy(view.threads[0].label[0..160], "🎮" ** 40);
+    view.threads[0].len = 160;
+    view.beginSidebarRename(0);
+    const bounds = layout.coding(1280);
+    try view.drawChrome(renderer, text, bounds, view.design.colors.foreground, view.design.colors.muted);
+    try std.testing.expectEqual(@as(f32, 78), view.threadRowBounds(0).h);
+    try std.testing.expectEqualStrings("🎮" ** 40, view.sidebar_rename_buffer[0..view.sidebar_rename_len]);
+    view.sidebar_rename_thread = .{};
+    try std.testing.expectEqual(@as(f32, 78), view.threadRowBounds(2).h);
+    try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(3));
+    try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(4));
+    try std.testing.expectEqual(@as(f32, 0), view.sidebar_shelf_bounds[0].h);
+    try std.testing.expect(view.sidebar_shelf_bounds[1].h > 0);
+    try std.testing.expect(view.sidebar_shelf_bounds[2].h > 0);
+    view.active_thread = view.threads[4].id;
+    try view.drawChrome(renderer, text, bounds, view.design.colors.foreground, view.design.colors.muted);
+    try std.testing.expectEqual(@as(f32, 36), view.threadRowBounds(4).h);
+    view.sidebar_shelf_expanded[1] = true;
+    try view.drawChrome(renderer, text, bounds, view.design.colors.foreground, view.design.colors.muted);
+    try std.testing.expectEqual(@as(f32, 36), view.threadRowBounds(3).h);
+    view.sidebar_menu_thread = view.threads[0].id;
+    try view.drawSidebarMenu(renderer, text, 1280, 800);
+    try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(0));
+    std.mem.swap(View.Entry, &view.threads[0], &view.threads[1]);
+    view.activateSidebarMenu(0);
+    try std.testing.expectEqual(@as(usize, 1), view.navigation.?.sidebar.index);
+    try std.testing.expectEqual(View.SidebarAction.unpin, view.navigation.?.sidebar.action);
+    try std.testing.expectEqualStrings("preserve this draft", view.editor.textBytes());
+    view.sidebar_collapsed = true;
+    layout.sidebar_collapsed = true;
+    const collapsed = layout.coding(1280);
+    try view.drawChrome(renderer, text, collapsed, view.design.colors.foreground, view.design.colors.muted);
+    try std.testing.expectEqual(@as(f32, 0), view.sidebarWidth(1280));
+    try std.testing.expectEqual(@as(f32, 0), view.search_bounds.w);
+    try std.testing.expectEqual(@as(f32, 0), view.setup_bounds.w);
+    try std.testing.expect(collapsed.composer.x < bounds.composer.x);
+    view.sidebar_collapsed = false;
+    layout.sidebar_collapsed = false;
+    view.sidebar_width_override = 340;
+    layout.sidebar_width_override = view.sidebar_width_override;
+    try std.testing.expectEqual(view.sidebarWidth(1280), layout.sidebarWidthFor(1280));
+    try std.testing.expectEqual(@as(f32, 340), view.sidebarWidth(1280));
+    try std.testing.expectEqual(@as(?i64, view.threads[3].snoozed_until), view.nextSidebarWakeMs(View.wallTimeMs()));
+    try std.testing.expectEqual(@as(?i64, null), view.nextSidebarWakeMs(view.threads[3].snoozed_until));
+}
+
 test "flat rendered sidebar cards clip hits filter real project IDs and use bundled chrome" {
     for ([_][2]f32{ .{ 720, 480 }, .{ 900, 650 }, .{ 1100, 740 }, .{ 1280, 800 } }) |size| {
         const surface = c.SDL_CreateSurface(@intFromFloat(size[0]), @intFromFloat(size[1]), c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
@@ -3869,7 +5491,7 @@ test "flat rendered sidebar cards clip hits filter real project IDs and use bund
         const first = view.threadRowBounds(0);
         const second = view.threadRowBounds(1);
         try std.testing.expectEqual(@as(f32, 78), first.h);
-        try std.testing.expectEqual(@as(f32, 83), second.y - first.y);
+        try std.testing.expectEqual(@as(f32, 82), second.y - first.y);
         try std.testing.expectEqual(view.sidebar_rows.x, first.x);
         try std.testing.expectEqual(view.sidebar_rows.w, first.w);
         try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(11));
@@ -3911,9 +5533,9 @@ test "flat rendered sidebar cards clip hits filter real project IDs and use bund
         try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(0));
         try view.drawChrome(renderer, text, bounds, fg, muted);
         const filtered = view.threadRowBounds(1);
-        try std.testing.expect(filtered.h == 78);
+        try std.testing.expectEqual(@as(f32, 36), filtered.h);
         event.button.x = filtered.x + 4;
-        event.button.y = filtered.y + 40;
+        event.button.y = filtered.y + 18;
         try std.testing.expect(try view.handle(event, undefined, undefined));
         try std.testing.expectEqual(@as(usize, 1), view.navigation.?.thread);
         try std.testing.expectEqual(@as(usize, 0), view.search_len);
@@ -3937,7 +5559,7 @@ test "flat rendered sidebar cards clip hits filter real project IDs and use bund
         try std.testing.expectEqualDeep(View.zero_rect, view.threadRowBounds(1));
         const a = view.threadRowBounds(0);
         const c_row = view.threadRowBounds(2);
-        try std.testing.expectEqual(@as(f32, 83), c_row.y - a.y);
+        try std.testing.expectEqual(@as(f32, 82), c_row.y - a.y);
         var stats: c.SpicaTextStats = undefined;
         try std.testing.expect(c.spica_text_get_stats(text, &stats));
         try std.testing.expectEqual(@as(c_uint, 1), stats.face_count);
@@ -4119,5 +5741,213 @@ test "workflow paging keeps every bounded action inside minimum native geometry"
             if (std.mem.eql(u8, target.id[0..target.id_len], expected)) found = true;
         }
         try std.testing.expect(found);
+    }
+}
+
+test "small fields own Unicode selection composition and trimmed blur without touching draft" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.insert("composer draft", .typing);
+    view.navigation_enabled = true;
+    view.thread_count = 1;
+    view.threads[0].id = try transcript.Id.init("row");
+    view.beginSidebarRename(0);
+    try view.sidebarRenameInsert("a" ++ "e\u{301}" ++ "🇺🇸" ++ "👩‍💻");
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_BACKSPACE;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqualStrings("ae\u{301}🇺🇸", view.sidebar_rename_buffer[0..view.sidebar_rename_len]);
+    event.key.key = c.SDLK_HOME;
+    _ = try view.handle(event, undefined, undefined);
+    event.key.key = c.SDLK_RIGHT;
+    event.key.mod = c.SDL_KMOD_SHIFT;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqual(@as(usize, 1), view.rename_edit.range().end);
+    try view.sidebarRenameInsert("z");
+    try std.testing.expectEqualStrings("ze\u{301}🇺🇸", view.sidebar_rename_buffer[0..view.sidebar_rename_len]);
+    event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_TEXT_EDITING;
+    event.edit.text = "日本";
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqualStrings("日本", view.line_view.preedit[0..view.line_view.preedit_len]);
+    try std.testing.expectEqual(@as(usize, 0), view.preedit_len);
+    event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_KEY_DOWN;
+    event.key.key = c.SDLK_RETURN;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expect(view.navigation == null);
+    try std.testing.expect(view.sidebar_rename_thread.eql("row"));
+    event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_TEXT_INPUT;
+    event.text.text = "日本";
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqual(@as(usize, 0), view.line_view.preedit_len);
+    view.sidebar_rename_select_all = true;
+    try view.sidebarRenameInsert("  trimmed title  ");
+    view.sidebar_rename_bounds = .{ .x = 10, .y = 10, .w = 100, .h = 22 };
+    view.sidebar_toggle_bounds = .{ .x = 200, .y = 100, .w = 20, .h = 20 };
+    event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    event.button.x = 200;
+    event.button.y = 100;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqualStrings("trimmed title", view.navigation.?.rename.title[0..view.navigation.?.rename.len]);
+    try std.testing.expectEqualStrings("composer draft", view.editor.textBytes());
+}
+
+test "modal input ownership protects covered title and sidebar fields" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    try view.insert("draft", .typing);
+    try view.titleInsert("title");
+    try view.searchInsert("search");
+    view.title_editing = true;
+    view.search_focused = true;
+    inline for (.{ "setup_open", "workflow_open", "workspace_open", "scope_open", "picker_open", "effort_open" }) |modal| {
+        @field(view, modal) = true;
+        try std.testing.expect(view.activeLine() == null);
+        var event = std.mem.zeroes(c.SDL_Event);
+        event.type = c.SDL_EVENT_KEY_DOWN;
+        event.key.key = c.SDLK_A;
+        event.key.mod = c.SDL_KMOD_CTRL;
+        _ = try view.handle(event, undefined, undefined);
+        event.key.key = c.SDLK_LEFT;
+        _ = try view.handle(event, undefined, undefined);
+        event = std.mem.zeroes(c.SDL_Event);
+        event.type = c.SDL_EVENT_TEXT_EDITING;
+        event.edit.text = "日本";
+        _ = try view.handle(event, undefined, undefined);
+        event = std.mem.zeroes(c.SDL_Event);
+        event.type = c.SDL_EVENT_TEXT_INPUT;
+        event.text.text = "x";
+        _ = try view.handle(event, undefined, undefined);
+        try std.testing.expectEqualStrings("title", view.title_buffer[0..view.title_len]);
+        try std.testing.expectEqualStrings("search", view.search_query[0..view.search_len]);
+        try std.testing.expectEqual(@as(usize, 0), view.line_view.preedit_len);
+        try std.testing.expectEqualStrings("draft", view.editor.textBytes());
+        @field(view, modal) = false;
+    }
+}
+
+test "blur retains the clicked thread identity until rename receipt" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.navigation_enabled = true;
+    view.thread_count = 2;
+    view.threads[0].id = try transcript.Id.init("renamed");
+    view.threads[1].id = try transcript.Id.init("clicked");
+    view.sidebar_bounds = .{ .x = 0, .y = 0, .w = 256, .h = 300 };
+    view.sidebar_rows = view.sidebar_bounds;
+    view.thread_bounds[1] = .{ .x = 0, .y = 100, .w = 256, .h = 80 };
+    view.sidebar_rename_bounds = .{ .x = 10, .y = 10, .w = 100, .h = 22 };
+    view.beginSidebarRename(0);
+    try view.sidebarRenameInsert("name");
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    event.button.x = 120;
+    event.button.y = 120;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqualStrings("name", view.navigation.?.rename.title[0..view.navigation.?.rename.len]);
+    std.mem.swap(View.Entry, &view.threads[0], &view.threads[1]);
+    try std.testing.expect(view.takeRenameFollowup().?.thread.eql("clicked"));
+    try std.testing.expect(view.takeRenameFollowup() == null);
+}
+
+test "bounded field errors explain limits while diagnostic errors stay available" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.search_focused = true;
+    try std.testing.expectEqualStrings("Search is limited to 160 UTF-8 bytes. Existing text retained.", view.inputErrorNotice(error.TextTooLarge).?);
+    view.search_focused = false;
+    view.title_editing = true;
+    try std.testing.expectEqualStrings("Titles are limited to 160 UTF-8 bytes. Existing text retained.", view.inputErrorNotice(error.TextTooLarge).?);
+    try std.testing.expect(view.inputErrorNotice(error.Unrelated) == null);
+}
+
+test "rename blur preserves hover settlement and header editing intent" {
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.navigation_enabled = true;
+    view.thread_count = 2;
+    view.threads[0].id = try transcript.Id.init("renamed");
+    view.threads[1].id = try transcript.Id.init("settled-on-click");
+    view.active_thread = view.threads[0].id;
+    view.sidebar_bounds = .{ .x = 0, .y = 0, .w = 256, .h = 300 };
+    view.sidebar_rows = view.sidebar_bounds;
+    view.sidebar_rename_bounds = .{ .x = 10, .y = 10, .w = 100, .h = 22 };
+    view.sidebar_action_bounds[1][0] = .{ .x = 190, .y = 100, .w = 54, .h = 22 };
+    view.beginSidebarRename(0);
+    try view.sidebarRenameInsert("saved title");
+    var event = std.mem.zeroes(c.SDL_Event);
+    event.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.button = c.SDL_BUTTON_LEFT;
+    event.button.x = 200;
+    event.button.y = 110;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expectEqualStrings("saved title", view.navigation.?.rename.title[0..view.navigation.?.rename.len]);
+    const followup = view.takeRenameFollowup().?.sidebar;
+    try std.testing.expect(followup.id.eql("settled-on-click"));
+    try std.testing.expectEqual(View.SidebarAction.settle, followup.action);
+    view.navigation = null;
+    view.title_bounds = .{ .x = 300, .y = 10, .w = 200, .h = 32 };
+    view.beginSidebarRename(0);
+    try view.sidebarRenameInsert("new header title");
+    event.button.x = 320;
+    event.button.y = 20;
+    _ = try view.handle(event, undefined, undefined);
+    try std.testing.expect(!view.title_editing);
+    try std.testing.expectEqualStrings("new header title", view.navigation.?.rename.title[0..view.navigation.?.rename.len]);
+    try std.testing.expectEqual(std.meta.Tag(View.RenameFollowup).edit_active_title, std.meta.activeTag(view.takeRenameFollowup().?));
+}
+
+test "long hovered project text cannot paint underneath sidebar actions" {
+    const surface = c.SDL_CreateSurface(720, 480, c.SDL_PIXELFORMAT_RGBA8888) orelse return error.Surface;
+    defer c.SDL_DestroySurface(surface);
+    const renderer = c.SDL_CreateSoftwareRenderer(surface) orelse return error.Renderer;
+    defer c.SDL_DestroyRenderer(renderer);
+    const text = c.spica_text_create(renderer, @import("build_options").font_directory ++ "/Inter.ttf") orelse return error.Font;
+    defer c.spica_text_destroy(text);
+    var layout = try Layout.init(std.testing.allocator, 720, 480);
+    defer layout.deinit();
+    var view = try View.init(std.testing.allocator);
+    defer view.deinit();
+    view.sidebar_width_override = 208;
+    layout.sidebar_width_override = 208;
+    view.navigation_enabled = true;
+    view.sidebar_hover = 0;
+    view.thread_count = 1;
+    view.threads[0].id = try transcript.Id.init("long-project");
+    view.threads[0].can_snooze = true;
+    for ([_]bool{ false, true }) |pinned| {
+        view.threads[0].pinned = pinned;
+        view.threads[0].project_name = try transcript.Id.init("Project with a deliberately long name that must stop before hovered controls");
+        _ = c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        _ = c.SDL_RenderClear(renderer);
+        const bounds = layout.coding(720);
+        try view.drawChrome(renderer, text, bounds, view.design.colors.foreground, view.design.colors.muted);
+        _ = c.SDL_RenderPresent(renderer);
+        const expected = c.SDL_DuplicateSurface(surface) orelse return error.Surface;
+        defer c.SDL_DestroySurface(expected);
+        const action = view.sidebar_action_bounds[0][1];
+        view.threads[0].project_name = .{};
+        _ = c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        _ = c.SDL_RenderClear(renderer);
+        try view.drawChrome(renderer, text, bounds, view.design.colors.foreground, view.design.colors.muted);
+        _ = c.SDL_RenderPresent(renderer);
+        const row = view.thread_bounds[0];
+        var y: c_int = @intFromFloat(row.y + 6);
+        while (y < @as(c_int, @intFromFloat(row.y + 30))) : (y += 1) {
+            var x: c_int = @intFromFloat(action.x);
+            while (x < @as(c_int, @intFromFloat(row.x + row.w))) : (x += 1) {
+                var a: [4]u8 = undefined;
+                var b: [4]u8 = undefined;
+                try std.testing.expect(c.SDL_ReadSurfacePixel(surface, x, y, &a[0], &a[1], &a[2], &a[3]));
+                try std.testing.expect(c.SDL_ReadSurfacePixel(expected, x, y, &b[0], &b[1], &b[2], &b[3]));
+                try std.testing.expectEqualSlices(u8, &a, &b);
+            }
+        }
     }
 }

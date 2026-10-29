@@ -49,6 +49,18 @@ class SpicaUiOfflineTests(unittest.TestCase):
         self.assertIn("scenario", result.stdout)
         self.assertIn("ordinary private-desktop", result.stdout)
 
+    def test_launch_dry_run_forwards_optional_metrics_without_creating_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "session"
+            metrics = Path(temporary) / "metrics.json"
+            result = self.run_cli("launch", "--private", "--dry-run", "--output", str(output),
+                                  "--metrics-output", str(metrics))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            command = json.loads(result.stdout)["argv"]
+            self.assertEqual(command[command.index("--metrics-output") + 1], str(metrics))
+            self.assertFalse(output.exists())
+            self.assertFalse(metrics.exists())
+
     def test_title_assertion_requires_header_sidebar_commit_and_retained_draft(self):
         module = load_cli()
         saved = {"title_editing": False, "pending_command": False, "title_text": "Native café 🎮",
@@ -549,7 +561,214 @@ class SpicaUiOfflineTests(unittest.TestCase):
             self.assertEqual(bind.call_args.args[1], 101)
             self.assertEqual(session.data["launch"]["pid"], 101)
             self.assertEqual(session.observations, output / "restart-process" / "live.json")
-            self.assertEqual(session.data["actions"][0]["action"], "scenario.restart")
+            self.assertEqual(session.data["actions_count"], 1)
+            session.materialize_actions()
+            self.assertEqual(json.loads((output / "actions.json").read_text())[0]["action"], "scenario.restart")
+
+
+class ActionJournalTests(unittest.TestCase):
+    def create_session(self, module, output):
+        session = module.Session(output, {"version": 1, "session_nonce": "fixture-session",
+                                          "actions": [], "binary_sha256": "fixture-binary"})
+        session.save()
+        return session
+
+    def test_full_events_are_redacted_once_and_materialize_in_order(self):
+        module = load_cli()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            session = self.create_session(module, output)
+            session.journal("first", {"draft": "private", "thread_id": "alpha"},
+                            {"title_text": "café 世界", "token": "private"}, exact_id="alpha")
+            session.journal("second", None, {"run_id": "run", "frame_id": 7})
+            self.assertNotIn("actions", session.data)
+            self.assertFalse((output / "actions.json").exists())
+            session.materialize_actions()
+            actions = json.loads((output / "actions.json").read_text())
+            self.assertEqual([item["action"] for item in actions], ["first", "second"])
+            self.assertEqual(actions[0]["before"], {"draft": "<omitted>", "thread_id": "alpha"})
+            self.assertEqual(actions[0]["after"], {"title_text": "café 世界", "token": "<redacted>"})
+            self.assertEqual(actions[0]["exact_id"], "alpha")
+            raw = (output / "actions.jsonl").read_text()
+            self.assertNotIn("private", raw)
+            self.assertEqual([json.loads(line)["sequence"] for line in raw.splitlines()], [1, 2])
+
+    def test_snapshot_metadata_does_not_rewrite_or_walk_accumulated_events(self):
+        module = load_cli()
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.create_session(module, Path(directory))
+            session.journal("first", None, {"run_id": "run"})
+            before = session.journal_path.read_bytes()
+            observed = {"version": 2, "process_nonce": "process", "generation": 1, "frame_id": 1, "event_sequence": 1}
+            session.data.update(process_nonce="process", observations="/unused/live.json")
+            session.require_live = Mock()
+            with patch.object(module, "read_json", wraps=module.read_json) as read, \
+                    patch.object(session, "_records", side_effect=AssertionError("unexpected full journal scan")):
+                original_read = read._mock_wraps
+                read.side_effect = lambda path, *args: observed if str(path) == "/unused/live.json" else original_read(path, *args)
+                for _ in range(20):
+                    session.snapshot()
+            self.assertEqual(session.journal_path.read_bytes(), before)
+            self.assertEqual(session.data["actions_count"], 1)
+
+    def test_complete_durable_records_recover_past_lagged_checkpoint_and_preserve_torn_tail(self):
+        module = load_cli()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            session = self.create_session(module, output)
+            session.journal("first", None, {"id": "first"})
+            checkpoint = (output / "session.json").read_bytes()
+            session.journal("second", None, {"id": "second"})
+            committed = session.journal_path.read_bytes()
+            (output / "session.json").write_bytes(checkpoint)
+            torn = b'{"version":1,"entry":'
+            with session.journal_path.open("ab") as out:
+                out.write(torn)
+            recovered = module.Session.load(output)
+            self.assertEqual(recovered.data["actions_count"], 2)
+            self.assertEqual(recovered.journal_path.read_bytes(), committed)
+            artifact = Path(recovered.data["journal_recovery"]["torn_artifact"])
+            self.assertEqual(artifact.read_bytes(), torn)
+            recovered.save()
+            recovered.materialize_actions()
+            self.assertEqual([row["action"] for row in json.loads((output / "actions.json").read_text())], ["first", "second"])
+            recovered.journal("third", None, {})
+            self.assertEqual(recovered.data["actions_count"], 3)
+
+    def test_complete_record_corruption_nonce_sequence_and_hash_changes_fail_closed(self):
+        module = load_cli()
+        changes = ({"session_nonce": "other"}, {"sequence": 2}, {"version": True},
+                   {"entry": {"action": "changed"}}, {"previous_sha256": "changed"})
+        for changed in changes:
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                session = self.create_session(module, output)
+                session.journal("one", None, {"thread_id": "alpha"})
+                record = json.loads(session.journal_path.read_bytes())
+                raw = json.dumps({**record, **changed}).encode() + b"\n"
+                session.journal_path.write_bytes(raw)
+                with self.assertRaises(module.DriverError):
+                    module.Session.load(output)
+                self.assertEqual(session.journal_path.read_bytes(), raw)
+        for raw in (b'{}\n', b'[]\n', b'not json\n', b'\xff\n'):
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                session = self.create_session(module, output)
+                session.journal_path.write_bytes(raw)
+                with self.assertRaises(module.DriverError):
+                    module.Session.load(output)
+                self.assertEqual(session.journal_path.read_bytes(), raw)
+
+    def test_stale_event_writer_and_metadata_checkpoint_are_rejected(self):
+        module = load_cli()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            first = self.create_session(module, output)
+            stale = module.Session.load(output)
+            first.journal("one", None, {})
+            committed = first.journal_path.read_bytes()
+            with self.assertRaises(module.DriverError):
+                stale.journal("must-not-append", None, {})
+            with self.assertRaises(module.DriverError):
+                stale.save()
+            self.assertEqual(first.journal_path.read_bytes(), committed)
+            stale_metadata = module.Session.load(output)
+            first.save()
+            with self.assertRaises(module.DriverError):
+                stale_metadata.save()
+
+    def test_metadata_failure_after_fsync_retains_recoverable_complete_action(self):
+        module = load_cli()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            session = self.create_session(module, output)
+            with patch.object(module, "atomic_json", side_effect=OSError("checkpoint failed")):
+                with self.assertRaises(OSError):
+                    session.journal("durable-before-checkpoint", None, {"run_id": "run"})
+            recovered = module.Session.load(output)
+            self.assertEqual(recovered.data["actions_count"], 1)
+            recovered.materialize_actions()
+            self.assertEqual(json.loads((output / "actions.json").read_text())[0]["action"], "durable-before-checkpoint")
+
+    def test_journal_fsync_precedes_metadata_checkpoint(self):
+        module = load_cli()
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.create_session(module, Path(directory))
+            calls = []
+            fsync, checkpoint = module.os.fsync, module.atomic_json
+            def sync(fd):
+                calls.append(("fsync", Path(f"/proc/self/fd/{fd}").resolve()))
+                return fsync(fd)
+            def save(path, value):
+                calls.append(("checkpoint", path))
+                return checkpoint(path, value)
+            with patch.object(module.os, "fsync", side_effect=sync), patch.object(module, "atomic_json", side_effect=save):
+                session.journal("ordered", None, {})
+            self.assertEqual(calls, [("fsync", session.journal_path), ("checkpoint", Path(directory) / "session.json")])
+
+    def test_append_handles_partial_writes_without_losing_bytes(self):
+        module = load_cli()
+        received = bytearray()
+        writer = Mock()
+        def short_write(value):
+            count = min(3, len(value))
+            received.extend(value[:count])
+            return count
+        writer.write.side_effect = short_write
+        module.Session._append(writer, b"full evidence bytes")
+        self.assertEqual(received, b"full evidence bytes")
+        writer.write.side_effect = lambda value: 0
+        with self.assertRaises(OSError):
+            module.Session._append(writer, b"x")
+
+    def test_explicit_materialize_recovers_offline_and_legacy_events_are_preserved(self):
+        module = load_cli()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            legacy = {"action": "legacy", "begin_unix_ns": 1, "end_unix_ns": 2,
+                      "before": {"draft": "private"}, "after": {"thread_id": "alpha"}}
+            module.atomic_json(output / "session.json", {"version": 1, "session_nonce": "legacy-session", "actions": [legacy]})
+            with patch.object(module, "run_command", side_effect=AssertionError("desktop command during offline recovery")), \
+                    patch("builtins.print"):
+                module.materialize(argparse.Namespace(output=output, dry_run=False))
+            self.assertEqual(json.loads((output / "actions.json").read_text()), [module.redact(legacy)])
+            checkpoint = json.loads((output / "session.json").read_text())
+            self.assertNotIn("actions", checkpoint)
+            self.assertEqual(checkpoint["actions_count"], 1)
+            reopened = module.Session.load(output)
+            reopened.journal("new", None, {})
+            reopened.materialize_actions()
+            self.assertEqual([row["action"] for row in json.loads((output / "actions.json").read_text())], ["legacy", "new"])
+
+    def test_linear_journal_and_metadata_write_volume_at_100_and_500_events(self):
+        module = load_cli()
+        reports = []
+        for count in (100, 500):
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                session = self.create_session(module, output)
+                original = module.atomic_json
+                metadata_bytes = []
+                def checkpoint(path, value):
+                    metadata_bytes.append(len(json.dumps(value, sort_keys=True).encode()))
+                    original(path, value)
+                with patch.object(module, "atomic_json", side_effect=checkpoint), \
+                        patch.object(module, "now_ns", return_value=42), \
+                        patch.object(session, "_records", side_effect=AssertionError("append rescanned history")):
+                    for _ in range(count):
+                        session.journal("fixed", {"run_id": "run"}, {"title_text": "café " + "x" * 256})
+                reports.append({"events": count, "journal_bytes": session.journal_path.stat().st_size,
+                                "metadata_bytes_written": sum(metadata_bytes), "metadata_max_bytes": max(metadata_bytes),
+                                "metadata_min_bytes": min(metadata_bytes), "metadata_writes": len(metadata_bytes)})
+                self.assertEqual(len(metadata_bytes), count)
+                self.assertLess(max(metadata_bytes) - min(metadata_bytes), 64)
+                self.assertNotIn("actions", session.data)
+                self.assertEqual(session._legacy_actions, [])
+                session.materialize_actions()
+                self.assertEqual(len(json.loads((output / "actions.json").read_text())), count)
+        for key in ("journal_bytes", "metadata_bytes_written"):
+            self.assertGreater(reports[1][key] / reports[0][key], 4.9)
+            self.assertLess(reports[1][key] / reports[0][key], 5.1)
 
 
 if __name__ == "__main__":
