@@ -216,6 +216,7 @@ pub const View = struct {
     sidebar_resizing: bool = false,
     sidebar_toggle_bounds: c.SDL_FRect = zero_rect,
     sidebar_resize_bounds: c.SDL_FRect = zero_rect,
+    sidebar_empty_project_bounds: c.SDL_FRect = zero_rect,
     sidebar_now_ms: i64 = 0,
     sidebar_working_shelf: bool = false,
     sidebar_shelf_expanded: [3]bool = @splat(false),
@@ -1946,6 +1947,10 @@ pub const View = struct {
                         self.search_focused = false;
                         return true;
                     }
+                    if (widgets.contains(self.sidebar_empty_project_bounds, x, y)) {
+                        self.navigation = .new_project;
+                        return true;
+                    }
                     if (widgets.contains(self.sidebar_archive_bounds, x, y)) {
                         self.sidebar_archived = !self.sidebar_archived;
                         self.sidebar_archive_request = self.sidebar_archived;
@@ -2940,11 +2945,14 @@ pub const View = struct {
         self.sidebar_window_width = bounds.header.width;
         const sidebar = self.sidebarWidth(bounds.header.width);
         const height = bounds.composer.y + bounds.composer.height + metrics.gutter;
-        const inset = @min(metrics.gutter, 20);
         const radius = @min(metrics.radius, 8);
         self.sidebar_bounds = .{ .x = 0, .y = 0, .w = sidebar, .h = height };
-        self.sidebar_toggle_bounds = .{ .x = sidebar + 8, .y = 12, .w = 28, .h = 28 };
+        self.sidebar_toggle_bounds = if (self.sidebar_collapsed)
+            .{ .x = 8, .y = 12, .w = 28, .h = 28 }
+        else
+            .{ .x = 12, .y = 12, .w = 28, .h = 28 };
         self.sidebar_resize_bounds = if (self.sidebar_collapsed) zero_rect else .{ .x = sidebar - 3, .y = 0, .w = 6, .h = height };
+        self.sidebar_empty_project_bounds = zero_rect;
         _ = self.navigation_targets.add("sidebar.toggle", "button", self.sidebar_toggle_bounds, true) catch {};
         _ = self.navigation_targets.add("sidebar.resize", "separator", self.sidebar_resize_bounds, !self.sidebar_collapsed) catch {};
         self.new_thread_bounds = zero_rect;
@@ -2961,15 +2969,32 @@ pub const View = struct {
         if (!self.sidebar_collapsed) {
             try widgets.panel(renderer, self.sidebar_bounds, 0, palette.sidebar);
             try widgets.panel(renderer, .{ .x = sidebar - 1, .y = 0, .w = 1, .h = height }, 0, palette.sidebar_border);
-            try self.labels.draw(text, "Spica", inset, (bounds.header.height - 16) / 2, 14, foreground);
+            // T3 Code keeps its compact brand and collapse affordance inside a
+            // dark, softly colored header. Paint the gradient as bounded one
+            // pixel strips so it remains cheap on software renderers.
+            const header_height = @min(@as(f32, 52), bounds.header.height);
+            var strip: c.SDL_FRect = .{ .x = 0, .y = 0, .w = sidebar, .h = 1 };
+            var row: usize = 0;
+            while (row < @as(usize, @intFromFloat(header_height))) : (row += 1) {
+                const fade = 1.0 - @as(f32, @floatFromInt(row)) / @max(1, header_height);
+                const r: u8 = @intFromFloat(8 + 22 * fade);
+                const g: u8 = @intFromFloat(10 + 20 * fade);
+                const b: u8 = @intFromFloat(22 + 42 * fade);
+                if (!c.SDL_SetRenderDrawColor(renderer, r, g, b, 255) or !c.SDL_RenderFillRect(renderer, &strip)) return error.SidebarHeaderDraw;
+                strip.y += 1;
+            }
+            try icon(renderer, .sidebar, self.sidebar_toggle_bounds.x + 6, self.sidebar_toggle_bounds.y + 6, foreground);
+            try self.labels.draw(text, "T3", 50, (bounds.header.height - 16) / 2, 14, foreground);
+            try self.labels.draw(text, " Code", 70, (bounds.header.height - 16) / 2, 14, palette.sidebar_muted);
             // Current eb1510d source puts Search and all three icon actions on
             // one 32px row. The older marketing image uses a separate scope row.
             const row_top = bounds.header.height + 4;
             const action_y = row_top + 2;
+            const empty_sidebar = self.project_count == 0 and self.thread_count == 0 and self.search_len == 0;
             self.new_thread_bounds = .{ .x = sidebar - 36, .y = action_y, .w = 28, .h = 28 };
-            self.new_project_bounds = .{ .x = sidebar - 65, .y = action_y, .w = 28, .h = 28 };
-            self.scope_bounds = .{ .x = sidebar - 94, .y = action_y, .w = 28, .h = 28 };
-            self.search_bounds = .{ .x = 8, .y = row_top, .w = @max(0, self.scope_bounds.x - 9), .h = 32 };
+            self.new_project_bounds = if (empty_sidebar) zero_rect else .{ .x = sidebar - 65, .y = action_y, .w = 28, .h = 28 };
+            self.scope_bounds = if (empty_sidebar) zero_rect else .{ .x = sidebar - 94, .y = action_y, .w = 28, .h = 28 };
+            self.search_bounds = .{ .x = 8, .y = row_top, .w = @max(0, if (empty_sidebar) sidebar - 48 else self.scope_bounds.x - 9), .h = 32 };
             self.search_clear_bounds = if (self.search_len == 0) zero_rect else .{ .x = self.search_bounds.x + self.search_bounds.w - 22, .y = action_y, .w = 22, .h = 28 };
             const sidebar_muted = palette.sidebar_muted;
             if (self.search_focused) try widgets.panel(renderer, self.search_bounds, 6, palette.raised);
@@ -2981,10 +3006,12 @@ pub const View = struct {
                 try self.line_view.draw(renderer, text, self.search_query[0..self.search_len], self.search_edit, .{ .x = 40, .y = row_top + 8, .w = @max(0, self.search_bounds.w - 54), .h = 20 }, foreground, palette.selection, self.window_active);
             }
             if (self.search_len != 0) try icon(renderer, .close, self.search_clear_bounds.x + 3, row_top + 8, sidebar_muted);
-            if (self.scope_project.len != 0) try widgets.panel(renderer, self.scope_bounds, 6, palette.sidebar_active);
-            try icon(renderer, .filter, self.scope_bounds.x + 6, action_y + 6, sidebar_muted);
-            try icon(renderer, .folder, self.new_project_bounds.x + 6, action_y + 5, sidebar_muted);
-            try icon(renderer, .plus, self.new_project_bounds.x + 8, action_y + 7, sidebar_muted);
+            if (!empty_sidebar) {
+                if (self.scope_project.len != 0) try widgets.panel(renderer, self.scope_bounds, 6, palette.sidebar_active);
+                try icon(renderer, .filter, self.scope_bounds.x + 6, action_y + 6, sidebar_muted);
+                try icon(renderer, .folder, self.new_project_bounds.x + 6, action_y + 5, sidebar_muted);
+                try icon(renderer, .plus, self.new_project_bounds.x + 8, action_y + 7, sidebar_muted);
+            }
             try icon(renderer, .pen, self.new_thread_bounds.x + 6, action_y + 6, sidebar_muted);
             const more_height: f32 = if (self.search_more_available) 24 else 0;
             self.search_more_bounds = if (more_height != 0) .{ .x = 8, .y = row_top + 36, .w = sidebar - 16, .h = more_height } else zero_rect;
@@ -2997,22 +3024,29 @@ pub const View = struct {
             var clip = widgets.Clip.push(renderer, self.sidebar_rows);
             defer clip.restore(renderer);
             try self.drawThreads(renderer, text, foreground, sidebar_muted);
-            if (self.visibleThreadCount() == 0) try self.labels.drawFitted(renderer, text, if (self.search_len != 0 and self.thread_search_busy) "Searching older threads…" else if (self.search_len != 0 and self.search_more_available) "No match here · Enter searches older threads" else if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
+            if (self.visibleThreadCount() == 0 and !(self.project_count == 0 and self.thread_count == 0 and self.search_len == 0)) try self.labels.drawFitted(renderer, text, if (self.search_len != 0 and self.thread_search_busy) "Searching older threads…" else if (self.search_len != 0 and self.search_more_available) "No match here · Enter searches older threads" else if (self.search_len != 0) "No threads found" else "No threads in this project", 18, self.sidebar_rows.y + 12, sidebar - 36, 12, sidebar_muted);
+            if (self.project_count == 0 and self.thread_count == 0 and self.search_len == 0) {
+                const center_x = self.sidebar_rows.x + self.sidebar_rows.w / 2;
+                try self.labels.drawFitted(renderer, text, "No projects yet", self.sidebar_rows.x, self.sidebar_rows.y + 26, self.sidebar_rows.w, 12, sidebar_muted);
+                self.sidebar_empty_project_bounds = .{ .x = center_x - 48, .y = self.sidebar_rows.y + 52, .w = 96, .h = 28 };
+                try widgets.panel(renderer, self.sidebar_empty_project_bounds, 5, palette.surface);
+                try icon(renderer, .plus, self.sidebar_empty_project_bounds.x + 10, self.sidebar_empty_project_bounds.y + 6, sidebar_muted);
+                try self.labels.draw(text, "Add project", self.sidebar_empty_project_bounds.x + 28, self.sidebar_empty_project_bounds.y + 8, 11, foreground);
+                _ = self.navigation_targets.add("workspace.empty_project", "button", self.sidebar_empty_project_bounds, true) catch {};
+            }
             clip.restore(renderer);
             // Make the actual connection entry point legible. A settings glyph
             // alone left first-time users guessing where provider setup lived;
             // the whole status row is now one painted, clickable target.
-            self.setup_bounds = .{ .x = 8, .y = height - 36, .w = @max(0, sidebar - 120), .h = 32 };
-            self.sidebar_archive_bounds = .{ .x = @max(8, sidebar - 112), .y = height - 36, .w = 96, .h = 32 };
+            self.setup_bounds = .{ .x = 8, .y = height - 36, .w = 32, .h = 32 };
+            self.sidebar_archive_bounds = .{ .x = 48, .y = height - 36, .w = 32, .h = 32 };
             if (self.setup_open) try widgets.panel(renderer, self.setup_bounds, 6, palette.sidebar_active);
             try icon(renderer, .settings, 16, height - 28, sidebar_muted);
-            try self.labels.draw(text, "Connection", 40, height - 29, 12, foreground);
-            try self.labels.drawFitted(renderer, text, self.status, 40, height - 16, sidebar - 56, 10, sidebar_muted);
+            try icon(renderer, .branch, 56, height - 28, sidebar_muted);
             _ = self.navigation_targets.add("sidebar.archived.toggle", "button", self.sidebar_archive_bounds, true) catch {};
-            try self.labels.drawFitted(renderer, text, if (self.sidebar_archived) "Active threads" else "Archived", self.sidebar_archive_bounds.x + 8, height - 28, self.sidebar_archive_bounds.w - 8, 11, sidebar_muted);
             if (self.scope_open) try self.drawScope(renderer, text, foreground, sidebar_muted);
         }
-        try icon(renderer, .sidebar, self.sidebar_toggle_bounds.x + 6, self.sidebar_toggle_bounds.y + 6, muted);
+        if (self.sidebar_collapsed) try icon(renderer, .sidebar, self.sidebar_toggle_bounds.x + 6, self.sidebar_toggle_bounds.y + 6, muted);
         const header_x = sidebar + metrics.gutter + 32;
         var project_name: []const u8 = "Workspace";
         var thread_name: []const u8 = "New chat";
@@ -4130,7 +4164,7 @@ test "sidebar Undo is not consumed by a plain view poll" {
     var view = try View.init(std.testing.allocator);
     defer view.deinit();
     const id = try transcript.Id.init("undo-poll");
-    view.offerSidebarUndo(.{ .restore = .{ .id = id, .navigate = true } }, "Archived", View.wallTimeMs());
+    view.offerSidebarUndo(.{ .restore = .{ .id = id, .navigate = true } }, "Archived");
     try std.testing.expect(view.takeSidebarUndoRequest() == null);
     view.sidebar_undo_request = .{ .restore = .{ .id = id, .navigate = true } };
     try std.testing.expect(view.takeSidebarUndoRequest() != null);
