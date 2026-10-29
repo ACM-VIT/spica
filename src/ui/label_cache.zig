@@ -62,6 +62,12 @@ pub const LabelCache = struct {
         clip.restore(renderer);
         if (truncated) try self.draw(text, "…", x + available - suffix_width, top, size, color);
     }
+
+    pub fn drawCentered(self: *LabelCache, renderer: *c.SDL_Renderer, text: *c.SpicaText, bytes: []const u8, x: f32, top: f32, available: f32, size: c_uint, color: Color) !void {
+        if (available <= 0) return;
+        const label_width = @min(available, try self.width(text, utf8.prefix(bytes, max_bytes), size));
+        try self.drawFitted(renderer, text, bytes, x + (available - label_width) / 2, top, label_width, size, color);
+    }
 };
 
 const TestCanvas = struct {

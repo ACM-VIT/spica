@@ -555,7 +555,10 @@ pub const App = struct {
         const scale_y = @as(f32, @floatFromInt(pixel_height)) / h;
         if (!c.SDL_SetRenderScale(self.renderer, scale_x, scale_y) or !c.spica_text_set_render_scale(self.text, scale_x, scale_y)) return error.RenderScale;
         self.layout.resize(w, h);
-        const coding_bounds = if (self.view.custom_root) |root| self.layout.script(root, &self.view.custom_bounds) else self.layout.coding(w);
+        var coding_bounds = if (self.view.custom_root) |root| self.layout.script(root, &self.view.custom_bounds) else self.layout.coding(w);
+        if (self.view.custom_root == null and self.view.rich_count == 0 and !self.view.workflow_open and !self.view.workspace_open) {
+            self.layout.centerEmpty(&coding_bounds);
+        }
         try self.view.draw(self.renderer, self.text, self.window, coding_bounds);
         self.snapshot.draft = self.view.editor.textBytes();
         self.snapshot.presentation = self.view.design;

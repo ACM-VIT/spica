@@ -36,6 +36,7 @@ pub const Layout = struct {
         header: c.Clay_BoundingBox,
         transcript: c.Clay_BoundingBox,
         composer: c.Clay_BoundingBox,
+        canvas_height: f32 = 0,
     };
 
     /// Setup geometry is shared by painting, hit testing and native automation.
@@ -126,7 +127,19 @@ pub const Layout = struct {
         c.Clay__CloseElement();
         c.Clay__CloseElement();
         _ = c.Clay_EndLayout();
-        return .{ .header = bounds("header"), .transcript = bounds("transcript"), .composer = bounds("composer") };
+        return .{ .header = bounds("header"), .transcript = bounds("transcript"), .composer = bounds("composer"), .canvas_height = self.height };
+    }
+
+    /// Empty chats in T3 keep the welcome copy and composer together in the
+    /// working area instead of pinning the composer to the window footer.
+    /// The caller decides when the chat is empty; this helper only adjusts the
+    /// retained geometry shared by painting and input hit targets.
+    pub fn centerEmpty(self: *const Layout, geometry: *Coding) void {
+        const top = geometry.header.y + geometry.header.height + self.design.layout.gap;
+        const bottom = self.height - self.design.layout.gutter;
+        const available = @max(0, bottom - top - geometry.composer.height);
+        geometry.composer.y = top + available / 2;
+        geometry.transcript.height = @max(0, geometry.composer.y - geometry.transcript.y - self.design.layout.gap);
     }
 
     /// The runtime validates preorder, unique IDs, depth and node/text bounds.
@@ -169,6 +182,7 @@ pub const Layout = struct {
         while (depth != 0) : (depth -= 1) c.Clay__CloseElement();
         _ = c.Clay_EndLayout();
         var result: Coding = std.mem.zeroes(Coding);
+        result.canvas_height = self.height;
         for (root.nodes[0..root.count], 0..) |*node, index| {
             output[index] = bounds(node.id.bytes[0..node.id.len]);
             if (node.kind == 4) result.composer = output[index];
@@ -247,6 +261,18 @@ test "configured native geometry keeps responsive sidebar and bounded centered c
         if (width == 1000) try std.testing.expectEqual(@as(f32, 360), layout.sidebarWidthFor(width));
         if (width == 1280) try std.testing.expectEqual(@as(f32, 360), layout.sidebarWidthFor(width));
     }
+}
+
+test "empty coding centers the composer in the working area" {
+    var layout = try Layout.init(std.testing.allocator, 1100, 780);
+    defer layout.deinit();
+    const base = layout.coding(1100);
+    var centered = base;
+    layout.centerEmpty(&centered);
+    try std.testing.expect(centered.composer.y > base.header.y + base.header.height);
+    try std.testing.expect(centered.composer.y < base.composer.y);
+    try std.testing.expectApproxEqAbs(centered.transcript.y + centered.transcript.height + layout.design.layout.gap, centered.composer.y, 0.1);
+    try std.testing.expectApproxEqAbs(@as(f32, 136), centered.composer.height, 0.1);
 }
 
 test "custom node dimensions padding and gap reach Clay and preserve action indices" {

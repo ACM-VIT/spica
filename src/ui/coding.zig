@@ -1142,7 +1142,11 @@ pub const View = struct {
                         return true;
                     }
                     if (widgets.contains(self.workflow_button, x, y) and !self.setup_open and !self.workspace_open) {
-                        self.workflow_open = !self.workflow_open;
+                        if (self.selected == null) {
+                            self.setup_open = true;
+                            self.setup_action = .status;
+                            self.workflow_open = false;
+                        } else self.workflow_open = !self.workflow_open;
                         self.workflow_path_focus = false;
                         self.workflow_keyboard = 0;
                         try self.focus(window, true);
@@ -1930,7 +1934,7 @@ pub const View = struct {
         const metrics = self.design.layout;
         const palette = self.design.colors;
         const sidebar = self.sidebarWidth(bounds.header.width);
-        const height = bounds.composer.y + bounds.composer.height + metrics.gutter;
+        const height = @max(bounds.canvas_height, bounds.composer.y + bounds.composer.height + metrics.gutter);
         const inset = @min(metrics.gutter, 20);
         const radius = @min(metrics.radius, 8);
         self.sidebar_bounds = .{ .x = 0, .y = 0, .w = sidebar, .h = height };
@@ -2191,7 +2195,7 @@ pub const View = struct {
         self.controls[primary] = .{ .x = panel.x + panel.w - 44, .y = y - 2, .w = 32, .h = 32 };
         const model_x = panel.x + 10;
         self.workflow_button = .{ .x = self.controls[primary].x - 110, .y = y, .w = 104, .h = 28 };
-        try self.labels.drawFitted(renderer, text, "More · F10", self.workflow_button.x + 4, y + 6, 98, 13, foreground);
+        try self.labels.drawFitted(renderer, text, if (self.selected == null) "Open Connection" else "More · F10", self.workflow_button.x + 4, y + 6, 98, 13, foreground);
         const available = @max(0, self.workflow_button.x - model_x - gap * 2);
         var label_buffer: [768]u8 = undefined;
         const label = if (self.selected) |*selected| modelLabel(selected, &label_buffer) else "Choose model";
@@ -2356,7 +2360,7 @@ pub const View = struct {
 
     fn drawSetup(self: *View, renderer: *c.SDL_Renderer, text: *c.SpicaText, bounds: Layout.Coding, foreground: Color, muted: Color) !void {
         const width = bounds.header.width;
-        const height = bounds.composer.y + bounds.composer.height + self.design.layout.gutter;
+        const height = @max(bounds.canvas_height, bounds.composer.y + bounds.composer.height + self.design.layout.gutter);
         const geometry = Layout.setup(width, height, self.setup_advanced_open);
         const menu = geometry.menu;
         self.setup_menu = menu;
@@ -2578,9 +2582,12 @@ pub const View = struct {
             if (self.rich_count == 0) {
                 var context: [1024]u8 = undefined;
                 const empty = try self.emptyState(&context);
-                try self.labels.drawFitted(renderer, text, "What would you like to build?", bounds.transcript.x, self.transcript_bounds.y + 20, bounds.transcript.width, 22, foreground);
-                try self.labels.drawFitted(renderer, text, empty.description, bounds.transcript.x, self.transcript_bounds.y + 58, bounds.transcript.width, 14, muted);
-                try self.labels.drawFitted(renderer, text, empty.context, bounds.transcript.x, self.transcript_bounds.y + 86, bounds.transcript.width, 13, muted);
+                const block_height: f32 = 78;
+                const bottom = @min(self.transcript_bounds.y + self.transcript_bounds.h, bounds.composer.y - 18);
+                const empty_y = @max(self.transcript_bounds.y + 12, bottom - block_height);
+                try self.labels.drawCentered(renderer, text, "What should we work on?", bounds.transcript.x, empty_y, bounds.transcript.width, 28, foreground);
+                try self.labels.drawCentered(renderer, text, empty.description, bounds.transcript.x, empty_y + 42, bounds.transcript.width, 14, muted);
+                try self.labels.drawCentered(renderer, text, empty.context, bounds.transcript.x, empty_y + 65, bounds.transcript.width, 13, muted);
             }
         }
         transcript_clip.restore(renderer);
@@ -2608,7 +2615,7 @@ pub const View = struct {
             try self.editor_view.ensureLayout(text, &self.editor, editor_bounds.w, font_size);
             try self.ensurePreedit(text, @max(1, editor_bounds.w - 24));
             var clip = widgets.Clip.push(renderer, .{ .x = editor_bounds.x + 10, .y = editor_bounds.y + 8, .w = @max(0, editor_bounds.w - 20), .h = @max(0, editor_bounds.h - 12) });
-            if (self.editor.len == 0 and self.preedit_len == 0) try self.labels.drawFitted(renderer, text, "Ask for changes, or send a follow-up…", editor_bounds.x + 12, editor_bounds.y + 10, editor_bounds.w - 24, @intFromFloat(font_size), muted);
+            if (self.editor.len == 0 and self.preedit_len == 0) try self.labels.drawFitted(renderer, text, if (self.selected == null) "Enable a provider in Connection to send a message" else "Ask for changes, or send a follow-up…", editor_bounds.x + 12, editor_bounds.y + 10, editor_bounds.w - 24, @intFromFloat(font_size), muted);
             if (self.editor_view.layout) |layout| {
                 const content_height = c.spica_text_layout_height(layout);
                 const available = @max(0, editor_bounds.h - 20);

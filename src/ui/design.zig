@@ -26,14 +26,14 @@ pub const Palette = struct {
 pub const Metrics = struct {
     sidebar_width: f32 = 256,
     content_width: f32 = 736,
-    header_height: f32 = 52,
-    composer_height: f32 = 160,
+    header_height: f32 = 40,
+    composer_height: f32 = 136,
     gutter: f32 = 24,
     gap: f32 = 12,
     radius: f32 = 24,
 };
 
-pub const metric_min = [7]f32{ 148, 400, 48, 136, 12, 4, 0 };
+pub const metric_min = [7]f32{ 148, 400, 40, 136, 12, 4, 0 };
 pub const metric_max = [7]f32{ 400, 1600, 96, 240, 48, 32, 24 };
 pub const ValidationError = error{InvalidDesign};
 
