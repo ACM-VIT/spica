@@ -217,6 +217,7 @@ pub const View = struct {
     sidebar_toggle_bounds: c.SDL_FRect = zero_rect,
     sidebar_resize_bounds: c.SDL_FRect = zero_rect,
     sidebar_empty_project_bounds: c.SDL_FRect = zero_rect,
+    sidebar_footer_bounds: [4]c.SDL_FRect = @splat(zero_rect),
     sidebar_now_ms: i64 = 0,
     sidebar_working_shelf: bool = false,
     sidebar_shelf_expanded: [3]bool = @splat(false),
@@ -1957,6 +1958,15 @@ pub const View = struct {
                         self.sidebarChanged();
                         return true;
                     }
+                    if (widgets.contains(self.sidebar_footer_bounds[2], x, y)) {
+                        self.notice = "Usage metrics are available after a connected provider is selected.";
+                        return true;
+                    }
+                    if (widgets.contains(self.sidebar_footer_bounds[3], x, y)) {
+                        self.sidebar_archive_request = self.sidebar_archived;
+                        self.sidebarChanged();
+                        return true;
+                    }
                     if (widgets.contains(self.sidebar_undo_bounds, x, y)) {
                         self.claimSidebarUndo();
                         return true;
@@ -2907,7 +2917,7 @@ pub const View = struct {
 
     // Fixed native strokes: no decorative Unicode, face discovery or retained
     // icon textures. Coordinates use a 16-unit local grid.
-    const Icon = enum { plus, folder, pen, chevron, send, stop, settings, search, filter, branch, close, sidebar, chevron_up, working, alert, question, clock, pin, check, copy };
+    const Icon = enum { plus, folder, pen, chevron, send, stop, settings, search, filter, branch, analytics, refresh, close, sidebar, chevron_up, working, alert, question, clock, pin, check, copy };
     fn icon(renderer: *c.SDL_Renderer, kind: Icon, x: f32, y: f32, color: Color) !void {
         // ComposerPrimaryActions.tsx uses an 8px filled rounded square inside
         // its 12px Stop glyph, centered in the 32px action.
@@ -2926,6 +2936,8 @@ pub const View = struct {
             .search => &.{ .{ 3, 2, 9, 2 }, .{ 9, 2, 12, 5 }, .{ 12, 5, 12, 9 }, .{ 12, 9, 9, 12 }, .{ 9, 12, 3, 12 }, .{ 3, 12, 1, 9 }, .{ 1, 9, 1, 5 }, .{ 1, 5, 3, 2 }, .{ 11, 11, 15, 15 } },
             .filter => &.{ .{ 1, 3, 15, 3 }, .{ 4, 8, 12, 8 }, .{ 6, 13, 10, 13 } },
             .branch => &.{ .{ 4, 2, 4, 13 }, .{ 4, 9, 11, 9 }, .{ 11, 9, 12, 7 }, .{ 12, 7, 12, 3 }, .{ 2, 1, 6, 1 }, .{ 10, 2, 14, 2 }, .{ 2, 14, 6, 14 } },
+            .analytics => &.{ .{ 2, 14, 2, 9 }, .{ 7, 14, 7, 5 }, .{ 12, 14, 12, 2 }, .{ 1, 14, 14, 14 } },
+            .refresh => &.{ .{ 13, 5, 11, 3 }, .{ 11, 3, 8, 2 }, .{ 8, 2, 5, 3 }, .{ 5, 3, 3, 6 }, .{ 3, 6, 3, 10 }, .{ 3, 10, 5, 13 }, .{ 5, 13, 8, 14 }, .{ 8, 14, 11, 13 }, .{ 11, 13, 13, 10 }, .{ 13, 10, 10, 10 }, .{ 13, 10, 13, 7 } },
             .close => &.{ .{ 4, 4, 12, 12 }, .{ 12, 4, 4, 12 } },
             .plus => &.{ .{ 8, 2, 8, 14 }, .{ 2, 8, 14, 8 } },
             .folder => &.{ .{ 1, 4, 6, 4 }, .{ 6, 4, 8, 6 }, .{ 8, 6, 15, 6 }, .{ 15, 6, 15, 14 }, .{ 15, 14, 1, 14 }, .{ 1, 14, 1, 4 } },
@@ -2966,6 +2978,7 @@ pub const View = struct {
         self.project_bounds = @splat(zero_rect);
         self.sidebar_shelf_bounds = @splat(zero_rect);
         self.sidebar_action_bounds = @splat(@splat(zero_rect));
+        self.sidebar_footer_bounds = @splat(zero_rect);
         if (!self.sidebar_collapsed) {
             try widgets.panel(renderer, self.sidebar_bounds, 0, palette.sidebar);
             try widgets.panel(renderer, .{ .x = sidebar - 1, .y = 0, .w = 1, .h = height }, 0, palette.sidebar_border);
@@ -3040,10 +3053,20 @@ pub const View = struct {
             // the whole status row is now one painted, clickable target.
             self.setup_bounds = .{ .x = 8, .y = height - 36, .w = 32, .h = 32 };
             self.sidebar_archive_bounds = .{ .x = 48, .y = height - 36, .w = 32, .h = 32 };
+            self.sidebar_footer_bounds = .{
+                .{ .x = 8, .y = height - 36, .w = 32, .h = 32 },
+                .{ .x = 48, .y = height - 36, .w = 32, .h = 32 },
+                .{ .x = 84, .y = height - 36, .w = 32, .h = 32 },
+                .{ .x = sidebar - 40, .y = height - 36, .w = 32, .h = 32 },
+            };
             if (self.setup_open) try widgets.panel(renderer, self.setup_bounds, 6, palette.sidebar_active);
             try icon(renderer, .settings, 16, height - 28, sidebar_muted);
             try icon(renderer, .branch, 56, height - 28, sidebar_muted);
+            try icon(renderer, .analytics, 92, height - 28, sidebar_muted);
+            try icon(renderer, .refresh, sidebar - 34, height - 28, sidebar_muted);
             _ = self.navigation_targets.add("sidebar.archived.toggle", "button", self.sidebar_archive_bounds, true) catch {};
+            _ = self.navigation_targets.add("sidebar.analytics", "button", self.sidebar_footer_bounds[2], true) catch {};
+            _ = self.navigation_targets.add("sidebar.refresh", "button", self.sidebar_footer_bounds[3], true) catch {};
             if (self.scope_open) try self.drawScope(renderer, text, foreground, sidebar_muted);
         }
         if (self.sidebar_collapsed) try icon(renderer, .sidebar, self.sidebar_toggle_bounds.x + 6, self.sidebar_toggle_bounds.y + 6, muted);
